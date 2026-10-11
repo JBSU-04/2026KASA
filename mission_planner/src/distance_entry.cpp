@@ -1,0 +1,178 @@
+#include "mission_planner/distance_entry.hpp"
+#include <algorithm>
+#include <cmath>
+namespace mission_planner {
+namespace {
+bool validMeasuredProfile(const EgoEntryModel& ego) {
+  const auto& t=ego.profile_times;const auto& v=ego.profile_speeds;
+  if(t.size()<2||t.size()!=v.size()||t.front()!=0||v.front()!=0)return false;
+  for(size_t i=0;i<t.size();++i){
+    if(!std::isfinite(t[i])||!std::isfinite(v[i])||t[i]<0||v[i]<0)return false;
+    if(i&&(t[i]<=t[i-1]||v[i]<=v[i-1]))return false;
+  }
+  return true;
+}
+double measuredAcceleration(const EgoEntryModel& ego,double speed){
+  auto it=std::upper_bound(ego.profile_speeds.begin(),ego.profile_speeds.end(),speed);
+  if(it==ego.profile_speeds.end())return 0.;
+  const size_t i=std::max<size_t>(1,it-ego.profile_speeds.begin());
+  return (ego.profile_speeds[i]-ego.profile_speeds[i-1])/(ego.profile_times[i]-ego.profile_times[i-1]);
+}
+}
+double frontBrakingSpeedCap(double gap,double lead_speed,double standstill,double decel,double reaction,
+                            double lead_decel,double ego_speed){
+  // A leader's stopping distance cannot manufacture clearance when the
+  // measured bumper gap is already below our minimum separation.
+  if (gap <= standstill) return 0.0;
+  const double a=std::max(.5,decel),at=a*std::max(0.,reaction);
+  const double leader_stop=lead_speed*lead_speed/(2*std::max(.5,lead_decel>0?lead_decel:a));
+  const double usable=std::max(0.,gap-standstill);
+  const double future=std::max(0.,std::sqrt(at*at+2*a*(usable+leader_stop))-at);
+  const double after_reaction=std::sqrt(std::max(0.,2*a*(usable+leader_stop-std::max(0.,ego_speed)*reaction)));
+  return std::min(future,after_reaction);
+}
+void sampleEntryMotion(const DistanceEntryResult& result,double time,double* s,double* v){
+  const auto& samples=result.motion;
+  auto it=std::lower_bound(samples.begin(),samples.end(),time,
+      [](const EntryMotionSample& sample,double t){return sample.time<t;});
+  if(it==samples.end()){*s=samples.back().position;*v=samples.back().speed;return;}
+  if(it==samples.begin()){*s=it->position;*v=it->speed;return;}
+  const auto& prev=*(it-1);double f=(time-prev.time)/(it->time-prev.time);
+  *s=prev.position+f*(it->position-prev.position);*v=prev.speed+f*(it->speed-prev.speed);
+}
+DistanceEntryResult evaluateDistanceEntry(const GapCandidate& gap,
+    const EgoEntryModel& original, const DistanceEntryParams& p) {
+  DistanceEntryResult out;
+  if(original.measured_profile&&!validMeasuredProfile(original)){
+    out.reason="invalid_measured_profile";return out;
+  }
+  if (!std::isfinite(original.distance_to_merge)||!std::isfinite(original.speed)||
+      original.max_speed<=.1||original.accel<=0||p.front_gap<0||p.rear_gap<0||p.horizon<0||
+      !std::isfinite(p.follow_time_gap)||p.follow_time_gap<0||
+      !std::isfinite(p.follow_standstill_gap)||p.follow_standstill_gap<0||
+      !std::isfinite(p.leader_release_gap)||p.leader_release_gap<0||
+      !std::isfinite(p.front_response_time)||p.front_response_time<0||
+      !std::isfinite(p.front_max_decel)||p.front_max_decel<0||
+      !std::isfinite(p.comfortable_decel)||p.comfortable_decel<=0||
+      p.reaction<0||p.rear_decel<=0) {out.reason="invalid_prediction";return out;}
+  if((gap.leader_id>=0&&(!std::isfinite(gap.leader_pos)||!std::isfinite(gap.leader_speed)||!std::isfinite(gap.leader_length)))||
+     (gap.follower_id>=0&&(!std::isfinite(gap.follower_pos)||!std::isfinite(gap.follower_speed)||!std::isfinite(gap.follower_length)))){
+    out.reason="invalid_vehicle_prediction";return out;}
+  const double horizon=p.clearance_only?0.:p.horizon;
+  EgoEntryModel ego=original;
+  const double vl=std::max(0.,gap.leader_speed-p.speed_margin);
+  const double vf=std::max(0.,gap.follower_speed+p.speed_margin);
+  if(!ego.measured_profile&&p.follow_time_gap<=0&&gap.leader_id>=0&&gap.leader_pos<30.)ego.max_speed=std::min(ego.max_speed,std::max(.1,vl));
+  const double half=.5*std::max(.1,ego.length);
+  // Integrate the same path-distance ACC cap as the speed-cap converter.
+  // Once its nose occupies the merge, follow using entry-path plus ring
+  // distance. Retain braking-response reserve through the merge.
+  double s=0,v=std::max(0.,ego.speed);out.motion.push_back({0,s,v});
+  const double dt=.02,delay=!ego.departure_in_progress&&v<.5?std::max(0.,ego.start_delay):0.;
+  out.delay_remaining=delay;
+  double cleared_at=-1.;
+  for(int i=1;i<=1500;++i){double t=i*dt;
+    if(!ego.measured_profile&&p.follow_time_gap<=0){GapSelector::egoProfile(ego,t,&s,&v);}
+    else{double cap=ego.max_speed;
+      if(ego.measured_profile)cap=std::min(cap,std::max(v,ego.profile_speeds.back()));
+      double rear=gap.leader_pos+vl*(t-dt)-.5*gap.leader_length;
+      const bool leader_occupies_merge = rear + gap.leader_length >= 0.0;
+      if(p.follow_time_gap>0&&gap.leader_id>=0&&
+         (p.project_leader || rear>=p.leader_release_gap || (ego.measured_profile && leader_occupies_merge))){
+        double lead_gap=ego.distance_to_merge+rear-s-half;
+        double usable=std::max(0.,lead_gap-p.follow_standstill_gap);
+        double braking=frontBrakingSpeedCap(lead_gap,vl,p.follow_standstill_gap,
+                                           p.comfortable_decel,p.front_response_time,p.front_max_decel,v);
+        double headway=std::max(0.,vl+(usable-p.follow_time_gap*v)/p.follow_time_gap);
+        const double follow_cap=std::min(braking,headway);
+        if(follow_cap<cap&&v>=follow_cap-.05)out.leader_limited=true;
+        cap=std::min(cap,follow_cap);
+      }
+      double next=v;
+      const double acceleration=ego.measured_profile?measuredAcceleration(ego,v):ego.accel;
+      if(t>delay)next=v<cap?std::min(cap,v+acceleration*dt):std::max(cap,v-std::max(.5,p.comfortable_decel)*dt);
+      if(ego.measured_profile&&ego.max_speed<ego.profile_speeds.back()&&
+         v>=ego.max_speed-.05&&cap>=ego.max_speed-.05)out.curve_limited=true;
+      s+=.5*(v+next)*dt;v=next;
+    }
+    out.motion.push_back({t,s,v});
+    if(cleared_at<0&&s>=ego.distance_to_merge+half)cleared_at=t;
+    if(cleared_at>=0&&t>=cleared_at+horizon+.05)break;
+  }
+  auto profile=[&](double t,double* position,double* speed){sampleEntryMotion(out,t,position,speed);};
+  auto timeAt=[&](double target){double lo=0,hi=30,s,v;profile(hi,&s,&v);
+    if(s<target)return std::numeric_limits<double>::infinity();
+    for(int i=0;i<40;++i){double mid=(lo+hi)/2;profile(mid,&s,&v);if(s<target)lo=mid;else hi=mid;}return hi;};
+  out.entry_time=timeAt(std::max(0.,ego.distance_to_merge-half));
+  out.reference_time=timeAt(std::max(0.,ego.distance_to_merge));
+  out.clear_time=timeAt(std::max(0.,ego.distance_to_merge+half));
+  if(!std::isfinite(out.clear_time)){out.reason="prediction_horizon";return out;}
+  out.front_now=gap.leader_id<0?out.front_now:gap.leader_pos-.5*gap.leader_length+ego.distance_to_merge-half;
+  out.rear_now=gap.follower_id<0?out.rear_now:-ego.distance_to_merge-half-gap.follower_pos-.5*gap.follower_length;
+  // NPC begins reacting only after our front actually enters its lane, not at
+  // evaluation time. Never borrow braking before the vehicle can see the merge.
+  auto check=[&](double braking,double* front_min,double* rear_min){
+    *front_min=*rear_min=std::numeric_limits<double>::infinity();
+    if(p.clearance_only){
+      // Admission uses two instants. Continuous front braking remains in the
+      // predicted motion and the live roundabout lead-speed constraint.
+      double s,v;profile(out.entry_time,&s,&v);
+      if(gap.leader_id>=0)*front_min=gap.leader_pos+vl*out.entry_time-
+          .5*gap.leader_length-(s-ego.distance_to_merge)-half;
+      profile(out.clear_time,&s,&v);
+      if(gap.follower_id>=0){
+        const double dt=std::max(0.,out.clear_time-out.entry_time-p.reaction);
+        const double bt=braking>0?std::min(dt,vf/braking):0.;
+        const double travel=vf*out.clear_time-(braking>0?
+            .5*braking*bt*bt+braking*bt*(dt-bt):0.);
+        *rear_min=std::max(0.,s-ego.distance_to_merge-half)-gap.follower_pos-travel-.5*gap.follower_length;
+      }
+      return *front_min>=p.front_gap-1e-6&&*rear_min>=p.rear_gap-1e-6;
+    }
+    double end=out.clear_time+horizon;
+    for(double t=out.entry_time;;t=std::min(end,t+.05)){
+      double s,v;profile(t,&s,&v);double center=s-ego.distance_to_merge;
+      if(gap.leader_id>=0)*front_min=std::min(*front_min,gap.leader_pos+vl*t-.5*gap.leader_length-center-half);
+      if(gap.follower_id>=0){double dt=std::max(0.,t-out.entry_time-p.reaction);
+        double bt=braking>0?std::min(dt,vf/braking):0;
+        double travel=vf*t-(braking>0?(.5*braking*bt*bt+braking*bt*(dt-bt)):0);
+        // Before our rear joins the circulating lane, the occupied interval
+        // starts at the conflict point, not at a fictitious rear on the ring.
+        // Retain the rear-space margin at that entrance throughout partial merge.
+        *rear_min=std::min(*rear_min,std::max(0.,center-half)-gap.follower_pos-travel-.5*gap.follower_length);}
+      if(t>=end-1e-9)break;
+    }
+    return *front_min>=p.front_gap-1e-6&&*rear_min>=p.rear_gap-1e-6;
+  };
+  if(check(0,&out.front_min,&out.rear_min)){out.safe=true;out.reason=p.clearance_only?"clearance_clear":"distance_clear";return out;}
+  if(out.front_min<p.front_gap-1e-6){out.reason="front_space";return out;}
+  if(!p.rear_yield||gap.follower_id<0){out.reason="rear_space";return out;}
+  if(p.clearance_only){
+    // Until full rear clearance our occupied interval starts at the conflict.
+    // The follower's monotone forward travel makes clearance the worst rear
+    // instant. Solve its required braking once, without a future horizon or
+    // a repeated braking search. Reaction starts at actual predicted entry.
+    const double available_time=std::max(0.,out.clear_time-out.entry_time-p.reaction);
+    const double reduction=p.rear_gap-out.rear_min;
+    double required=std::numeric_limits<double>::infinity();
+    if(available_time>0 && vf>0){
+      required=2*reduction/(available_time*available_time);
+      if(required>vf/available_time){
+        const double room=vf*available_time-reduction;
+        required=room>0?vf*vf/(2*room):std::numeric_limits<double>::infinity();
+      }
+    }
+    if(!std::isfinite(required)||required>p.rear_decel+1e-6){
+      double f,r;check(p.rear_decel,&f,&r);out.rear_min=r;
+      out.required_decel=required;out.reason="rear_yield_insufficient";return out;
+    }
+    out.required_decel=required;
+    out.safe=check(required,&out.front_min,&out.rear_min);
+    out.reason=out.safe?"clearance_rear_yield":"rear_yield_insufficient";return out;
+  }
+  double lo=0,hi=p.rear_decel,f,r;
+  if(!check(hi,&f,&r)){out.rear_min=r;out.required_decel=std::numeric_limits<double>::infinity();out.reason="rear_yield_insufficient";return out;}
+  for(int i=0;i<24;++i){double a=(lo+hi)/2;if(check(a,&f,&r))hi=a;else lo=a;}
+  out.required_decel=hi;out.safe=check(hi,&out.front_min,&out.rear_min);out.reason="distance_rear_yield";return out;
+}
+}

@@ -1,0 +1,243 @@
+<launch>
+  <!-- 우리 경로 기준값은 total_bringup 에서 넘긴다. 1430 은 정동적 트리 자체 CSV 값. -->
+  <arg name="static_dynamic_split_idx" default="1430" />
+  <!-- 원본은 /ctrl_cmd 직접 발행. 중재기 방식일 때만 우회한다. -->
+  <arg name="ctrl_cmd_topic" default="/ctrl_cmd" />
+  <!-- 비중재 원본 사슬에서 reverse_escape_node 출력을 /ctrl_cmd와 기어로 직접
+       연결한다. control_arbiter 사용 시에는 false로 넘겨 발행 충돌을 막는다. -->
+  <arg name="reverse_direct_control" default="true" />
+  <!-- 동적 미션 구간의 끝(CSV idx). 음수면 상한 없음 == 정동적 원본 거동.
+       원본 코스는 split 뒤가 곧 코스 끝이라 상한이 필요 없었다. -->
+  <arg name="dynamic_zone_max_idx" default="-1" />
+
+  <node name="obstacle_stop_node" pkg="new_lane" type="obstacle_stop_node.py" output="screen" respawn="true">
+    <!-- ★ 2026-09-29 (20:27 백) 터널 벽/턱 조각 제외(idx 별 실측 경계). -->
+    <rosparam command="load" file="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+    <param name="tunnel_wall_piece_filter_enabled" value="true" />
+    <param name="tunnel_wall_piece_margin" value="0.3" />
+
+    <!-- 정지판단구역: 전방 거리(m) 범위. 18m로 설정하여 고속 주행 시에도 충분한 제동 거리 확보 -->
+    <param name="stop_zone_min_forward" value="0.0" />
+    <param name="stop_zone_max_forward" value="18.0" />
+
+    <!-- 정지판단구역: 좌우 폭(m), 차량 중심선 기준 +-width/2 (use_path_corridor=false 일 때의 레거시 폴백) -->
+    <param name="stop_zone_width" value="3.6" />
+
+    <!-- 경로 코리더 반경(m): 정적 장애물 회피(obstacle_avoidance)와 동일한 1.5m 기준 적용 -->
+    <param name="use_path_corridor" value="true" />
+    <!-- 2026-10-05: 기준경로 코리도(2차) 정적/동적/음영 모두 1.4 m(반폭) -->
+    <param name="path_corridor_radius" value="1.3" />
+    <!-- ★ 2026-10-05 M3(동적 장애물 구간) 정지 판정. 1차 수집 코리도(인지)는 그대로 두고
+         2차 즉시정지 코리도만 1.4 m(물체 가장자리 기준). 그 밖은 기준경로 쪽으로 다가오는 동적만 정지:
+         세계좌표 이동(0.5 s) 0.8 m/s 이상, 경로 쪽 법선과 50 deg 이내, 2 회 연속, 코리도 도달 4 s 이내,
+         동적 판정이 없으면 1.2 m/s 이상일 때만. 양쪽 모두 본다. 14:52 백 중앙분리봉(경로 방향 흔들림) 오정지 대응.
+         zone_by_object_idx: 동적구간 판정을 물체가 놓인 경로 idx 로(M2/M3 경계 옆 정적 장애물 정지 방지). -->
+    <param name="m3_path_corridor_radius" value="1.3" />
+    <param name="m3_approach_gate_enabled" value="true" />
+    <param name="m3_approach_min_speed" value="0.8" />
+    <param name="m3_approach_max_angle_deg" value="50.0" />
+    <param name="m3_approach_hits" value="2" />
+    <!-- ★ 2026-10-06(13:05:27/13:06:03 백): 길가에서 서 있다가 6~10 m 앞에서 출발하는 횡단 물체를 0.28 s 늦게 정지,
+         13:05:27 충돌. 속도는 최근 0.25 s 이동으로(이전 0.5 s 창은 정지 구간이 섞여 출발 속도를 낮게 쟀다),
+         앞범퍼 15 m 안 물체는 1회 확인, 지평선 4 -> 6 s. 이전 값: lookback 0.5, min_dt 0.3, horizon 4.0, hits_near 2. -->
+    <param name="m3_approach_lookback_s" value="0.25" />
+    <param name="m3_approach_min_dt" value="0.2" />
+    <param name="m3_approach_near_m" value="15.0" />
+    <param name="m3_approach_hits_near" value="1" />
+    <param name="m3_approach_horizon_s" value="6.0" />
+    <!-- ★ 2026-10-06(16:27:55 백): 짧은 창 + 1회 확인으로 정지 물체 위치 떨림(0.2~0.3 m)이 접근으로 판정돼 5 번 오정지.
+         경로 쪽으로 실제 이동한 거리 >= 0.45 m 요구(0.25 s 창이 모자라면 0.5 s 창), 1회 확인은 0.6 m 이상 움직였고
+         트래커가 '정지(< 0.4 m/s)'라 하지 않을 때만. 재생: 오정지 id147/179/150 제거, 실제 횡단 판단 시각 동일~+0.15 s. -->
+    <param name="m3_approach_min_disp_m" value="0.45" />
+    <param name="m3_approach_long_s" value="0.5" />
+    <param name="m3_approach_near_disp_m" value="0.6" />
+    <param name="m3_tracker_still_speed" value="0.4" />
+    <!-- ★ 2026-10-06(16:41:24 백 id170/id162): 이웃 정지 물체와 트랙이 바뀌며 1.4~1.6 m 튄 것을 접근으로 판정해 재정지.
+         이동 거리에서 한 스텝 > 6 m/s(튐)와 0.3 s 넘는 관측 끊김 스텝은 빼고 센다. 경로 반대쪽으로 0.5 m 이상 갔다
+         돌아온 이력이 있고 마지막 스텝이 더 다가오지 않으면 무시. 재생: 오정지 0, 실제 횡단 5 건 유지. -->
+    <param name="m3_jump_speed" value="6.0" />
+    <param name="m3_reversal_m" value="0.5" />
+    <!-- 정지/통과 비교: 반응 0.3 s + 5 m/s^2 로 횡단선 1 m 앞에 못 멈추고, 차 꼬리가 물체보다 0.5 s 이상 먼저
+         지나가면 정지하지 않고 통과. 경로 안(코리도 안) 물체는 항상 정지. 끄려면 m3_pass_through_enabled false. -->
+    <param name="m3_pass_through_enabled" value="true" />
+    <param name="m3_reaction_s" value="0.3" />
+    <param name="m3_brake_decel" value="5.0" />
+    <param name="m3_pass_margin_s" value="0.5" />
+    <param name="m3_stop_margin_m" value="1.0" />
+    <!-- 통과 판단의 물체 횡속도 하한(출발 직후 측정은 가속 중이라 낮게 나온다) -->
+    <param name="m3_pass_assumed_speed" value="3.5" />
+    <param name="m3_approach_untracked_speed" value="1.2" />
+    <param name="zone_by_object_idx" value="true" />
+    <!-- 동적 이력 없는 정적 물체가 앞범퍼(3.85 m)보다 뒤(차 옆)면 지나가는 중 - M3 즉시정지 제외 -->
+    <param name="m3_pass_beside_max_x" value="3.85" />
+    <!-- 터널 기준경로 코리도와 차체 근접 보호. 회피 플래너/인지의 트리거 코리도(1.5)는 그대로다. -->
+    <param name="tunnel_path_corridor_radius" value="1.3" />
+    <!-- 실제 local_path의 장애물 가장자리 기준 코리도. 인계 제동에도 적용하며
+         기준경로/차체 근접/TTC 폭과 독립적이다. 플래너 robot_radius(1.30)와 맞춘다. -->
+    <param name="tunnel_avoidance_corridor_radius" value="1.30" />
+    <param name="stop_corridor_radius" value="1.5" />
+    <param name="collision_corridor_radius" value="4.0" />
+
+    <!-- 정지 시 brake 값 (0~1) -->
+    <param name="stop_brake" value="1.0" />
+
+    <!-- PointPainting 확정된 장애물만 정지 판단에 사용할지 -->
+    <param name="require_confirmed" value="false" />
+
+    <!-- /obstacle_info가 이 시간(s) 이상 안 들어오면 안전하게 정지 유지 -->
+    <param name="obstacle_timeout" value="1.0" />
+
+    <!-- 트래킹 노이즈로 장애물이 한두 프레임 빠졌다 잡혔다 해도 정지가 걸렸다 풀렸다
+         하지 않도록, 한번 정지 트리거되면 최소 이 시간(s) 동안은 유지 (0.4s -> 1.2s로 안정화) -->
+    <param name="stop_hold_sec" value="1.2" />
+
+    <!-- CSV 웨이포인트 idx 기준: 0~이 값은 정적 미션 구간(회피, 정지 안 함),
+         이후는 동적 미션 구간(동적으로 확인된 장애물만 정지 판단) -->
+    <param name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)" />
+
+    <param name="dynamic_zone_max_idx" value="$(arg dynamic_zone_max_idx)" />
+    <!-- 동적 ID가 경로 코리도 안에 있으면 즉시 정지한다. 코리도 밖 물체는
+         fresh velocity와 swept TTC 시간 겹침이 모두 있을 때만 정지한다. -->
+    <!-- 최신 실측에서 GroundGrid/클러스터/트래커를 지난 observation_age가
+         0.63~0.78s였다. 0.3s는 실제 동적 보행자까지 전부 stale 처리했으므로
+         한 프레임 처리 지연과 3.4Hz 갱신 주기를 포함해 1.0s로 맞춘다. -->
+    <param name="motion_fresh_sec" value="1.0" />
+    <param name="dynamic_memory_sec" value="2.0" />
+    <param name="ttc_ego_front_m" value="2.0" />
+    <!-- 접근 즉시정지(2026-09-25): 경로 밖 동적 물체가 대향차선 쪽(좌측)에서 경로 쪽으로
+         approach_min_lateral_speed 이상으로 다가오면 TTC/시간겹침 예측 없이 바로 정지.
+         움직임 확인(동적 판정, 유효 속도, 연속 2회 증거)은 그대로 요구한다.
+         approach_sides: left(대향차선 쪽만) / both(인도 쪽 포함). 터널은 approach_in_tunnel. -->
+    <param name="approach_stop_enabled" value="true" />
+    <param name="approach_min_lateral_speed" value="0.8" />
+    <param name="approach_max_lateral" value="8.0" />
+    <param name="approach_sides" value="left" />
+    <!-- 2026-09-30: 터널도 접근 즉시정지(양쪽, 1.0 m/s 이상, 경로 방향 속도 2 m/s 넘는 차량 제외,
+         자차 기준 횡 6 m 안). 좌우 끝에서 나오는 동적 장애물이 코리도에 들어오기 전에 선다. -->
+    <param name="approach_in_tunnel" value="true" />
+    <param name="tunnel_approach_sides" value="both" />
+    <param name="tunnel_approach_max_lateral" value="6.0" />
+    <param name="tunnel_approach_max_long_speed" value="2.0" />
+    <!-- 터널 예측 충돌 범위(자차 기준): 횡 -4.5 ~ +6.5 m (좌우 턱 경계까지, 벽 조각은 배경맵으로
+         먼저 거름), 전방 25 m (코리도 밖 접근/예측 판정만. 코리도 안 즉시정지는 stop_zone_max_forward 18 m)
+         2026-09-30: 우 -2.4 -> -4.0 -> -4.5, 좌 5.5 -> 6.5, 전방 18 -> 25 -->
+    <param name="tunnel_predict_lat_min" value="-4.5" />
+    <param name="tunnel_predict_lat_max" value="6.5" />
+    <param name="tunnel_predict_max_forward" value="25.0" />
+    <!-- 터널 코리도 안 즉시정지 전방 범위(도심 stop_zone_max_forward 18 m 와 별개). 2026-09-30: 18 -> 25 m -->
+    <param name="tunnel_stop_max_forward" value="25.0" />
+    <!-- 2026-09-30 (19:19 충돌) 월드 이동량 보강: 0.45 s 안에 1.0 m 이상 일관 이동 -> 즉시 동적,
+         최근 0.5 s 월드 평균 0.6 m/s 미만 -> 동적 진입 금지(박스 흔들림 오판 방지). -->
+    <param name="tunnel_dyn_fast_window" value="0.45" />
+    <param name="tunnel_dyn_fast_move_m" value="1.0" />
+    <!-- 그중 자차 진행방향 기준 횡 이동이 0.8 m 이상 + 종 이동의 절반 이상(다가갈수록 길어지는 정적 박스/벽 조각 제외) -->
+    <param name="tunnel_dyn_fast_lat_m" value="0.8" />
+    <param name="tunnel_dyn_gate_span" value="0.5" />
+    <param name="tunnel_dyn_min_world_speed" value="0.6" />
+    <!-- 18 m 너머 코리도 안 동적 정지는 동적 상태 0.5 s 유지 후(원거리 드문 클러스터 튐 오정지 방지) -->
+    <param name="tunnel_far_dyn_confirm_sec" value="0.5" />
+    <!-- 배경맵 움직임(/tunnel/bg_moving) 정지: 코리도 안 즉시, 밖이면 경로 쪽 0.3 m/s 이상 접근 시 -->
+    <param name="tunnel_bg_moving_enabled" value="true" />
+    <param name="tunnel_bg_moving_min_toward" value="0.3" />
+    <!-- 신선한 근거리 정적 관측과 대조한다. 실제 일관 이동 시작/관측 부족/매칭
+         불확실 시 배경 이동 정지 판정을 유지하며, 정적 이력만으로 무시하지 않는다. -->
+    <param name="tunnel_bg_static_validation_enabled" value="true" />
+    <param name="tunnel_bg_static_fresh_sec" value="0.3" />
+    <!-- ★ 2026-10-01 M3 정적 전환: 동적이었던 물체가 경로 위에서 2 s 동안 월드 평균 0.3 m/s 미만이면
+         static_ids 로 넘겨 플래너가 회피(공간이 모자라면 reverse_escape_node 가 후진). -->
+    <param name="m3_static_handoff_enabled" value="true" />
+    <param name="m3_restatic_sec" value="2.0" />
+    <param name="m3_still_speed" value="0.3" />
+    <!-- 가까운 거리에서 동적->정적으로 바뀐 물체는 8초 후진 판단 전까지
+         전진 회피를 금지한다. 후진 후 앞범퍼 gap이 5m를 넘으면 자동 해제. -->
+    <param name="handoff_guard_enabled" value="true" />
+    <param name="handoff_guard_front_overhang_m" value="3.85" />
+    <param name="handoff_guard_trigger_gap_m" value="5.0" />
+    <param name="handoff_guard_min_gap_m" value="-3.0" />
+    <param name="handoff_guard_hold_sec" value="1.0" />
+    <!-- 인계 제동 대상: 주행 경로(/local_path, 회피 중이면 회피 경로)에서 가장자리가
+         path_corridor_radius(기준경로 코리도와 같은 폭) 안이고, 앞범퍼에서 경로를 따라
+         trigger_gap(5 m) 안인 물체만. -->
+    <!-- 터널 동적 판정 히스테리시스: 1.0 m/s 이상 2 연속 -> 동적, 0.5 m/s 미만 0.5 s -> 해제 -->
+    <param name="tunnel_dyn_on_speed" value="1.0" />
+    <param name="tunnel_dyn_off_speed" value="0.5" />
+    <param name="tunnel_dyn_off_sec" value="0.5" />
+    <param name="tunnel_dyn_on_hits" value="2" />
+    <!-- 음영구간(M8) 랜덤 정적/동적 (2026-09-26). 경로 안 물체:
+         동적(또는 tunnel_dynamic_restatic_sec 안에 동적이었음) -> 정지,
+         tunnel_static_confirm_sec 이상 정지한 정적 / 원거리 정적 제안 -> 회피 노드에 맡김(M2),
+         미확정 -> tunnel_unknown_stop_distance_m 이내면 정지해 판별 대기, 멀면 통과(감속은 kick).
+         false 면 예전처럼 M3 규칙(경로 안이면 무조건 정지). -->
+    <param name="tunnel_static_avoid_enabled" value="true" />
+    <param name="tunnel_static_confirm_sec" value="0.8" />
+    <param name="tunnel_unknown_stop_distance_m" value="10.0" />
+    <!-- 3.0 -> 1.5 (2026-09-30): 히스테리시스(0.5 m/s 미만 0.5 s)로 흔들림을 거르므로 줄인다.
+         경로 위에 멈춘 동적 장애물 -> 약 0.5 + 1.5 + 정지유지 1.2 = ~3.2 s 뒤 정적 회피 시작. -->
+    <param name="tunnel_dynamic_restatic_sec" value="1.5" />
+    <!-- ★ 2026-09-29 (19:23 백): 원거리 정적 확정 이어받기 / 관측 끊긴 트랙 제외.
+         far 정적 확정 자리(1.8 m 안, 6 s 기억)의 근거리 미확정 트랙 -> 정적(회피에 맡김).
+         observation_age > 1.0 s 이고 동적 이력이 없는 트랙 -> 정지 근거 아님(라이다 사각의
+         낮은 장애물, 건너간 동적 물체의 유령 조각). 동적 확정 이력은 위 3 s 유지 그대로. -->
+    <param name="tunnel_far_static_inherit" value="true" />
+    <param name="tunnel_far_static_match_m" value="1.8" />
+    <param name="tunnel_far_static_memory_sec" value="6.0" />
+    <param name="tunnel_stale_track_sec" value="1.0" />
+    <!-- M8 터널 벽 세로 모서리 오검출 제거. 차량은 폭이 1m보다 크고,
+         사람/동물은 수직 두께가 2m보다 작아 이 조건을 통과한다. -->
+    <param name="tunnel_wall_min_vertical_thickness" value="2.0" />
+    <param name="tunnel_wall_min_top_elevation" value="2.2" />
+    <param name="tunnel_wall_min_length" value="1.5" />
+    <param name="tunnel_wall_max_width" value="1.0" />
+
+    <param name="ctrl_cmd_topic" value="$(arg ctrl_cmd_topic)" />
+    <param name="reverse_direct_control" value="$(arg reverse_direct_control)" />
+    <param name="reverse_cmd_timeout_sec" value="0.3" />
+  </node>
+
+  <!-- ★ 2026-10-01 후진 탈출: 동적 장애물이 바로 앞에서 멈춰 정적이 되면 회피 거리(~5 m)가 없어
+       플래너가 계속 회피 실패 -> 영구 정지한다. 터널/M3 에서 8 s 정지 + 회피 실패 + 앞범퍼 5 m 안
+       정적 장애물이면 뒤로 물러난다. 후진 거리는 장애물 침범 정도(신호 정지거리와 같은 방식)로
+       5~10 m, 후방 확인 길이도 그만큼(+1 m). /control/reverse_cmd, /control/reverse_gear
+       -> control_arbiter -> /control/gear -> morai_udp_bridge(기어 R). -->
+  <node name="reverse_escape_node" pkg="new_lane" type="reverse_escape_node.py" output="screen" respawn="true">
+    <param name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)" />
+    <param name="dynamic_zone_max_idx" value="$(arg dynamic_zone_max_idx)" />
+    <param name="trigger_stop_sec" value="8.0" />
+    <param name="trigger_gap_m" value="5.0" />
+    <param name="reverse_min_m" value="5.0" />
+    <param name="reverse_max_m" value="10.0" />
+    <param name="shift_min_m" value="0.35" />
+    <param name="shift_max_m" value="1.85" />
+    <param name="rear_margin_m" value="1.0" />
+    <param name="reverse_speed" value="1.0" />
+    <param name="max_attempts" value="2" />
+    <param name="debug_rate_hz" value="5.0" />
+    <!-- ★ 2026-10-05 재설계(16:13 백 후진 충돌/후진 후 회피 불가): 현재 헤딩 후진(헤딩 보정 최대 10 deg),
+         헤딩 변화 15 deg 넘으면 조향 0, 조향 0.3 rad 이내, 차체 전체 궤적 + 기억된 물체(10 s)로 여유 0.5 m,
+         후진 거리 = 전진 회피 필요 거리 기준(5~10 m), 접촉 의심(속도 급감) 정지. 이전 방식은 path_mode=ref. -->
+    <rosparam command="load" file="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+    <!-- Joint mode keeps existing trigger/gear/stop gates. reverse_min_m is legacy-only;
+         joint search minimizes reverse distance >= min_reverse_m, capped at reverse_max_m. -->
+    <param name="joint_planning_enabled" value="true" />
+    <param name="min_reverse_m" value="2.0" />
+    <param name="cloud_topic" value="/perception/points_gravity" />
+    <param name="path_mode" value="heading" />
+    <param name="heading_fix_max_deg" value="10.0" />
+    <param name="heading_change_limit_deg" value="15.0" />
+    <param name="steer_limit_rad" value="0.3" />
+    <param name="body_margin_m" value="0.5" />
+    <param name="memory_sec" value="10.0" />
+    <param name="avoid_turn_radius_m" value="8.0" />
+    <param name="contact_drop_mps" value="0.3" />
+  </node>
+
+  <!-- ★ 2026-10-05 구간별 기준경로 코리도 RViz 시각화(/reference_corridor/markers).
+       정적=파랑, 동적=주황, 음영=보라. 폭은 이 정지 노드의 실제 파라미터를 1 s 마다 읽는다. -->
+  <node name="reference_corridor_viz" pkg="new_lane" type="reference_corridor_viz.py" output="screen" respawn="true">
+    <param name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)" />
+    <param name="dynamic_zone_max_idx" value="$(arg dynamic_zone_max_idx)" />
+    <param name="static_zone_min_idx" value="2400" />
+    <param name="stop_node_ns" value="/obstacle_stop_node" />
+  </node>
+
+</launch>

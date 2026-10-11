@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<launch>
+  <!-- One terrain model is shared by every LiDAR mission. Mission nodes keep
+       their own ROI, clustering, shape fitting and tracking parameters. -->
+  <arg name="use_ttc_tracker" default="true"/>
+  <arg name="use_adapters" default="true"/>
+  <arg name="use_traffic_light_detector" default="false"/>
+  <arg name="use_obstacle_perception" default="false"/>
+  <arg name="use_tunnel_xicp" default="true"/>
+  <arg name="use_camera_speed_kick" default="true"/>
+  <arg name="tl_model_path"
+       default="$(find yolo_distance_pkg)/models/traffic_light_best.pt"/>
+  <arg name="tl_image_topic" default="/image_jpeg/compressed"/>
+  <!-- 상향 보조 카메라. 비우면 단일 카메라로 동작한다(기존 구성과 동일). -->
+  <arg name="tl_image_topic2" default="/image_jpeg2/compressed"/>
+  <!-- 이 거리(m) 안쪽이면 상향 카메라를 주로 믿는다.
+       Front 1280x720(16:9) 수직 half-FOV 29.4deg,
+       상향  640x480 (4:3)  수직 half-FOV 36.9deg - 4:3 이라 세로가 더 넓다.
+       장착 (x-0.20, z1.25) / pitch 325 기준 실제 커버:
+         Front : 정지선 3.75m 앞까지 (그 안쪽은 화각 위로 벗어남)
+         상향  : -1.9~71.9deg = 사실상 전 거리
+       상향이 전 거리를 덮지만 원거리는 Front 가 주다 - 해상도 2배라
+       신호등 램프 픽셀수가 2배고(20m 에서 12px vs 6px) 색 판정이 안정적. -->
+  <arg name="tl_near_switch_dist" default="12.0"/>
+  <!-- 대회 RViz는 라이다/판단 마커를 사용한다. 신호등 영상 JPEG 재인코딩은
+       필요할 때만 켜서 CPU 사용량과 토픽 대역폭을 줄인다. -->
+  <arg name="tl_publish_debug" default="false"/>
+
+  <!-- IMU/LiDAR 정렬 보정(0단계 튜닝 대상). 실측 확정값을 여기 넣는다. -->
+  <arg name="roll_bias_deg" default="0.0"/>
+  <arg name="pitch_bias_deg" default="0.0"/>
+  <arg name="imu_to_lidar_roll_deg" default="0.0"/>
+  <arg name="imu_to_lidar_pitch_deg" default="0.0"/>
+
+  <!-- Official dcmlr GroundGrid + project gravity alignment/deskew adapter. -->
+  <include file="$(find groundgrid)/launch/kcity_ground_pipeline.launch">
+    <arg name="raw_cloud_topic" value="/velodyne_points"/>
+    <arg name="imu_topic" value="/imu"/>
+    <arg name="odom_topic" value="/odom"/>
+    <arg name="nonground_topic" value="/nonground"/>
+    <arg name="roll_bias_deg" value="$(arg roll_bias_deg)"/>
+    <arg name="pitch_bias_deg" value="$(arg pitch_bias_deg)"/>
+    <arg name="imu_to_lidar_roll_deg" value="$(arg imu_to_lidar_roll_deg)"/>
+    <arg name="imu_to_lidar_pitch_deg" value="$(arg imu_to_lidar_pitch_deg)"/>
+  </include>
+
+  <!-- Comparison only: no TF, obstacle decisions or control outputs. -->
+  <include if="$(arg use_tunnel_xicp)" file="$(find tunnel_xicp)/launch/observer.launch"/>
+
+  <!-- Highway/TTC retains ring-continuity vehicle recovery and consumes the
+       common engine's labels plus per-point terrain-relative height. -->
+  <include if="$(arg use_ttc_tracker)"
+           file="$(find lidar_ttc_tracker)/launch/lidar_ttc_tracker.launch">
+    <arg name="cloud_topic" value="/groundgrid/segmented_sensor"/>
+    <arg name="ground_input_mode" value="groundgrid_labeled"/>
+  </include>
+
+  <node if="$(arg use_traffic_light_detector)" pkg="kcity_localizer"
+        type="traffic_light_detector.py" name="traffic_light_detector"
+        output="screen">
+    <param name="model_path" value="$(arg tl_model_path)"/>
+    <param name="image_topic" value="$(arg tl_image_topic)"/>
+    <param name="image_topic2" value="$(arg tl_image_topic2)"/>
+    <param name="near_switch_dist" value="$(arg tl_near_switch_dist)"/>
+    <param name="conf" value="0.30"/>
+    <param name="always_infer" value="false"/>
+    <param name="green_priority_tl_ids" value="C1256W000052"/>
+    <param name="priority_green_confirm_frames" value="2"/>
+    <param name="collect_dataset" value="false"/>
+    <param name="publish_debug" value="$(arg tl_publish_debug)"/>
+  </node>
+
+  <!-- GroundGrid output is the authoritative near detector. Its topic is
+       renamed so the M2-only sparse raw proposal can be merged without
+       changing any downstream consumer of /obstacle_info. -->
+  <group if="$(arg use_obstacle_perception)">
+    <group>
+      <remap from="/obstacle_info" to="/obstacle_info_near"/>
+      <include file="$(find yolo_test)/launch/obstacle_perception.launch">
+        <arg name="lidar_topic" value="/nonground"/>
+        <arg name="ground_relative_field" value="ground_relative"/>
+      </include>
+    </group>
+
+    <node pkg="new_lane" type="far_static_obstacle_detector.py"
+          name="far_static_obstacle_detector" output="screen" respawn="true">
+      <!-- M2 + M8(음영구간, 2026-09-26). 고주로 노변 구조물은 여전히 제외.
+           터널 벽은 section_y_limits 로 벽 안쪽(자차 기준 -2.0 ~ +5.0 m)만
+           모아 이 느슨한 희소 점 검출기에 들어오지 않게 한다
+           (obstacle_stop tunnel_wall_roi: y < -2.4 또는 y > 5.5 가 벽). -->
+      <rosparam param="active_sections">[M2, M8]</rosparam>
+      <rosparam param="section_y_limits">{M8: [-2.0, 5.0]}</rosparam>
+      <rosparam param="section_mission_modes">{M8: tunnel}</rosparam>
+      <!-- 터널 바닥은 좌로 ~3% 횡경사 + 종경사가 있어 고정 평면(ground_z) 기준으로
+           0.1~0.35 m 가짜 물체가 계속 생겼다(17:09/20:27 백). M8 은 매 스캔 바닥
+           평면을 맞춰 그 기준 높이를 쓰고, 천장 잔여 점은 높이 2.0 m 로 자른다. -->
+      <rosparam param="plane_ground_sections">[M8]</rosparam>
+      <rosparam param="section_max_height_m">{M8: 2.0}</rosparam>
+      <!-- ★ 2026-09-29 (19:49 백): 횡 범위는 기준경로 횡거리로(벽/턱 1 m 안쪽: 우 -3.4 ~ 좌 +6.4).
+           자차 기준 y 로 자르면 진입 곡선에서 차로 안 장애물이 -3.3~-4.2 m 로 보여 잘렸다.
+           (바닥 평면을 근거리 3~15 m 로만 맞춰 연장하는 것도 시험했으나, 터널 종단 경사가
+            바뀌는 idx ~7805~7960 노면을 0.08~0.3 m 물체로 오제안해 쓰지 않는다(16:23 백).) -->
+      <rosparam param="section_path_lat_limits">{M8: [-3.4, 6.4]}</rosparam>
+      <!-- 2026-09-29 (20:27 백): 터널은 idx 별 실측 벽/턱 경계(new_lane/config/tunnel_wall_profile.yaml)
+           안쪽 0.5 m 까지만 모은다. 경계 없는 idx(입구/출구)는 위 상수 범위. -->
+      <rosparam command="load" file="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+      <rosparam param="section_profile_sections">[M8]</rosparam>
+      <param name="profile_margin_m" value="0.5"/>
+      <!-- 터널 최소 높이 0.20 m: 종단 경사 변화 노면이 0.075~0.19 m 로 떠 오제안(16:23 백). -->
+      <rosparam param="section_min_height_m">{M8: 0.20}</rosparam>
+      <param name="x_min_m" value="12.0"/>
+      <param name="x_max_m" value="40.0"/>
+      <!-- 4.5 -> 7.5 (2026-09-23): 아래 gather_half_width_m(7.0)만큼 점을 모으려면
+           차량 기준 좌우 범위도 그만큼 넓어야 한다. -->
+      <param name="y_half_m" value="7.5"/>
+      <param name="ground_z" value="-1.765"/>
+      <param name="sensor_x_m" value="1.1"/>
+      <param name="sensor_y_m" value="0.0"/>
+      <param name="min_height_m" value="0.10"/>
+      <param name="max_height_m" value="2.8"/>
+      <!-- 2단계 코리도 (2026-09-23, 근거리 obstacle_perception 과 같은 구조).
+           gather_half_width_m 로 점을 모아 물체 모양을 온전히 잡고, 만들어진
+           물체의 안쪽 끝이 path_corridor_half_width_m 안이면 제안한다.
+           예전에는 1.9 하나로 점부터 잘라 물체 바깥 끝이 1.9 m 에서 잘렸다
+           (원거리 바깥 끝 p50 1.89 vs 근거리 2.05, 바깥 0.15~0.35 m 손실).
+           연석 구간에서는 회피 폭 곡선의 연석선 근처·바깥 점을 뺀다. -->
+      <!-- 1.9 -> 1.7 (2026-09-23): 근거리 obstacle_perception 의 판단 폭
+           (path_corridor_half_width 1.7)과 맞춘다. 다르면 안쪽 끝이 1.7~1.9 m 인
+           물체가 원거리에서는 회피 대상이었다가 근거리로 넘어오면 빠진다. -->
+      <!-- 2026-10-05: 엔진 작업 때 1.5 로 바꿨던 것을 기존 값 1.7 로 되돌림(기존 베이스 유지). -->
+      <param name="path_corridor_half_width_m" value="1.7"/>
+      <param name="gather_half_width_m" value="7.0"/>
+      <!-- 횡 범위: 안쪽 끝(경로 쪽)은 가장 가까운 점 그대로, 바깥 끝은 이 비율(%)을
+           버린 백분위. 넓게 모으면 누적 중 번진 점이 바깥 끝을 0.3~0.4 m 부풀렸다.
+           리플레이(17:26, 17:46) 오차: 안쪽 -0.05~-0.21, 바깥 +0.12~+0.19 로
+           모두 안전 쪽(안쪽은 경로에 가깝게, 바깥은 크게). -->
+      <param name="extent_trim_pct" value="10.0"/>
+      <param name="accumulation_sec" value="0.55"/>
+      <param name="voxel_m" value="0.16"/>
+      <param name="cluster_eps_m" value="0.65"/>
+      <param name="min_accumulated_points" value="5"/>
+      <param name="min_distinct_scans" value="2"/>
+      <!-- 제안 ID 승계. 이전 주기 제안과 이 거리 안에서 최근접 매칭되면
+           같은 ID 를 물려준다. 예전에는 중심좌표 해시를 ID 로 써서 중심이
+           몇 cm 만 흔들려도 ID 가 바뀌었고(실측: 같은 물체가 1초에 7번),
+           그때마다 회피 방향 락이 풀려 경로가 좌우로 뒤집혔다.
+           1.6 은 실측 중심 흔들림(0.08~0.34 m)보다 넉넉하고, 인접 물체를
+           흡수하지 않을 값이다. -->
+      <param name="id_match_distance_m" value="1.6"/>
+      <!-- 16채널 저상 물체는 이번 백에서 1.18초간 새 상부 점이 없었다.
+           월드 좌표 물체를 1.25초 유지하고, 복귀 시 같은 ID를 승계한다. -->
+      <param name="id_timeout_sec" value="1.4"/>
+      <param name="proposal_hold_sec" value="1.25"/>
+    </node>
+    <node pkg="new_lane" type="obstacle_info_merger.py"
+          name="obstacle_info_merger" output="screen" respawn="true">
+      <!-- obstacle_perception can take 0.6 to 0.7 s on a loaded machine; keep its
+           authoritative collision list between publications. -->
+      <param name="near_timeout_sec" value="1.0"/>
+      <param name="far_timeout_sec" value="0.75"/>
+      <param name="dedup_distance_m" value="1.5"/>
+    </node>
+  </group>
+
+  <include if="$(arg use_camera_speed_kick)"
+           file="$(find yolo_test)/launch/camera_speed_kick.launch">
+    <arg name="section_gating_enabled" value="true"/>
+    <arg name="max_fps" value="8.0"/>
+  </include>
+
+  <node if="$(arg use_adapters)" pkg="perception_adapters"
+        type="tracked_object_adapter.py" name="tracked_object_adapter"
+        output="screen"/>
+</launch>

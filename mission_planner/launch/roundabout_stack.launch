@@ -1,0 +1,40 @@
+<launch>
+  <arg name="mission_config"
+       default="$(find mission_planner)/config/sites/roundabout_template.yaml" />
+  <arg name="gateway_config"
+       default="$(find control_constraint_gateway)/config/gateway.yaml" />
+  <arg name="start_lidar_tracker" default="true" />
+  <arg name="cloud_topic" default="/demo/nonground" />
+  <arg name="cloud_input_mode" default="sensor_nonground" />
+  <arg name="expected_cloud_frame" default="" />
+  <arg name="odom_topic" default="/odom" />
+  <arg name="route_topic" default="/local_path" />
+  <arg name="localization_valid_topic" default="/localization/valid" />
+  <arg name="gateway_output_topic" default="/ctrl_cmd" />
+  <arg name="raw_command_topic" default="/control/raw_cmd" />
+
+  <include if="$(arg start_lidar_tracker)"
+           file="$(find roundabout_lidar_tracker)/launch/roundabout_lidar_tracker.launch">
+    <arg name="config_file" value="$(arg mission_config)" />
+    <arg name="cloud_topic" value="$(arg cloud_topic)" />
+    <arg name="odom_topic" value="$(arg odom_topic)" />
+    <arg name="input_mode" value="$(arg cloud_input_mode)" />
+    <arg name="expected_cloud_frame" value="$(arg expected_cloud_frame)" />
+  </include>
+
+  <include file="$(find mission_planner)/launch/roundabout_mission.launch">
+    <arg name="config_file" value="$(arg mission_config)" />
+    <arg name="odom_topic" value="$(arg odom_topic)" />
+    <arg name="route_topic" value="$(arg route_topic)" />
+    <arg name="localization_valid_topic"
+         value="$(arg localization_valid_topic)" />
+    <arg name="constraint_topic" value="/mission/constraints/roundabout" />
+  </include>
+  <include file="$(find mission_manager)/launch/mission_manager.launch" />
+  <include file="$(find control_constraint_gateway)/launch/control_constraint_gateway.launch">
+    <arg name="config_file" value="$(arg gateway_config)" />
+    <arg name="odom_topic" value="$(arg odom_topic)" />
+    <arg name="raw_command_topic" value="$(arg raw_command_topic)" />
+    <arg name="output_command_topic" value="$(arg gateway_output_topic)" />
+  </include>
+</launch>

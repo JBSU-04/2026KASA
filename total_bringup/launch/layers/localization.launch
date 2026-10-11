@@ -1,0 +1,63 @@
+<launch>
+  <!-- existing: LiDAR policy; dr: uncorrected DR; ufld: lane heading only. -->
+  <arg name="tunnel_heading_mode" default="existing"/>
+  <!-- EKF 기반 고정밀 융합 측위 사용 여부 (기본값: true, 50 Hz 예측 및 이상치 제거) -->
+  <arg name="use_ekf" default="true"/>
+  <!-- 대회 신호등 구간에서는 색 판정 미정 시 정지선을 넘지 않는다. -->
+  <arg name="stop_on_unknown" default="true"/>
+  <arg name="unknown_stop_dist" default="40.0"/>
+
+  <!-- 1. EKF 모드: 50 Hz Autoware EKF Localizer (GPS + IMU + Speed 센서 융합) -->
+  <group if="$(arg use_ekf)">
+    <include file="$(find morai_sensor_fusion)/launch/autoware_ekf_morai.launch">
+      <arg name="tunnel_heading_mode" value="$(arg tunnel_heading_mode)"/>
+      <arg name="use_full_utm" value="true"/>
+    </include>
+  </group>
+
+  <!-- 2. 레거시 모드: gps_common + odom_information (단순 LPF 측위) -->
+  <group unless="$(arg use_ekf)">
+    <group>
+      <remap from="/gps_back"  to="/gps"/>
+      <remap from="/gps_front" to="/gps"/>
+      <include file="$(find gps_common)/launch/utm_odometry_dual.launch"/>
+    </group>
+    <include file="$(find odom_information)/launch/odom_information.launch"/>
+  </group>
+
+  <!-- 신호등 정지선 탐색에는 map_localizer가 필요하다. competition.launch는
+       이를 명시적으로 켜며, EKF 모드에서는 이미 융합된 /odom을 저주기로
+       받아 지도 매칭만 수행해 중복 측위 계산과 /odom 중복 발행을 피한다. -->
+  <arg name="use_map_localizer" default="$(eval not arg('use_ekf'))"/>
+  <!-- 회전교차로 미션이 요구하는 /localization/valid 를 채운다.
+       EKF 모드일 때는 ekf_odom_output.py 가 이미 /localization/valid 를 발행하므로
+       레거시 모드에서만 localization_validity.py 를 켠다. -->
+  <arg name="use_localization_validity" default="$(eval not arg('use_ekf'))"/>
+  <node if="$(arg use_localization_validity)" pkg="kcity_localizer"
+        type="localization_validity.py" name="localization_validity"
+        output="screen"/>
+  <group if="$(arg use_map_localizer)">
+    <include file="$(find kcity_localizer)/launch/localizer.launch">
+      <arg name="use_odom"     value="$(arg use_ekf)"/>
+      <arg name="use_rviz"     value="false"/>
+      <arg name="rate"         value="10.0"/>
+      <arg name="publish_tf"   value="false"/>
+      <arg name="publish_odom" value="false"/>
+      <arg name="stop_on_unknown" value="$(arg stop_on_unknown)"/>
+      <arg name="unknown_stop_dist" value="$(arg unknown_stop_dist)"/>
+    </include>
+  </group>
+
+  <!-- RViz 배경용 mgeo 지도(차선 도색, 정지선, 신호등, 횡단보도). 순수
+       시각화라 판단 경로엔 안 들어간다 - 꺼도 주행에 영향 없음.
+       kcity_localizer/data 를 직접 가리킨다(map_loader 번들 sangam/kcity
+       예시 데이터가 아니라 실제 대회 지도). -->
+  <!-- RViz 배경 지도 전용. 판단 경로에 안 들어가는데 실측 CPU 45% 를 먹어서
+       (2026-09-04) MPC/인지 노드 스케줄링을 밀어냈다. 지도를 봐야 할 때만
+       use_mgeo_viz:=true 로 켠다. -->
+  <arg name="use_mgeo_viz" default="false"/>
+  <node if="$(arg use_mgeo_viz)" pkg="map_loader" type="mgeo_pub.py" name="mgeo_pub"
+        output="screen">
+    <param name="map" value="$(find kcity_localizer)/data"/>
+  </node>
+</launch>

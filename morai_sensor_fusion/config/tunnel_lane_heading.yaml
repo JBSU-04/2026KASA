@@ -1,0 +1,23 @@
+# MORAI front camera confirmed by user: source 1231 -> receive 1232.
+# 1280x720, x1.90 y0 z1.20, roll0 pitch-down2 yaw0, HFOV90.
+image_topic: /image_jpeg/compressed
+calibration_confirmed: true
+camera_hfov_deg: 90.0
+camera_z_vehicle_m: 1.20
+# Ground height is derived at startup from the shared LiDAR measured height.
+camera_height_from_ground_m: 1.635
+camera_x_m: 1.9
+camera_pitch_down_deg: 2.0
+preview_m: 8.0
+max_lane_image_fraction: 0.78
+max_image_age_s: 0.30
+max_rate_hz: 10.0
+max_path_distance_m: 0.25
+max_fit_rms_m: 0.12
+max_yaw_rate_rad_s: 0.12
+min_lane_width_m: 2.5
+max_lane_width_m: 4.8
+confirm_frames: 3
+# Encode only with a viewer connected, at most 2Hz.
+publish_debug_image: true
+device: cuda

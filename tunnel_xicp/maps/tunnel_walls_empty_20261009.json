@@ -1,0 +1,47 @@
+{
+  "format_version": 1,
+  "frame": "map",
+  "source_frame": "velodyne_ground",
+  "origin": [
+    302665.26383715635,
+    4123727.0398684195,
+    0.0
+  ],
+  "road_heading_rad": -2.65010793622819,
+  "sensor_offset": [
+    1.1,
+    0,
+    1.33
+  ],
+  "voxel_m": 0.2,
+  "wall_height_sensor_m": [
+    0.0,
+    1.5
+  ],
+  "wall_normal_max_abs_z": 0.3,
+  "points": 5620,
+  "pcd_sha256": "bf88c9bcacf3e8a176aed03e8b44c892236215091a3b29ff4cba35ef9617e823",
+  "bounds_local": [
+    [
+      -148.7420654296875,
+      -134.6317138671875,
+      1.331721305847168
+    ],
+    [
+      -18.239181518554688,
+      -40.087974548339844,
+      2.8011317253112793
+    ]
+  ],
+  "limitations": "User-confirmed empty drives; measured surfaces only; incomplete coverage is invalid, no SLAM pose replacement.",
+  "empty_drives": [
+    [
+      "bags/competition_2026-10-09-16-47-53.bag",
+      "bags/competition_heavy_2026-10-09-16-47-52.bag"
+    ],
+    [
+      "bags/competition_2026-10-09-16-48-33.bag",
+      "bags/competition_heavy_2026-10-09-16-48-33.bag"
+    ]
+  ]
+}

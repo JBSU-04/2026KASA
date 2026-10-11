@@ -1,0 +1,10 @@
+<launch>
+
+	<arg name="state_inspection" default="0" />
+
+	<node name="waypoint_maker_loader_node" pkg="waypoint_maker" type="waypoint_maker_loader_node" output="screen">
+		<param name="state_inspection" value="$(arg state_inspection)" />
+	</node>
+  	<node type="rviz" name="rviz" pkg="rviz" args="-d $(find waypoint_maker)/rviz/path.rviz"/>
+
+</launch>

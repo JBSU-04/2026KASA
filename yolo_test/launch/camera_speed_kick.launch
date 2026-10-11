@@ -1,0 +1,28 @@
+<launch>
+
+  <arg name="debug_show" default="false" />
+  <arg name="hold_sec" default="1.0" />
+  <arg name="section_gating_enabled" default="false" />
+  <arg name="max_fps" default="8.0" />
+
+  <node name="camera_speed_kick_node" pkg="yolo_test" type="camera_speed_kick_node.py" output="screen">
+    <!-- 모라이 시뮬레이터 보행자(3D 그래픽) 검출을 위해 0.6 -> 0.35로 완화 -->
+    <param name="coco_conf" value="0.35" />
+    <param name="custom_conf" value="0.35" />
+    <!-- 도로 우측 갓길/인도에서 대기/진입하는 보행자를 조기 포착하기 위해 가로 비율 확장 (0.15 ~ 0.88)
+         2026-09-25: 0.0 ~ 1.0 (화면 전체 폭). 18:19 백에서 좌측 인도(대향차선 쪽)
+         보행자가 화면 x 0.11 위치라 ROI 밖이었다. 선감속은 동적 구간·터널에서만
+         걸리므로(obstacle_avoidance camera_kick_static_zone_enabled=false) 좌우 끝까지 본다. -->
+    <param name="roi_x_min_ratio" value="0.0" />
+    <param name="roi_x_max_ratio" value="1.0" />
+    <!-- 화면 맨 아래 이 비율 밑은 아예 무시 (본네트 오탐 방지) -->
+    <param name="roi_y_max_ratio" value="0.75" />
+    <!-- 마지막 감지 후 이 시간(s) 동안은 "감지됨" 유지 (한 프레임 튀는 것 방지) -->
+    <param name="hold_sec" value="$(arg hold_sec)" />
+    <param name="section_gating_enabled" value="$(arg section_gating_enabled)" />
+    <param name="max_fps" value="$(arg max_fps)" />
+    <!-- 오탐(false positive) 확인용 디버그 창 (X11 GUI 환경에서 debug_show:=true 로 확인 가능) -->
+    <param name="debug_show" value="$(arg debug_show)" />
+  </node>
+
+</launch>

@@ -1,0 +1,21 @@
+# local_path_mux — /local_path 의 유일한 publisher
+local_path_mux:
+  rate: 30.0
+  source_timeout: 0.5
+  blend_points: 20
+  hold_on_stale: true
+  base_source: waypoint
+  # 회피 경로는 obstacle_avoidance_node 가 '회피 중'이라고 말할 때만 승격한다.
+  #   /obstacle_avoidance/target_speed_mps
+  #     9999.0 = 평소 주행(passthrough)   그 외 = 회피/복귀 중
+  # 편차로 판별하려 했으나 실패했다. 그 노드는 원래 local_path_publisher 를
+  # '대체'하는 구조라 장애물이 없어도 CSV 경로와 중앙 2.33 m 벌어진다(실측).
+  avoidance_signal_topic: /obstacle_avoidance/target_speed_mps
+  avoidance_signal_idle: 9000.0
+  avoidance_signal_timeout: 1.0
+  sources:
+    - name: avoidance
+      topic: /planning/local_path/avoidance
+      promote_on_signal: true
+    - name: waypoint
+      topic: /planning/local_path/waypoint

@@ -1,0 +1,6 @@
+image_topic: /image_jpeg/compressed
+compressed: true
+device: cuda
+output_topic: /lane_perception/overlay
+lane_mask_topic: /lane_perception/lane_mask
+show: false

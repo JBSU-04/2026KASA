@@ -1,0 +1,96 @@
+# MORAI와 브리지 사이의 IP. 같은 PC에서 실행할 때는 아래 값을 유지한다.
+# 다른 PC에서 MORAI를 돌릴 때는 이 파일을 직접 고치지 말고
+# `roslaunch morai_udp_bridge morai_udp_all.launch simulator_ip:=<MORAI PC IP>`
+# 로 오버라이드한다 (launch의 simulator_ip 인자가 이 값을 덮어씀).
+network:
+  bind_ip: 0.0.0.0
+  simulator_ip: 127.0.0.1
+
+protocol:
+  # 25.S4 일반 네트워크 패킷의 보조 헤더 크기
+  network_aux_bytes: 12
+
+enable:
+  # ctrl_cmd는 UDP가 아니라 ROS Bridge(rosbridge_websocket)로 나간다.
+  control: false
+  competition: true
+  collision: true
+  gps: true
+  imu: true
+  # 현재 SensorInfo에 카메라가 없으므로 추가한 뒤 true로 변경한다.
+  camera: false
+  # 상향 보조 카메라(신호등 근접용). transport.launch 가 true 로 켠다.
+  camera2: false
+
+ports:
+  control:
+    local: 7600
+    simulator: 7601
+  competition:
+    listen: 8000
+  collision:
+    listen: 8300
+  gps:
+    listen: 1234 
+  imu:
+    listen: 1236
+  camera:
+    listen: 1232
+  camera2:
+    listen: 1238
+
+topics:
+  control_command: /ctrl_cmd
+  competition_status: /Competition_topic
+  collision: /CollisionData
+  gps: /gps
+  imu: /imu
+  camera: /image_jpeg/compressed
+  camera2: /image_jpeg2/compressed
+  current_link_id: /morai/current_link_id
+
+frames:
+  ego: base_link
+  gps: gps
+  imu: imu
+  camera: camera
+  camera2: camera2
+
+control:
+  # 2: MORAI 자동제어, 4: D 기어
+  ctrl_mode: 2
+  gear: 4
+  send_rate: 50.0
+  # Ioniq5 시뮬 차량의 최대 전륜각. ROS rad 명령을 UDP -1~1로 바꿀 때 사용한다.
+  max_wheel_angle_deg: 40.0
+  # 제어 토픽이 끊기면 이전 명령을 유지하지 않고 안전 제동한다.
+  command_timeout: 0.3
+  stale_brake: 0.7
+  send_before_first_cmd: false
+
+gps:
+  # NMEA에는 MORAI 맵 오프셋이 없으므로 필요한 맵에서만 값을 지정한다.
+  east_offset: 302595.0
+  north_offset: 4124145.0
+  # MORAI 25.S4는 GPS 한 fix를 RMC와 GGA 두 datagram으로 따로 보낸다
+  # (1ms 미만 간격, lat/lon 동일). 2026-08-11 주행로그 3건에서 /gps 메시지의
+  # 정확히 50%가 좌표까지 같은 중복이었고, 20Hz 센서가 37Hz로 보였다.
+  # 중복을 그대로 발행하면 EKF가 같은 측정을 독립 관측 2회로 반영해 위치를
+  # 과신한다(실효 sigma가 1/sqrt(2)로 축소). GGA를 받은 뒤로는 RMC를 버린다.
+  dedupe_duplicate_sentence: true
+
+imu:
+  # 25.S4 IMU는 20Hz 설정에서도 두 datagram이 거의 붙어 들어오는 구간이 있다.
+  # 원본 sec/nsec 간격이 너무 작으면 같은 센서 tick의 burst로 보고 버린다.
+  drop_non_increasing_stamp: true
+  min_stamp_step: 0.01
+  # MORAI noise setting (2026-08-15): velocity RW 0.2 m/s/sqrt(h), angle RW
+  # 0.02 rad/sqrt(h). At the measured 20-21 Hz this is about 0.017 m/s^2
+  # and 0.0016 rad/s per sample. Covariance fields contain variance, not sigma.
+  # Quaternion yaw is treated conservatively as a 0.02 rad absolute observation.
+  orientation_covariance: 0.0004
+  angular_velocity_covariance: 0.00000256
+  linear_acceleration_covariance: 0.000289
+
+camera:
+  max_frame_bytes: 8388608

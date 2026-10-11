@@ -1,0 +1,1007 @@
+#include "occupancy_avoidance/ros_adapter.hpp"
+#include "occupancy_avoidance/joint_escape.hpp"
+#include "occupancy_avoidance/scene_tracking.hpp"
+#include "occupancy_avoidance/tunnel_region.hpp"
+#include <occupancy_avoidance/TunnelScene.h>
+#include <ros/ros.h>
+#include <ros/callback_queue.h>
+#include <mutex>
+#include <atomic>
+#include <boost/bind.hpp>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
+#include <nav_msgs/Odometry.h>
+#include <morai_msgs/EgoVehicleStatus.h>
+#include <nav_msgs/Path.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
+#include <std_msgs/Float32MultiArray.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <grid_map_ros/GridMapRosConverter.hpp>
+#include <waypoint_maker/Lane.h>
+#include <jsoncpp/json/json.h>
+#include <XmlRpcValue.h>
+#include <deque>
+#include <set>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <limits>
+
+using namespace occupancy_avoidance;
+namespace {
+double number(const XmlRpc::XmlRpcValue& v){return v.getType()==XmlRpc::XmlRpcValue::TypeInt?double(int(v)):double(v);}
+double yawOf(const geometry_msgs::Quaternion&q){return std::atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z));}
+std::vector<Point> points(const sensor_msgs::PointCloud2&msg){
+  std::vector<Point> out;out.reserve(msg.width*msg.height);
+  sensor_msgs::PointCloud2ConstIterator<float>x(msg,"x"),y(msg,"y"),z(msg,"z");
+  for(;x!=x.end();++x,++y,++z)if(std::isfinite(*x+*y+*z))out.push_back({double(*x),double(*y),double(*z)});
+  return out;
+}
+std::vector<Reference> csv(const std::string&name){
+  std::ifstream file(name);std::string line;std::vector<Reference> out;int i=0;
+  while(std::getline(file,line)){std::replace(line.begin(),line.end(),',',' ');std::istringstream s(line);double ignored,x,y;
+    if(s>>ignored>>x>>y)out.push_back({x,y,0,i++});}
+  for(size_t j=0;j+1<out.size();++j)out[j].yaw=std::atan2(out[j+1].y-out[j].y,out[j+1].x-out[j].x);
+  if(out.size()>1)out.back().yaw=out[out.size()-2].yaw;
+  return out;
+}
+}
+struct RosAdapter::Impl {
+  ros::NodeHandle nh_,pnh_;Config cfg_;std::unique_ptr<Engine> engine_;
+  ros::Subscriber admission_sub_,ego_sub_,lidar_,ground_sub_,odom_,waypoint_,near_,stop_dist_sub_,stop_required_sub_,coverage_sub_,wall_sub_,dynamic_state_sub_;
+  ros::Publisher path_pub_,failed_pub_,speed_pub_,scale_pub_,debug_pub_,grid_pub_,marker_pub_,d_pub_,active_pub_;
+  ros::Timer plan_timer_,publish_timer_;std::deque<Pose> history_;Pose pose_;
+  std::mutex pose_in_mutex_;std::vector<std::pair<Pose,double>> pose_in_;
+  // 입력 큐(odom/ego/경로/지면)는 엔진 잠금을 절대 기다리지 않는다. 받은 값은 여기 두고 syncPoses() 가 반영.
+  waypoint_maker::Lane::ConstPtr route_in_;double route_in_stamp_=0;
+  std::vector<Point> ground_in_;double ground_in_stamp_=0;bool ground_in_new_=false;
+  double ego_in_speed_=0,ego_in_stamp_=-1;double last_vis_stamp_=0;
+  std::vector<Reference> route_,road0_,road3_;std::vector<Edge> edges0_,edges3_;
+  std::vector<Point> ground_;double ground_stamp_=0,waypoint_stamp_=0,result_stamp_=0,result_geometry_stamp_=-1;uint32_t candidate_sequence_=0;
+  ros::Subscriber random_active_sub_;std::atomic<bool>random_active_{false};std::atomic<double>random_active_stamp_{-1};
+  int tunnel_shadow_first_=7201;
+  int tunnel_prepare_=100;
+  int lane_=-1,index_=-1,road_lane_=-1,min_idx_=2400,max_idx_=3700,tunnel_min_=7000,tunnel_max_=9000;
+  bool previous_active_=false,stop_required_=false;double stop_dist_=-1,stop_stamp_=0,required_stamp_=0,coverage_=9999,coverage_stamp_=0;
+  double recovery_rear_observation_=15.;
+  double objects_stamp_=0,dynamic_state_stamp_=-1,front_axle_offset_=3.845,stop_buffer_=3.;
+  Json::Value latest_objects_;std::set<int> dynamic_ids_,static_ids_;std::vector<DynamicRegion> dynamic_;
+  std::map<int,DynamicRegion> old_regions_;Result result_;bool tl_guard_=true;
+  // ★ 2026-10-05 서비스 모드: 경로/회피실패/속도는 기존 obstacle_avoidance_node 가 발행하고,
+  //   이 노드는 누적 점유 장애물(footprint)과 후보 경로/상태만 준다.
+  std::atomic<bool> common_m8_active_{false};
+  bool native_scene_=true;double native_debug_stamp_=-1;ros::Publisher native_scene_pub_,scene_compute_pub_,scene_age_pub_,planning_age_pub_;ros::Subscriber native_scene_sub_,native_detector_sub_;
+  bool scene_only_=false,common_scene_=false;ros::Publisher scene_pub_;ros::Subscriber scene_sub_,gps_mode_sub_,frame_sub_,detector_sub_;Json::Value scene_input_,detector_input_;
+  SurfaceTracker surface_tracker_;std::vector<DynamicRegion> scene_dynamic_;std::vector<std::pair<double,double>> scene_measured_;std::set<std::pair<int,int>> scene_verified_cells_;std::map<int,bool> scene_verified_ids_;
+  std::string gps_mode_;
+  uint64_t coordinate_version_=0;double frame_x_=0,frame_y_=0,coordinate_stamp_=-1;
+  uint64_t scene_id_=0;std::string map_version_;double scene_recv_=-1;
+  bool service_mode_=false;ros::Publisher candidate_pub_,state_pub_,obstacles_pub_;
+  ros::CallbackQueue escape_queue_;std::unique_ptr<ros::AsyncSpinner> escape_spinner_;
+  ros::Subscriber classified_sub_;double classified_stamp_=-1;bool tunnel_map_enabled_=true;
+  ros::Subscriber owner_feedback_sub_;
+  ros::Subscriber escape_sub_,handoff_sub_;bool recovery_active_=false;ros::Publisher escape_pub_,divider_pub_,handoff_ack_pub_;
+  bool dynamic_hold_=false;std::vector<Edge> divider_candidates_;
+  std::string obstacles_json_;double obstacles_encoded_stamp_=-1;uint64_t obstacles_encoded_digest_=0;std::recursive_mutex engine_mutex_;
+  bool embedded_=false,tunnel_owner_active_=false;Json::Value pending_handoff_;double pending_stamp_=0;
+  std::vector<Reference> joint_forward_latched_;bool tunnel_integrated_enabled_=true;
+  bool tunnel_replan_enabled_=true,replan_pending_=false,tunnel_cells_authoritative_=true;double tracking_cte_=0,tracking_yaw_=0;
+  ros::CallbackQueue plan_queue_;std::unique_ptr<ros::AsyncSpinner> plan_spinner_;
+  uint64_t route_generation_=0,traffic_revision_=0,planned_traffic_revision_=0;Result last_good_;double last_good_stamp_=-1;
+  uint32_t last_good_id_=0,consumed_id_=0,last_rejected_id_=0;
+  bool tunnel_immediate_replan_=true;double tunnel_replan_brake_=2.;std::vector<Reference> consumed_path_;
+  double ego_speed_=0,ego_stamp_=-1;
+  ros::CallbackQueue cloud_queue_;std::unique_ptr<ros::AsyncSpinner> cloud_spinner_;
+  // 2026-10-05: 자세/경로/속도/지면 입력은 별도 큐. 내장 모드에서 이 노드의 주 스레드(계획 루프)가 막히면
+  //   /odom 이 밀려 stale_pose -> 보간 실패 -> 점군 누적 생략 -> stale_lidar 로 이어졌다(20:22 백).
+  ros::CallbackQueue input_queue_;std::unique_ptr<ros::AsyncSpinner> input_spinner_;
+  double hold_sec_=1.0;
+  double tunnel_wall_surface_band_=0.9;double corridor_target_extra_=.4,tunnel_corridor_target_extra_=.15;
+ public:
+  Impl(ros::NodeHandle params,bool embedded):pnh_(params),embedded_(embedded){
+    pnh_.param("scene_only",scene_only_,false);
+    nh_.param("/tunnel_recovery/native_scene_enabled",native_scene_,true);
+    nh_.param("/tunnel_recovery/common_scene_enabled",common_scene_,true);
+    pnh_.param("tunnel_cells_authoritative_enabled",tunnel_cells_authoritative_,true);
+    pnh_.param("tunnel_replan_enabled",tunnel_replan_enabled_,true);
+    pnh_.param("static_zone_min_idx",min_idx_,2400);pnh_.param("static_dynamic_split_idx",max_idx_,3700);
+    pnh_.param("static_planning_start_idx",cfg_.static_planning_start_idx,min_idx_-300);
+    cfg_.static_planning_start_idx=std::max(0,std::min(min_idx_,cfg_.static_planning_start_idx));
+    cfg_.static_zone_min_idx=min_idx_;
+    pnh_.param("tunnel_min_idx",tunnel_min_,7000);pnh_.param("tunnel_max_idx",tunnel_max_,9000);
+    if(common_scene_){const auto region=TunnelRegion::load(nh_);tunnel_min_=region.first;tunnel_shadow_first_=region.shadow_first;tunnel_max_=region.last;tunnel_prepare_=region.preview;if(region.lane!=3)throw std::runtime_error("M8 must use csv3");}
+    pnh_.param("tl_guard_enabled",tl_guard_,true);
+    nh_.param("/lidar_extrinsic/x",cfg_.sensor_x,1.1);nh_.param("/lidar_extrinsic/y",cfg_.sensor_y,0.);
+    nh_.param("/lidar_extrinsic/z",cfg_.sensor_z,1.33);nh_.param("/lidar_extrinsic/z_from_ground",cfg_.sensor_height,1.765);
+    pnh_.param("resolution",cfg_.resolution,.1);pnh_.param("map_length_m",cfg_.length,80.);
+    pnh_.param("vehicle_half_width",cfg_.half_width,.95);
+    pnh_.param("curb_margin",cfg_.curb_margin,.1);pnh_.param("obstacle_margin",cfg_.obstacle_margin,.2);
+    pnh_.param("min_height",cfg_.min_height,.15);pnh_.param("certified_min_height",cfg_.certified_min_height,.06);pnh_.param("certified_margin",cfg_.certified_margin,.3);pnh_.param("certified_far_proxy",cfg_.certified_far_proxy,false);pnh_.param("certified_far_min_cells",cfg_.certified_far_min_cells,3);pnh_.param("max_height",cfg_.max_height,2.8);
+    pnh_.param("target_speed_mps",cfg_.target_speed,8.333);pnh_.param("max_curvature",cfg_.max_curvature,.18);
+    pnh_.param("max_lateral_accel",cfg_.max_lateral_accel,2.5);pnh_.param("horizon_m",cfg_.horizon,40.);
+    pnh_.param("approach_horizon_m",cfg_.approach_horizon,50.);
+    pnh_.param("approach_obstacle_margin_m",cfg_.approach_obstacle_margin,.2);
+    pnh_.param("trigger_enabled",cfg_.trigger_enabled,true);
+    pnh_.param("trigger_corridor_half_width_m",cfg_.trigger_half_width,1.5);
+    pnh_.param("trigger_distance_m",cfg_.trigger_distance,30.);
+    pnh_.param("trigger_hold_sec",cfg_.trigger_hold,3.);
+    pnh_.param("tl_guard_range_m",cfg_.traffic_range,80.);
+    pnh_.param("tl_input_timeout_sec",cfg_.traffic_timeout,.7);
+    pnh_.param("tl_hold_gap_min_m",cfg_.traffic_gap_min,10.);
+    pnh_.param("tl_hold_gap_m",cfg_.traffic_gap_max,20.);
+    pnh_.param("tl_hold_decel_mps2",cfg_.traffic_decel,1.5);
+    nh_.param("/traffic_light_mission/front_axle_offset_m",front_axle_offset_,3.845);
+    nh_.param("/traffic_light_mission/stop_buffer_m",stop_buffer_,3.);
+
+    pnh_.param("recovery_rear_observation_m",recovery_rear_observation_,15.);
+    pnh_.param("scan_timeout",cfg_.scan_timeout,.35);
+    pnh_.param("return_min_distance_m",cfg_.return_min_distance,12.);
+    pnh_.param("return_min_time_sec",cfg_.return_min_time,2.);
+    pnh_.param("return_offset_tolerance_m",cfg_.return_tolerance,.2);
+    pnh_.param("return_center_weight",cfg_.return_center_weight,2.);
+    pnh_.param("return_ramp_time_sec",cfg_.return_ramp_time,0.);pnh_.param("avoid_speed_ceiling_mps",cfg_.avoid_speed_ceiling,-1.);pnh_.param("return_quintic_enabled",cfg_.return_quintic,false);pnh_.param("return_quintic_accel",cfg_.return_quintic_accel,1.5);pnh_.param("path_lateral_accel",cfg_.path_lateral_accel,-1.);pnh_.param("path_smooth_scale",cfg_.path_smooth_scale,1.0);pnh_.param("connector_smooth",cfg_.connector_smooth,true);pnh_.param("return_ramp_min_m",cfg_.return_ramp_min_m,10.);
+    pnh_.param("return_overshoot_m",cfg_.return_overshoot,.1);
+    pnh_.param("spatial_return_max_lat_accel",cfg_.spatial_return_accel,1.5);
+    pnh_.param("spatial_return_max_lat_jerk",cfg_.spatial_return_jerk,8.);
+    pnh_.param("spatial_return_min_speed",cfg_.spatial_return_min_speed,4.5);
+    pnh_.param("spatial_return_min_transition_m",cfg_.spatial_return_min_length,6.);
+    pnh_.param("spatial_return_max_transition_m",cfg_.spatial_return_max_length,32.);
+    pnh_.param("cruise_offset_m",cfg_.cruise_offset,.15);
+    double cruise_degrees=3,wall_degrees=5;
+    pnh_.param("cruise_heading_deg",cruise_degrees,3.);cfg_.cruise_heading=cruise_degrees*std::acos(-1)/180;
+    pnh_.param("cruise_path_offset_m",cfg_.cruise_path_offset,.2);
+    pnh_.param("cruise_preview_m",cfg_.cruise_preview,8.);pnh_.param("cruise_hold_sec",cfg_.cruise_hold,.5);
+    pnh_.param("live_boundary_distance_m",cfg_.live_boundary_distance,6.);
+    pnh_.param("ceiling_skip_height",cfg_.ceiling_skip_height,3.2);
+    pnh_.param("tunnel_corridor_relaxed",cfg_.tunnel_recovery_enabled,true);
+    pnh_.param("tunnel_integrated_enabled",tunnel_integrated_enabled_,true);
+    pnh_.param("tunnel_map_enabled",tunnel_map_enabled_,true);
+    bool master=true;nh_.param("/tunnel_recovery/enabled",master,true);tunnel_cells_authoritative_ &= master;tunnel_replan_enabled_ &= master;tunnel_map_enabled_ &= master;tunnel_integrated_enabled_ &= master;cfg_.tunnel_recovery_enabled &= master;
+    pnh_.param("tunnel_wall_surface_band",tunnel_wall_surface_band_,0.9);
+    pnh_.param("corridor_target_extra_m",corridor_target_extra_,.4);pnh_.param("tunnel_corridor_target_extra_m",tunnel_corridor_target_extra_,.15);
+    pnh_.param("live_boundary_heading_deg",wall_degrees,5.);cfg_.live_boundary_heading=wall_degrees*std::acos(-1)/180;
+    std::string path0,path3;pnh_.getParam("csv0",path0);pnh_.getParam("csv3",path3);road0_=csv(path0);road3_=csv(path3);
+    if(road0_.size()<10||road3_.size()<10)throw std::runtime_error("reference CSV is missing/invalid");
+    XmlRpc::XmlRpcValue edges;if(pnh_.getParam("curb_edges",edges))for(int i=0;i<edges.size();++i){
+      auto&r=edges[i];if(r.size()>=3)edges0_.push_back({int(r[0]),int(r[1]),number(r[2]),r.size()>=5?number(r[4]):-1});}
+    XmlRpc::XmlRpcValue tunnel;if(pnh_.getParam("tunnel_wall_profile",tunnel))for(int i=0;i+2<tunnel.size();i+=3){
+      int last=i+3<tunnel.size()?int(tunnel[i+3])-1:9000;
+      edges3_.push_back({int(tunnel[i]),last,-number(tunnel[i+1]),number(tunnel[i+2])});}
+    // Only annotated measured divider edges are conditional. Other curbs stay fixed.
+    if(pnh_.getParam("curb_edges",edges))for(int i=0;i<edges.size();++i){auto&r=edges[i];
+      if(r.size()>=5&&r[3].getType()==XmlRpc::XmlRpcValue::TypeString&&
+         std::string(r[3]).find("분리봉")!=std::string::npos){
+        divider_candidates_.push_back({int(r[0]),int(r[1]),-1,number(r[4])});
+        for(auto& e:edges0_)if(e.first==int(r[0]))e.left=-1;
+      }}
+    engine_.reset(new Engine(cfg_));engine_->setConditionalDividers(divider_candidates_);
+    pnh_.param("service_mode",service_mode_,false);
+    if(embedded_){service_mode_=true;nh_.param("/speed_limit/avoidance_mps",cfg_.target_speed,cfg_.target_speed);engine_.reset(new Engine(cfg_));engine_->setConditionalDividers(divider_candidates_);}
+    if(scene_only_)service_mode_=true;
+    if(!service_mode_){
+      path_pub_=nh_.advertise<nav_msgs::Path>("/local_path",1);
+      failed_pub_=nh_.advertise<std_msgs::Bool>("/avoidance_failed",1);
+      speed_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/target_speed_mps",1);
+      scale_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/static_speed_scale",1);
+    }
+    if(!scene_only_){
+    candidate_pub_=nh_.advertise<nav_msgs::Path>("/occupancy_avoidance/candidate_path",1);
+    state_pub_=nh_.advertise<std_msgs::String>("/occupancy_avoidance/candidate_state",1);
+    obstacles_pub_=nh_.advertise<std_msgs::String>("/occupancy_avoidance/obstacles",1);
+    debug_pub_=nh_.advertise<std_msgs::String>(service_mode_?"/occupancy_avoidance/validation_debug":"/obstacle_avoidance/validation_debug",1);
+    grid_pub_=nh_.advertise<grid_map_msgs::GridMap>("/occupancy_avoidance/grid",1);
+    marker_pub_=nh_.advertise<visualization_msgs::MarkerArray>("/occupancy_avoidance/markers",1);
+    if(!service_mode_)d_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/frenet_d",1);
+    active_pub_=nh_.advertise<std_msgs::Bool>("/occupancy_avoidance/active",1,true);
+    }else {marker_pub_=nh_.advertise<visualization_msgs::MarkerArray>("/tunnel/scene_markers",1);scene_pub_=nh_.advertise<std_msgs::String>("/tunnel/perception_scene",1);}
+    pnh_.param("validated_hold_sec",hold_sec_,1.0);
+    ros::NodeHandle input(nh_);input.setCallbackQueue(&input_queue_);
+    ego_sub_=input.subscribe<morai_msgs::EgoVehicleStatus>("/Competition_topic",1,[this](const morai_msgs::EgoVehicleStatus::ConstPtr& m){
+      std::lock_guard<std::mutex> lock(pose_in_mutex_);ego_in_speed_=std::hypot(m->velocity.x,m->velocity.y);ego_in_stamp_=ros::Time::now().toSec();
+    });
+    odom_=input.subscribe("/odom",100,&Impl::odom,this);
+    waypoint_=input.subscribe("/final_waypoint",1,&Impl::route,this);
+    ground_sub_=input.subscribe("/groundgrid/ground",1,&Impl::ground,this);
+    input_spinner_.reset(new ros::AsyncSpinner(1,&input_queue_));input_spinner_->start();
+    // 점군 누적은 별도 큐/스레드: 계획(100~240 ms)이 스캔 반영을 밀어내지 않게 한다.
+    {if(!scene_only_){ros::SubscribeOptions so=ros::SubscribeOptions::create<sensor_msgs::PointCloud2>(
+        "/perception/points_gravity",1,boost::bind(&Impl::cloud,this,_1),ros::VoidPtr(),&cloud_queue_);
+      lidar_=nh_.subscribe(so);
+      auto classified=ros::SubscribeOptions::create<sensor_msgs::PointCloud2>("/tunnel/map_classified",1,boost::bind(&Impl::classified,this,_1),ros::VoidPtr(),&cloud_queue_);classified_sub_=nh_.subscribe(classified);}
+      cloud_spinner_.reset(new ros::AsyncSpinner(1,&cloud_queue_));cloud_spinner_->start();}
+    bool transition=true;nh_.param("/tunnel_recovery/continuous_transition_enabled",transition,true);engine_->setContinuousTransition(transition);
+    frame_sub_=nh_.subscribe<std_msgs::String>("/localization/frame_update",20,[this](const std_msgs::String::ConstPtr&m){
+      Json::Value v;Json::Reader rd;if(!rd.parse(m->data,v))return;
+      std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
+      if(!common_scene_)return;
+      auto version=v.get("coordinate_version",0).asUInt64();if(version<=coordinate_version_)return;
+      const double x=v.get("offset_x",0).asDouble(),y=v.get("offset_y",0).asDouble();
+      if(coordinate_version_==0&&engine_->lastScan()<0){frame_x_=x;frame_y_=y;coordinate_version_=version;coordinate_stamp_=v.get("stamp",-1).asDouble();return;}
+      if(lane_!=3||index_<tunnel_min_||index_>tunnel_max_){frame_x_=x;frame_y_=y;coordinate_version_=version;coordinate_stamp_=v.get("stamp",-1).asDouble();return;}
+      const double dx=x-frame_x_,dy=y-frame_y_;
+      if(scene_only_){engine_->rebaseEvidence(dx,dy);surface_tracker_.rebase(dx,dy);}
+      else{engine_->rebasePlanning(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}++route_generation_;}
+      frame_x_=x;frame_y_=y;coordinate_version_=version;coordinate_stamp_=v.get("stamp",-1).asDouble();
+    });
+    if(scene_only_){
+      if(native_scene_){
+        native_scene_pub_=nh_.advertise<occupancy_avoidance::TunnelScene>("/tunnel/perception_scene_native",1);scene_compute_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/scene_processing_ms",1);scene_age_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/scene_input_age_ms",1);
+        auto so=ros::SubscribeOptions::create<occupancy_avoidance::TunnelScene>("/tunnel/detector_native",1,boost::bind(&Impl::detectorNative,this,_1),ros::VoidPtr(),&cloud_queue_);native_detector_sub_=nh_.subscribe(so);
+      }else detector_sub_=nh_.subscribe<std_msgs::String>("/tunnel/detector_objects",1,&Impl::detectorScene,this,ros::TransportHints().tcpNoDelay());
+      nh_.param<std::string>("/tunnel_map_filter/map_binary",map_version_,"");
+      wall_sub_=nh_.subscribe<std_msgs::Float64MultiArray>("/tunnel/wall_limits",1,[this](const std_msgs::Float64MultiArray::ConstPtr&m){
+        std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();LiveEdges e;
+        if(lane_==3&&m->data.size()>=5&&m->data[0]>0&&m->data[1]>0&&m->data[2]>0){e.pose=pose_;e.pose.stamp=ros::Time::now().toSec();e.right=m->data[1];e.left=m->data[2];e.right_slope=m->data[3];e.left_slope=m->data[4];e.valid=true;}engine_->setLiveEdges(e);});
+      publish_timer_=nh_.createTimer(ros::Duration(.1),&Impl::sceneHeartbeat,this);
+      ROS_INFO("[tunnel scene] independent perception, no path/control/escape publishers");return;
+    }
+    if(native_scene_)planning_age_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/planning_input_age_ms",1);
+    if(native_scene_)native_scene_sub_=nh_.subscribe<occupancy_avoidance::TunnelScene>("/tunnel/perception_scene_native",1,&Impl::nativeScene,this,ros::TransportHints().tcpNoDelay());
+    else scene_sub_=nh_.subscribe<std_msgs::String>("/tunnel/perception_scene",1,&Impl::scene,this);
+    gps_mode_sub_=nh_.subscribe<std_msgs::String>("/localization/gps_mode",1,[this](const std_msgs::String::ConstPtr&m){std::lock_guard<std::recursive_mutex>lock(engine_mutex_);if(m->data!=gps_mode_){gps_mode_=m->data;if(lane_==3)++route_generation_;}engine_->setReacquiring(lane_==3&&m->data=="reacquiring");});
+    admission_sub_=nh_.subscribe<std_msgs::String>("/obstacle_info",1,[this](const std_msgs::String::ConstPtr& m){
+      Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);std::vector<CertifiedTrigger> hints;
+      double now=ros::Time::now().toSec();
+      bool authority=lane_==3&&dynamic_state_stamp_>=0&&now>=dynamic_state_stamp_&&now-dynamic_state_stamp_<=.5;
+      for(const auto& o:root["obstacles"]){int id=o.get("id",-1).asInt();
+        if(!o.get("static_occupancy",false).asBool()||o.get("passed",false).asBool()||
+           o.get("background_excluded",false).asBool()||o.get("motion_state","").asString()=="dynamic"||(authority&&dynamic_ids_.count(id)))continue;
+        if(lane_==3&&!(authority&&static_ids_.count(id))&&o.get("motion_state","").asString()!="static"&&!o.get("static_certified",false).asBool())continue;
+        CertifiedTrigger hint;hint.stamp=o.get("last_seen",root.get("stamp",now)).asDouble();
+        if(now-hint.stamp>cfg_.trigger_hold||hint.stamp>now+.05)continue;
+        const auto& poly=o["planning_footprint_world"].isArray()?o["planning_footprint_world"]:o["footprint_world"];
+        for(const auto& p:poly)if(p.size()>=2&&std::isfinite(p[0].asDouble()+p[1].asDouble()))hint.footprint.push_back({p[0].asDouble(),p[1].asDouble(),0});
+        if(hint.footprint.size()>=3)hints.push_back(std::move(hint));
+      }
+      if(lane_==3&&tunnel_cells_authoritative_)hints.clear(); // boxes never fabricate M8 collision occupancy
+      if(common_scene_&&lane_==3){latest_objects_=root;objects_stamp_=root.get("stamp",now).asDouble();}
+      engine_->setCertifiedTriggers(std::move(hints));
+    });
+    near_=nh_.subscribe("/obstacle_info_near",1,&Impl::objects,this);
+    wall_sub_=nh_.subscribe<std_msgs::Float64MultiArray>("/tunnel/wall_limits",1,[this](const std_msgs::Float64MultiArray::ConstPtr&m){
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();LiveEdges e;if(lane_==3&&m->data.size()>=5&&m->data[0]>0&&m->data[1]>0&&m->data[2]>0){
+        e.pose=pose_;e.pose.stamp=ros::Time::now().toSec();e.right=m->data[1];e.left=m->data[2];e.right_slope=m->data[3];e.left_slope=m->data[4];e.valid=true;
+      }engine_->setLiveEdges(e);
+    });
+    stop_dist_sub_=nh_.subscribe<std_msgs::Float32MultiArray>("/localization/stop_ahead",1,[this](const std_msgs::Float32MultiArray::ConstPtr&m){
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);double distance=m->data.empty()?-1:m->data[0];
+      if((distance>=0&&distance<=cfg_.traffic_range)!=(stop_dist_>=0&&stop_dist_<=cfg_.traffic_range))++traffic_revision_;
+      stop_dist_=distance;stop_stamp_=ros::Time::now().toSec();});
+    stop_required_sub_=nh_.subscribe<std_msgs::Bool>("/localization/stop_required",1,[this](const std_msgs::Bool::ConstPtr&m){
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);if(stop_required_!=m->data)++traffic_revision_;
+      stop_required_=m->data;required_stamp_=ros::Time::now().toSec();});
+    escape_pub_=nh_.advertise<std_msgs::String>("/occupancy_avoidance/escape_response",1);
+    ros::SubscribeOptions escape_options=ros::SubscribeOptions::create<std_msgs::String>(
+      "/occupancy_avoidance/escape_request",1,boost::bind(&Impl::escapeRequest,this,_1),ros::VoidPtr(),&escape_queue_);
+    escape_sub_=nh_.subscribe(escape_options);escape_spinner_.reset(new ros::AsyncSpinner(1,&escape_queue_));escape_spinner_->start();
+    handoff_ack_pub_=nh_.advertise<std_msgs::String>("/occupancy_avoidance/escape_handoff_state",1);
+    handoff_sub_=nh_.subscribe("/reverse_escape/handoff",1,&Impl::handoff,this);
+    pnh_.param("tunnel_immediate_replan",tunnel_immediate_replan_,true);
+    owner_feedback_sub_=nh_.subscribe<std_msgs::String>("/obstacle_avoidance/selection_state",1,[this](const std_msgs::String::ConstPtr&m){
+      Json::Value v;Json::Reader rd;if(!rd.parse(m->data,v))return;
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);
+      if(lane_!=3||!tunnel_replan_enabled_||(!tunnel_cells_authoritative_&&joint_forward_latched_.empty()))return;
+      const uint32_t rejected=v.get("plan_id",0).asUInt();
+      if(!rejected||(rejected!=candidate_sequence_&&rejected!=last_good_id_)||rejected==last_rejected_id_)return;
+      if(v.isMember("coordinate_version")&&v["coordinate_version"].asUInt64()!=coordinate_version_)return;
+      const std::string reason=v.get("reason","").asString();
+      if(reason=="occupancy"||reason=="curvature"||reason=="collision"||reason=="road_boundary"||reason=="no_valid_connector"){
+        last_rejected_id_=rejected;++route_generation_;replan_pending_=true;engine_->invalidateHeldPath();
+        if(rejected==last_good_id_){last_good_=Result();last_good_id_=0;last_good_stamp_=-1;}
+        if(rejected==candidate_sequence_){result_.clear=false;result_.path.clear();result_.reason="final_owner_"+reason;}
+        if(!tunnel_immediate_replan_)last_good_=Result();
+      }
+    });
+    divider_pub_=nh_.advertise<std_msgs::String>("/perception/divider_boundary",1);
+    dynamic_state_sub_=nh_.subscribe<std_msgs::String>("/obstacle_stop/dynamic_state",1,[this](const std_msgs::String::ConstPtr&m){
+      Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);dynamic_hold_=root.get("hold",false).asBool();
+      dynamic_ids_.clear();static_ids_.clear();
+      for(const auto&id:root["dynamic_ids"])dynamic_ids_.insert(id.asInt());
+      for(const auto&id:root["static_ids"])static_ids_.insert(id.asInt());
+      dynamic_state_stamp_=ros::Time::now().toSec();
+    });
+    coverage_sub_=nh_.subscribe<std_msgs::Float64>("/obstacle_stop/path_speed_limit_mps",1,[this](const std_msgs::Float64::ConstPtr&m){
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);coverage_=m->data;coverage_stamp_=ros::Time::now().toSec();});
+    ros::NodeHandle worker(nh_);worker.setCallbackQueue(&plan_queue_);
+    plan_timer_=worker.createTimer(ros::Duration(.1),&Impl::plan,this);
+    plan_spinner_.reset(new ros::AsyncSpinner(1,&plan_queue_));plan_spinner_->start();
+    publish_timer_=nh_.createTimer(ros::Duration(.05),&Impl::publish,this);
+    random_active_sub_=nh_.subscribe<std_msgs::Bool>("/tunnel/random_obstacle_active",1,[this](const std_msgs::Bool::ConstPtr&m){random_active_=m->data;random_active_stamp_=ros::Time::now().toSec();});
+    ROS_INFO("[occupancy] static %d..%d tunnel %d..%d curb inset %.2fm; original Apollo + OSQP%s",min_idx_,max_idx_,tunnel_min_,tunnel_max_,cfg_.half_width+cfg_.curb_margin,service_mode_?" (service mode: perception + candidate only)":"");
+  }
+  ~Impl(){plan_timer_.stop();publish_timer_.stop();if(plan_spinner_)plan_spinner_->stop();if(escape_spinner_)escape_spinner_->stop();if(cloud_spinner_)cloud_spinner_->stop();if(input_spinner_)input_spinner_->stop();}
+  bool entryArmed()const{return index_>=tunnel_shadow_first_||(random_active_&&ros::Time::now().toSec()-random_active_stamp_<.5);}
+  bool active()const{return(recovery_active_&&lane_==0&&index_>max_idx_&&index_<=4900)||(lane_==0&&index_>=cfg_.static_planning_start_idx&&index_<=max_idx_)||(lane_==3&&entryArmed()&&index_>=tunnel_min_&&(index_<=tunnel_max_||(tunnel_owner_active_&&index_<=tunnel_max_+100)));}
+  bool warm()const{return(lane_==0&&index_>=cfg_.static_planning_start_idx-200&&index_<=4900)||(lane_==3&&index_>=tunnel_min_-std::max(100,tunnel_prepare_)&&index_<=tunnel_max_+100);}
+  // 2026-10-07: odom 은 엔진 잠금을 잡지 않는다. 터널에서 integrate/plan 이 잠금을 길게 잡아 /odom 이 밀리면
+  //   pose_ 가 0.25 s 넘게 늦어 stale_pose -> 회피 실패 -> 긴급제동(21:05~21:08 백). 받은 자세는 버퍼에 쌓고,
+  //   엔진 잠금을 잡은 쪽이 syncPoses() 로 반영한다(판단 시점에 항상 최신 자세).
+  void odom(const nav_msgs::Odometry::ConstPtr&m){Pose p;p.stamp=m->header.stamp.toSec();const double recv=ros::Time::now().toSec();if(!p.stamp)p.stamp=recv;
+    p.x=m->pose.pose.position.x;p.y=m->pose.pose.position.y;p.z=m->pose.pose.position.z;p.yaw=yawOf(m->pose.pose.orientation);
+    p.speed=std::hypot(m->twist.twist.linear.x,m->twist.twist.linear.y);
+    std::lock_guard<std::mutex> lock(pose_in_mutex_);pose_in_.push_back({p,recv});if(pose_in_.size()>400)pose_in_.erase(pose_in_.begin(),pose_in_.begin()+200);
+  }
+  void syncPoses(){
+    std::vector<std::pair<Pose,double>> incoming;waypoint_maker::Lane::ConstPtr route_msg;double route_recv=0;
+    {std::lock_guard<std::mutex> lock(pose_in_mutex_);incoming.swap(pose_in_);
+      ego_speed_=ego_in_speed_;ego_stamp_=ego_in_stamp_;
+      if(route_in_){route_msg.swap(route_in_);route_recv=route_in_stamp_;}
+      if(ground_in_new_){ground_.swap(ground_in_);ground_stamp_=ground_in_stamp_;ground_in_new_=false;}}
+    if(route_msg)applyRoute(route_msg,route_recv);
+    for(auto&q:incoming){Pose p=q.first;
+      if(q.second-ego_stamp_<=.5)p.speed=ego_speed_;
+      if(!history_.empty()&&p.stamp<history_.back().stamp){history_.clear();engine_->reset();result_=Result();last_good_=Result();++route_generation_;}
+      if(history_.empty()||p.stamp>history_.back().stamp)history_.push_back(p);
+      while(history_.size()>200)history_.pop_front();
+      pose_=p;}
+  }
+  bool interpolate(double stamp,Pose&out){if(history_.empty())return false;
+    auto it=std::lower_bound(history_.begin(),history_.end(),stamp,[](const Pose&p,double t){return p.stamp<t;});
+    if(it==history_.end()){if(stamp-history_.back().stamp>.08)return false;out=history_.back();out.stamp=stamp;return true;}
+    if(it==history_.begin()){if(it->stamp-stamp>.08)return false;out=*it;out.stamp=stamp;return true;}
+    auto a=it-1,b=it;if(b->stamp-a->stamp>.3)return false;double u=(stamp-a->stamp)/(b->stamp-a->stamp);
+    out=*a;out.stamp=stamp;out.x+=u*(b->x-a->x);out.y+=u*(b->y-a->y);out.z+=u*(b->z-a->z);
+    out.speed+=u*(b->speed-a->speed);out.yaw+=u*std::atan2(std::sin(b->yaw-a->yaw),std::cos(b->yaw-a->yaw));return true;
+  }
+  void route(const waypoint_maker::Lane::ConstPtr&m){const double recv=ros::Time::now().toSec();
+    {std::lock_guard<std::mutex> lock(pose_in_mutex_);route_in_=m;route_in_stamp_=recv;}
+    // 잠금이 비어 있으면 바로 반영(active() 판단이 늦지 않게), 바쁘면 다음 syncPoses() 가 반영.
+    std::unique_lock<std::recursive_mutex> lock(engine_mutex_,std::try_to_lock);if(lock.owns_lock())syncPoses();}
+  void applyRoute(const waypoint_maker::Lane::ConstPtr&m,double recv){if(m->waypoints.empty()){route_.clear();index_=-1;return;}
+    int lane=m->waypoints.front().lane_number;index_=m->waypoints.front().waypoint_index;
+    if(lane!=road_lane_){engine_->reset();engine_->setRoad(lane==3?road3_:road0_,lane==3?edges3_:edges0_);
+      engine_->setNearMemory(lane==3&&common_scene_?10.:0.);engine_->setStrictSceneMargins(lane==3&&common_scene_);engine_->setWallSurfaceBand(lane==3?tunnel_wall_surface_band_:0.);
+      engine_->setCorridorTargetExtra(lane==3?tunnel_corridor_target_extra_:corridor_target_extra_);road_lane_=lane;replan_pending_=false;joint_forward_latched_.clear();result_=Result();last_good_=Result();++route_generation_;}
+    lane_=lane;common_m8_active_=common_scene_&&lane==3&&index_>=tunnel_min_&&index_<=tunnel_max_;route_.clear();for(const auto&w:m->waypoints)route_.push_back({w.pose.pose.position.x,w.pose.pose.position.y,w.ryaw,w.waypoint_index});
+    for(size_t i=0;i+1<route_.size();++i)route_[i].yaw=std::atan2(route_[i+1].y-route_[i].y,route_[i+1].x-route_[i].x);
+    if(route_.size()>1)route_.back().yaw=route_[route_.size()-2].yaw;
+    waypoint_stamp_=recv;
+  }
+  void ground(const sensor_msgs::PointCloud2::ConstPtr&m){if(m->header.frame_id!="velodyne_ground"&&m->header.frame_id!="velodyne")return;
+    try{auto g=points(*m);std::lock_guard<std::mutex> lock(pose_in_mutex_);ground_in_.swap(g);ground_in_stamp_=m->header.stamp.toSec();ground_in_new_=true;}
+    catch(const std::exception&e){ROS_WARN_THROTTLE(1,"ground: %s",e.what());}}
+  void classified(const sensor_msgs::PointCloud2::ConstPtr&m){
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
+    if((scene_only_||!common_scene_)&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_){classified_stamp_=m->header.stamp.toSec();cloud(m);}
+  }
+  void cloud(const sensor_msgs::PointCloud2::ConstPtr&m){std::lock_guard<std::recursive_mutex> input_lock(engine_mutex_);syncPoses();if(!warm())return;
+    if(scene_only_)return; // Final M8 objects come from the shared nonground detector.
+    if(scene_only_&&(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_))return;
+    if(!scene_only_&&common_scene_&&lane_==3&&index_>=tunnel_min_-tunnel_prepare_&&index_<=tunnel_max_)return;
+    if(m->header.frame_id!="velodyne_ground"){ROS_ERROR_THROTTLE(1,"occupancy expects gravity-aligned sensor frame, got %s",m->header.frame_id.c_str());return;}
+    Pose p;if(!interpolate(m->header.stamp.toSec(),p))return;
+    if(scene_only_&&p.stamp<=coordinate_stamp_)return;
+    try{static const std::vector<DynamicRegion> no_dynamic;
+      std::vector<Point> aligned_ground;Pose gp;
+      if(std::abs(ground_stamp_-p.stamp)<=.2&&interpolate(ground_stamp_,gp)){
+        aligned_ground.reserve(ground_.size());double cg=std::cos(gp.yaw),sg=std::sin(gp.yaw),cp=std::cos(p.yaw),sp=std::sin(p.yaw);
+        for(const auto&g:ground_){
+          double dx=gp.x+cg*(g.x+cfg_.sensor_x)-sg*(g.y+cfg_.sensor_y)-p.x;
+          double dy=gp.y+sg*(g.x+cfg_.sensor_x)+cg*(g.y+cfg_.sensor_y)-p.y;
+          aligned_ground.push_back({cp*dx+sp*dy-cfg_.sensor_x,-sp*dx+cp*dy-cfg_.sensor_y,g.z+gp.z-p.z});
+        }
+      }
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);
+      refreshDynamic(ros::Time::now().toSec());
+      engine_->setRearObservation((lane_==3||(lane_==0&&index_>max_idx_))?recovery_rear_observation_:5.);
+      bool annotated=std::any_of(m->fields.begin(),m->fields.end(),[](const auto&f){return f.name=="map_label";});
+      if(!annotated&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_&&(scene_only_||ros::Time::now().toSec()-classified_stamp_<.35))return;
+      auto raw=points(*m);
+      if(!annotated&&lane_==3&&tunnel_map_enabled_)for(auto& p:raw){p.map_label=0;p.map_ground=std::numeric_limits<double>::quiet_NaN();}
+      if(annotated){sensor_msgs::PointCloud2ConstIterator<float> g(*m,"map_ground"),l(*m,"map_label"),x(*m,"x"),y(*m,"y"),z(*m,"z");size_t j=0;
+        for(;x!=x.end();++x,++y,++z,++g,++l)if(std::isfinite(*x+*y+*z)){raw[j].map_ground=*g;raw[j].map_label=*l;++j;}}
+      if(scene_only_){
+        std::map<std::pair<int,int>,int> support;
+        for(const auto&q:raw)if(q.map_label==2)++support[{int(std::floor(q.x/.5)),int(std::floor(q.y/.5))}];
+        for(auto&q:raw)if(q.map_label==2){int ix=std::floor(q.x/.5),iy=std::floor(q.y/.5),count=0;for(int di=-1;di<=1;++di)for(int dj=-1;dj<=1;++dj){auto i=support.find({ix+di,iy+dj});if(i!=support.end())count+=i->second;}if(count<3)q.map_label=5;}
+        for(auto&q:raw)if(q.map_label==0)q.map_label=5; // outside classified candidate ROI: near evidence only
+        scene_measured_.clear();scene_verified_cells_.clear();double c=std::cos(p.yaw),sn=std::sin(p.yaw);
+        for(const auto&q:raw){double height=q.z-(std::isfinite(q.map_ground)?q.map_ground:-cfg_.sensor_height);
+          if(q.map_label==1||height<.08||height>cfg_.max_height)continue;
+          double x=q.x+cfg_.sensor_x,y=q.y+cfg_.sensor_y;double wx=p.x+c*x-sn*y,wy=p.y+sn*x+c*y;scene_measured_.push_back({wx,wy});if(q.map_label==3)scene_verified_cells_.insert({int(std::floor(wx/.1)),int(std::floor(wy/.1))});}
+      }
+      bool integrated=engine_->integrate(p,raw,aligned_ground,
+                         scene_only_?scene_dynamic_:(std::abs(objects_stamp_-p.stamp)<=.35?dynamic_:no_dynamic));
+      if(scene_only_){if(integrated)publishScene();}else publishDivider(p.stamp);
+    }catch(const std::exception&e){ROS_ERROR_THROTTLE(1,"occupancy cloud: %s",e.what());}}
+  void scene(const std_msgs::String::ConstPtr&m){
+    Json::Value v;Json::Reader rd;if(!rd.parse(m->data,v)||v.get("state","").asString()!="valid")return;
+    std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
+    if(!common_scene_||lane_!=3)return;
+    double stamp=v.get("geometry_stamp",-1).asDouble(),now=ros::Time::now().toSec();if(now-stamp>cfg_.scan_timeout||now<stamp-.05)return;
+    SceneSnapshot snap;const auto&p=v["scan_pose"];if(p.size()!=7)return;
+    snap.pose={stamp,p[0].asDouble(),p[1].asDouble(),p[2].asDouble(),p[3].asDouble(),p[4].asDouble()};snap.curvature=p[5].asDouble();
+    for(const auto&q:v["voxels"])if(q.size()==5)snap.voxels.push_back({{q[0].asDouble(),q[1].asDouble(),q[2].asDouble()},q[3].asBool(),q[4].asDouble()});
+    for(const auto&q:v["visibility"])if(q.size()==3)snap.visibility.push_back({q[0].asDouble(),q[1].asDouble(),q[2].asDouble()});
+    for(const auto&q:v["measured_ray_cleared_world"])if(q.size()>=2)snap.cleared.push_back({q[0].asDouble(),q[1].asDouble(),q.size()>2?q[2].asDouble():0});
+    auto version=v.get("coordinate_version",0).asUInt64();
+    if(version<coordinate_version_)return;
+    if(version>coordinate_version_){
+      double x=v.get("offset_x",0).asDouble(),y=v.get("offset_y",0).asDouble(),dx=x-frame_x_,dy=y-frame_y_;
+      engine_->rebasePlanning(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}
+      frame_x_=x;frame_y_=y;++route_generation_;
+    }
+    if(engine_->importScene(snap)){scene_input_=v;scene_id_=v.get("scene_id",0).asUInt64();coordinate_version_=v.get("coordinate_version",0).asUInt64();scene_recv_=now;}
+  }
+  static bool detectorContains(const Json::Value& o,double x,double y) {
+    if(o.get("background_excluded",false).asBool())return false;
+    const auto& poly=o["footprint_world"];
+    if(!poly.isArray()||poly.size()<3)return false;
+    bool inside=false;
+    for(unsigned i=0,j=poly.size()-1;i<poly.size();j=i++){
+      double ax=poly[i][0].asDouble(),ay=poly[i][1].asDouble(),bx=poly[j][0].asDouble(),by=poly[j][1].asDouble();
+      if((ay>y)!=(by>y)&&x<(bx-ax)*(y-ay)/(by-ay)+ax)inside=!inside;
+      double dx=bx-ax,dy=by-ay,u=std::max(0.,std::min(1.,((x-ax)*dx+(y-ay)*dy)/std::max(1e-9,dx*dx+dy*dy)));
+      if(std::hypot(x-ax-u*dx,y-ay-u*dy)<.15)return true;
+    }
+    return inside;
+  }
+  bool nativeSnapshot(const occupancy_avoidance::TunnelScene& m,SceneSnapshot& snap,Json::Value& meta){
+    size_t n=m.cells.size();if(m.owner_ids.size()!=n||m.fixed.size()!=n||m.seen.size()!=n||m.observed.size()!=n||m.visibility.size()%3)return false;
+    Json::Reader rd;if(!rd.parse(m.metadata_json,meta)||meta.get("state","").asString()!="valid")return false;
+    double stamp=m.header.stamp.toSec(),now=ros::Time::now().toSec();if(now-stamp>cfg_.scan_timeout||stamp>now+.05)return false;
+    double yaw=std::atan2(2*(m.ego_pose.orientation.w*m.ego_pose.orientation.z+m.ego_pose.orientation.x*m.ego_pose.orientation.y),1-2*(m.ego_pose.orientation.y*m.ego_pose.orientation.y+m.ego_pose.orientation.z*m.ego_pose.orientation.z));
+    snap.pose={stamp,m.ego_pose.position.x,m.ego_pose.position.y,m.ego_pose.position.z,yaw,m.speed};snap.curvature=m.curvature;
+    std::set<int64_t> moving,owners,statics,confirmed;meta["obstacles"]=Json::Value(Json::arrayValue);
+    for(const auto&o:m.objects){if(!owners.insert(o.id).second)return false;Json::Value attr;if(!rd.parse(o.metadata_json,attr))return false;
+      attr["id"]=Json::Int64(o.id);attr["confirmed"]=o.confirmed;attr["confirmed_obstacle"]=o.confirmed;attr["static_certified"]=o.static_certified;attr["dynamic_confirmed"]=o.dynamic_confirmed;attr["motion_state"]=o.motion_state==o.STATIC?"static":o.motion_state==o.DYNAMIC?"dynamic":"unknown";meta["obstacles"].append(attr);
+      if(o.confirmed&&o.dynamic_confirmed&&o.motion_state==o.DYNAMIC)moving.insert(o.id);
+      if(o.confirmed)confirmed.insert(o.id);
+      if(o.static_certified&&!o.dynamic_confirmed&&o.motion_state!=o.DYNAMIC)statics.insert(o.id);}
+
+    for(size_t i=0;i<n;++i){const auto&p=m.cells[i];if(!owners.count(m.owner_ids[i])||!std::isfinite(p.x+p.y+p.z+m.seen[i]))return false;
+      if(m.fixed[i]&&!statics.count(m.owner_ids[i]))return false;
+      // Fresh measured unknown occupancy is a transient constraint, not static
+      // admission. Otherwise the final node sees cells the planner never saw.
+      if(m.fixed[i]||moving.count(m.owner_ids[i])||(m.observed[i]&&confirmed.count(m.owner_ids[i])))snap.voxels.push_back({{p.x,p.y,p.z},bool(m.fixed[i]),m.seen[i]});}
+    for(size_t i=0;i<m.visibility.size();i+=3){snap.visibility.push_back({m.visibility[i],m.visibility[i+1],m.visibility[i+2]});}
+    return true;
+  }
+  void detectorNative(const occupancy_avoidance::TunnelScene::ConstPtr& input){
+    const double begin=ros::WallTime::now().toSec();
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    double stamp=input->header.stamp.toSec();Pose p;if(!interpolate(stamp,p)||stamp<=coordinate_stamp_||input->coordinate_version<coordinate_version_)return;
+    auto out=*input;out.ego_pose.position.x=p.x;out.ego_pose.position.y=p.y;out.ego_pose.position.z=p.z;
+    out.ego_pose.orientation.x=out.ego_pose.orientation.y=0;out.ego_pose.orientation.z=std::sin(p.yaw/2);out.ego_pose.orientation.w=std::cos(p.yaw/2);out.speed=p.speed;out.map_version=map_version_;
+    Pose previous;if(std::abs(p.speed)>.3&&interpolate(stamp-.1,previous))out.curvature=std::atan2(std::sin(p.yaw-previous.yaw),std::cos(p.yaw-previous.yaw))/(.1*p.speed);
+    out.visibility.clear();std::set<std::pair<int,int>> floor;
+    Pose gp;if(std::abs(ground_stamp_-stamp)<.2&&interpolate(ground_stamp_,gp)){
+      double c=std::cos(gp.yaw),s=std::sin(gp.yaw);
+      for(const auto&g:ground_){double x=gp.x+c*(g.x+cfg_.sensor_x)-s*(g.y+cfg_.sensor_y),y=gp.y+s*(g.x+cfg_.sensor_x)+c*(g.y+cfg_.sensor_y);
+        floor.insert({int(std::floor(x/.5)),int(std::floor(y/.5))});}
+      for(auto q:floor){out.visibility.push_back(q.first);out.visibility.push_back(q.second);out.visibility.push_back(ground_stamp_);}}
+    SceneSnapshot snap;Json::Value meta;if(!nativeSnapshot(out,snap,meta)||!engine_->importScene(snap))return;
+    scene_id_=out.scene_id;coordinate_version_=out.coordinate_version;frame_x_=out.offset_x;frame_y_=out.offset_y;native_scene_pub_.publish(out);
+    std_msgs::Float64 metric;metric.data=(ros::WallTime::now().toSec()-begin)*1000.;scene_compute_pub_.publish(metric);metric.data=(ros::Time::now().toSec()-stamp)*1000.;scene_age_pub_.publish(metric);
+    if(scene_pub_.getNumSubscribers()&&ros::Time::now().toSec()-native_debug_stamp_>=.5){
+      native_debug_stamp_=ros::Time::now().toSec();meta["geometry_stamp"]=stamp;meta["scene_id"]=Json::UInt64(out.scene_id);meta["coordinate_version"]=Json::UInt64(out.coordinate_version);meta["map_version"]=out.map_version;meta["native_compute_ms"]=(ros::WallTime::now().toSec()-begin)*1000.;
+      meta["voxels"]=Json::Value(Json::arrayValue);for(auto q:snap.voxels){Json::Value a(Json::arrayValue);a.append(q.point.x);a.append(q.point.y);a.append(q.point.z);a.append(q.fixed);a.append(q.seen);meta["voxels"].append(a);}std_msgs::String d;d.data=Json::FastWriter().write(meta);scene_pub_.publish(d);}
+    if(marker_pub_.getNumSubscribers()&&ros::Time::now().toSec()-last_vis_stamp_>=.5){last_vis_stamp_=ros::Time::now().toSec();visualization_msgs::MarkerArray a;
+      for(int k=0;k<3;++k){visualization_msgs::Marker v;v.header=out.header;v.ns="native_cells";v.id=k;v.type=v.POINTS;v.action=v.ADD;v.pose.orientation.w=1;v.scale.x=v.scale.y=.1;v.color.a=.8;v.color.r=k!=0;v.color.g=k!=1;v.color.b=k==1;v.lifetime=ros::Duration(.7);
+        for(size_t i=0;i<out.cells.size();++i){int category=out.fixed[i]?(out.observed[i]?0:1):2;if(category==k)v.points.push_back(out.cells[i]);}a.markers.push_back(v);}marker_pub_.publish(a);}
+  }
+  void nativeScene(const occupancy_avoidance::TunnelScene::ConstPtr&m){
+    std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();if(!common_scene_||lane_!=3||m->coordinate_version<coordinate_version_)return;
+    SceneSnapshot snap;Json::Value meta;if(!nativeSnapshot(*m,snap,meta))return;
+    if(m->coordinate_version>coordinate_version_){double dx=m->offset_x-frame_x_,dy=m->offset_y-frame_y_;engine_->rebasePlanning(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}frame_x_=m->offset_x;frame_y_=m->offset_y;++route_generation_;}
+    if(engine_->importScene(snap)){
+      const double stamp=m->header.stamp.toSec();scene_id_=m->scene_id;coordinate_version_=m->coordinate_version;scene_recv_=ros::Time::now().toSec();scene_input_=meta;
+      scene_input_["geometry_digest"]=Json::UInt64(engine_->geometryDigest());scene_input_["geometry_stamp"]=stamp;scene_input_["stamp"]=stamp;scene_input_["scene_id"]=Json::UInt64(m->scene_id);scene_input_["coordinate_version"]=Json::UInt64(m->coordinate_version);scene_input_["mission_mode"]="tunnel";scene_input_["perception_source"]="common_scene";scene_input_["map_version"]=m->map_version;scene_input_["cell_resolution"]=.1;
+      std::map<int64_t,unsigned> owner;for(unsigned i=0;i<scene_input_["obstacles"].size();++i){auto&o=scene_input_["obstacles"][i];owner[o["id"].asInt64()]=i;o["occupied_cells_world"]=Json::Value(Json::arrayValue);o["observed_cells_world"]=Json::Value(Json::arrayValue);o["perception_source"]="common_scene";o["collision_geometry_valid"]=true;o["collision_geometry_stamp"]=stamp;o["scene_id"]=Json::UInt64(m->scene_id);o["coordinate_version"]=Json::UInt64(m->coordinate_version);}
+      for(size_t i=0;i<m->cells.size();++i){Json::Value xy(Json::arrayValue);xy.append(m->cells[i].x);xy.append(m->cells[i].y);auto&o=scene_input_["obstacles"][owner.at(m->owner_ids[i])];o["occupied_cells_world"].append(xy);if(m->observed[i])o["observed_cells_world"].append(xy);}
+      scene_input_["collision_objects"]=scene_input_["obstacles"];
+      std_msgs::Float64 metric;metric.data=(ros::Time::now().toSec()-stamp)*1000.;planning_age_pub_.publish(metric);
+    }
+  }
+  void detectorScene(const std_msgs::String::ConstPtr& m){
+    Json::Value root;Json::Reader rd;if(!rd.parse(m->data,root))return;
+    const auto& scan=root["geometry_scan"];double stamp=scan.get("stamp",-1).asDouble(),now=ros::Time::now().toSec();
+    if(now-stamp>cfg_.scan_timeout||stamp>now+.05||!scan["endpoints"].isArray())return;
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    Pose p;if(!interpolate(stamp,p)||stamp<=coordinate_stamp_)return;
+    std::vector<Point> returns;double c=std::cos(p.yaw),s=std::sin(p.yaw);
+    scene_measured_.clear();scene_verified_cells_.clear();scene_dynamic_.clear();
+    const auto& objects=root["collision_objects"];
+    for(const auto&o:objects)if(o.get("is_dynamic",false).asBool()&&o["position_world"].size()>=2){
+      scene_dynamic_.push_back({o["position_world"][0].asDouble(),o["position_world"][1].asDouble(),p.yaw,o.get("length",.3).asDouble(),o.get("width",.3).asDouble(),o.get("vx",0).asDouble(),o.get("vy",0).asDouble(),.3});
+    }
+    for(const auto& w:scan["endpoints"]){if(w.size()<3)continue;
+      double x=w[0].asDouble(),y=w[1].asDouble(),z=w[2].asDouble();
+      double dx=x-p.x,dy=y-p.y;Point q{c*dx+s*dy-cfg_.sensor_x,-s*dx+c*dy-cfg_.sensor_y,z-p.z-cfg_.sensor_z};
+      q.map_label=1; // Non-detections supply real rays, never create obstacle cells.
+      for(const auto&o:objects)if(detectorContains(o,x,y)){
+        q.map_label=o.get("is_dynamic",false).asBool()?2:3;
+        // Detection has already passed the shared terrain/shape filters.
+        q.map_ground=q.z-o.get("top_elevation",o.get("height",Json::Value(NAN))).asDouble();
+        scene_measured_.push_back({x,y});scene_verified_cells_.insert({int(std::floor(x/.1)),int(std::floor(y/.1))});break;
+      }
+      returns.push_back(q);
+    }
+    // GroundGrid ground supplies observed floor coverage, not new obstacles.
+    if(std::abs(ground_stamp_-stamp)<.2){Pose gp;if(interpolate(ground_stamp_,gp)){
+      double cg=std::cos(gp.yaw),sg=std::sin(gp.yaw);
+      for(const auto& g:ground_){double wx=gp.x+cg*(g.x+cfg_.sensor_x)-sg*(g.y+cfg_.sensor_y),wy=gp.y+sg*(g.x+cfg_.sensor_x)+cg*(g.y+cfg_.sensor_y);
+        double dx=wx-p.x,dy=wy-p.y;Point q{c*dx+s*dy-cfg_.sensor_x,-s*dx+c*dy-cfg_.sensor_y,g.z+gp.z-p.z};q.map_label=1;q.map_ground=q.z;returns.push_back(q);}
+    }}
+    detector_input_=root;
+    if(engine_->integrate(p,returns,{},scene_dynamic_))publishScene();
+  }
+  void sceneHeartbeat(const ros::TimerEvent&){
+    std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    if(ros::Time::now().toSec()-engine_->lastScan()<=cfg_.scan_timeout)return;
+    Json::Value v;v["schema_version"]=1;v["state"]="expired";v["scene_id"]=Json::UInt64(scene_id_);v["geometry_stamp"]=engine_->lastScan();v["map_version"]=map_version_;std_msgs::String m;m.data=Json::FastWriter().write(v);scene_pub_.publish(m);
+  }
+  void publishScene(){
+    auto snap=engine_->exportScene();Json::Value v;
+    v["obstacles"]=Json::Value(Json::arrayValue);v["collision_cells_world"]=Json::Value(Json::arrayValue);
+    // Preserve detector IDs and motion evidence. Never re-cluster or infer motion here.
+    std::vector<SceneVoxel> owned;
+    for(auto o:detector_input_["collision_objects"]){
+      if(o.get("background_excluded",false).asBool())continue;
+      o["occupied_cells_world"]=Json::Value(Json::arrayValue);std::set<std::pair<int,int>> cells;
+      for(const auto&q:snap.voxels)if(detectorContains(o,q.point.x,q.point.y)){
+        if(cells.insert({int(std::floor(q.point.x/.1)),int(std::floor(q.point.y/.1))}).second){Json::Value a(Json::arrayValue);a.append(q.point.x);a.append(q.point.y);o["occupied_cells_world"].append(a);v["collision_cells_world"].append(a);}owned.push_back(q);
+      }
+      if(o["occupied_cells_world"].empty())continue;
+      o["center"]=o["position_world"];o["confirmed_obstacle"]=o.get("confirmed",false);
+      unsigned measured=0;for(auto q:scene_measured_)if(detectorContains(o,q.first,q.second))++measured;
+      o["observed_surface_count"]=measured;o["last_surface_count"]=std::max(measured,unsigned(o.get("geometry_support_count",0).asUInt()));
+      o.removeMember("support_points_world");o["final_detector_source"]="shared_nonground_detector";
+      v["obstacles"].append(o);
+    }
+    snap.voxels=std::move(owned);
+    v["geometry_stamp"]=snap.pose.stamp;v["geometry_digest"]=Json::UInt64(engine_->geometryDigest());
+    v["pose_world"].append(snap.pose.x);v["pose_world"].append(snap.pose.y);v["pose_world"].append(snap.pose.yaw);
+    v["measured_ray_cleared_world"]=Json::Value(Json::arrayValue);for(auto q:snap.cleared){Json::Value a(Json::arrayValue);a.append(q.x);a.append(q.y);v["measured_ray_cleared_world"].append(a);}
+    v["perception_source"]="shared_nonground_detector";
+    v["voxels"]=Json::Value(Json::arrayValue);v["visibility"]=Json::Value(Json::arrayValue);
+    v["schema_version"]=1;v["reference_corridor_half_width_m"]=cfg_.trigger_half_width;v["background_topic"]="/tunnel/map_background";v["unobserved_is_free"]=false;
+    v["state"]="valid";v["scene_id"]=Json::UInt64(++scene_id_);v["coordinate_version"]=Json::UInt64(coordinate_version_);v["map_version"]=map_version_;v["frame_id"]="map";v["offset_x"]=frame_x_;v["offset_y"]=frame_y_;
+    for(double x:{snap.pose.x,snap.pose.y,snap.pose.z,snap.pose.yaw,snap.pose.speed,snap.curvature,0.})v["scan_pose"].append(x);
+    for(const auto&q:snap.voxels){Json::Value a(Json::arrayValue);a.append(q.point.x);a.append(q.point.y);a.append(q.point.z);a.append(q.fixed);a.append(q.seen);v["voxels"].append(a);}
+    for(const auto&q:snap.visibility){Json::Value a(Json::arrayValue);for(double x:q)a.append(x);v["visibility"].append(a);}
+    std_msgs::String m;m.data=Json::FastWriter().write(v);scene_pub_.publish(m);
+    double now=ros::Time::now().toSec();if(marker_pub_.getNumSubscribers()&&now-last_vis_stamp_>=.5){last_vis_stamp_=now;visualization_msgs::MarkerArray a;
+      for(int k=0;k<3;++k){visualization_msgs::Marker mark;mark.header.frame_id="map";mark.header.stamp=ros::Time(snap.pose.stamp);mark.ns=k==0?"observed":k==1?"retained":"unconfirmed";mark.id=k;mark.type=mark.POINTS;mark.action=mark.ADD;mark.pose.orientation.w=1;mark.scale.x=mark.scale.y=cfg_.resolution;mark.color.a=.85;mark.color.r=k==1||k==2?1:0;mark.color.g=k==0||k==2?1:0;mark.color.b=k==1?1:0;mark.lifetime=ros::Duration(.7);
+        for(auto&q:snap.voxels){int group=!q.fixed?2:(snap.pose.stamp-q.seen<.06?0:1);if(group==k){geometry_msgs::Point point;point.x=q.point.x;point.y=q.point.y;point.z=.2;mark.points.push_back(point);}}a.markers.push_back(mark);
+      }marker_pub_.publish(a);
+    }
+  }
+  std::string compatibilityScene()const{auto v=scene_input_;v.removeMember("voxels");v.removeMember("visibility");return Json::FastWriter().write(v);}
+  // 근거리 JSON(250~870 KB, geometry_scan 포함)은 잠금 밖에서 파싱한다. 점은 안 쓰므로 버린다.
+  void objects(const std_msgs::String::ConstPtr&m){if(common_m8_active_)return;Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
+    root.removeMember("geometry_scan");const double stamp=root.get("stamp",ros::Time::now().toSec()).asDouble();
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);if(common_scene_&&lane_==3)return;latest_objects_.swap(root);objects_stamp_=stamp;
+  }
+  void refreshDynamic(double now){
+    dynamic_.clear();if((lane_!=3&&!(lane_==0&&index_>max_idx_))||std::abs(objects_stamp_-now)>.35)return;
+    bool authoritative=dynamic_state_stamp_>=0&&now-dynamic_state_stamp_>=0&&now-dynamic_state_stamp_<=.5;
+    const auto& list=latest_objects_.isMember("collision_objects")?latest_objects_["collision_objects"]:latest_objects_["obstacles"];
+    for(const auto&o:list){if(!o["position_world"].isArray()||o["position_world"].size()<2)continue;
+      DynamicRegion region;region.x=o["position_world"][0].asDouble();region.y=o["position_world"][1].asDouble();
+      region.yaw=o.get("geometry_reference_yaw",pose_.yaw).asDouble();region.length=o.get("length",.35).asDouble();region.width=o.get("width",.35).asDouble();
+      int id=o.get("id",-1).asInt();bool moving=authoritative?
+        (dynamic_ids_.count(id)&&!static_ids_.count(id)):
+        (o.get("motion_state","").asString()=="dynamic"&&o.get("dynamic_streak",0).asInt()>=2&&
+         (o.get("velocity_valid",false).asBool()||o.get("observed_motion_valid",false).asBool()));
+      if(moving){dynamic_.push_back(region);auto old=old_regions_.find(id);if(old!=old_regions_.end())dynamic_.push_back(old->second);}
+      old_regions_[id]=region;
+    }
+    if(old_regions_.size()>1000)old_regions_.clear();
+  }
+  void plan(const ros::TimerEvent&){
+    std::unique_lock<std::recursive_mutex> lock(engine_mutex_);syncPoses();double now=ros::Time::now().toSec();
+    if(!pending_handoff_.isNull()&&now-pending_stamp_>=.5)pending_handoff_=Json::Value();
+    if(!active()||(!pending_handoff_.isNull()&&now-pending_stamp_<.5))return;
+    if(engine_->lastScan()<0){result_=Result();result_.reason="waiting_lidar";result_stamp_=now;return;}
+    expireDivider(now);
+    if((lane_==3||recovery_active_)&&dynamic_hold_&&now-dynamic_state_stamp_<.5){result_=Result();result_.reason="dynamic_hold";result_stamp_=now;return;}
+    if(now-pose_.stamp>.25||now-waypoint_stamp_>.5){result_=Result();result_.reason="stale_pose_or_reference";result_stamp_=now;return;}
+    TrafficState traffic;traffic.enabled=tl_guard_&&lane_==0&&index_<=max_idx_;traffic.seen=stop_stamp_>0||required_stamp_>0;
+    traffic.required=stop_required_;traffic.distance=stop_dist_;traffic.distance_stamp=stop_stamp_;traffic.required_stamp=required_stamp_;
+    traffic.stop_target=stop_dist_-front_axle_offset_-stop_buffer_;engine_->setTraffic(traffic);
+    if(lane_==3&&tunnel_replan_enabled_&&replan_pending_){
+      // Ordinary forward replanning uses the current moving pose. Only a latched
+      // escape trajectory requires a stop before releasing its gear/path contract.
+      const bool wait_stop=!tunnel_immediate_replan_||!joint_forward_latched_.empty();
+      if(wait_stop&&std::abs(pose_.speed)>.15){result_=Result();result_.reason="escape_replan_wait_stop";result_stamp_=now;return;}
+      joint_forward_latched_.clear();engine_->invalidateHeldPath();if(!tunnel_immediate_replan_)last_good_=Result();replan_pending_=false;
+    }
+    if(lane_==3&&tunnel_integrated_enabled_&&!joint_forward_latched_.empty()){
+      size_t j=0;double best=1e9;Reference projection=joint_forward_latched_.front();
+      for(size_t i=0;i+1<joint_forward_latched_.size();++i){
+        const auto&a=joint_forward_latched_[i];const auto&b=joint_forward_latched_[i+1];double dx=b.x-a.x,dy=b.y-a.y,l2=dx*dx+dy*dy;if(l2<1e-10)continue;
+        double u=std::max(0.,std::min(1.,((pose_.x-a.x)*dx+(pose_.y-a.y)*dy)/l2));
+        double x=a.x+u*dx,y=a.y+u*dy,d=std::hypot(pose_.x-x,pose_.y-y);
+        if(d<best){best=d;j=i;projection=a;projection.x=x;projection.y=y;projection.yaw=std::atan2(dy,dx);}
+      }
+      double yaw_error=std::atan2(std::sin(pose_.yaw-projection.yaw),std::cos(pose_.yaw-projection.yaw));tracking_cte_=best;tracking_yaw_=yaw_error;
+      if(best>.3||std::abs(yaw_error)>.1745329252){replan_pending_=tunnel_replan_enabled_;result_=Result();result_.reason="escape_tracking_error";result_stamp_=now;return;}
+      std::vector<Reference> remaining(joint_forward_latched_.begin()+j+1,joint_forward_latched_.end());remaining.insert(remaining.begin(),projection);
+      if(remaining.size()>1&&std::hypot(remaining[0].x-remaining[1].x,remaining[0].y-remaining[1].y)<1e-5)remaining.erase(remaining.begin());
+      double length=0;for(size_t i=1;i<remaining.size();++i)length+=std::hypot(remaining[i].x-remaining[i-1].x,remaining[i].y-remaining[i-1].y);
+      std::string why;
+      if(length>3.){
+        result_=Result();result_.reason="escape_forward_latched";result_.path=remaining;
+        result_.clear=engine_->validate(remaining,now,&why);result_.avoiding=true;result_.motion_state="AVOIDING";result_.speed_limit_reason="joint_escape_forward";result_.speed_cap=2.;
+        if(!result_.clear){result_.reason="escape_new_collision_"+why;replan_pending_=tunnel_replan_enabled_;}
+        result_stamp_=now;result_geometry_stamp_=engine_->lastScan();++candidate_sequence_;return;
+      }
+      // The exit goal already included a clear 4 m forward tail. Handoff only in
+      // this safe tail, never at the reverse cusp or immediately after gear D.
+      joint_forward_latched_.clear();
+    }
+    const uint64_t generation=route_generation_,traffic_generation=traffic_revision_;const double scan=engine_->lastScan();
+    engine_->setTunnelConnectedHold(lane_==3&&tunnel_cells_authoritative_);
+    auto snapshot=engine_->planningSnapshot();const auto route=route_;Pose current=pose_;current.stamp=now;
+    lock.unlock();
+    // QP and candidate search must not occupy the safety callback queue/map lock.
+    auto planned=snapshot->plan(current,route);
+    if(!planned.clear&&lane_==3&&tunnel_integrated_enabled_&&planned.reason!="stale_lidar"&&planned.reason!="dynamic_hold"){
+      double ahead=planned.failure_distance>0?planned.failure_distance:5.;
+      auto escape=snapshot->jointEscapePlan(current,current.x+std::cos(current.yaw)*ahead,current.y+std::sin(current.yaw)*ahead,2.,{},3.,.45,0.,.10,true);
+      if(escape.valid){planned.clear=true;planned.path=escape.forward;planned.reason="forward_hybrid_recovery";planned.avoiding=true;planned.motion_state="AVOIDING";planned.speed_limit_reason="joint_escape_forward";planned.speed_cap=2.;}
+    }
+    lock.lock();
+    if(generation!=route_generation_||traffic_generation!=traffic_revision_||!active()||!pending_handoff_.isNull()||
+       ((lane_==3||recovery_active_)&&dynamic_hold_&&ros::Time::now().toSec()-dynamic_state_stamp_<.5))return;
+    planned_traffic_revision_=traffic_generation;result_=std::move(planned);result_stamp_=now;result_geometry_stamp_=scan;++candidate_sequence_;
+    // The live map may have changed during optimization. Revalidate before adopting history.
+    if(result_.clear){std::string why;std::vector<Reference> connected;
+      const double validation_now=ros::Time::now().toSec();
+      const Pose validation_pose=pose_;
+      bool connected_ok=(lane_!=3||!tunnel_immediate_replan_)?engine_->validate(result_.path,validation_now,&why):engine_->connect(validation_pose,result_.path,validation_now,connected,&why);
+      if(connected_ok){if(!connected.empty())result_.path=std::move(connected);engine_->adoptPlanning(*snapshot);result_geometry_stamp_=engine_->lastScan();if(lane_==3&&result_.reason=="forward_hybrid_recovery")joint_forward_latched_=result_.path;}
+      else {result_.clear=false;result_.reason="updated_geometry_"+why;}}
+    if(result_.compute_ms>95)ROS_WARN_THROTTLE(1,"occupancy planning %.1fms",result_.compute_ms);
+    // 2026-10-07(20:07:40 백): 80 m x 0.1 m 격자 변환과 마커(13만 칸 x 2)를 계획마다(10 Hz) 엔진 잠금 안에서 만들어
+    //   회피 노드 consume() 가 0.4~0.8 s 씩 막혔다 -> /local_path 끊김 -> 정지 노드 커버리지 0 -> 순간 서행.
+    //   시각화는 구독자가 있을 때만 2 Hz 로.
+    if(lane_==3&&service_mode_&&(engine_->lastScan()!=obstacles_encoded_stamp_||engine_->geometryDigest()!=obstacles_encoded_digest_)){
+      obstacles_json_=(common_scene_&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();
+    }
+    const double vis_now=ros::Time::now().toSec();
+    if(vis_now-last_vis_stamp_>=.5){last_vis_stamp_=vis_now;
+      if(grid_pub_.getNumSubscribers()>0){grid_map_msgs::GridMap map;grid_map::GridMapRosConverter::toMessage(engine_->grid(),map);
+        map.info.header.stamp=ros::Time(engine_->lastScan());map.info.header.seq=candidate_sequence_;grid_pub_.publish(map);}
+      if(marker_pub_.getNumSubscribers()>0)markers();}
+  }
+  RosAdapter::Output consume(const Pose& current,bool recovery,bool tunnel){
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();double now=current.stamp;
+    tunnel_owner_active_=tunnel;
+    if(lane_==0&&index_>max_idx_&&index_<=4900)recovery_active_=recovery;
+    RosAdapter::Output out;out.result=result_;out.recovery=recovery_active_;
+    out.plan_stamp=result_stamp_;out.geometry_stamp=engine_->lastScan();
+    out.plan_id=candidate_sequence_;out.geometry_digest=common_scene_&&lane_==3?scene_input_.get("geometry_digest",0).asUInt64():engine_->geometryDigest();out.scene_id=scene_id_;out.coordinate_version=coordinate_version_;
+    bool fresh=active()&&now-pose_.stamp<=.25&&now-waypoint_stamp_<=.5&&
+      now-engine_->lastScan()<=cfg_.scan_timeout&&now>=engine_->lastScan()-.05;
+    if(!fresh){out.rejection="stale_pose_reference_or_geometry";return out;}
+    if(tl_guard_&&lane_==0&&planned_traffic_revision_!=traffic_revision_){out.rejection="traffic_changed_wait_for_plan";return out;}
+    if((lane_==3||recovery_active_)&&dynamic_hold_&&now-dynamic_state_stamp_<.5){out.rejection="dynamic_hold";return out;}
+    std::vector<Reference> connected;std::string why;
+    // 2026-10-08(11:33:35 백): 입구 장애물 다수에서 계획 계산이 주행 중 0.3 s 를 넘어 결과가 도착 즉시 버려졌다
+    //   (1.4 s 연속 -> AEB). connect() 가 현재 자세/최신 점유로 다시 검증하므로 0.6 s 까지 받는다.
+    bool valid=result_.clear&&now-result_stamp_<=.6&&
+      engine_->connect(current,result_.path,now,connected,&why);
+    if(valid){last_good_=result_;last_good_.path=connected;last_good_stamp_=result_stamp_;last_good_id_=candidate_sequence_;}
+    else if(pending_handoff_.isNull()&&!result_.traffic_held&&now-last_good_stamp_<=hold_sec_&&last_good_.clear&&
+            engine_->connect(current,last_good_.path,now,connected,&why)){
+      out.result=last_good_;out.result.held=true;out.result.reason="validated_previous_gap";
+      out.plan_stamp=last_good_stamp_;out.plan_id=last_good_id_;valid=true;
+    }
+    if(!valid&&lane_==3&&tunnel_immediate_replan_&&pending_handoff_.isNull()&&
+        !result_.traffic_held&&last_good_.clear&&now-last_good_stamp_<=hold_sec_&&current.speed>=0){
+      const double required=current.speed*current.speed/(2*tunnel_replan_brake_)+1.;
+      const auto& previous=last_good_.path;
+      size_t near=0;double best=1e100;
+      for(size_t i=0;i<previous.size();++i){double d=std::hypot(previous[i].x-current.x,previous[i].y-current.y);if(d<best){best=d;near=i;}}
+      // Include a finite safe stopping prefix, rather than blindly holding a
+      // complete path whose remote end has just become occupied.
+      size_t end=near;double arc=0;
+      while(end+1<previous.size()&&arc<required+2.){arc+=std::hypot(previous[end+1].x-previous[end].x,previous[end+1].y-previous[end].y);++end;}
+      if(arc>=required&&end>=near+3){
+        std::vector<Reference> prefix(previous.begin()+near,previous.begin()+end+1);
+        std::string tail_reason;
+        if(engine_->connect(current,prefix,now,connected,&tail_reason)){
+          double length=0;for(size_t i=1;i<connected.size();++i)length+=std::hypot(connected[i].x-connected[i-1].x,connected[i].y-connected[i-1].y);
+          if(length>=required){out.result=last_good_;out.result.held=true;out.result.reason="validated_braking_prefix";
+            out.result.speed_cap=std::min(last_good_.speed_cap,std::max(0.,current.speed-.2));
+            out.plan_stamp=last_good_stamp_;out.plan_id=last_good_id_;valid=true;}
+        }
+      }
+    }
+    out.valid=valid;out.rejection=valid?"":why.empty()?result_.reason:why;
+    out.path.header.frame_id="map";out.path.header.stamp=ros::Time(now);out.path.header.seq=out.plan_id;
+    if(valid){consumed_id_=out.plan_id;consumed_path_=connected;out.result.path=connected;
+      for(const auto& p:connected){geometry_msgs::PoseStamped q;q.header=out.path.header;
+        q.pose.position.x=p.x;q.pose.position.y=p.y;q.pose.orientation.z=std::sin(p.yaw/2);q.pose.orientation.w=std::cos(p.yaw/2);out.path.poses.push_back(q);}
+    }
+    return out;
+  }
+  void published(uint32_t id){
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);
+    if(pending_handoff_.isNull()||id!=candidate_sequence_||id!=consumed_id_||
+       ros::Time::now().toSec()-pending_stamp_>=.5||
+       ros::Time::now().toSec()-engine_->lastScan()>cfg_.scan_timeout||
+       !engine_->validate(consumed_path_,ros::Time::now().toSec()))return;
+    Json::Value ack;ack["id"]=pending_handoff_["id"];ack["valid"]=true;
+    ack["stamp"]=ros::Time::now().toSec();ack["reason"]="forward_owner_ready";ack["plan_id"]=id;
+    std_msgs::String m;m.data=Json::FastWriter().write(ack);handoff_ack_pub_.publish(m);pending_handoff_=Json::Value();
+  }
+  void publishDivider(double now){
+    const auto active=engine_->conditionalDividers(now);Json::Value d;d["stamp"]=now;
+    d["observed_stamp"]=engine_->dividerObservationStamp();d["active"]=!active.empty();
+    d["candidates"]=Json::Value(Json::arrayValue);d["edges"]=Json::Value(Json::arrayValue);
+    for(const auto& e:divider_candidates_){Json::Value v(Json::arrayValue);v.append(e.first);v.append(e.last);v.append(e.left);d["candidates"].append(v);}
+    for(const auto& e:active){Json::Value v(Json::arrayValue);v.append(e.first);v.append(e.last);v.append(e.left);d["edges"].append(v);}
+    std_msgs::String m;m.data=Json::FastWriter().write(d);divider_pub_.publish(m);
+  }
+  void expireDivider(double now){publishDivider(now);}
+  void handoff(const std_msgs::String::ConstPtr& msg){
+    Json::Value req,ack;Json::Reader reader;if(!reader.parse(msg->data,req))return;
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();double now=ros::Time::now().toSec();
+    ack["id"]=req["id"];ack["valid"]=false;ack["stamp"]=now;ack["reason"]="handoff_rejected";
+    bool fresh=now-req.get("stamp",0.).asDouble()<=.5&&now-pose_.stamp<=.25&&now-engine_->lastScan()<=cfg_.scan_timeout&&
+      !(dynamic_hold_&&now-dynamic_state_stamp_<.5);
+    bool zone=(lane_==3&&index_>=tunnel_min_&&index_<=tunnel_max_)||(lane_==0&&index_>max_idx_&&index_<=4900);
+    if(fresh&&zone){
+      std::vector<Reference> path;for(const auto& v:req["forward"]){if(v.size()!=3)continue;
+        Reference p;p.x=v[0].asDouble();p.y=v[1].asDouble();p.yaw=v[2].asDouble();path.push_back(p);}
+      std::string why;std::vector<Reference> connected;
+      if(engine_->connect(pose_,path,now,connected,&why)){
+        path=std::move(connected);engine_->adoptEscape(path);++route_generation_;recovery_active_=lane_==0;
+        result_=Result();result_.clear=true;result_.avoiding=true;result_.path=path;result_.reason="validated_escape_handoff";result_.speed_cap=(lane_==3&&req.get("integrated",false).asBool())?2.:cfg_.target_speed;
+        if(lane_==3&&tunnel_integrated_enabled_&&req.get("integrated",false).asBool()){joint_forward_latched_=path;result_.motion_state="AVOIDING";result_.speed_limit_reason="joint_escape_forward";}
+        result_stamp_=now;result_geometry_stamp_=engine_->lastScan();++candidate_sequence_;
+        if(embedded_){pending_handoff_=req;pending_stamp_=now;ack["reason"]="awaiting_final_owner";}
+        else {ack["valid"]=true;ack["reason"]="forward_owner_ready";}
+        publishService(true,now);
+      }else ack["reason"]="handoff_"+why;
+    }else ack["reason"]="handoff_stale_or_dynamic_hold";
+    std_msgs::String out;out.data=Json::FastWriter().write(ack);handoff_ack_pub_.publish(out);
+  }
+  void escapeRequest(const std_msgs::String::ConstPtr& msg){
+    Json::Value req,res;Json::Reader reader;if(!reader.parse(msg->data,req))return;
+    std::unique_lock<std::recursive_mutex> lock(engine_mutex_);syncPoses();
+    double now=ros::Time::now().toSec();res["id"]=req["id"];res["valid"]=false;
+    res["geometry_stamp"]=engine_->lastScan();res["stamp"]=now;
+    res["reason"]="stale_geometry_or_pose";
+    bool zone=(lane_==3&&index_>=tunnel_min_&&index_<=tunnel_max_)||(lane_==0&&index_>max_idx_&&index_<=4900);
+    if(zone&&now-pose_.stamp<=.25&&now-engine_->lastScan()<=cfg_.scan_timeout&&now-req.get("stamp",0).asDouble()<.5&&
+       !(dynamic_hold_&&now-dynamic_state_stamp_<.5)){
+      auto snapshot=engine_->recoverySnapshot();const auto road=lane_==3?road3_:road0_;const Pose current_pose=pose_;
+      lock.unlock();
+      if(lane_==3&&tunnel_integrated_enabled_&&req.get("integrated",false).asBool()){
+        std::vector<DynamicRegion> forecast;for(const auto& v:req["dynamic"])if(v.size()==8)forecast.push_back({v[0].asDouble(),v[1].asDouble(),v[6].asDouble(),v[4].asDouble(),v[5].asDouble(),v[2].asDouble(),v[3].asDouble(),v[7].asDouble()});
+        std::vector<Point> memory;for(const auto& v:req["memory"])if(v.size()>=2)memory.push_back({v[0].asDouble(),v[1].asDouble(),0});
+        auto encode=[](const std::vector<Reference>& path){Json::Value out(Json::arrayValue);for(const auto&p:path){Json::Value v(Json::arrayValue);v.append(p.x);v.append(p.y);v.append(p.yaw);out.append(v);}return out;};
+        if(req.get("recheck",false).asBool()){
+          std::vector<Reference> forward;for(const auto& v:req["forward"])if(v.size()==3)forward.push_back({v[0].asDouble(),v[1].asDouble(),v[2].asDouble(),0});
+          std::string why;res["valid"]=forward.size()>1&&snapshot->validate(forward,now,&why);res["reason"]=res["valid"].asBool()?"joint_forward_still_clear":"joint_forward_"+why;res["forward"]=encode(forward);
+        }else{
+          auto path=snapshot->jointEscapePlan(current_pose,req["blocker"][0].asDouble(),req["blocker"][1].asDouble(),req.get("blocker_length",2.).asDouble(),memory,
+            req.get("wheelbase",3.).asDouble(),std::min(.6,std::max(.05,req.get("steer_limit",.3).asDouble())),std::min(10.,req.get("reverse_max",10.).asDouble()),req.get("skip_forward_probe",false).asBool()?0.:.10,true,forecast);
+          if(!path.valid)path=snapshot->jointEscapePlan(current_pose,req["blocker"][0].asDouble(),req["blocker"][1].asDouble(),req.get("blocker_length",2.).asDouble(),memory,
+            req.get("wheelbase",3.).asDouble(),std::min(.6,std::max(.05,req.get("steer_limit",.3).asDouble())),std::min(10.,req.get("reverse_max",10.).asDouble()),req.get("skip_forward_probe",false).asBool()?.48:.38,false,forecast);
+          res["valid"]=path.valid;res["reason"]=path.reason;res["reverse"]=encode(path.reverse);res["forward"]=encode(path.forward);res["reverse_distance"]=path.reverse_distance;
+          Json::Value controls(Json::arrayValue);for(double v:path.reverse_steer)controls.append(v);res["controls"]=controls;res["compute_ms"]=path.compute_ms;res["minimum_clearance"]=path.minimum_clearance;res["map_version"]=Json::UInt64(snapshot->geometryDigest());res["handoff_condition"]="validated_forward_tail";res["reverse_speed_mps"]=1.;res["forward_speed_mps"]=2.;
+        }
+        lock.lock();syncPoses();double finished=ros::Time::now().toSec();
+        if(res["valid"].asBool()){
+          bool fresh=finished-pose_.stamp<=.25&&finished-engine_->lastScan()<=cfg_.scan_timeout&&!(dynamic_hold_&&finished-dynamic_state_stamp_<.5);
+          for(const auto& v:res["reverse"])fresh=fresh&&engine_->escapeBodyClear({v[0].asDouble(),v[1].asDouble(),v[2].asDouble(),0},finished,true);
+          for(const auto& v:res["forward"])fresh=fresh&&engine_->escapeBodyClear({v[0].asDouble(),v[1].asDouble(),v[2].asDouble(),0},finished,false);
+          res["valid"]=fresh;if(!fresh)res["reason"]="updated_geometry_or_sensor_expired";
+          else res["geometry_stamp"]=engine_->lastScan();
+        }
+        std_msgs::String out;out.data=Json::FastWriter().write(res);escape_pub_.publish(out);return;
+      }
+      auto start=std::chrono::steady_clock::now();int k=0;
+      for(const auto& candidate:req["candidates"]){
+        if(++k>24||std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()>.4)break;
+        std::vector<Reference> reverse;for(const auto& v:candidate["poses"]){if(v.size()!=3)continue;Reference p;p.x=v[0].asDouble();p.y=v[1].asDouble();p.yaw=v[2].asDouble();reverse.push_back(p);}
+        if(reverse.empty())continue;std::string why;
+        if(!snapshot->validateReverse(reverse,now,&why)){res["reason"]=why;continue;}
+        Pose end=current_pose;end.x=reverse.back().x;end.y=reverse.back().y;end.yaw=reverse.back().yaw;end.speed=0;end.stamp=now;
+        Reference nearest;if(!snapshot->locate(end.x,end.y,nearest))continue;
+        size_t j=std::min(size_t(std::max(0,nearest.idx)),road.size()-1);
+        std::vector<Reference> route(road.begin()+j,road.begin()+std::min(road.size(),j+700));
+        auto forward=snapshot->evaluateEscape(end,route);
+        if(!forward.clear||forward.path.size()<2||forward.traffic_held){res["reason"]="no_forward_escape_"+forward.reason;continue;}
+        Reference blocker,tail;if(!snapshot->locate(req["blocker"][0].asDouble(),req["blocker"][1].asDouble(),blocker)||
+          !snapshot->locate(forward.path.back().x,forward.path.back().y,tail))continue;
+        double need=req.get("blocker_length",1.).asDouble()*.5+cfg_.rear+5.;
+        double beyond=0;for(int i=blocker.idx;i<tail.idx&&i+1<int(road.size());++i)if(i>=0)beyond+=std::hypot(road[i+1].x-road[i].x,road[i+1].y-road[i].y);
+        if(beyond<need){res["reason"]="forward_prefix_not_escape";continue;}
+        Json::Value path(Json::arrayValue);for(const auto& p:forward.path){Json::Value v(Json::arrayValue);v.append(p.x);v.append(p.y);v.append(p.yaw);path.append(v);}
+        res["valid"]=true;res["reason"]="joint_path_clear";res["candidate"]=candidate["index"];res["forward"]=path;break;
+      }
+    }
+    std_msgs::String out;out.data=Json::FastWriter().write(res);escape_pub_.publish(out);
+  }
+  // 정적 점유 칸을 8-연결(2칸 간격 허용)로 묶어 경로 방향 사각형 footprint 로.
+  std::string extractObstacles(){
+    const auto& g=engine_->grid();const grid_map::Size size=g.getSize();
+    std::vector<std::pair<int,int>> cells;
+    for(grid_map::GridMapIterator it(g);!it.isPastEnd();++it)if(g.at("static",*it)>.5||(scene_only_&&g.at("transient",*it)>.5))cells.push_back({(*it)(0),(*it)(1)});
+    std::map<std::pair<int,int>,int> id;for(size_t i=0;i<cells.size();++i)id[cells[i]]=int(i);
+    std::vector<int> comp(cells.size(),-1);int nc=0;Json::Value out(Json::arrayValue);
+    for(size_t s0=0;s0<cells.size();++s0){if(comp[s0]>=0)continue;std::vector<int> stack{int(s0)},members;comp[s0]=nc;
+      while(!stack.empty()){int k=stack.back();stack.pop_back();members.push_back(k);
+        for(int di=-2;di<=2;++di)for(int dj=-2;dj<=2;++dj){auto f=id.find({cells[k].first+di,cells[k].second+dj});
+          if(f!=id.end()&&comp[f->second]<0){comp[f->second]=nc;stack.push_back(f->second);}}}
+      ++nc;if(members.size()<(scene_only_?1:4))continue;
+      double cx=0,cy=0;std::vector<std::pair<double,double>> pts;
+      for(int k:members){grid_map::Position q;if(!g.getPosition(grid_map::Index(cells[k].first,cells[k].second),q))continue;pts.push_back({q.x(),q.y()});cx+=q.x();cy+=q.y();}
+      if(pts.size()<(scene_only_?1:4))continue;cx/=pts.size();cy/=pts.size();
+      double yaw=pose_.yaw;{double best=1e18;for(const auto&r:route_){double d=std::hypot(r.x-cx,r.y-cy);if(d<best){best=d;yaw=r.yaw;}}}
+      double c=std::cos(yaw),sn=std::sin(yaw),a0=1e9,a1=-1e9,b0=1e9,b1=-1e9;
+      for(const auto&q:pts){double a=c*(q.first-cx)+sn*(q.second-cy),b=-sn*(q.first-cx)+c*(q.second-cy);a0=std::min(a0,a);a1=std::max(a1,a);b0=std::min(b0,b);b1=std::max(b1,b);}
+      double h=cfg_.resolution*.5;a0-=h;a1+=h;b0-=h;b1+=h;
+      Json::Value o;o["id"]=nc;Json::Value poly(Json::arrayValue);
+      for(auto ab:{std::make_pair(a0,b0),std::make_pair(a1,b0),std::make_pair(a1,b1),std::make_pair(a0,b1)}){
+        Json::Value v(Json::arrayValue);v.append(cx+c*ab.first-sn*ab.second);v.append(cy+sn*ab.first+c*ab.second);poly.append(v);}
+      Json::Value ctr(Json::arrayValue);ctr.append(cx+c*.5*(a0+a1)-sn*.5*(b0+b1));ctr.append(cy+sn*.5*(a0+a1)+c*.5*(b0+b1));
+      o["center"]=ctr;o["footprint_world"]=poly;o["length"]=a1-a0;o["width"]=b1-b0;o["cells"]=Json::UInt64(members.size());o["static"]=true;o["bbox_is_diagnostic_only"]=true;
+      Json::Value occupied(Json::arrayValue);for(const auto& q:pts){Json::Value v(Json::arrayValue);v.append(q.first);v.append(q.second);occupied.append(v);}o["occupied_cells_world"]=occupied;
+      out.append(o);if(!scene_only_&&out.size()>=60)break;}
+    (void)size;Json::Value root;
+    if(lane_==3&&(tunnel_map_enabled_||tunnel_integrated_enabled_)){
+      Json::Value collision(Json::arrayValue);for(grid_map::GridMapIterator it(g);!it.isPastEnd();++it)if(g.at("static",*it)>.5||g.at("transient",*it)>.5){grid_map::Position q;if(g.getPosition(*it,q)){Json::Value v(Json::arrayValue);v.append(q.x());v.append(q.y());collision.append(v);}}
+      Json::Value cleared(Json::arrayValue);for(const auto&q:engine_->measuredRayCleared()){Json::Value v(Json::arrayValue);v.append(q.x);v.append(q.y);cleared.append(v);}
+      root["measured_ray_cleared_world"]=cleared;
+      root["collision_cells_world"]=collision;root["cell_resolution"]=cfg_.resolution;root["obstacle_margin"]=cfg_.obstacle_margin;
+    }
+    root["pose_world"].append(pose_.x);root["pose_world"].append(pose_.y);root["pose_world"].append(pose_.yaw);
+    root["stamp"]=engine_->lastScan();root["plan_id"]=candidate_sequence_;root["geometry_stamp"]=engine_->lastScan();root["geometry_digest"]=Json::UInt64(engine_->geometryDigest());root["obstacles"]=out;return Json::FastWriter().write(root);
+  }
+  // 후보 경로의 기준경로 대비 최대 횡편차 부호(+1 왼쪽, -1 오른쪽, 0 중앙 0.3 m 이내).
+  int candidateSide(double* max_offset)const{double best=0;
+    for(size_t i=0;i<result_.path.size();i+=5){const auto&p=result_.path[i];double bd=1e18;const Reference* r=nullptr;
+      for(const auto&q:route_){double d=std::hypot(q.x-p.x,q.y-p.y);if(d<bd){bd=d;r=&q;}}
+      if(!r)continue;double lat=-(p.x-r->x)*std::sin(r->yaw)+(p.y-r->y)*std::cos(r->yaw);if(std::abs(lat)>std::abs(best))best=lat;}
+    if(max_offset)*max_offset=best;return std::abs(best)<.3?0:(best>0?1:-1);}
+  void publishService(bool on,double now){
+    std_msgs::String obs;obs.data=on?obstacles_json_:std::string("{\"obstacles\":[]}");obstacles_pub_.publish(obs);
+    // 서비스 모드 유효성: 결과가 신선하고 clear 면 됨. 처리 지연 판단은 소비 쪽(기존 노드)의 몫.
+    bool valid=on&&result_.clear&&now-result_stamp_<.3&&now-result_geometry_stamp_<=cfg_.scan_timeout&&now-engine_->lastScan()<=cfg_.scan_timeout&&now-pose_.stamp<.25&&!result_.path.empty();
+    if(valid&&engine_->lastScan()>result_geometry_stamp_&& !engine_->validate(result_.path,now))valid=false;
+    double max_off=0;int side=valid?candidateSide(&max_off):0;
+    nav_msgs::Path path;path.header.frame_id="map";path.header.stamp=ros::Time::now();
+    if(valid)for(const auto&p:result_.path){geometry_msgs::PoseStamped q;q.header=path.header;q.pose.position.x=p.x;q.pose.position.y=p.y;
+      q.pose.orientation.z=std::sin(p.yaw/2);q.pose.orientation.w=std::cos(p.yaw/2);path.poses.push_back(q);}
+    path.header.seq=candidate_sequence_;candidate_pub_.publish(path);
+    Json::Value st;st["tracking_cte_m"]=tracking_cte_;st["tracking_heading_error_rad"]=tracking_yaw_;st["replan_pending"]=replan_pending_;st["plan_id"]=candidate_sequence_;st["recovery"]=recovery_active_;st["active"]=on;st["valid"]=valid;st["reason"]=result_.reason;st["side"]=side;st["max_offset"]=max_off;st["speed_cap_mps"]=valid?result_.speed_cap:0.;st["speed_limit_reason"]=result_.speed_limit_reason;
+    st["scene_id"]=Json::UInt64(scene_id_);st["coordinate_version"]=scene_input_.get("coordinate_version",0);st["geometry_stamp"]=result_geometry_stamp_;st["plan_stamp"]=result_stamp_;st["returning"]=result_.returning;st["motion_state"]=result_.motion_state;st["compute_ms"]=result_.compute_ms;st["stamp"]=now;st["scan_age"]=now-engine_->lastScan();st["static_voxels"]=Json::UInt64(result_.static_voxels);
+    auto hit=engine_->collisionLocation();if(!valid&&std::isfinite(hit[0]+hit[1])){st["collision_location_world"].append(hit[0]);st["collision_location_world"].append(hit[1]);}
+    st["collision_object_id"]=-1; // cells have no stable tracker ID; do not guess one.
+    std_msgs::String sm;sm.data=Json::FastWriter().write(st);state_pub_.publish(sm);
+  }
+  void publish(const ros::TimerEvent&){std::lock_guard<std::recursive_mutex> publish_lock(engine_mutex_);syncPoses();
+    if(lane_==3&&service_mode_&&(engine_->lastScan()!=obstacles_encoded_stamp_||engine_->geometryDigest()!=obstacles_encoded_digest_)){
+      obstacles_json_=(common_scene_&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();}
+    bool on=active();std_msgs::Bool enabled;enabled.data=on;active_pub_.publish(enabled);
+    if(service_mode_){std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();publishService(on,ros::Time::now().toSec());return;}
+    if(!on){if(previous_active_){std_msgs::Bool fail;fail.data=false;failed_pub_.publish(fail);std_msgs::Float64 release;release.data=9999;speed_pub_.publish(release);scale_pub_.publish(release);}
+      previous_active_=false;return;}previous_active_=true;
+    double now=ros::Time::now().toSec();bool valid=result_.clear&&now-result_stamp_<.3&&now-engine_->lastScan()<=cfg_.scan_timeout&&now-pose_.stamp<.25;
+    std_msgs::Bool fail;fail.data=!valid;failed_pub_.publish(fail);
+    std_msgs::Float64 speed;speed.data=valid?result_.speed_cap:0;
+    std::string limit_reason=valid?result_.speed_limit_reason:result_.clear?"output_guard_expired":"no_valid_path";
+    if(valid&&lane_==3&&now-coverage_stamp_<.3&&coverage_<speed.data){speed.data=coverage_;limit_reason="tunnel_path_coverage";}
+    if(tl_guard_&&lane_==0&&stop_required_&&stop_dist_>=0&&now-stop_stamp_<cfg_.traffic_timeout&&now-required_stamp_<cfg_.traffic_timeout){
+      double cap=std::sqrt(2*cfg_.braking*std::max(0.,stop_dist_-front_axle_offset_-stop_buffer_));
+      if(cap<speed.data){speed.data=cap;limit_reason="traffic_stop";}
+    }
+    speed_pub_.publish(speed);std_msgs::Float64 scale;scale.data=9999;scale_pub_.publish(scale);
+    nav_msgs::Path path;path.header.frame_id="map";path.header.stamp=ros::Time::now();
+    if(valid)for(const auto&p:result_.path){geometry_msgs::PoseStamped q;q.header=path.header;q.pose.position.x=p.x;q.pose.position.y=p.y;
+      q.pose.orientation.z=std::sin(p.yaw/2);q.pose.orientation.w=std::cos(p.yaw/2);path.poses.push_back(q);}
+    path_pub_.publish(path);
+    std_msgs::Float64 lateral;if(!route_.empty())lateral.data=-(pose_.x-route_[0].x)*std::sin(route_[0].yaw)+(pose_.y-route_[0].y)*std::cos(route_[0].yaw);d_pub_.publish(lateral);
+    Json::Value d;d["engine"]="occupancy_corridor_apollo";d["clear"]=valid;d["stage"]=result_.held?"held":"corridor";
+    d["returning"]=result_.returning;
+    d["trigger_count"]=result_.trigger_count;d["trigger_reason"]=result_.trigger_reason;
+    d["trigger_held"]=result_.trigger_held;d["trigger_nearest_m"]=result_.trigger_nearest;
+    d["traffic_avoidance_held"]=result_.traffic_held;
+    d["return_complete_distance_m"]=result_.return_complete_distance;d["traffic_stop_target_m"]=result_.traffic_stop_target;
+
+    d["reason"]=result_.reason;
+    d["motion_state"]=valid?result_.motion_state:"STOP";
+    d["return_rejection_reason"]=result_.return_rejection_reason;
+    d["speed_limit_reason"]=limit_reason;d["planner_speed_cap_mps"]=result_.speed_cap;
+    d["boundary_source"]=result_.boundary_source;d["failure_distance_m"]=result_.failure_distance;
+    d["planning_horizon_m"]=result_.planning_horizon;
+    d["approach_blockage_distance_m"]=result_.approach_blockage_distance;
+    d["static_approach"]=lane_==0&&index_<min_idx_;
+    d["static_planning_start_idx"]=cfg_.static_planning_start_idx;
+    d["return_min_distance_m"]=cfg_.return_min_distance;d["return_min_time_sec"]=cfg_.return_min_time;
+    d["execution_phase"]=joint_forward_latched_.empty()?"FORWARD_QP":"ESCAPE_FORWARD";
+    const auto& why=result_.reason;
+    d["failure_kind"]=valid?"none":(why.find("stale")!=std::string::npos||why.find("expired")!=std::string::npos)?"sensor_expired":why=="dynamic_hold"?"dynamic_wait":why.find("no_connected")!=std::string::npos?"no_spatial_corridor":why.find("solver")!=std::string::npos||why.find("dynamics_infeasible")!=std::string::npos?"optimization_failed":"geometry_or_tracking_guard";
+    d["map_classification_fresh"]=tunnel_map_enabled_&&now-classified_stamp_<=cfg_.scan_timeout;
+    d["candidate_rejection_reason"]=valid?"none":result_.reason;d["held"]=result_.held;d["static_voxels"]=Json::UInt64(result_.static_voxels);
+    d["transient_voxels"]=Json::UInt64(result_.transient_voxels);d["compute_ms"]=result_.compute_ms;d["max_curvature"]=result_.max_curvature;
+    d["curb_center_inset_m"]=cfg_.half_width+cfg_.curb_margin;d["speed_cap_mps"]=speed.data;d["geometry_stamp"]=engine_->lastScan();d["index"]=index_;d["mission_mode"]=lane_==3?"tunnel":"static";
+    std_msgs::String debug;debug.data=Json::FastWriter().write(d);debug_pub_.publish(debug);
+  }
+  void markers(){visualization_msgs::MarkerArray out;visualization_msgs::Marker clear;clear.action=visualization_msgs::Marker::DELETEALL;out.markers.push_back(clear);
+    // Show measured occupied cells, rather than an inflated fitted object box.
+    for(const std::string kind:{"observed","retained","transient"}){
+      const std::string layer=kind=="transient"?"transient":"static";
+      visualization_msgs::Marker cells;cells.header.frame_id="map";cells.header.stamp=ros::Time::now();
+      cells.ns="occupied_"+kind;cells.id=0;cells.type=visualization_msgs::Marker::CUBE_LIST;
+      cells.action=visualization_msgs::Marker::ADD;cells.pose.orientation.w=1;
+      cells.scale.x=cells.scale.y=cfg_.resolution;cells.scale.z=.08;
+      cells.color.r=1;cells.color.g=kind=="transient"?.7:.2;cells.color.b=kind=="retained"?.8:0.;cells.color.a=.8;
+      const auto& grid=engine_->grid();
+      for(grid_map::GridMapIterator it(grid);!it.isPastEnd();++it){
+        if(!(grid.at(layer,*it)>.5))continue;
+        if(layer=="static"&&((grid.at("observed",*it)>.2)!=(kind=="retained")))continue;
+        grid_map::Position position;grid.getPosition(*it,position);
+        geometry_msgs::Point p;p.x=position.x();p.y=position.y();p.z=.12;cells.points.push_back(p);
+      }
+      out.markers.push_back(cells);
+    }
+    int id=0;for(bool inset:{false,true}){visualization_msgs::Marker m;m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns=inset?"curb_center_limit":"physical_curb";m.id=id++;
+      m.type=visualization_msgs::Marker::LINE_LIST;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1;m.scale.x=.07;
+      m.color.r=inset?1:0;m.color.g=1;m.color.b=inset?0:1;m.color.a=1;
+      for(size_t i=5;i<route_.size();i+=5)for(bool left:{false,true}){auto a=engine_->bounds(route_[i-5].idx),b=engine_->bounds(route_[i].idx);
+        if(!engine_->boundaryKnown(route_[i-5].idx,left)||!engine_->boundaryKnown(route_[i].idx,left))continue;
+        double da=left?a.second:a.first,db=left?b.second:b.first;if(std::abs(da-db)>1)continue;
+        if(inset){da+=left?-(cfg_.half_width+cfg_.curb_margin):cfg_.half_width+cfg_.curb_margin;db+=left?-(cfg_.half_width+cfg_.curb_margin):cfg_.half_width+cfg_.curb_margin;}
+        for(auto q:{std::make_pair(route_[i-5],da),std::make_pair(route_[i],db)}){geometry_msgs::Point p;p.x=q.first.x-std::sin(q.first.yaw)*q.second;p.y=q.first.y+std::cos(q.first.yaw)*q.second;p.z=.1;m.points.push_back(p);}}
+      out.markers.push_back(m);}
+    visualization_msgs::Marker corridor;corridor.header=clear.header;corridor.header.frame_id="map";corridor.header.stamp=ros::Time::now();corridor.ns="selected_corridor";corridor.id=id++;
+    corridor.type=visualization_msgs::Marker::LINE_LIST;corridor.action=visualization_msgs::Marker::ADD;corridor.pose.orientation.w=1;corridor.scale.x=.04;corridor.color.g=1;corridor.color.a=.6;
+    for(const auto& row:result_.corridor){size_t j=0;double best=1e20;for(size_t i=0;i<route_.size();++i){double d=std::hypot(route_[i].x-row[0],route_[i].y-row[1]);if(d<best){best=d;j=i;}}
+      for(double v:{row[2],row[3]}){geometry_msgs::Point p;p.x=row[0]-std::sin(route_[j].yaw)*v;p.y=row[1]+std::cos(route_[j].yaw)*v;p.z=.15;corridor.points.push_back(p);}}
+    out.markers.push_back(corridor);
+    for(size_t i=0;i<result_.path.size();i+=25){const auto&p=result_.path[i];visualization_msgs::Marker m;m.header=corridor.header;m.ns="swept_body";m.id=id++;
+      m.type=visualization_msgs::Marker::LINE_STRIP;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1;m.scale.x=.035;m.color.b=1;m.color.a=.55;
+      for(auto xy:{std::make_pair(-cfg_.rear,-cfg_.half_width),std::make_pair(cfg_.front,-cfg_.half_width),std::make_pair(cfg_.front,cfg_.half_width),std::make_pair(-cfg_.rear,cfg_.half_width),std::make_pair(-cfg_.rear,-cfg_.half_width)}){
+        geometry_msgs::Point q;q.x=p.x+std::cos(p.yaw)*xy.first-std::sin(p.yaw)*xy.second;q.y=p.y+std::sin(p.yaw)*xy.first+std::cos(p.yaw)*xy.second;q.z=.2;m.points.push_back(q);}out.markers.push_back(m);}
+    visualization_msgs::Marker trigger;trigger.header=corridor.header;trigger.ns="static_start_corridor";trigger.id=0;
+    trigger.lifetime=ros::Duration(.35);trigger.type=visualization_msgs::Marker::LINE_LIST;trigger.action=visualization_msgs::Marker::ADD;trigger.pose.orientation.w=1;
+    trigger.scale.x=.06;trigger.color.r=1;trigger.color.b=1;trigger.color.a=.9;
+    double travelled=0;
+    for(size_t i=1;i<route_.size();++i){double ds=std::hypot(route_[i].x-route_[i-1].x,route_[i].y-route_[i-1].y);
+      double u=std::min(1.,(cfg_.trigger_distance-travelled)/std::max(ds,1e-9));if(u<=0)break;
+      Reference end=route_[i];end.x=route_[i-1].x+u*(end.x-route_[i-1].x);end.y=route_[i-1].y+u*(end.y-route_[i-1].y);
+      for(double side:{-cfg_.trigger_half_width,cfg_.trigger_half_width})for(const auto&r:{route_[i-1],end}){
+        geometry_msgs::Point p;p.x=r.x-std::sin(r.yaw)*side;p.y=r.y+std::cos(r.yaw)*side;p.z=.3;trigger.points.push_back(p);}
+      travelled+=ds;if(u<1||travelled>=cfg_.trigger_distance){
+        for(double side:{-cfg_.trigger_half_width,cfg_.trigger_half_width}){geometry_msgs::Point p;p.x=end.x-std::sin(end.yaw)*side;p.y=end.y+std::cos(end.yaw)*side;p.z=.3;trigger.points.push_back(p);}break;}
+    }out.markers.push_back(trigger);
+    for(const auto& mark: {std::make_pair("traffic_stop_target",result_.traffic_stop_target),std::make_pair("avoidance_return_complete",result_.return_complete_distance)}){
+      if(mark.second<0)continue;double arc=0;
+      for(size_t i=1;i<route_.size();++i){double ds=std::hypot(route_[i].x-route_[i-1].x,route_[i].y-route_[i-1].y);
+        if(arc+ds>=mark.second){double u=(mark.second-arc)/std::max(ds,1e-9);visualization_msgs::Marker m;
+          m.lifetime=ros::Duration(.35);m.header=corridor.header;m.ns=mark.first;m.id=0;m.type=visualization_msgs::Marker::SPHERE;m.action=visualization_msgs::Marker::ADD;
+          m.pose.orientation.w=1;m.pose.position.x=route_[i-1].x+u*(route_[i].x-route_[i-1].x);m.pose.position.y=route_[i-1].y+u*(route_[i].y-route_[i-1].y);m.pose.position.z=.5;
+          m.scale.x=m.scale.y=m.scale.z=.5;m.color.r=1;m.color.g=std::string(mark.first)=="traffic_stop_target"?0:1;m.color.a=1;out.markers.push_back(m);break;}
+        arc+=ds;}
+    }
+    visualization_msgs::Marker text;text.header=corridor.header;text.ns="static_admission_status";text.id=0;text.type=visualization_msgs::Marker::TEXT_VIEW_FACING;
+    text.lifetime=ros::Duration(.35);text.action=visualization_msgs::Marker::ADD;text.pose.orientation.w=1;text.pose.position.x=pose_.x;text.pose.position.y=pose_.y;text.pose.position.z=3;
+    text.scale.z=.5;text.color.r=text.color.g=text.color.b=text.color.a=1;text.text=result_.trigger_reason+" / "+result_.reason;
+    if(result_.traffic_held)text.text+=" stop="+std::to_string(result_.traffic_stop_target)+" return="+std::to_string(result_.return_complete_distance);
+    out.markers.push_back(text);
+    auto hit=engine_->collisionLocation();if(lane_==3&&!result_.clear&&std::isfinite(hit[0]+hit[1])){visualization_msgs::Marker m;m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns="collision_cell";m.id=900;m.type=visualization_msgs::Marker::SPHERE;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1;m.pose.position.x=hit[0];m.pose.position.y=hit[1];m.pose.position.z=.35;m.scale.x=m.scale.y=m.scale.z=.3;m.color.r=1;m.color.a=1;out.markers.push_back(m);}
+    marker_pub_.publish(out);
+  }
+};
+RosAdapter::RosAdapter(ros::NodeHandle params,bool embedded):impl_(new Impl(params,embedded)){}
+RosAdapter::~RosAdapter()=default;
+RosAdapter::Output RosAdapter::consume(const Pose& pose,bool recovery,bool tunnel){return impl_->consume(pose,recovery,tunnel);}
+void RosAdapter::published(uint32_t id){impl_->published(id);}

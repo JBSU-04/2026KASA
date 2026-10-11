@@ -1,0 +1,9 @@
+std_msgs/Header header
+bool raw_command_valid
+bool constraint_valid
+bool constraint_active
+bool odom_valid
+bool limited
+float64 ego_speed
+float64 safe_speed
+string reason

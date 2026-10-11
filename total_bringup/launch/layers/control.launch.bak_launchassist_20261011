@@ -1,0 +1,63 @@
+<launch>
+  <!-- ==================================================================
+       제어 계층 - 원본(0901) 방식 유지.
+
+       0901 에서는 mpc_path_tracking 이 /ctrl_cmd 를 직접 발행했다.
+       미션 속도 제한은 /smpc/target_speed_mps 로 들어가 MPC 가
+       ref_v/speed_upperBound 에 min 으로 접는다(smpc_lane_change 의
+       ACC 가 쓰던 원래 경로). 검증된 구성이라 그대로 둔다.
+
+       use_arbiter:=true 면 MPC 출력을 /control/raw_cmd 로 우회하고
+       control_arbiter 가 AEB/속도리미터/M8 소스전환을 중재한다.
+       ================================================================== -->
+  <arg name="dry_run" default="false"/>
+  <arg name="mpc_N" default="30"/>
+  <arg name="use_arbiter" default="false"/>
+  <arg name="use_m8_control" default="false"/>
+
+  <!-- 비중재 모드에서 MPC 가 낼 토픽.
+       기본 /ctrl_cmd (0901 원본). obstacle_stop_node 를 최종단에 끼울 때만
+       /ctrl_cmd_raw 로 바꾼다 == 그게 정동적 트리의 원래 사슬이다.
+         MPC -> /ctrl_cmd_raw -> obstacle_stop_node -> /ctrl_cmd -> 브리지 -->
+  <arg name="mpc_cmd_topic" default="/ctrl_cmd"/>
+
+  <!-- MPC 가 외부 ACC 목표속도로 구독하는 토픽. mission.launch 의
+       cap_direct_topic 과 반드시 같아야 한다 - constraint_to_speed_cap 이
+       구간별로(M6/M7 은 ACC 원본 값 중계, 그 외는 자기 미션 캡) 이 이름의
+       유일한 발행자가 된다. smpc_lane_change 원본 이름(/smpc/target_speed_mps)
+       은 그 패키지 내부 배선(acc_speed_planner_node <-> smpc_decision_node)
+       때문에 그대로 두고, MPC 구독만 이 이름으로 뗀다. -->
+  <arg name="external_acc_topic" default="/smpc/target_speed_mps_gated"/>
+  <!-- false 면 MPC 가 ACC 목표속도를 무시한다. SMPC 차선변경 판단은 유지되고
+       속도 개입만 끊기므로, ACC 가 감속 원인인지 분리 검증할 때 쓴다. -->
+  <arg name="external_acc_enabled" default="true"/>
+
+  <!-- 원본 방식 -->
+  <group unless="$(arg use_arbiter)">
+    <include unless="$(arg dry_run)"
+             file="$(find mpc_path_tracking)/launch/mpc_path_tracking.launch">
+      <arg name="N" value="$(arg mpc_N)"/>
+      <arg name="ctrl_cmd_topic" value="$(arg mpc_cmd_topic)"/>
+      <arg name="external_acc_topic" value="$(arg external_acc_topic)"/>
+      <arg name="external_acc_enabled" value="$(arg external_acc_enabled)"/>
+    </include>
+  </group>
+
+  <!-- 중재 방식. 예전에는 group remap 으로 걸어서 control_feedback_monitor 까지
+       같이 끌려갔다. 이제 노드 인자로 넘겨 MPC 노드만 우회시킨다. -->
+  <group if="$(arg use_arbiter)">
+    <include unless="$(arg dry_run)"
+             file="$(find mpc_path_tracking)/launch/mpc_path_tracking.launch">
+      <arg name="N" value="$(arg mpc_N)"/>
+      <arg name="ctrl_cmd_topic" value="/control/raw_cmd"/>
+      <arg name="external_acc_topic" value="$(arg external_acc_topic)"/>
+      <arg name="external_acc_enabled" value="$(arg external_acc_enabled)"/>
+    </include>
+    <node unless="$(arg dry_run)" pkg="aeb_safety" type="control_arbiter_node.py"
+          name="control_arbiter" output="screen"/>
+  </group>
+
+  <group if="$(arg use_m8_control)">
+    <include file="$(find control_pkg)/launch/control.launch"/>
+  </group>
+</launch>

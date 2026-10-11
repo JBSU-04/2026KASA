@@ -1,0 +1,74 @@
+frame_id: map
+
+roundabout:
+  center: {x: 0.0, y: 0.0}
+  radius: {inner: 8.0, outer: 18.0}
+
+lidar_tracker:
+  enabled: false
+  topics:
+    cloud: /nonground
+    odom: /odom
+    output: /perception/roundabout/tracked_objects
+    markers: /perception/roundabout/tracker_markers
+    roi_cloud: /perception/roundabout/roi_cloud
+    vehicle_cloud: /perception/roundabout/vehicle_cloud
+    aligned_cloud: /perception/roundabout/aligned_cloud
+  expected_cloud_frame: velodyne
+  # sensor_nonground | sensor_raw | map_groundgrid
+  input_mode: sensor_nonground
+  max_processing_hz: 12.0
+  processing_radius: 80.0
+  odom_timeout: 0.35
+  cloud_timeout: 0.5
+  reset_jump_distance: 5.0
+
+  # LiDAR 원점의 base_link 기준 위치
+  sensor_extrinsic: {x: 1.10, y: 0.0, z: 1.33, yaw_deg: 0.0}
+
+  roi:
+    min_range: 1.5
+    max_range: 60.0
+    min_z: -0.8
+    max_z: 2.5
+    ring_margin: 3.0
+  voxel_size: 0.2
+  groundgrid:
+    nonground_min_intensity: 90.0
+  raw_ground:
+    percentile: 20.0
+    clearance: 0.25
+
+  cluster:
+    tolerance: 0.8
+    min_points: 5
+    max_points: 1500
+  vehicle_filter:
+    min_length: 0.4
+    max_length: 8.0
+    min_width: 0.15
+    max_width: 6.0
+    min_height: 0.2
+    max_height: 4.0
+    reject_low_linear: true
+    linear_min_length: 2.0
+    linear_max_width: 0.45
+    linear_max_height: 1.3
+    linear_min_aspect_ratio: 6.0
+
+  tracking:
+    association_distance: 3.0
+    position_alpha: 0.75
+    velocity_alpha: 0.4
+    circular_velocity_enabled: true
+    velocity_window_size: 7
+    velocity_min_span: 0.12
+    size_alpha: 0.5
+    stale_seconds: 0.6
+    max_prediction_seconds: 0.3
+    max_object_speed: 30.0
+    min_confirm_hits: 3
+    min_velocity_hits: 4
+    moving_speed_threshold: 0.7
+    moving_distance_threshold: 1.0
+    moving_confirm_hits: 3

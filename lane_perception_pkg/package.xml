@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>lane_perception_pkg</name>
+  <version>0.1.0</version>
+  <description>TwinLiteNet lane segmentation and sliding-window steering estimation.</description>
+  <maintainer email="user@example.com">kuuve</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>cv_bridge</depend>
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+</package>

@@ -1,0 +1,51 @@
+# Curb constraints participate in connected-corridor search AND QP bounds.
+# A path center cannot enter the 0.95 + 0.10 = 1.05m strip inside the curb.
+vehicle_half_width: 0.95
+curb_margin: 0.10
+obstacle_margin: 0.20
+resolution: 0.10
+min_height: 0.06
+max_height: 2.8
+target_speed_mps: 8.333 # 30km/h; existing MPC/mission caps still apply
+max_curvature: 0.18
+max_lateral_accel: 2.5
+# Start the first avoidance approach before M2; mission labels stay unchanged.
+static_planning_start_idx: 2100
+map_length_m: 80.0 # forward occupancy coverage 60m, including vehicle front
+approach_horizon_m: 50.0 # idx 2100..2399 only; reference length may clip this
+approach_obstacle_margin_m: 0.20 # admission corridor handles early relevance, geometry stays unchanged
+horizon_m: 40.0 # same effective 40 knots as before for the second obstacle/M8
+scan_timeout: 0.35
+# After obstacles: release offset history only in a body-clear reference tail.
+return_min_distance_m: 12.0
+return_min_time_sec: 2.0
+return_offset_tolerance_m: 0.20
+return_center_weight: 2.0
+return_overshoot_m: 0.10
+# Legacy new_lane spatial return defaults, independent of MPC fitting.
+spatial_return_max_lat_accel: 1.5
+spatial_return_max_lat_jerk: 8.0
+spatial_return_min_speed: 4.5
+spatial_return_min_transition_m: 6.0
+spatial_return_max_transition_m: 32.0
+cruise_offset_m: 0.15
+cruise_heading_deg: 3.0
+cruise_path_offset_m: 0.20
+cruise_preview_m: 8.0
+cruise_hold_sec: 0.5
+# A straight measured wall must not be extrapolated into a curved entrance.
+live_boundary_distance_m: 6.0
+live_boundary_heading_deg: 5.0
+tunnel_min_idx: 7000
+tunnel_max_idx: 9000
+
+# Admission only; never crop stored occupancy or candidate collision checks.
+trigger_enabled: true
+trigger_corridor_half_width_m: 1.5
+trigger_distance_m: 30.0
+trigger_hold_sec: 3.0
+tl_guard_range_m: 80.0
+tl_input_timeout_sec: 0.7
+tl_hold_gap_min_m: 10.0
+tl_hold_gap_m: 20.0
+tl_hold_decel_mps2: 1.5

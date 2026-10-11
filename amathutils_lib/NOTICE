@@ -1,0 +1,7 @@
+Vendored from Autoware.AI common/amathutils_lib.
+Repository: https://github.com/autowarefoundation/autoware_ai_common
+Pinned commit: 202e492b88a89b58ca83f66cec089eaa27b440d4
+Build/package metadata modified by KUUVe, 2026, for standalone catkin use.
+Only kalman_filter and time_delay_kalman_filter are included.
+The included Kalman filter implementation sources are unmodified.
+License: Apache-2.0. Copyright remains with the Autoware Foundation.

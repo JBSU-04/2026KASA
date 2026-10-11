@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>yolo_test</name>
+  <version>0.0.0</version>
+  <description>UDP 센서 브릿지 + 카메라/라이다 센서퓨전 장애물 인지</description>
+  <maintainer email="kuuve@todo.todo">kuuve</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>morai_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>mission_supervisor</exec_depend>
+
+  <export></export>
+  <exec_depend>occupancy_avoidance</exec_depend>
+  <exec_depend>apollo_motion_bridge</exec_depend>
+  <exec_depend>new_lane</exec_depend>
+  <exec_depend>rospkg</exec_depend>
+</package>

@@ -1,0 +1,300 @@
+frame_id: map
+lidar_tracker:
+  cloud_timeout: 0.5
+  cluster:
+    max_points: 3000
+    min_points: 3
+    tolerance: 1.25
+  enabled: true
+  expected_cloud_frame: velodyne_ground
+  groundgrid:
+    nonground_min_intensity: 90.0
+  input_mode: sensor_nonground
+  max_processing_hz: 15.0
+  odom_timeout: 0.35
+  processing_radius: 80.0
+  raw_ground:
+    clearance: 0.2
+    percentile: 20.0
+  reset_jump_distance: 5.0
+  roi:
+    max_range: 60.0
+    max_z: 2.5
+    min_range: 1.5
+    min_z: -1.66
+    ring_margin: 2.0
+  sensor_extrinsic:
+    x: 1.1
+    y: 0.0
+    yaw_deg: 0.0
+    z: 1.33
+  topics:
+    aligned_cloud: /perception/roundabout/aligned_cloud
+    cloud: /nonground
+    markers: /perception/roundabout/tracker_markers
+    odom: /odom
+    output: /perception/roundabout/tracked_objects
+    roi_cloud: /perception/roundabout/roi_cloud
+    vehicle_cloud: /perception/roundabout/vehicle_cloud
+  tracking:
+    association_distance: 3.0
+    circular_velocity_enabled: true
+    confirmed_hold_seconds: 3.0
+    confirmed_size_shrink_alpha: 0.02
+    expiry_guard_seconds: 1.0
+    max_object_speed: 30.0
+    max_prediction_seconds: 1.0
+    min_confirm_hits: 2
+    min_velocity_hits: 2
+    moving_confirm_hits: 2
+    moving_distance_threshold: 1.0
+    moving_speed_threshold: 0.8
+    position_alpha: 0.7
+    retained_confidence_floor: 0.45
+    robust_circular_velocity: true
+    size_alpha: 0.5
+    stale_seconds: 1.5
+    velocity_alpha: 0.25
+    velocity_extent_tolerance: 0.5
+    velocity_hold_seconds: 0.6
+    velocity_min_span: 0.3
+    velocity_pair_min_span: 0.6
+    velocity_window_seconds: 1.8
+    velocity_window_size: 20
+  vehicle_filter:
+    linear_max_height: 0.6
+    linear_max_width: 0.3
+    linear_min_aspect_ratio: 8.0
+    linear_min_length: 2.0
+    max_height: 4.5
+    max_length: 14.0
+    max_width: 3.5
+    min_height: 0.08
+    min_length: 0.2
+    min_width: 0.1
+    reject_low_linear: true
+    thin_top:
+      enabled: true
+      ground_z_sensor: -1.754
+      max_top: 2.2
+      min_length: 0.8
+      min_points: 5
+      min_top: 0.9
+  voxel_size: 0.1
+odom_timeout: 0.4
+roundabout:
+  auto:
+    conflict_point: false
+    conflict_radius_margin: 1.0
+    exit: true
+    exit_radius_margin: 0.5
+  center:
+    x: 302492.838
+    y: 4124488.413
+  conflict_point:
+    x: 302501.042
+    y: 4124471.967
+  counter_clockwise: true
+  distance:
+    activation: 25.0
+    creep_buffer: 0.0
+    decision: 25.0
+    exit_clear: 6.0
+    exit_detection: 3.0
+    lead_search: 60.0
+    route_projection_tolerance: 4.0
+    stop_buffer: 0.0
+    yield_go: 4.0
+  distance_entry:
+    confirm_s: 0.2
+    front_gap_m: 2.5
+    pair_invalid_s: 0.3
+    post_clear_horizon_s: 1.5
+    rear_gap_m: 2.0
+    rear_max_decel_mps2: 2.0
+    rear_reaction_s: 0.5
+    rear_yield_assumption: true
+    unknown_observe_s: 0.6
+  enabled: true
+  entry_heading_deg: 69.713
+  entry_heading_tolerance_deg: 70.0
+  entry_model: distance
+  exit_point:
+    x: 302512.545
+    y: 4124484.278
+  gap:
+    ego_merge_time: 1.0
+    front_check_distance: 35.0
+    front_departure_speed_ratio: 0.25
+    front_standstill_distance: 0.0
+    front_time: 1.0
+    front_time_relax_floor: 0.8
+    prediction_uncertainty_time: 0.2
+    rear_time: 1.5
+    rear_time_is_total_ttc: true
+    rear_ttc_relax_floor: 1.0
+    rear_ttc_relax_max: 0.7
+    relax_rate: 0.1
+    relax_start_seconds: 4.0
+    safe_confirm_relax_floor: 0.15
+    safe_confirm_seconds: 0.3
+    stationary_block_distance: 20.0
+    uncertain_object_block_distance: 15.0
+  gap_select:
+    abort_margin: 0.5
+    adaptive_leader_start: true
+    check_horizon: 1.5
+    circle_stop_margin: 0.5
+    commit_abort_confirm: 0.2
+    commit_abort_enabled: true
+    commit_front_tolerance: 1.0
+    confirm_seconds: 0.1
+    ego_accel: 3.0
+    ego_length: 4.6
+    ego_max_speed: 0.0
+    ego_start_delay: 0.2
+    enabled: true
+    entry_zone: 1.0
+    front_headway: 0.3
+    go_after_leader_passed: false
+    go_tolerance: 0.05
+    go_tolerance_front: 0.4
+    late_margin: 0.2
+    leader_decel_horizon: 0.5
+    leader_decel_limit: 1.5
+    leader_release_accel: 3.0
+    leader_release_margin_s: 1.0
+    leader_release_min_speed: 2.0
+    leader_start_distance: 6.5
+    leader_start_max_distance: 10.0
+    max_wait: 12.0
+    min_vehicle_length: 4.0
+    mpc_feedback_timeout: 0.5
+    phantom_arc: 22.0
+    phantom_enabled: false
+    phantom_speed: 5.0
+    prediction_follow_standstill_gap: 4.0
+    prediction_follow_time_gap: 1.5
+    rear_headway: 0.5
+    require_merge_progress: true
+    seq_go_tolerance: 0.3
+    seq_rear_headway: 0.2
+    sequential: true
+    skip_confirm: 0.3
+    skip_confirm_after_safe: 0.8
+    speed_disagreement_limit: 1.0
+    speed_margin: 0.2
+    speed_min_span: 0.8
+    speed_window: 1.5
+    standstill_gap: 0.8
+    stationary_yield_confirm_s: 3.0
+    stationary_yield_min_distance_m: 3.0
+    stationary_yield_release_enabled: true
+    stationary_yield_release_start_s: 7.0
+    stop_margin: 0.5
+    stop_reaction_time: 0.3
+    stream_speed_memory_sec: 30.0
+    stream_speed_min_travel_m: 15.0
+    switch_margin: 0.5
+    ttc_rear: 1.0
+    unconfirmed_enabled: true
+    unconfirmed_max_hits: 45
+    unconfirmed_range: 40.0
+    unconfirmed_speed: 5.0
+    use_mpc_prediction: true
+    use_tracker_velocity: true
+    velocity_hold_min_hits: 20
+    viz_range: 35.0
+    zone_commit_tolerance_m: 1.5
+    zone_confirm_seconds: 0.3
+    zone_front_gap_floor_m: 99.0
+    zone_front_gap_m: 2.5
+    zone_front_time_s: 0.45
+    zone_length_estimate: true
+    zone_length_max_m: 7.5
+    zone_length_min_samples: 10
+    zone_length_percentile: 0.8
+    zone_length_prior_memory_s: 60.0
+    zone_length_window_s: 8.0
+    zone_pair_tolerance_m: 0.8
+    zone_position_bias: []
+    zone_preconfirm: true
+    zone_rear_gap_floor_m: 1.5
+    zone_rear_gap_m: 2.0
+    zone_relax_from_stop: true
+    zone_relax_rate_mps: 0.4
+    zone_relax_start_s: 0.0
+    zone_rule_enabled: true
+    zone_vehicle_length_m: 5.0
+  radius:
+    inner: 16.0
+    nominal: 18.338
+    outer: 21.5
+  require_localization: true
+  require_tracker_stream: true
+  safety:
+    comfortable_decel: 2.5
+    emergency_decel: 5.0
+    reset_jump_distance: 5.0
+  speed:
+    approach: 8.0
+    circulation: 8.5
+    degraded: 2.0
+    exit: 15.0
+    stationary_threshold: 0.3
+    yield_roll: 0.0
+  tangent_heading_tolerance_deg: 75.0
+  time_window:
+    assumed_speed: 5.0
+    commit_m_front: 0.0
+    commit_m_rear: 0.0
+    confirm: 0.3
+    front_space: 2.0
+    ghost_age: 1.0
+    leader_headway: 0.0
+    m_front: 0.3
+    m_rear: 0.3
+    min_observe: 1.0
+    moving_speed: 1.5
+    near_upstream: 25.0
+    rear_decel: 2.0
+    rear_space: 1.5
+    restart_accel: 2.0
+    restart_delay: 0.5
+    sigma_v: 0.2
+    stopped_min_gap: 1.5
+    stopped_wait: 2.0
+    young_age: 2.5
+  timing:
+    commit_timeout_seconds: 6.0
+    exit_hold_seconds: 1.0
+    mandatory_stop_position_tolerance: 0.8
+    mandatory_stop_seconds: 0.0
+    mandatory_stop_speed_threshold: 0.25
+    minimum_circulate_seconds: 1.0
+    tracker_guard_commit_grace_s: 1.2
+    tracker_stale_grace_s: 0.8
+    tracker_timeout: 0.5
+  vehicle_roi:
+    exit_lead_lateral_tolerance: 2.0
+    inner_radius: 16.0
+    outer_radius: 20.0
+    point_padding: 1.2
+  yield_point:
+    x: 302496.16555312654
+    y: 4124463.6043231008
+topics:
+  constraint: /mission/constraints/roundabout
+  curve_speed_limit: /control_feedback/curvature_capacity_speed_mps
+  debug: /mission/roundabout/debug
+  localization_valid: /localization/valid
+  markers: /mission/roundabout/markers
+  odom: /odom
+  route: /local_path
+  state: /mission/roundabout/state
+  tracked_objects: /perception/roundabout/tracked_objects
+tracked_objects:
+  min_confidence: 0.4
+  require_movement_confirmation: true
+  require_velocity_valid: true
+update_rate_hz: 20.0

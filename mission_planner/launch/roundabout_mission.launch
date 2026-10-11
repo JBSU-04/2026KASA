@@ -1,0 +1,19 @@
+<launch>
+  <arg name="config_file"
+       default="$(find mission_planner)/config/sites/roundabout_template.yaml" />
+  <arg name="node_name" default="roundabout_mission" />
+  <arg name="odom_topic" default="/odom" />
+  <arg name="route_topic" default="/local_path" />
+  <arg name="localization_valid_topic" default="/localization/valid" />
+  <arg name="constraint_topic" default="/mission/constraints/roundabout" />
+
+  <node pkg="mission_planner" type="roundabout_mission_node"
+        name="$(arg node_name)" output="screen" respawn="true">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="topics/odom" value="$(arg odom_topic)" />
+    <param name="topics/route" value="$(arg route_topic)" />
+    <param name="topics/localization_valid"
+           value="$(arg localization_valid_topic)" />
+    <param name="topics/constraint" value="$(arg constraint_topic)" />
+  </node>
+</launch>

@@ -1,0 +1,153 @@
+#pragma once
+
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace mission_planner {
+
+struct Point2 {
+  double x = 0.0;
+  double y = 0.0;
+};
+
+struct EgoState {
+  Point2 position;
+  double yaw = 0.0;
+  double speed = 0.0;
+  bool valid = false;
+};
+
+struct TrackedObject {
+  int id = -1;
+  Point2 position;
+  double velocity_x = 0.0;
+  double velocity_y = 0.0;
+  double length = 4.5;
+  bool velocity_valid = false;
+  bool has_moved = false;
+};
+
+enum class RoundaboutState : std::uint8_t {
+  kIdle = 0,
+  kApproach = 1,
+  kYield = 2,
+  kCommit = 3,
+  kCirculate = 4,
+  kExit = 5,
+  kFailsafe = 6,
+};
+
+struct RoundaboutConfig {
+  bool enabled = false;
+  bool counter_clockwise = true;
+  bool require_tracker_stream = true;
+  bool require_localization = true;
+
+  Point2 center;
+  Point2 yield_point;
+  Point2 conflict_point;
+  Point2 exit_point;
+  double entry_heading = 0.0;
+
+  double inner_radius = 8.0;
+  double outer_radius = 18.0;
+  double nominal_radius = 13.0;
+  double activation_distance = 35.0;
+  double decision_distance = 18.0;
+  double exit_detection_radius = 6.0;
+  double exit_clear_distance = 12.0;
+  double entry_heading_tolerance = 1.2;
+  double tangent_heading_tolerance = 1.05;
+  double route_projection_tolerance = 4.0;
+
+  double approach_speed = 6.0;
+  double circulation_speed = 7.0;
+  double exit_speed = 8.0;
+  double degraded_speed = 2.0;
+  double ego_merge_time = 2.0;
+  double rear_time_gap = 4.0;
+  // YIELD 교착 완화의 하한 [s]. rear_time_gap 아래로 얼마나 내려갈 수 있는지.
+  // 하드코딩 3.0 이었는데, rear_time 을 3.0 미만으로 튜닝한 현장에서는
+  // 완화가 오히려 값을 '올려버리는' 역전이 생겼다. 설정으로 뺀다.
+  double rear_ttc_relax_floor = 3.0;
+  // 교착 완화의 최대 감소량 [s].
+  double rear_ttc_relax_max = 0.5;
+  // YIELD 진입 후 완화를 시작할 대기 시간과 초당 완화량.
+  // relax_rate=0이면 모든 점진 완화를 비활성화한다.
+  double gap_relax_start_seconds = 5.0;
+  double gap_relax_rate = 0.1;
+  bool rear_time_is_total_ttc = false;
+  double front_time_gap = 2.0;
+  double front_time_relax_floor = 1.2;
+  double front_standstill_distance = 5.0;
+  double front_departure_speed_ratio = 1.0;
+  double front_check_distance = 35.0;
+  double stationary_speed = 0.3;
+  double stationary_block_distance = 20.0;
+  double uncertain_object_block_distance = 15.0;
+  double prediction_uncertainty_time = 0.5;
+  double safe_confirm_seconds = 0.5;
+  double safe_confirm_relax_floor = 0.15;
+  double tracker_timeout = 0.5;
+  double mandatory_stop_seconds = 0.0;
+  double mandatory_stop_position_tolerance = 0.5;
+  double mandatory_stop_speed_threshold = 0.25;
+  double minimum_circulate_seconds = 1.0;
+  double commit_timeout_seconds = 8.0;
+  double exit_hold_seconds = 1.0;
+  double reset_jump_distance = 5.0;
+
+  double comfortable_decel = 2.5;
+  double emergency_decel = 5.0;
+  double stop_buffer = 1.0;
+  // 의무 정지를 마친 뒤 gap 을 기다리는 위치 [m]. 양보선 기준이며 음수면
+  // 양보선을 지나 합류점 쪽으로 더 나간다.
+  // 왜 분리하나: 양보선 뒤에서 기다리면 중앙분리대가 링 반대편을 가려
+  // 순환 차량이 105° 밖에 안 보인다. 규정 정지는 stop_buffer 로 지키고,
+  // 관측은 시야가 열리는 앞쪽에서 한다. creep_buffer 를 stop_buffer 와
+  // 같게 두면 기존 동작과 동일하다.
+  double creep_buffer = 1.0;
+  double lead_search_distance = 45.0;
+};
+
+struct RoundaboutInput {
+  double now = 0.0;
+  EgoState ego;
+  bool localization_valid = false;
+  bool tracker_stream_valid = false;
+  std::vector<Point2> route;
+  std::vector<TrackedObject> objects;
+};
+
+struct MissionConstraint {
+  bool active = false;
+  std::uint8_t priority = 0;
+  double max_speed = -1.0;
+  bool stop_required = false;
+  double stop_distance = 0.0;
+  bool lead_vehicle_active = false;
+  int lead_vehicle_id = -1;
+  double lead_distance = 0.0;
+  double lead_speed = 0.0;
+  double comfortable_decel = 0.0;
+  double emergency_decel = 0.0;
+  std::string reason;
+};
+
+struct RoundaboutOutput {
+  RoundaboutState state = RoundaboutState::kIdle;
+  MissionConstraint constraint;
+  bool gap_safe = false;
+  int blocking_object_id = -1;
+  int tracked_object_count = 0;
+  double distance_to_yield = std::numeric_limits<double>::infinity();
+  double next_npc_ttc = std::numeric_limits<double>::infinity();
+  double front_gap = std::numeric_limits<double>::infinity();
+  double ego_radius = 0.0;
+  double ego_angle = 0.0;
+  std::string reason;
+};
+
+}  // namespace mission_planner

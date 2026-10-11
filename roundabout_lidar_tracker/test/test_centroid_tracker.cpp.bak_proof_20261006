@@ -1,0 +1,428 @@
+#include <cmath>
+
+#include <gtest/gtest.h>
+
+#include "roundabout_lidar_tracker/centroid_tracker.hpp"
+
+namespace roundabout_lidar_tracker {
+namespace {
+
+Detection2D detection(double x, double y) {
+  Detection2D value;
+  value.x = x;
+  value.y = y;
+  value.size_x = 4.5;
+  value.size_y = 1.8;
+  value.size_z = 1.5;
+  return value;
+}
+
+Detection2D circularDetection(double radius, double angle) {
+  return detection(radius * std::cos(angle), radius * std::sin(angle));
+}
+
+TrackerConfig testConfig() {
+  TrackerConfig config;
+  config.position_alpha = 1.0;
+  config.velocity_alpha = 1.0;
+  config.min_confirm_hits = 2;
+  config.min_velocity_hits = 2;
+  config.moving_confirm_hits = 2;
+  config.moving_speed_threshold = 0.5;
+  config.association_distance = 2.0;
+  return config;
+}
+
+TEST(CentroidTracker, ConfirmsStableIdAndVelocity) {
+  CentroidTracker tracker(testConfig());
+  tracker.update({detection(0.0, 0.0)}, 0.0);
+  EXPECT_TRUE(tracker.tracks(0.0).empty());
+
+  tracker.update({detection(0.5, 0.0)}, 0.1);
+  std::vector<Track2D> tracks = tracker.tracks(0.1);
+  ASSERT_EQ(tracks.size(), 1U);
+  const int id = tracks.front().id;
+  EXPECT_TRUE(tracks.front().velocity_valid);
+  EXPECT_NEAR(tracks.front().velocity_x, 5.0, 1.0e-9);
+
+  tracker.update({detection(1.0, 0.0)}, 0.2);
+  tracks = tracker.tracks(0.2);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_EQ(tracks.front().id, id);
+  EXPECT_TRUE(tracks.front().has_moved);
+}
+
+TEST(CentroidTracker, StationaryNoiseIsNotClassifiedAsMoving) {
+  CentroidTracker tracker(testConfig());
+  tracker.update({detection(1.0, 2.0)}, 0.0);
+  tracker.update({detection(1.01, 2.0)}, 0.1);
+  tracker.update({detection(0.99, 2.01)}, 0.2);
+  tracker.update({detection(1.0, 1.99)}, 0.3);
+
+  const std::vector<Track2D> tracks = tracker.tracks(0.3);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_FALSE(tracks.front().has_moved);
+}
+
+TEST(CentroidTracker, KeepsTwoObjectsSeparate) {
+  CentroidTracker tracker(testConfig());
+  tracker.update({detection(0.0, 0.0), detection(0.0, 8.0)}, 0.0);
+  tracker.update({detection(0.4, 0.0), detection(0.3, 8.0)}, 0.1);
+
+  const std::vector<Track2D> tracks = tracker.tracks(0.1);
+  ASSERT_EQ(tracks.size(), 2U);
+  EXPECT_NE(tracks[0].id, tracks[1].id);
+  EXPECT_LT(std::abs(tracks[0].y - tracks[1].y), 9.0);
+  EXPECT_GT(std::abs(tracks[0].y - tracks[1].y), 7.0);
+}
+
+TEST(CentroidTracker, RemovesStaleTrack) {
+  CentroidTracker tracker(testConfig());
+  tracker.update({detection(0.0, 0.0)}, 0.0);
+  tracker.update({detection(0.2, 0.0)}, 0.1);
+  ASSERT_EQ(tracker.tracks(0.1).size(), 1U);
+
+  tracker.update({}, 1.0);
+  EXPECT_TRUE(tracker.tracks(1.0).empty());
+}
+
+TEST(CentroidTracker, CircularRegressionRejectsRadialCentroidJitter) {
+  TrackerConfig config = testConfig();
+  config.circular_velocity_enabled = true;
+  config.circular_center_x = 0.0;
+  config.circular_center_y = 0.0;
+  config.association_distance = 3.0;
+  config.velocity_window_size = 7;
+  config.velocity_min_span = 0.15;
+  CentroidTracker tracker(config);
+
+  tracker.update({circularDetection(9.0, 0.0)}, 0.0);
+  tracker.update({circularDetection(11.0, 0.05)}, 0.1);
+  ASSERT_EQ(tracker.tracks(0.1).size(), 1U);
+  EXPECT_FALSE(tracker.tracks(0.1).front().velocity_valid);
+
+  tracker.update({circularDetection(10.0, 0.10)}, 0.2);
+  const std::vector<Track2D> tracks = tracker.tracks(0.2);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_TRUE(tracks.front().velocity_valid);
+  EXPECT_NEAR(std::hypot(tracks.front().velocity_x,
+                         tracks.front().velocity_y),
+              5.0, 1.0e-6);
+}
+
+TEST(CentroidTracker, CircularRegressionUnwrapsAngleAtPi) {
+  TrackerConfig config = testConfig();
+  config.circular_velocity_enabled = true;
+  config.circular_center_x = 0.0;
+  config.circular_center_y = 0.0;
+  config.velocity_min_span = 0.15;
+  CentroidTracker tracker(config);
+
+  tracker.update({circularDetection(10.0, 3.10)}, 0.0);
+  tracker.update({circularDetection(10.0, 3.15)}, 0.1);
+  tracker.update({circularDetection(10.0, 3.20)}, 0.2);
+  const std::vector<Track2D> tracks = tracker.tracks(0.2);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_TRUE(tracks.front().velocity_valid);
+  EXPECT_NEAR(std::hypot(tracks.front().velocity_x,
+                         tracks.front().velocity_y),
+              5.0, 1.0e-6);
+}
+
+TEST(CentroidTracker, ConfirmedVehicleSurvivesOcclusionAndReacquiresSameId) {
+  auto config = testConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  tracker.update({detection(0.0, 0.0)}, 0.0);
+  tracker.update({detection(0.5, 0.0)}, 0.1);
+  tracker.update({detection(1.0, 0.0)}, 0.2);
+  const int id = tracker.tracks(0.2).front().id;
+  for (int i = 3; i <= 22; ++i) tracker.update({}, i * 0.1);
+  auto held = tracker.tracks(2.2);
+  ASSERT_EQ(held.size(), 1U);
+  EXPECT_EQ(held.front().id, id);
+  EXPECT_NEAR(held.front().x, 11.0, 1e-6);
+  EXPECT_GE(held.front().confidence, 0.45);
+  EXPECT_TRUE(held.front().velocity_valid);
+  EXPECT_GT(held.front().size_x, 4.5);
+  tracker.update({detection(11.5, 0.0)}, 2.3);
+  ASSERT_EQ(tracker.tracks(2.3).size(), 1U);
+  EXPECT_EQ(tracker.tracks(2.3).front().id, id);
+  EXPECT_DOUBLE_EQ(tracker.tracks(2.3).front().measurement_age, 0.0);
+}
+
+TEST(CentroidTracker, RetentionIsBoundedAndExpiryTemporarilyInvalidatesClearance) {
+  auto config = testConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  tracker.update({detection(0.0, 0.0)}, 0.0);
+  tracker.update({detection(0.5, 0.0)}, 0.1);
+  tracker.update({detection(1.0, 0.0)}, 0.2);
+  tracker.update({}, 3.21);
+  EXPECT_TRUE(tracker.tracks(3.21).empty());
+  EXPECT_TRUE(tracker.occlusionUnresolved(3.21));
+  EXPECT_FALSE(tracker.occlusionUnresolved(4.22));
+  tracker.reset();
+  EXPECT_FALSE(tracker.occlusionUnresolved(3.22));
+}
+
+TEST(CentroidTracker, StationaryTrackDoesNotGetExtendedVehicleRetention) {
+  auto config = testConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  tracker.update({detection(0.0, 0.0)}, 0.0);
+  tracker.update({detection(0.0, 0.0)}, 0.1);
+  tracker.update({detection(0.0, 0.0)}, 0.2);
+  tracker.update({}, 1.0);
+  EXPECT_TRUE(tracker.tracks(1.0).empty());
+  EXPECT_FALSE(tracker.occlusionUnresolved(1.0));
+}
+
+TEST(CentroidTracker, PartialTruckDetectionDoesNotCollapseBodySize) {
+  auto config = testConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  auto truck = detection(0.0, 0.0); truck.size_x = 8.7;
+  tracker.update({truck}, 0.0);
+  truck.x = 0.5; tracker.update({truck}, 0.1);
+  truck.x = 1.0; tracker.update({truck}, 0.2);
+  truck.x = 1.5; truck.size_x = 2.8;
+  for (int i = 3; i <= 23; ++i) {
+    truck.x = i * 0.5;
+    tracker.update({truck}, i * 0.1);
+    EXPECT_GE(std::max(tracker.tracks(i * 0.1).front().size_x,
+                       tracker.tracks(i * 0.1).front().size_y), 8.7);
+  }
+}
+
+TEST(CentroidTracker, OccludedVehicleContinuesAlongCircle) {
+  auto config = testConfig();
+  config.circular_velocity_enabled = true;
+  config.velocity_min_span = 0.15;
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  tracker.update({circularDetection(18.0, 0.0)}, 0.0);
+  tracker.update({circularDetection(18.0, 0.05)}, 0.1);
+  tracker.update({circularDetection(18.0, 0.10)}, 0.2);
+  tracker.update({circularDetection(18.0, 0.15)}, 0.3);
+  ASSERT_TRUE(tracker.tracks(0.3).front().has_moved);
+  for (int i = 4; i <= 22; ++i) tracker.update({}, i * 0.1);
+  const auto held = tracker.tracks(2.2);
+  ASSERT_EQ(held.size(), 1U);
+  EXPECT_NEAR(std::hypot(held[0].x, held[0].y), 18.0, 1e-6);
+  EXPECT_NEAR(std::atan2(held[0].y, held[0].x), 1.10, 1e-6);
+}
+
+TEST(CentroidTracker, PartialBodyCentroidDoesNotCauseFullPositionJump) {
+  auto config = testConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  auto truck = detection(0.0, 0.0); truck.size_x = 8.7;
+  tracker.update({truck}, 0.0);
+  truck.x = 0.5; tracker.update({truck}, 0.1);
+  truck.x = 1.0; tracker.update({truck}, 0.2);
+  truck.x = 3.5; truck.size_x = 2.8; // body center is 1.5, fragment is offset 2m
+  tracker.update({truck}, 0.3);
+  EXPECT_NEAR(tracker.tracks(0.3).front().x, 2.0, 1e-6);
+  EXPECT_GE(tracker.tracks(0.3).front().size_x, 8.7);
+}
+
+TEST(CentroidTracker, ExpiryOfDepartedCarDoesNotBlockAnotherEntryGap) {
+  auto config = testConfig();
+  config.circular_velocity_enabled = true;
+  config.velocity_min_span = 0.15;
+  config.confirmed_hold_seconds = 3.0;
+  config.expiry_guard_conflict_angle = 0.0;
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 3; ++i)
+    tracker.update({circularDetection(18.0, 1.0 + i * 0.05)}, i * 0.1);
+  ASSERT_TRUE(tracker.tracks(0.3).front().has_moved);
+  for (int i = 4; i <= 34; ++i) tracker.update({}, i * 0.1);
+  EXPECT_TRUE(tracker.tracks(3.4).empty());
+  EXPECT_FALSE(tracker.occlusionUnresolved(3.4));
+}
+
+TrackerConfig robustConfig() {
+  auto config = testConfig();
+  config.circular_velocity_enabled = true;
+  config.robust_circular_velocity = true;
+  config.velocity_window_size = 20;
+  config.velocity_window_seconds = 1.8;
+  config.velocity_pair_min_span = 0.6;
+  config.velocity_min_span = 0.3;
+  config.association_distance = 3.0;
+  return config;
+}
+
+TEST(CentroidTracker, RobustSpeedRejectsIsolatedCentroidJump) {
+  auto config = robustConfig();
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 18; ++i) {
+    double angle = i * 0.03; // 5.4 m/s, no scenario speed assumption
+    if (i == 10) angle += 0.08; // 1.44m appearance-induced centroid jump
+    tracker.update({circularDetection(18.0, angle)}, i * 0.1);
+    if (i >= 8) {
+      const auto tracks = tracker.tracks(i * 0.1);
+      ASSERT_EQ(tracks.size(), 1U);
+      EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 5.4, 1e-6);
+    }
+  }
+}
+
+TEST(CentroidTracker, RobustEstimatorAdaptsToDifferentActualSpeed) {
+  auto config = robustConfig();
+  CentroidTracker tracker(config);
+  double angle = 0.0;
+  for (int i = 0; i <= 50; ++i) {
+    if (i > 0) angle += i <= 15 ? 0.03 : 0.015;
+    tracker.update({circularDetection(18.0, angle)}, i * 0.1);
+  }
+  const auto tracks = tracker.tracks(5.0);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 2.7, 1e-6);
+}
+
+TEST(CentroidTracker, RobustLongWindowRecognizesRealStopQuickly) {
+  auto config = robustConfig();
+  config.velocity_alpha = 0.25;
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 20; ++i)
+    tracker.update({circularDetection(18.0, i * 0.03)}, i * 0.1);
+  for (int i = 21; i <= 24; ++i)
+    tracker.update({circularDetection(18.0, 0.60)}, i * 0.1);
+  const auto tracks = tracker.tracks(2.4);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_TRUE(tracks[0].has_moved);
+  EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 0.0, 1e-6);
+}
+
+TEST(CentroidTracker, DuplicateAndOutOfOrderStampsDoNotCreateVelocitySamples) {
+  CentroidTracker tracker(robustConfig());
+  for (int i = 0; i <= 5; ++i)
+    tracker.update({circularDetection(18.0, i * 0.03)}, i * 0.1);
+  const auto before = tracker.tracks(0.5).front();
+  tracker.update({circularDetection(18.0, 0.8)}, 0.5);
+  tracker.update({circularDetection(18.0, 0.8)}, 0.45);
+  const auto after = tracker.tracks(0.5).front();
+  EXPECT_EQ(before.hit_count, after.hit_count);
+  EXPECT_DOUBLE_EQ(before.velocity_x, after.velocity_x);
+  EXPECT_DOUBLE_EQ(before.velocity_y, after.velocity_y);
+}
+
+TEST(CentroidTracker, OcclusionPredictionDoesNotIncreaseVelocityEvidence) {
+  auto config = robustConfig(); config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 10; ++i)
+    tracker.update({circularDetection(18.0, i * 0.03)}, i * 0.1);
+  const auto before = tracker.tracks(1.0).front();
+  for (int i = 11; i <= 25; ++i) tracker.update({}, i * 0.1);
+  const auto after = tracker.tracks(2.5).front();
+  EXPECT_EQ(before.hit_count, after.hit_count);
+  EXPECT_NEAR(std::hypot(after.velocity_x, after.velocity_y), 5.4, 1e-6);
+  EXPECT_GT(after.measurement_age, 1.0);
+}
+
+TEST(CentroidTracker, PartialBodySpeedUsesRawObservationsNotBlendedPrediction) {
+  auto config = robustConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  double angle = 0.0;
+  for (int i = 0; i <= 60; ++i) {
+    if (i > 0) angle += i <= 15 ? 0.03 : 0.01;
+    auto object = circularDetection(18.0, angle);
+    if (i > 15) object.size_x = 2.0; // position is blended with prediction
+    tracker.update({object}, i * 0.1);
+  }
+  const auto tracks = tracker.tracks(6.0);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 1.8, 0.02);
+  EXPECT_TRUE(tracks[0].velocity_valid);
+}
+
+TEST(CentroidTracker, MovingVehicleKeepsBoundedSpeedEvidenceDuringFaceChange) {
+  auto config = robustConfig();
+  config.velocity_hold_seconds = 0.6;
+  CentroidTracker held(config);
+  config.velocity_hold_seconds = 0.0;
+  CentroidTracker immediate(config);
+  for (int i = 0; i <= 26; ++i) {
+    auto object = circularDetection(18.0, i * 0.03);
+    if (i > 20) object.size_x = 1.0 + i; // No comparable new faces.
+    held.update({object}, i * 0.1);
+    immediate.update({object}, i * 0.1);
+  }
+  ASSERT_EQ(held.tracks(2.6).size(), 1u);
+  EXPECT_TRUE(held.tracks(2.6).front().has_moved);
+  EXPECT_TRUE(held.tracks(2.6).front().velocity_valid);
+  EXPECT_FALSE(immediate.tracks(2.6).front().velocity_valid);
+  EXPECT_NEAR(std::hypot(held.tracks(2.6).front().velocity_x,
+                         held.tracks(2.6).front().velocity_y), 5.4, 1e-6);
+  for (int i = 27; i <= 33; ++i) {
+    auto object = circularDetection(18.0, i * 0.03);
+    object.size_x = 1.0 + i;
+    held.update({object}, i * 0.1);
+  }
+  EXPECT_FALSE(held.tracks(3.3).front().velocity_valid);
+}
+
+TEST(CentroidTracker, PersistentFaceChangeDoesNotBecomeAcceleration) {
+  auto config = robustConfig();
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 35; ++i) {
+    auto object = circularDetection(18.0, i * 0.03 + (i >= 15 ? 0.07 : 0.0));
+    object.size_x = i >= 15 ? 3.0 : 4.5;
+    tracker.update({object}, i * 0.1);
+    if (i >= 10) {
+      const auto tracks = tracker.tracks(i * 0.1);
+      ASSERT_EQ(tracks.size(), 1U);
+      if (tracks[0].velocity_valid) {
+        EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 5.4, 1e-6);
+      }
+    }
+  }
+  EXPECT_TRUE(tracker.tracks(3.5).front().velocity_valid);
+}
+
+TEST(CentroidTracker, StopRemainsObservableAfterFaceChange) {
+  auto config = robustConfig();
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 20; ++i)
+    tracker.update({circularDetection(18.0, i * 0.03)}, i * 0.1);
+  for (int i = 21; i <= 26; ++i) {
+    auto object = circularDetection(18.0, 0.67);
+    object.size_x = 3.0;
+    tracker.update({object}, i * 0.1);
+  }
+  const auto tracks = tracker.tracks(2.6);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_TRUE(tracks[0].velocity_valid);
+  EXPECT_NEAR(std::hypot(tracks[0].velocity_x, tracks[0].velocity_y), 0.0, 1e-6);
+}
+
+TEST(CentroidTracker, UncertainNewFaceKeepsConfirmedBodyAndOcclusionHold) {
+  auto config = robustConfig();
+  config.confirmed_hold_seconds = 3.0;
+  CentroidTracker tracker(config);
+  for (int i = 0; i <= 19; ++i) {
+    auto object = circularDetection(18.0, i * 0.03 + (i >= 15 ? 0.07 : 0.0));
+    if (i >= 15) object.size_x = 3.0;
+    tracker.update({object}, i * 0.1);
+  }
+  auto tracks = tracker.tracks(1.9);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_TRUE(tracks[0].velocity_valid); // Recent comparable evidence is held briefly.
+  EXPECT_GE(std::max(tracks[0].size_x, tracks[0].size_y), 4.5);
+  tracker.update({}, 3.5);
+  tracks = tracker.tracks(3.5);
+  ASSERT_EQ(tracks.size(), 1U);
+  EXPECT_FALSE(tracks[0].velocity_valid); // Prediction cannot restore evidence.
+  EXPECT_GE(std::max(tracks[0].size_x, tracks[0].size_y), 4.5);
+}
+
+}  // namespace
+}  // namespace roundabout_lidar_tracker
+
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

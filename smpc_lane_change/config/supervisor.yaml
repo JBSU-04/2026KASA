@@ -1,0 +1,58 @@
+# 3 -> 1 (2026-09-16). SMPC 가 이미 change_feasible_confirm_count(3 연속)로
+# 안전을 확인한 뒤 CHANGE 를 보내므로, supervisor 에서 같은 확인을 또 3 번
+# 반복하면 실행이 그만큼 늦어진다. 실측(15:59 백)에서 SMPC 확정이 간헐적으로
+# 성립하던 구간이 이 중복 확인 때문에 매번 흘러갔다.
+confirmation_count: 1
+lane_start_extension_m: 80.0
+lane_start_extension_spacing_m: 0.1
+# 연속 차선변경 사이의 최소 간격. 변경이 '완료'된 시점부터 잰다
+# (lane_change_supervisor_node.cpp finishLaneChange). 새로 옆이 된 차로의
+# 차량을 관측·확정할 시간을 준다.
+#   실측 2026-09-14(13:00 백): 1->2 완료(t=22.8) 0.1초 뒤에 2->3 을 요청했다.
+#   그 시점 목표 차로 관측은 target_rear 무효 / nearby 1대뿐이었다.
+# 1.0 -> 2.0.
+cooldown_sec: 1.0
+# 자세 기반 완료 판정(completion_use_pose_check)이 불가능할 때만 쓰는
+# 시간 폴백. waypoint_system 블렌딩(4.00s)과 맞춘다.
+lane_change_duration_sec: 4.00
+
+# Completion is no longer just "4 seconds elapsed".  The supervisor confirms
+# that ego is actually established on the target lane CSV before closing the
+# lane-change window.
+completion_use_pose_check: true
+completion_min_active_sec: 2.5
+completion_timeout_sec: 10.0
+completion_lateral_d_m: 0.45 # 0.75 -> 0.45: 차선 중앙에 완전히 안착할 때까지 블렌딩을 유지하여 조향 충격 방지
+completion_confirmation_count: 5
+
+# At completion_timeout_sec, classify the actual ego pose instead of forcing
+# success.  Complete/failed decisions use CSV distance.  Yaw is only appended
+# to ambiguous in-progress/debug states so post-change oscillation does not
+# block completion.
+completion_aligning_lateral_d_m: 1.35
+completion_aligning_yaw_error_rad: 0.60 # Debug classification only.
+completion_failed_source_lateral_d_m: 0.90
+completion_lane_distance_margin_m: 0.30
+completion_hard_timeout_sec: 0.0 # 0 disables forced completion.
+
+# A CHANGE_LEFT command immediately switches /path_number, even from rest at a
+# source-path endpoint.  Do not start the maneuver-completion timeout until
+# the target path switch is acknowledged and the vehicle actually progresses.
+# /final_waypoint is the path that MPC consumes; four points is its minimum
+# polyfit requirement.
+final_waypoint_topic: '/final_waypoint'
+target_path_min_points: 4
+path_switch_timeout_sec: 2.0 # target /gps_state + usable /final_waypoint
+motion_start_speed_mps: 0.20
+motion_start_displacement_m: 0.30
+motion_start_timeout_sec: 0.0 # 0: do not fail an intentional standstill
+
+# Safety guards for bad lane/path association.
+# If ego is not reasonably near the source/target CSVs, do not start or keep a
+# lane-change active window.  This prevents a wrong /path_number from leaving
+# /local_path with only 1~3 points and freezing MPC in path-end stop.
+accept_source_max_abs_d_m: 4.0
+accept_target_max_abs_d_m: 6.0
+timeout_off_active_lanes_abs_d_m: 6.0
+recovery_nearest_lane_max_abs_d_m: 6.0
+odom_topic: '/odom'

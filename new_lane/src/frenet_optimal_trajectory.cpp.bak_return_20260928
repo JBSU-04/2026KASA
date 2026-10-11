@@ -1,0 +1,1596 @@
+#include <map>
+#include <chrono>
+#include "new_lane/frenet_optimal_trajectory.hpp"
+#include <ros/console.h>
+#include <bits/stdc++.h>
+#include <algorithm>
+#include <vector>
+
+// namespace plt = matplotlibcpp;
+
+// Parameters
+double MAX_SPEED = 0.0;	   // maximum speed [m/s]
+double MAX_ACCEL = 0.0;	   // maximum acceleration [m/ss]
+double MAX_CURVATURE = 0.0;  // maximum curvature [1/m]
+double MAX_ROAD_WIDTH = 0.0; // maximum road width [m]
+// 좌우 비대칭 회피 폭. 좌측(d>0, 진행방향 왼쪽)은 중앙선을 넘는 방향이라
+// 물리적으로는 더 넓게 쓸 수 있지만 대향 차량이 있으면 안 된다.
+// obstacle_avoidance_node 가 대향 차량 유무를 보고 매 사이클 갱신한다.
+//   MAX_ROAD_WIDTH_LEFT  : d > 0 방향 상한
+//   MAX_ROAD_WIDTH_RIGHT : d < 0 방향 상한
+// 둘 다 0 이면 기존처럼 MAX_ROAD_WIDTH 로 좌우 대칭 동작한다.
+double MAX_ROAD_WIDTH_LEFT = 0.0;
+double MAX_ROAD_WIDTH_RIGHT = 0.0;
+double D_ROAD_W = 0.0;	   // road width sampling length [m]
+double DT = 0.0;			   // time tick [s]
+double MAXT = 0.0;		   // max prediction time [m]
+double MINT = 0.0;		   // min prediction time [m]
+// 모든 후보를 여기까지 그린다. Ti(회피 완료 시간)와 분리해, 짧은 Ti 로 빠르게
+// 비킨 뒤에도 경로가 장애물 너머까지 이어지게 만든다. 이 값이 장애물 거리보다
+// 짧으면 '경로가 닿지 않아 통과'하는 가짜 해가 생기므로 넉넉히 잡는다.
+double PLAN_HORIZON_T = 4.0;   // common planning horizon [s]
+bool SPATIAL_AVOIDANCE_ENABLED = false;
+double SPATIAL_MAX_LAT_ACCEL = 3.0;
+double SPATIAL_MAX_LAT_JERK = 8.0;
+double SPATIAL_MIN_TRANSITION_M = 10.0;
+double SPATIAL_MAX_TRANSITION_M = 32.0;
+double SPATIAL_SAMPLE_DS = 0.25;
+// ★ 다단(S자) 후보. 노드가 '장애물 묶음 뒤끝 + 여유' 의 절대 s 를 가까운 순으로
+//   넣어 준다(최대 2개). 후보는 첫 묶음 옆은 d1 으로 지나고, 그 뒤에서 d2
+//   (둘째 묶음 옆) 로 옮기거나 0 으로 복귀한다.
+//   예전 후보는 'c_d -> di 로 한 번 옮기고 지평 끝까지 유지' 한 가지였다.
+//   그래서 좌우로 엇갈린 두 장애물을 한 번에 피할 방법이 '둘째 장애물 바깥까지
+//   크게 나가기' 뿐이었다.
+//     실측 2026-09-25(15:49 백): 첫 장애물(idx 3088, 우측)은 좌측 1.0 m 면
+//     충분한데, 21 m 뒤 좌측 장애물(idx 3299, [+0.7,+3.0])이 충돌 기하에 들어오자
+//     d_end 가 +1.25 -> +4.0~5.25 로 튀었다. 차는 +3.77 m 까지 나갔다가 둘째
+//     장애물 우측으로 되돌아오지 못하고 idx 3248 에서 실패 -> 영구 정지.
+//     15:45 백도 같은 모양(+4.5 선택 후 전환).
+std::vector<double> SPATIAL_SWITCH_S;
+double SPATIAL_STAGE_D_STEP = 0.5;    // 2단 오프셋 샘플 간격(m)
+// 끝(복귀 뒤) 오프셋 |d| 에 거는 비용 비율(AVOID_EXCESS_COST 대비).
+// 첫 장애물 옆 오프셋이 같으면, 장애물을 지난 뒤 기준선으로 돌아오는 후보가
+// 싸다 - '회피 후 복귀하려는 경향'.
+double AVOID_FINAL_COST_RATIO = 0.5;
+// 다단 후보 평가 시간 상한(ms). 단일 후보는 이 상한과 무관하게 전부 평가한다.
+double SPATIAL_EVAL_BUDGET_MS = 40.0;
+// ★ 전환 길이 속도 하한(m/s). 전환 길이 = 속도 x 시간이라 정지 출발 직후
+//   (속도 ~0 -> 하한 0.5) 모든 후보가 최소 길이(6 m)로 급해졌다.
+//     실측 2026-09-25(16:56 백): 초록불 뒤 3 초 동안 6 m 안에 1.0~1.25 m 를
+//     옮기는 경로(곡률 0.19~0.24) -> MPC 곡률 속도 한계 3.1~4.7 m/s 에 묶였다.
+//     실제 차는 그 1.3 m 를 12 m 에 걸쳐 옮겼다(급한 계획의 이득 없음).
+//   곧 도달할 속도로 길이를 잡는다. 장애물이 가까워 완만한 후보가 막히면
+//   현재 속도 기준의 급한 후보(sharp)를 SPATIAL_SHARP_COST 를 얹어 예비로 쓴다.
+double SPATIAL_LENGTH_MIN_SPEED = 6.0;
+double SPATIAL_SHARP_COST = 2.0e5;
+// ★ 경로 최소 길이(m). 지평 = max(전환+12, v x 7 s) 가 저속·속도 잡음에서
+//   18~45 m 로 프레임마다 바뀌어, 35 m 앞 둘째 장애물이 경로 안/밖을 오갔다
+//   -> '첫 장애물 뒤 복귀' 와 'S자' 계획이 3.2 s 동안 64 프레임 중 23 번
+//   번갈았다(16:56 백). 기준경로 끝(s_dest)에서는 여전히 자른다.
+double SPATIAL_MIN_HORIZON_M = 40.0;
+// 직전 계획과 '첫 묶음 뒤 오프셋' 이 다른 후보에 얹는 비용(계획 유지).
+// 노드가 AVOID_PREV_SECOND 를 채운다(NaN 이면 적용 안 함).
+double SPATIAL_PLAN_CHANGE_COST = 1.5e5;
+double AVOID_PREV_SECOND = std::numeric_limits<double>::quiet_NaN();
+double TARGET_SPEED = 0.0;   // target speed [m/s]
+double D_T_S = 0.0;		   // target speed sampling length [m/s]
+double N_S_SAMPLE = 0.0;	   // sampling number of target speed
+double ROBOT_RADIUS = 0.0;   // robot radius [m]
+bool ESCAPE_TOLERANCE_ENABLED = true;
+double ESCAPE_MIN_RADIUS = 1.05;
+double ESCAPE_MARGIN = 0.05;
+double ROBOT_CIRCLE_OFFSET = 1.2; // circle spacing around body center [m]
+double ROBOT_FOOTPRINT_CENTER_OFFSET = 1.35; // body center ahead of base_link [m]
+// 정적 회피 커밋 상태. obstacle_avoidance_node 가 매 사이클 갱신한다.
+//   AVOID_LOCK_SIDE : +1 좌 / -1 우 / 0 자유
+//   AVOID_PREV_OFFSET : 직전에 채택된 종점 오프셋 d
+// 커밋 중에는 '이전보다 안쪽(중앙 쪽)' 후보를 아예 후보 목록에서 뺀다.
+// src_최적(kcity2026_stack) local_planner 와 같은 방식이다. 선택된 뒤에
+// 되돌리는 방식은 이미 있던 clamp 로직과 매 프레임 상쇄돼서(실측 2026-09-08:
+// HOLD 가 -1.00 을 peak -3.50 으로 올리면 CLAMP 가 그 변화를 급변으로 보고
+// 다시 잘라냄) 요동을 못 잡았다. 애초에 후보로 만들지 않는 편이 확실하다.
+double AVOID_PREV_OFFSET = 0.0;
+// 충돌 비용화 상수(src_최적 local_planner 와 같은 역할).
+//   COLLISION_FRAC_COST : 막힌 비율에 비례하는 연속 비용
+//   COLLISION_COST      : 최근 막혔던 오프셋에 얹는 고정 대형 비용
+//   COLLISION_HOLD_CYCLES : 그 기억을 유지할 사이클 수
+// 실측 2026-09-08: 후보 cost 가 45만 대였다(jerk 항 KLAT*Jp 가 지배).
+// 6000 은 그 1.3% 라 완전히 묻혀서, 충돌 없는 후보가 있는데도(clear=1)
+// frac=0.01 로 실제 부딪히는 d=0 직진이 계속 선택됐다.
+// 충돌은 어떤 승차감 비용보다도 비싸야 하므로 기존 스케일을 압도하게 잡는다.
+static const double COLLISION_FRAC_COST = 2.0e7;
+static const double COLLISION_COST = 5.0e7;
+static const int COLLISION_HOLD_CYCLES = 10;
+// Prefer a gentler collision-free candidate when the extra offset is small.
+static const double AVOID_CURVATURE_COST = 1.0e6;
+double AVOID_INWARD_MARGIN = 0.1;   // 이만큼은 안쪽으로 와도 허용(수치 흔들림)
+// ★ 회피량 최소화.
+//   "충돌하지 않는 후보 중 가장 안쪽(|d| 최소)" 을 고른다. 장애물을 피하는
+//   데 필요한 거리는 충돌 검사(collision_fraction, ROBOT_RADIUS 기준)가 이미
+//   판정하므로, 따로 '필요량'을 계산해 넘길 필요가 없다 - 충돌만 안 나면
+//   그게 곧 지나갈 수 있는 경로다. 장애물 두 개 사이의 틈이 차폭보다 넓으면
+//   그 틈을 지나는 후보도 frac=0 이 되어 자연히 후보에 남는다.
+//     실측 2026-09-09: 폭 1.3~1.4m 장애물을 피하는 데 d=-4.6m 까지 나갔다.
+//     cf 는 jerk 지배(45만 규모)라 KD*d^2 (d=4.6 에서 31점)가 완전히 묻힌다.
+//     그래서 '충돌만 피하면 얼마나 나가든 비용이 같은' 상태였다.
+//   이 값은 |d| 1m 당 비용이다. cf 와 같은 규모로 두어 실제로 선택을 바꾸되,
+//   충돌 비용(2e7)보다는 훨씬 작아야 한다 - 크면 '부딪히더라도 안쪽으로'
+//   가 되어 버린다.
+double AVOID_EXCESS_COST = 3.0e5;
+// 커밋된 회피 방향과 반대쪽으로 넘어가는 후보에 거는 벌점.
+//   실측 2026-09-21(18:46 백): 한 번 좌/우를 정한 뒤에도 d_end 가
+//   -3.00 -> -2.50 -> +2.75 로 반대편까지 넘어갔다(주행 중 5회).
+//   방향이 뒤집힐 때마다 경로가 끊겨 MPC 가 멈췄다 가다를 반복했다.
+//   원인: 앞 장애물을 지나친 뒤(ego_x 음수) 그게 목록에서 빠지면서
+//   락이 풀리고, 다음 물체 기준으로 반대편이 |d| 최소가 되어 뒤집힌다.
+// 충돌 비용(2e7)보다는 작아야 한다 - 크면 '부딪히더라도 원래 방향으로'
+// 가 된다. AVOID_EXCESS_COST(3e5) 보다는 충분히 커서 |d| 최소화가
+// 방향을 뒤집지는 못하게 한다.
+double AVOID_SIDE_FLIP_COST = 5.0e6;
+int AVOID_LOCK_SIDE = 0;
+// ★ 경로점별 연석 검사.
+//   MAX_ROAD_WIDTH_RIGHT/LEFT 는 후보의 '끝점 di' 범위만 제한한다. 그런데
+//   경로는 여러 idx 구간에 걸쳐 있어서, 개방 구간(삼거리)에서 시작한 경로가
+//   제한 구간(연석)을 그대로 관통할 수 있다.
+//     실측 2026-09-22(17:19:35 백): 자차 idx 3300(개방구간, 우측상한 3.5)
+//     에서 d=-3.50 경로를 냈는데 그 경로 범위가 idx 3308~3596 이었다.
+//     끝점 3596 은 연석 구간(3365~3700) 한가운데다. 차는 그 경로를 따라가
+//     경계를 1.53 m 우측 이탈한 채 넘었고, 점군상 우측 저상 구조물이
+//     차체에서 0.04~0.32 m 거리였다(연석 올라탐).
+//   그래서 후보의 '모든 점'에 대해 그 점이 속한 idx 구간의 상한을 조회해
+//   위반 비율을 내고 비용에 반영한다. 장애물의 collision_fraction 과
+//   같은 구조다.
+//   비용 크기는 AVOID_EXCESS_COST(3e5) 보다 크고 COLLISION_COST(5e7)
+//   보다 작게 둔다 - '연석 밟느니 다른 경로'이되 '연석 밟느니 장애물
+//   충돌'은 아니게 하기 위해서다.
+double CURB_VIOLATION_COST = 8.0e6;
+// [idx_start, idx_end, right_m, left_m] * N. obstacle_avoidance_node 의
+// road_width_zones_ 를 그대로 받는다. 비어 있으면 검사하지 않는다.
+std::vector<double> CURB_ZONES;
+// ★ 연속 곡선 형태의 회피 폭 상한. [idx, right_m, left_m] * N (idx 오름차순).
+//   구간(CURB_ZONES)은 2.5 m 칸마다 값이 계단처럼 바뀌어, 칸 경계에서 한계가
+//   갑자기 0.1~0.9 m 씩 뛰었다(교차로 모서리 2.65 -> 개방 3.5). 곡선이면
+//   연석이 휘는 모양대로 한계도 서서히 바뀐다. 비어 있으면 CURB_ZONES 를 쓴다.
+std::vector<double> CURB_PROFILE;
+
+// 회피 폭 상한 조회(노드와 공유). 곡선이 있으면 선형 보간, 없으면 구간값.
+// 반환 false = 이 idx 에는 정의가 없음(제한 없음). right/left 0 이하 = 제한 없음.
+bool road_width_at(const std::vector<double> &profile, const std::vector<double> &zones,
+	int idx, double &right, double &left)
+{
+	if (profile.size() >= 6)
+	{
+		const std::size_t n = profile.size() / 3;
+		if (idx < profile[0] || idx > profile[(n - 1) * 3])
+			return false;
+		// 이분 탐색: profile[k*3] <= idx <= profile[(k+1)*3] 인 k
+		std::size_t lo = 0, hi = n - 1;
+		while (hi - lo > 1)
+		{
+			const std::size_t mid = (lo + hi) / 2;
+			if (profile[mid * 3] <= idx) lo = mid; else hi = mid;
+		}
+		const double i0 = profile[lo * 3], i1 = profile[hi * 3];
+		const double f = (i1 > i0) ? (idx - i0) / (i1 - i0) : 0.0;
+		right = profile[lo * 3 + 1] + f * (profile[hi * 3 + 1] - profile[lo * 3 + 1]);
+		left = profile[lo * 3 + 2] + f * (profile[hi * 3 + 2] - profile[lo * 3 + 2]);
+		return true;
+	}
+	for (std::size_t z = 0; z + 3 < zones.size(); z += 4)
+	{
+		if (idx < static_cast<int>(zones[z]) || idx > static_cast<int>(zones[z + 1]))
+			continue;
+		right = zones[z + 2];
+		left = zones[z + 3];
+		return true;
+	}
+	return false;
+}
+// 경로점의 s(누적거리, m)를 CSV idx 로 바꾸는 계수와 기준.
+// CSV 간격은 0.1 m/idx 이므로 idx = CURB_S0_IDX + s_rel / 0.1.
+double CURB_S_ORIGIN = 0.0;   // 경로 s 의 기준점(m)
+int    CURB_S0_IDX = -1;      // 그 기준점의 CSV idx. 음수면 검사 안 함
+double CURB_IDX_PER_M = 10.0; // 1 m 당 idx (CSV 0.1 m 간격)
+// ★ 연석 검사에서 '복귀'를 모델링한다.
+//   후보 경로는 횡오프셋을 지평 끝(~49 m)까지 그대로 유지한 채 그려진다.
+//   실제 차는 마지막 장애물을 passed_release_margin(2.5 m) 지난 뒤 복귀
+//   경로(calc_direct, d -> 0)로 바뀐다. 오프셋을 유지한 꼬리를 그대로 검사하면
+//   실제로 안 달릴 구간이 다음 연석 구간에 걸려 후보가 탈락한다.
+//     실측 2026-09-23(16:35:57 백): 장애물 idx 3190(교차로, 우측 개방).
+//     우측 필요 1.0~1.4 m, 좌측 3.1~3.3 m. 우측 -1.25/-1.50/-1.75 후보는
+//     충돌 0 인데 꼬리(idx ~3377)가 연석 구간 C(3365~, 우측 1.00)에 걸려
+//     curb=0.035~0.045 로 전부 제외 -> 남은 우측 -1.00 은 장애물 폭 추정이
+//     0.27 m 커지자 충돌 -> 좌측 +3.25 선택 후 락.
+//   반대로 검사를 그냥 잘라버리면 '장애물 직후 연석이 붙어 있어 복귀가 안
+//   끝나는' 경우를 못 막는다(16:04:23: 장애물 3260, C구간 3365 까지 10 m).
+//   그래서 CURB_RETURN_START_S 이후 점은 노드의 복귀 규칙과 같은 5차 복귀
+//   곡선(T = max(T_MIN, |d|*LAT_SCALE), 상한 T_MAX, 길이 v*T)으로 d 를
+//   줄여 가며 검사한다. 음수면 복귀 모델 없이 전 구간 그대로 검사한다.
+double CURB_RETURN_START_S = -1.0;
+double CURB_RETURN_T_MIN = 2.0;
+double CURB_RETURN_T_MAX = 7.2;
+double CURB_RETURN_LAT_SCALE = 1.0;
+// ★ 이미 한계 밖에 있을 때의 복귀 여유(m).
+//   후보는 모두 자차 현재 횡위치에서 시작한다. 차가 추종오차로 한계를 몇 cm
+//   만 넘어 있어도 모든 후보의 첫 점이 '연석 위반'이 되어 전부 탈락하고
+//   정지했다(09-23 16:50:00 백 리플레이: 자차 -1.8~-2.0, 한계 1.75).
+//   그래서 허용 경계를 '현재 횡위치'에서 시작해 이 거리 동안 구간 한계로
+//   선형으로 조인다. 안쪽으로 돌아오는 후보는 통과하고, 밖에 머물거나 더
+//   나가는 후보는 여전히 탈락한다.
+double CURB_RECOVER_M = 8.0;
+// ★ 연석 제한구역 전 구간 최근접 거리 검사 (2026-09-28).
+//   위 점별 검사는 경로점과 '같은 idx' 의 한계만 본다. 연석이 꺾이는 곳
+//   (교차로 모서리, 좁아지는 칸)에서는 차가 몇 m 앞뒤의 연석에 더 가깝다.
+//   그래서 경로점마다 앞뒤 CURB_CLEARANCE_M 안의 '제한구역' 연석선
+//   (= 한계 + CURB_CLEARANCE_M, 프로파일 산출식 연석 - 1.10 의 역) 전부와
+//   (s,d) 최근접 거리를 재서 CURB_CLEARANCE_M 보다 가까우면 침범(탈락)이다.
+//   한계가 CURB_OPEN_RIGHT/LEFT 이상인 칸은 연석 없음(개방)이라 보지 않는다 -
+//   개방 구간의 우측 경로를 막지 않기 위해서다. 가중치(근접 벌점)는 없다.
+bool   CURB_CORRIDOR_CHECK = true;
+double CURB_CLEARANCE_M = 1.10;
+double CURB_OPEN_RIGHT = 3.5;
+double CURB_OPEN_LEFT = 6.0;
+// 마지막 frenet_optimal_planning 호출이 '고정 방향 전부 막힘 -> 반대편
+// 비상경로' 를 썼는지. 노드가 방향 전환 판단에 쓴다.
+bool   LAST_PLAN_OPPOSITE_FALLBACK = false;
+double MIN_LAT_VEL = 0.0;	   // minimum lateral speed. Sampling for d_dot
+double MAX_LAT_VEL = 0.0;	   // maxmum lateral speed. Sampling for d_dot
+double D_D_NS = 0.0;		   // Step size for sampling of d_dot
+double MAX_SHIFT_D = 0.0;	   // Sampling width for s
+
+double KJ = 0.0;
+double KT = 0.0;
+double KD = 0.0;
+double KD_V = 0.0;
+double KLAT = 0.0;
+double KLON = 0.0;
+bool STOP_CAR = false;
+double s_dest = 0.0;
+
+int cnt111 = 0;
+int cnt222 = 0;
+// Waypoints
+vector<double> W_X;
+vector<double> W_Y;
+
+// vector<double> ob_x; // x coordinates of the obstacles
+// vector<double> ob_y; // y coordinates of the obstacles
+
+nav_msgs::Odometry odom;
+nav_msgs::OccupancyGrid cmap;
+geometry_msgs::PolygonStamped footprint;
+
+template <class T>
+ostream &operator<<(ostream &os, vector<T> V)
+{
+	os << "[ ";
+	for (auto v : V)
+		os << v << " ";
+	return os << "]";
+}
+
+#define trace(...) 42
+ostream &operator<<(ostream &os, const FrenetPath &fp)
+{
+	trace(fp.t);
+	trace(fp.d);
+	trace(fp.d_d);
+	trace(fp.d_dd);
+	trace(fp.d_ddd);
+	trace(fp.s);
+	trace(fp.s_d);
+	trace(fp.s_dd);
+	trace(fp.s_ddd);
+	trace(fp.x);
+	trace(fp.y);
+	trace(fp.yaw);
+	trace(fp.ds);
+	return os;
+}
+
+// convert the frenet path to global frame
+FrenetPath calc_global_path(FrenetPath fp, Spline2D csp)
+{
+	fp.adding_global_path(csp);
+	return fp;
+}
+
+FrenetPath calc_global_path_2(FrenetPath fp, Spline2D csp, int a)
+{
+	fp.adding_global_path_2(csp, a);
+	return fp;
+}
+
+void FrenetPath::adding_global_path(Spline2D &csp)
+{
+	int n = s.size();
+	x.resize(n);
+	y.resize(n);
+	// ★ s 가 전역경로 끝을 넘어가면 그 지점에서 자른다.
+	//   예전에는 여기서 곧바로 return 했는데, x/y 는 이미 resize(n) 으로
+	//   0 초기화된 상태라 나머지 원소가 (0,0) 인 채 그대로 발행됐다.
+	//     실측 2026-09-22(18:04 백): 437 프레임 중 6프레임(1.4%)에서
+	//     /local_path 뒤쪽 17점이 전부 (0,0) 이었다(n=71, 54번째부터).
+	//     map 좌표가 (302533, 4123997) 인 경로에 원점이 붙으니 MPC 의
+	//     polyfit 이 그 점들까지 물고 계수가 망가진다.
+	//   채워진 데까지만 남기면 짧은 경로가 될 뿐이라 안전하다
+	//   (path_end_stop 이 점 개수 부족을 따로 처리한다).
+	int filled = n;
+	for (int i = 0; i < n; i++)
+	{
+		double ix, iy;
+		csp.calc_position(ix, iy, s[i]);
+		if (ix == NONE)
+		{
+			filled = i;
+			break;
+		}
+		double iyaw = csp.calc_yaw(s[i]);
+		double fx = ix - d[i] * sin(iyaw);
+		double fy = iy + d[i] * cos(iyaw);
+		x[i] = (fx);
+		y[i] = (fy);
+	}
+	if (filled < n)
+	{
+		x.resize(filled);
+		y.resize(filled);
+		n = filled;
+		if (n < 2)
+		{
+			yaw.clear(); ds.clear(); c.clear();
+			return;
+		}
+	}
+	yaw.resize(n - 1);
+	ds.resize(n - 1);
+
+	for (int i = 0; i < n - 1; i++)
+	{
+		double dx = x[i + 1] - x[i];
+		double dy = y[i + 1] - y[i];
+		yaw[i] = std::atan2(dy, dx);
+
+		ds[i] = (sqrt(dx * dx + dy * dy));
+	}
+	// Compute curvature for full-length paths as well as truncated paths.
+	// Returning here when s.size() == x.size() left c empty for virtually
+	// every valid avoidance candidate, bypassing the curvature check.
+	c.resize((n - 1) - 1);
+	for (int i = 0; i < (n - 1) - 1; i++)
+	{
+		if (ds[i] != 0)
+		{
+			const double dyaw = yaw[i + 1] - yaw[i];
+			c[i] = std::atan2(std::sin(dyaw), std::cos(dyaw)) / ds[i];
+		}
+		else
+		{
+			c[i] = FLT_MAX;
+		}
+	}
+}
+
+void FrenetPath::adding_global_path_2(Spline2D csp, int a)
+{
+	int n = s.size();
+	x.resize(n);
+	y.resize(n);
+	for (int i = 0; i < n; i++)
+	{
+		double ix, iy;
+		csp.calc_position(ix, iy, s[i]);
+		if (ix == NONE)
+		{
+			return;
+		}
+		double iyaw = csp.calc_yaw(s[i]);
+		double fx = ix - (d[i]-a) * sin(iyaw);
+		double fy = iy + (d[i]-a) * cos(iyaw);
+		x[i] = (fx);
+		y[i] = (fy);
+	}
+	yaw.resize(n - 1);
+	ds.resize(n - 1);
+
+	for (int i = 0; i < n - 1; i++)
+	{
+		double dx = x[i + 1] - x[i];
+		double dy = y[i + 1] - y[i];
+		if (abs(dx) > 0.0001)
+		{
+			yaw[i] = (atan2(dy, dx));
+		}
+		else
+		{
+			yaw[i] = 0;
+		}
+
+		ds[i] = (sqrt(dx * dx + dy * dy));
+	}
+	// To remove paths whose predicted s goes out of bounds of global path.
+	if (s.size() == x.size())
+	{
+		return;
+	}
+	c.resize((n - 1) - 1);
+	for (int i = 0; i < (n - 1) - 1; i++)
+	{
+		if (ds[i] != 0)
+			c[i] = ((yaw[i + 1] - yaw[i]) / ds[i]);
+		else
+		{
+			c[i] = FLT_MAX;
+		}
+	}
+}
+
+// check for specified velocity, acceleration, curvature constraints and collisions
+bool check_path(FrenetPath fp, double bot_yaw, double yaw_error, double pose_x, double pose_y, vecD ob_x, vecD ob_y,
+				double obst_r)
+{
+	int flag = 0;
+	vecD path_yaw = fp.get_yaw();
+	if (path_yaw.size() == 0)
+		return 0;
+	if ((path_yaw[0] - bot_yaw) > yaw_error || (path_yaw[0] - bot_yaw) < -yaw_error) // 20 deg
+	{
+
+		flag = 1;
+	}
+	if (flag == 1)
+	{
+		return 0;
+	}
+	else if (fp.check_collision(pose_x, pose_y, ob_x, ob_y, obst_r) == 0)
+	{
+		return 1;
+	}
+	// 후보 하나 거부될 때마다(정상적으로 한 사이클에 수십 번) 찍히던 스팸 로그.
+	// ROS_INFO_THROTTLE 기반 디버그 로그(d_end, rejected path 등)로 이미 충분히
+	// 진단 가능해서 제거 - 터미널이 이 로그로 도배돼서 정작 필요한 로그를 못 봄.
+	return 0;
+}
+
+// transforms robot's footprint
+vector<geometry_msgs::Point32> transformation(vector<geometry_msgs::Point32> fp,
+											  geometry_msgs::Pose cp, double px, double py, double pyaw)
+{
+	vector<geometry_msgs::Point32> new_fp(fp.size());
+	tf::Quaternion qb(cp.orientation.x, cp.orientation.y, cp.orientation.z, cp.orientation.w);
+	tf::Matrix3x3 mb(qb);
+	double broll, bpitch, byaw;
+	mb.getRPY(broll, bpitch, byaw);
+	double bx, by;
+	bx = cp.position.x;
+	by = cp.position.y;
+	double x, y, theta;
+	theta = pyaw - byaw;
+	x = px - bx;
+	y = py - by;
+	int n = new_fp.size();
+	for (int i = 0; i < n; i++)
+	{
+		new_fp[i].x = (fp[i].x - bx) * cos(theta) + (fp[i].y - by) * sin(theta) + x + bx;
+		new_fp[i].y = -(fp[i].x - bx) * sin(theta) + (fp[i].y - by) * cos(theta) + y + by;
+	}
+	return new_fp;
+}
+
+// returns distance between two points
+#pragma omp declare simd
+double dist(double x1, double y1, double x2, double y2)
+{
+	return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+}
+
+//check collision against every obstacle point (linear scan)
+// ★ 장애물 점 격자 색인. 경로가 40 m 로 길어지고 충돌 코리도(7.5 m) 안
+//   노변 점이 많아 후보 하나 검사에 수 ms 가 걸렸다(09-23 16:49/16:50 백
+//   리플레이 계획 p95 125 ms > 계획주기 50 ms). frenet_optimal_planning 이
+//   그 호출의 ob_x/ob_y 로 한 번 만들고, 같은 벡터로 들어온 검사만 격자를 쓴다
+//   (노드가 따로 부르는 검사는 기존 선형 탐색).
+struct ObGrid
+{
+	const double *px = nullptr, *py = nullptr;
+	size_t n = 0;
+	double cell = 2.0;
+	std::unordered_map<long long, std::vector<int>> cells;
+	static long long key(long ix, long iy) { return (static_cast<long long>(ix) << 32) ^ static_cast<unsigned int>(iy); }
+	void build(const vecD &x, const vecD &y)
+	{
+		px = x.data(); py = y.data(); n = std::min(x.size(), y.size());
+		cells.clear();
+		for (size_t i = 0; i < n; ++i)
+			cells[key(static_cast<long>(std::floor(x[i] / cell)), static_cast<long>(std::floor(y[i] / cell)))].push_back(static_cast<int>(i));
+	}
+	void clear() { px = py = nullptr; n = 0; cells.clear(); }
+	bool matches(const vecD &x, const vecD &y) const
+	{
+		return px != nullptr && px == x.data() && py == y.data() && n == std::min(x.size(), y.size());
+	}
+};
+static ObGrid g_ob_grid;
+
+// ★ 탈출 허용(2026-09-28, 12:55 백).
+//   모든 후보는 현재 위치에서 시작한다. 옆을 지나는 중 장애물 추정이 경로 쪽으로
+//   커져(안쪽 끝 1.03 -> 0.27 m) 현재 위치가 이미 충돌 반경(ROBOT_RADIUS) 안이 되면,
+//   1025 개 후보가 전부 첫 점부터 충돌 -> avoidance_failed -> 정지 -> 옆에 계속
+//   있으니 영구 정지했다(실제 차체 간격 약 0.3 m).
+//   차 앞원 중심보다 뒤(옆/뒤)에 있고 이미 반경 안인 점만, 그 점의 반경을
+//   '현재 거리 - ESCAPE_MARGIN'(물리 하한 ESCAPE_MIN_RADIUS 이상)으로 낮춘다. 그러면
+//   지금보다 가까워지지 않는 경로만 통과한다. 앞쪽 점은 그대로 ROBOT_RADIUS.
+//   컨텍스트는 특정 ob 벡터(데이터 포인터)에만 적용된다.
+struct EscapeCtx
+{
+	const double *px = nullptr;
+	size_t n = 0;
+	std::vector<double> r;
+};
+static EscapeCtx g_escape;
+
+void set_escape_context(const vecD &ob_x, const vecD &ob_y,
+	double pose_x, double pose_y, double yaw)
+{
+	g_escape.px = nullptr; g_escape.n = 0; g_escape.r.clear();
+	if (!ESCAPE_TOLERANCE_ENABLED || ROBOT_RADIUS <= 0.0 || ob_x.empty())
+		return;
+	const double cy = std::cos(yaw), sy = std::sin(yaw);
+	const double front_circle = ROBOT_FOOTPRINT_CENTER_OFFSET + ROBOT_CIRCLE_OFFSET;
+	const size_t n = std::min(ob_x.size(), ob_y.size());
+	std::vector<double> radii(n, ROBOT_RADIUS);
+	bool any = false;
+	for (size_t i = 0; i < n; ++i)
+	{
+		const double dx = ob_x[i] - pose_x, dy = ob_y[i] - pose_y;
+		if (cy * dx + sy * dy > front_circle) continue;
+		double d0 = 1e18;
+		for (double body_offset : {-ROBOT_CIRCLE_OFFSET, 0.0, ROBOT_CIRCLE_OFFSET})
+		{
+			const double off = ROBOT_FOOTPRINT_CENTER_OFFSET + body_offset;
+			d0 = std::min(d0, std::hypot(pose_x + off * cy - ob_x[i], pose_y + off * sy - ob_y[i]));
+		}
+		if (d0 >= ROBOT_RADIUS) continue;
+		const double ri = std::max(ESCAPE_MIN_RADIUS, d0 - ESCAPE_MARGIN);
+		if (ri < ROBOT_RADIUS) { radii[i] = ri; any = true; }
+	}
+	if (!any) return;
+	g_escape.px = ob_x.data(); g_escape.n = n; g_escape.r = std::move(radii);
+}
+
+void clear_escape_context()
+{
+	g_escape.px = nullptr; g_escape.n = 0; g_escape.r.clear();
+}
+
+static inline double escapeRadius(const vecD &ob_x, size_t i, double obst_r)
+{
+	if (g_escape.px == nullptr || g_escape.px != ob_x.data() || i >= g_escape.n)
+		return obst_r;
+	return std::min(obst_r, g_escape.r[i]);
+}
+
+bool point_obcheck(double pose_x, double pose_y,
+	const vecD& ob_x, const vecD& ob_y, double obst_r)
+{
+	if (g_ob_grid.matches(ob_x, ob_y))
+	{
+		const double c = g_ob_grid.cell;
+		const long r = static_cast<long>(std::ceil(obst_r / c));
+		const long cx = static_cast<long>(std::floor(pose_x / c));
+		const long cy = static_cast<long>(std::floor(pose_y / c));
+		for (long ix = cx - r; ix <= cx + r; ++ix)
+			for (long iy = cy - r; iy <= cy + r; ++iy)
+			{
+				auto it = g_ob_grid.cells.find(ObGrid::key(ix, iy));
+				if (it == g_ob_grid.cells.end()) continue;
+				for (int i : it->second)
+					if (dist(pose_x, pose_y, ob_x[i], ob_y[i]) < escapeRadius(ob_x, i, obst_r))
+						return 1;
+			}
+		return 0;
+	}
+	if (ob_x.size() == 0)
+	{
+		return 0;
+	}
+	// 원래 lower_bound로 ob_x/ob_y를 이진탐색했는데, 그건 ob_x가 정렬돼
+	// 있어야만 유효함. 실제로 obstacle_avoidance_node에서 넘어오는 ob_x는
+	// 장애물 경계를 각도 순서(cos(ang))로 채운 것이라 정렬돼있지 않아서
+	// 완전히 엉뚱한 "최근접점"을 골라 충돌을 못 잡는 버그가 있었음.
+	// 점 개수가 몇 개(장애물당 <10개) 안 되므로 그냥 전체를 선형 탐색해서
+	// 진짜 최근접 거리로 판정한다.
+	for (size_t i = 0; i < ob_x.size(); ++i)
+	{
+		if (dist(pose_x, pose_y, ob_x[i], ob_y[i]) < escapeRadius(ob_x, i, obst_r))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// Approximate the 4.8 m x 2.1 m visualization footprint with three overlapping
+// circles.  base_link is near the rear axle, so the body center is 1.35 m
+// forward rather than symmetric around the reference point.  At radius 1.4 m
+// and spacing 1.2 m the envelope is about [-1.25, +3.95] m longitudinally.
+static bool footprint_obcheck(double pose_x, double pose_y, double pose_yaw,
+                              const vecD& ob_x, const vecD& ob_y,
+                              double radius)
+{
+    const double c = std::cos(pose_yaw), s = std::sin(pose_yaw);
+    for (double body_offset : {-ROBOT_CIRCLE_OFFSET, 0.0, ROBOT_CIRCLE_OFFSET})
+    {
+        const double offset = ROBOT_FOOTPRINT_CENTER_OFFSET + body_offset;
+        if (point_obcheck(pose_x + offset*c, pose_y + offset*s,
+                          ob_x, ob_y, radius))
+            return true;
+    }
+    return false;
+}
+
+// checks for collision of the bot
+// 경로 점 중 몇 %에서 차량 footprint가 장애물과 겹치는지. 0만 주행 가능하다.
+// 양수 값은 후보가 얼마나 막혔는지 진단하고 일시적 검출 흔들림을 홀드하는 데 쓴다.
+double FrenetPath::collision_fraction(const vecD& ob_x, const vecD& ob_y,
+	double obst_r) const
+{
+	if (ob_x.empty() || x.empty())
+		return 0.0;
+	if (s.size() != x.size())
+		return 1.0;
+	size_t n = std::min(x.size(), yaw.size());
+	if (n == 0)
+		return 1.0;
+	int hits = 0;
+	for (size_t i = 0; i < n; i++)
+		if (footprint_obcheck(x[i], y[i], yaw[i], ob_x, ob_y, obst_r))
+			hits++;
+	return static_cast<double>(hits) / static_cast<double>(n);
+}
+
+bool FrenetPath::collides(const vecD& ob_x, const vecD& ob_y, double obst_r) const
+{
+	if (ob_x.empty() || x.empty())
+		return false;
+	if (s.size() != x.size())
+		return true;
+	const size_t n = std::min(x.size(), yaw.size());
+	if (n == 0)
+		return true;
+	for (size_t i = 0; i < n; i++)
+		if (footprint_obcheck(x[i], y[i], yaw[i], ob_x, ob_y, obst_r))
+			return true;
+	return false;
+}
+
+// (s,d) 점이 앞뒤 CURB_CLEARANCE_M 안의 연석 제한구역 연석선에
+// CURB_CLEARANCE_M 보다 가까운지. 개방 칸(한계 >= OPEN)은 건너뛴다.
+static bool curbCorridorHit(double di, int idx_pt)
+{
+	const double clr = CURB_CLEARANCE_M;
+	const int w = static_cast<int>(std::ceil(clr * CURB_IDX_PER_M));
+	const int step = std::max(1, static_cast<int>(std::lround(0.2 * CURB_IDX_PER_M)));
+	for (int j = idx_pt - w; j <= idx_pt + w; j += step)
+	{
+		double right = 0.0, left = 0.0;
+		if (!road_width_at(CURB_PROFILE, CURB_ZONES, j, right, left))
+			continue;
+		double curb_d;
+		if (di < 0.0)
+		{
+			if (right <= 0.0 || right >= CURB_OPEN_RIGHT - 1e-3)
+				continue;
+			curb_d = -(right + clr);
+		}
+		else
+		{
+			if (left <= 0.0 || left >= CURB_OPEN_LEFT - 1e-3)
+				continue;
+			curb_d = left + clr;
+		}
+		const double ds = (j - idx_pt) / CURB_IDX_PER_M;
+		const double dd = di - curb_d;
+		if (ds * ds + dd * dd < (clr - 1e-3) * (clr - 1e-3))
+			return true;
+	}
+	return false;
+}
+
+// 경로점 중 몇 %가 그 지점의 연석 상한을 넘는지. 0 이면 전 구간 통과.
+// s(누적거리)로 각 점의 CSV idx 를 구하고, 그 idx 가 속한 구간의 상한과
+// 그 점의 d 를 비교한다. 구간이 없으면 그 점은 제한 없음으로 본다.
+double FrenetPath::curb_violation_fraction() const
+{
+	if ((CURB_ZONES.size() < 4 && CURB_PROFILE.size() < 6) || CURB_S0_IDX < 0)
+		return 0.0;
+	const size_t n = std::min(d.size(), s.size());
+	if (n == 0)
+		return 0.0;
+	int hits = 0;
+	double ret_len = -1.0, ret_d0 = 0.0;
+	// 다단 후보는 복귀/전환을 경로에 직접 담고 있다. 가상 복귀는 그 마지막
+	// 전환이 끝난 뒤부터만 적용한다(끝 오프셋이 0 이면 사실상 무효).
+	double ret_start = CURB_RETURN_START_S;
+	if (ret_start > 0.0 && stage_d.size() > 1)
+		ret_start = std::max(ret_start, stage_end_s);
+	for (size_t i = 0; i < n; i++)
+	{
+		double di = d[i];
+		if (ret_start > 0.0 && s[i] > ret_start)
+		{
+			if (ret_len < 0.0)
+			{
+				// 복귀 시작 시점의 오프셋과 복귀 길이(한 번만 계산)
+				ret_d0 = (i > 0) ? d[i - 1] : d[i];
+				const double v = std::max(0.5, (i < s_d.size()) ? s_d[i] : 0.5);
+				const double T = std::min(CURB_RETURN_T_MAX,
+					std::max(CURB_RETURN_T_MIN, std::abs(ret_d0) * CURB_RETURN_LAT_SCALE));
+				ret_len = std::max(1.0, v * T);
+			}
+			const double q = (s[i] - ret_start) / ret_len;
+			if (q >= 1.0)
+				break;   // 복귀 완료(d=0) - 이후 점은 연석과 무관
+			const double h = q * q * q * (10.0 - 15.0 * q + 6.0 * q * q);
+			di = ret_d0 * (1.0 - h);
+		}
+		const int idx = CURB_S0_IDX +
+			static_cast<int>(std::lround((s[i] - CURB_S_ORIGIN) * CURB_IDX_PER_M));
+		double right = 0.0, left = 0.0;
+		if (road_width_at(CURB_PROFILE, CURB_ZONES, idx, right, left))
+		{
+			// 현재 위치가 한계 밖이면 복귀 거리 동안 경계를 풀어 준다.
+			// 복귀 허용 거리는 첫 전환 길이 이상. 전환이 이보다 길면 한계 밖에서
+			// 돌아오는 도중의 점이 위반으로 잡혀 복귀 경로가 거부됐다
+			// (리플레이 2026-09-25, 09-23 17:46 백: curb=0.006 -> 8.5 s 실패).
+			const double recover = std::max(CURB_RECOVER_M, first_len);
+			const double decay = std::max(0.0, 1.0 - (s[i] - s[0]) / std::max(0.1, recover));
+			// 시작 기울기가 바깥쪽이면 곡선이 잠깐 더 나갔다 들어오므로 0.3 m 여유.
+			if (right > 0.0 && -d[0] > right - 0.3)
+				right = std::max(right, right + (-d[0] + 0.3 - right) * decay);
+			if (left > 0.0 && d[0] > left - 0.3)
+				left = std::max(left, left + (d[0] + 0.3 - left) * decay);
+			// d > 0 이 좌측(adding_global_path 의 fx = ix - d*sin(yaw)).
+			if ((right > 0.0 && di < -right) ||
+				(left > 0.0 && di > left))
+			{
+				hits++;
+				continue;
+			}
+			// 복귀 여유가 걸린 점(시작이 한계 근처/밖)은 위 완화 규칙만 쓴다.
+			const bool relaxed = decay > 0.0 &&
+				((di < 0.0 && -d[0] > right - 0.3) || (di > 0.0 && d[0] > left - 0.3));
+			if (CURB_CORRIDOR_CHECK && !relaxed && std::abs(di) > 0.3 &&
+				curbCorridorHit(di, idx))
+				hits++;
+		}
+	}
+	return static_cast<double>(hits) / static_cast<double>(n);
+}
+
+double path_max_curvature(FrenetPath &fp)
+{
+	const vecD c = fp.get_c();
+	const vecD s = fp.get_s();
+	double m = 0.0;
+	for (size_t k = 0; k < c.size(); ++k)
+	{
+		if (s_dest > 0.0 && k < s.size() && s[k] > s_dest - 1.5)
+			continue;
+		if (!std::isfinite(c[k]))
+			return std::numeric_limits<double>::infinity();
+		m = std::max(m, std::abs(c[k]));
+	}
+	return m;
+}
+
+// 오프셋별 '최근 충돌' 기억. 한 번 막힌 오프셋은 이 사이클 수만큼 비싸게
+// 유지해서, 충돌 검사가 프레임마다 흔들려도 방금 버린 후보로 바로 못
+// 돌아오게 한다(src_최적 COLLISION_HOLD_CYCLES 와 같은 역할).
+static std::map<int, int> g_collision_hold;
+static int quantize_offset(double d) { return static_cast<int>(std::lround(d / 0.25)); }
+
+bool FrenetPath::check_collision(double pose_x, double pose_y,
+	const vecD& ob_x, const vecD& ob_y, double obst_r)
+{
+	if (s.size() != x.size())
+	{
+		return 1;
+	}
+	for (unsigned int i = 0; i < min(x.size(), yaw.size()); i++)
+	{
+		// vector<geometry_msgs::Point32> trans_footprint = transformation(footprint.polygon.points,
+		// 																odom.pose.pose, x[i], y[i], yaw[i]);
+		// for (unsigned int j = 0; j < trans_footprint.size(); j++)
+		// {
+			// 후보 경로의 실제 지점(x[i], y[i])을 검사해야 하는데 ego의 현재
+			// 고정 위치(pose_x, pose_y)를 계속 검사하고 있었음 -> 장애물에
+			// 가까워지면 좌우 오프셋과 상관없이 모든 후보가 충돌 판정되어
+			// 회피 경로를 못 찾고 그대로 정지하는 버그였음.
+			if (footprint_obcheck(x[i], y[i], yaw[i], ob_x, ob_y, obst_r))
+			{
+				return 1;
+			}
+		// }
+	}
+	return 0;
+}
+
+//comparator function for sorting FrenetPaths on cost
+inline bool sortByCost(FrenetPath &a, FrenetPath &b)
+{
+	if (a.get_cf() != b.get_cf())
+	{
+		return a.get_cf() < b.get_cf();
+	}
+	else
+	{
+		double jerkCost1, jerkCost2;
+		jerkCost1 = KLAT * a.get_Jp() + KLON * a.get_Js();
+		jerkCost2 = KLAT * b.get_Jp() + KLON * b.get_Js();
+		return jerkCost1 < jerkCost2;
+	}
+}
+
+
+// //helper function to plot path
+// void FrenetPath::plot_path()
+// {
+// 	plt::plot(x, y);
+// 	plt::pause(0.001);
+// }
+
+// //helper function to plot velocity profile
+// void FrenetPath::plot_velocity_profile()
+// {
+// 	plt::plot(t, s_d);
+// 	plt::pause(0.001);
+// }
+
+// static int flag_for_display_paths = 0;
+
+// //helper function to display paths
+// void display_paths(vector<FrenetPath> fplist)
+// {
+// 	plt::ion();
+// 	plt::show();
+// 	int count = 0;
+// 	for (auto &fp : fplist)
+// 	{
+// 		if (count % 50 == 0 && flag_for_display_paths)
+// 		{
+// 			fp.plot_path();
+// 		}
+// 		count++;
+// 	}
+// 	flag_for_display_paths = 1;
+// }
+
+// samples paths and returns the bestpath
+FrenetPath frenet_optimal_planning(Spline2D csp, double s0, double c_speed, double c_d,
+								   double c_d_d, double c_d_dd, FrenetPath lp, double pose_x, double pose_y, vecD ob_x, vecD ob_y, double bot_yaw,
+								   int committed_avoid_side, int preferred_avoid_side,
+								   double side_preference_cost)
+{
+	// 후보 실패 시 이전 프레임의 오래된 경로에 차가 고착되지 않도록 매 사이클 초기화
+	FrenetPath bestpath;
+	LAST_PLAN_OPPOSITE_FALLBACK = false;
+	// 이 호출의 충돌 검사용 격자(ObGrid 주석). 어떤 경로로 나가도 비운다.
+	g_ob_grid.build(ob_x, ob_y);
+	struct GridGuard { ~GridGuard() { g_ob_grid.clear(); } } grid_guard;
+	// 탈출 허용(set_escape_context 주석). 이 호출의 ob 벡터에 대해 켜고, 끝나면 끈다.
+	set_escape_context(ob_x, ob_y, pose_x, pose_y, bot_yaw);
+	struct EscapeGuard { ~EscapeGuard() { clear_escape_context(); } } escape_guard;
+
+	//initialise object of class Fplist
+	//object member fplist_lat stores sampled frenet paths
+	vector<FrenetPath> fplist = Fplist(c_speed, c_d, c_d_d, c_d_dd, s0).fplist_lat;
+
+	// 이미 한쪽(좌측 또는 우측)으로 회피가 확정된 경우, 반대쪽으로 뒤집으려는 후보에 높은 비용 부과 (좌우 진동/오실 방지)
+	// 방향은 첫 장애물 옆 오프셋(avoid_offset)으로 본다 - 다단 후보의 끝점은
+	// 둘째 장애물 반대편이나 복귀 뒤 값이다.
+	if (committed_avoid_side != 0)
+	{
+		for (auto &fp : fplist)
+		{
+			const double off = fp.avoid_offset();
+			// committed_avoid_side == -1: 우측 회피 유지 -> 좌측(off > 0.15) 후보 억제
+			// committed_avoid_side == +1: 좌측 회피 유지 -> 우측(off < -0.15) 후보 억제
+			if (committed_avoid_side * off < -0.15)
+			{
+				fp.set_cf(fp.get_cf() + 3000.0);
+			}
+		}
+	}
+
+	int n_yaw_rejected = 0, n_collision_rejected = 0;
+	int n_curvature_rejected = 0, n_inward_rejected = 0;
+	double best_d_tried = 0.0, min_clearance = 1e18;
+	// (예전의 '이전보다 안쪽 후보 배제' 필터는 |d| 비용이 대신하므로 꺼져 있다.
+	//  AVOID_EXCESS_COST 주석 참조.)
+
+	// ---- 후보 평가 ----
+	// 충돌 비율은 진단과 홀드 비용을 계산하지만, 최종 선택에는 frac=0인
+	// 후보만 들어간다. 전부 막히면 빈 경로를 반환해 상위 노드가 안전 정지를
+	// 요청한다. 한 번 막힌 오프셋은 몇 사이클 동안
+	// 비싸게 유지해서, 경로점 기반 검사가 프레임마다 흔들려도 방금 버린
+	// 후보로 성급히 되돌아가지 않게 한다.
+	for (auto &kv : g_collision_hold)
+		if (kv.second > 0) kv.second--;
+
+	// ★ 분기한정. 다단 후보가 들어오면서 후보가 수십 개에서 최대 ~1500 개로
+	//   늘었다. 전역 변환·충돌 검사가 비용의 대부분이라, 변환 없이 계산되는
+	//   항(사전 비용)으로 먼저 정렬하고 싼 것부터 평가한다. 최종 비용 =
+	//   사전 비용 + 곡률 비용(>=0) 이므로, 사전 비용이 지금까지의 최적
+	//   최종 비용 이상이면 그 뒤 후보는 더 나을 수 없다 -> 중단.
+	//   전수 평가와 같은 답을 낸다(홀드 기억은 단일 후보에만 쓴다 - 아래).
+	struct Ranked { double pre; int i; };
+	std::vector<Ranked> order;
+	order.reserve(fplist.size());
+	for (int i = 0; i < static_cast<int>(fplist.size()); i++)
+	{
+		const FrenetPath &fp = fplist[i];
+		const double off = fp.avoid_offset();
+		// |d| 에 비례한 벌점. 충돌 비용이 압도적으로 크므로 '막힌 후보'는
+		// 어차피 탈락하고, 이 항은 '안 막힌 후보들 중 가장 안쪽'을 고르게 한다.
+		// 장애물 사이 틈이 차폭보다 넓으면 그 틈을 지나는 후보가 |d| 가 작아
+		// 자연히 선택된다(멀리 돌지 않는다).
+		// 뒤쪽 오프셋 항(AVOID_FINAL_COST_RATIO): 첫 묶음 뒤 오프셋과 끝 오프셋에도
+		// 비율만큼 |d| 비용을 건다.
+		//   - 첫 오프셋이 같으면 장애물 뒤에서 기준선으로 돌아오는 후보가 싸다.
+		//   - 둘째 장애물 옆 오프셋도 필요한 만큼만 고른다(이 항이 없으면 S자의
+		//     둘째 오프셋은 곡률 비용으로만 정해져 +1.5/+2.0 이 번갈았다).
+		//   단일 후보는 세 값이 같아 모두 같은 비율로 커질 뿐 순서는 그대로다.
+		const double second = fp.second_offset();
+		double pre = const_cast<FrenetPath &>(fp).get_cf() + AVOID_EXCESS_COST *
+			(std::abs(off) + AVOID_FINAL_COST_RATIO *
+				(std::abs(second) + std::abs(fp.final_offset())));
+		// 직전 계획과 첫 묶음 뒤 오프셋이 다르면 유지 비용(SPATIAL_PLAN_CHANGE_COST 주석).
+		if (std::isfinite(AVOID_PREV_SECOND) && std::abs(second - AVOID_PREV_SECOND) > 0.3)
+			pre += SPATIAL_PLAN_CHANGE_COST;
+		// 커밋된 방향의 반대편으로 넘어가는 후보에 벌점. 같은 쪽이면 0 이라
+		// 그 안에서는 기존대로 |d| 최소가 선택된다. 반대편이 유일하게
+		// 충돌 없는 선택지면(벌점은 충돌 비용보다 작으므로) 여전히 넘어간다.
+		if (AVOID_LOCK_SIDE != 0 && off * AVOID_LOCK_SIDE < -AVOID_INWARD_MARGIN)
+			pre += AVOID_SIDE_FLIP_COST;
+		// 최초 방향을 정할 때는 장애물 중심의 반대편을 우선한다. 단, 이 값은
+		// 충돌 제약보다 작은 비용일 뿐이므로 그쪽이 막혔거나 도로 폭 상한을
+		// 넘으면 반대편의 충돌 없는 후보가 선택된다.
+		if (committed_avoid_side == 0 && preferred_avoid_side != 0 &&
+			off * preferred_avoid_side < -AVOID_INWARD_MARGIN)
+			pre += side_preference_cost;
+		// 지금 따라가는 오프셋이 이번 프레임에 실제로 깨끗하면, 과거 한두
+		// 프레임의 기억만으로 다른 후보로 내쫓지 않는다.
+		// 홀드는 단일 후보(= 오프셋 하나)의 기억이다. 다단 후보에 같은 키를
+		// 쓰면 '둘째 장애물 때문에 막힌 단일 d1' 의 기억이 그 d1 으로 첫
+		// 장애물을 지나 S자로 빠지는 후보까지 막는다.
+		const bool is_current = std::abs(off - AVOID_PREV_OFFSET) < 0.3;
+		if (!fp.multi_stage() && !is_current)
+		{
+			auto it = g_collision_hold.find(quantize_offset(off));
+			if (it != g_collision_hold.end() && it->second > 0)
+				pre += COLLISION_COST;
+		}
+		order.push_back({pre, i});
+	}
+	std::sort(order.begin(), order.end(),
+		[](const Ranked &a, const Ranked &b) { return a.pre < b.pre; });
+
+	int best_idx = -1;
+	int opposite_fallback_idx = -1;
+	double best_cost = 1e18;
+	double opposite_fallback_cost = 1e18;
+	bool clear_found = false;
+	int n_evaluated = 0, n_multi_skipped = 0;
+	char curv_dbg[200] = "";
+	const auto eval_start = std::chrono::steady_clock::now();
+	for (const Ranked &rk : order)
+	{
+		if (rk.pre >= best_cost)
+			break;
+		const int i = rk.i;
+		const bool multi = fplist[i].multi_stage();
+		if (multi && SPATIAL_EVAL_BUDGET_MS > 0.0 &&
+			std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - eval_start).count() > SPATIAL_EVAL_BUDGET_MS)
+		{
+			++n_multi_skipped;
+			continue;   // 단일 후보는 예산과 무관하게 계속 평가한다
+		}
+		++n_evaluated;
+		fplist[i].adding_global_path(csp);
+		double max_candidate_curvature = 0.0;
+		const vecD candidate_curvatures = fplist[i].get_c();
+		const vecD candidate_s = fplist[i].get_s();
+		vecD preview_curvatures;
+		bool finite_curvature = true;
+		for (size_t k = 0; k < candidate_curvatures.size(); ++k)
+		{
+			// 기준 스플라인 끝 1.5 m 는 yaw 외삽 오차로 곡률이 튄다(path_max_curvature 참조).
+			//   리플레이 2026-09-25(15:45 백): 마지막 점 곡률 6.29 로 후보 64개 전량 탈락.
+			if (s_dest > 0.0 && k < candidate_s.size() && candidate_s[k] > s_dest - 1.5)
+				continue;
+			const double kappa = candidate_curvatures[k];
+			if (!std::isfinite(kappa)) { finite_curvature = false; break; }
+			max_candidate_curvature = std::max(max_candidate_curvature, std::abs(kappa));
+			if (k < candidate_s.size() && candidate_s[k] - s0 <= 30.0)
+				preview_curvatures.push_back(std::abs(kappa));
+		}
+		if (candidate_curvatures.empty() || !finite_curvature ||
+			(MAX_CURVATURE > 0.0 && max_candidate_curvature > MAX_CURVATURE))
+		{
+			if (n_curvature_rejected == 0)
+			{
+				// 진단: 첫 곡률 탈락 후보의 위치(전 후보가 곡률로 탈락할 때 원인 추적용)
+				size_t kk = 0;
+				double kv = 0.0;
+				for (size_t k = 0; k < candidate_curvatures.size(); ++k)
+					if (!std::isfinite(candidate_curvatures[k]) || std::abs(candidate_curvatures[k]) > kv)
+					{
+						kk = k;
+						kv = std::isfinite(candidate_curvatures[k]) ? std::abs(candidate_curvatures[k]) : 1e9;
+						if (kv >= 1e9) break;
+					}
+				const vecD cd = fplist[i].get_d();
+				snprintf(curv_dbg, sizeof(curv_dbg),
+					"first=[d_avoid %.2f kappa %.2f at k=%zu/%zu s-s0=%.2f d=%.2f n_xy=%zu n_s=%zu]",
+					fplist[i].avoid_offset(), kv, kk, candidate_curvatures.size(),
+					kk < candidate_s.size() ? candidate_s[kk] - s0 : -1.0,
+					kk < cd.size() ? cd[kk] : 0.0, fplist[i].get_x().size(), candidate_s.size());
+			}
+			++n_curvature_rejected;
+			continue;
+		}
+		// A single 0.25 m spline-sampling spike should not decide which side
+		// to use.  Score the 90th percentile over the controller preview;
+		// the hard maximum above still rejects genuinely sharp candidates.
+		double scored_curvature = max_candidate_curvature;
+		if (!preview_curvatures.empty())
+		{
+			const size_t rank = static_cast<size_t>(0.90 *
+				(preview_curvatures.size() - 1));
+			std::nth_element(preview_curvatures.begin(),
+				preview_curvatures.begin() + rank, preview_curvatures.end());
+			scored_curvature = preview_curvatures[rank];
+		}
+
+		vecD path_yaw_dbg = fplist[i].get_yaw();
+		bool yaw_ok = !path_yaw_dbg.empty() &&
+			std::abs(path_yaw_dbg[0] - bot_yaw) <= 0.523599;
+		if (!yaw_ok)
+		{
+			n_yaw_rejected++;
+			continue;   // 조향이 물리적으로 불가능한 후보는 그대로 배제
+		}
+
+		const double off = fplist[i].avoid_offset();
+		const int key = quantize_offset(off);
+		// 다단 후보는 첫 충돌에서 멈춘다(비율은 진단용일 뿐).
+		const double frac = multi
+			? (fplist[i].collides(ob_x, ob_y, ROBOT_RADIUS) ? 1.0 : 0.0)
+			: fplist[i].collision_fraction(ob_x, ob_y, ROBOT_RADIUS);
+		if (frac > 0.0)
+		{
+			if (!multi)
+				g_collision_hold[key] = COLLISION_HOLD_CYCLES;
+			n_collision_rejected++;
+		}
+		else
+		{
+			clear_found = true;
+		}
+
+		// 경로점별 연석 위반 비율. 끝점 di 범위 제한만으로는 개방 구간에서
+		// 시작해 제한 구간을 관통하는 경로를 못 막는다(위 CURB_* 주석 참조).
+		const double curb_frac = fplist[i].curb_violation_fraction();
+		const double cost = rk.pre
+			+ AVOID_CURVATURE_COST * scored_curvature
+			+ COLLISION_FRAC_COST * frac
+			+ CURB_VIOLATION_COST * curb_frac;
+		// Collision is a hard feasibility constraint.  Returning the
+		// least-colliding path made the vehicle intentionally follow a path
+		// with collision_frac > 0 when an oncoming vehicle narrowed M8.
+		const bool opposite_to_lock = AVOID_LOCK_SIDE != 0 &&
+			off * AVOID_LOCK_SIDE < -AVOID_INWARD_MARGIN;
+		// A curb crossing is a physical infeasibility, not merely a cost.
+		// Otherwise a cheap right-side candidate can beat a valid left-side
+		// candidate and get rejected only after planning, causing a stop.
+		if (frac <= 1e-9 && curb_frac <= 1e-9)
+		{
+			if (opposite_to_lock)
+			{
+				if (cost < opposite_fallback_cost)
+				{
+					opposite_fallback_cost = cost;
+					opposite_fallback_idx = i;
+				}
+			}
+			else if (cost < best_cost)
+			{
+				best_cost = cost;
+				best_idx = i;
+			}
+		}
+		// 진단용 최소 간격은 막힌 단일 후보 5 개까지만 잰다(점 x 장애물 전수라 비싸다).
+		if (frac > 0.0 && !multi && n_collision_rejected <= 5)
+		{
+			for (unsigned int k = 0; k < fplist[i].get_x().size(); ++k)
+				for (size_t j = 0; j < ob_x.size(); ++j)
+					min_clearance = std::min(min_clearance,
+						dist(fplist[i].get_x()[k], fplist[i].get_y()[k], ob_x[j], ob_y[j]));
+			best_d_tried = off;
+		}
+	}
+	const double eval_ms = std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::now() - eval_start).count();
+	// Once a side is committed, a same-side collision-free path always wins.
+	// Crossing to the other side is retained only as an emergency fallback
+	// when every path on the committed side is physically blocked.
+	if (best_idx < 0 && opposite_fallback_idx >= 0)
+	{
+		best_idx = opposite_fallback_idx;
+		best_cost = opposite_fallback_cost;
+		LAST_PLAN_OPPOSITE_FALLBACK = true;
+		ROS_WARN_THROTTLE(0.5,
+			"[frenet] committed side blocked; using opposite-side emergency path");
+	}
+
+	if (best_idx >= 0)
+	{
+		bestpath = fplist[best_idx];
+		const double d_avoid = bestpath.avoid_offset();
+		const double d_end = bestpath.final_offset();
+		std::string stages;
+		for (size_t k = 0; k < bestpath.stage_d.size(); ++k)
+		{
+			char buf[48];
+			snprintf(buf, sizeof(buf), k ? " ->%.2f@%.1fm" : "%.2f",
+				bestpath.stage_d[k], bestpath.stage_s[k] - s0);
+			stages += buf;
+		}
+		ROS_INFO_THROTTLE(0.2,
+			"[frenet] chosen d_avoid=%.2f d_end=%.2f stages[%s] cost=%.1f "
+			"(cands=%zu evaluated=%d multi_skipped=%d %.1fms yaw_rej=%d curvature_rej=%d "
+			"collided=%d clear_found=%d)",
+			d_avoid, d_end, stages.c_str(), best_cost, fplist.size(), n_evaluated,
+			n_multi_skipped, eval_ms, n_yaw_rejected, n_curvature_rejected,
+			n_collision_rejected, (int)clear_found);
+	}
+
+	if (bestpath.get_x().empty())
+	{
+		ROS_WARN_THROTTLE(0.2,
+			"[frenet] ALL %zu candidates rejected: yaw=%d curvature=%d collision=%d inward=%d "
+			"(evaluated=%d multi_skipped=%d %.1fms) %s "
+			"min_clearance_seen=%.2fm (robot_radius=%.2f) last_d_tried=%.2f",
+			fplist.size(), n_yaw_rejected, n_curvature_rejected,
+			n_collision_rejected, n_inward_rejected, n_evaluated, n_multi_skipped, eval_ms,
+			curv_dbg,
+			min_clearance > 1e17 ? -1.0 : min_clearance, ROBOT_RADIUS, best_d_tried);
+	}
+
+	return bestpath;
+}
+
+FrenetPath frenet_optimal_planning_2(Spline2D csp, double s0, double c_speed, double c_d,
+								   double c_d_d, double c_d_dd, FrenetPath lp, double pose_x, double pose_y, vecD ob_x, vecD ob_y, double bot_yaw, int a)
+{
+	// 후보 실패 시 이전 프레임의 오래된 경로에 차가 고착되지 않도록 매 사이클 초기화
+	FrenetPath bestpath;
+
+	//initialise object of class Fplist
+	//object member fplist_lat stores sampled frenet paths
+	vector<FrenetPath> fplist = Fplist(c_speed, c_d, c_d_d, c_d_dd, s0).fplist_lat;
+
+	//sort sampled paths and check for collision in order of path cost
+	std::sort(fplist.begin(), fplist.end(), sortByCost);
+	for (int i = 0; i < fplist.size(); i++)
+	{
+		//path converted to global frame first
+		fplist[i] = calc_global_path_2(fplist[i], csp, a);
+		if (check_path(fplist[i], bot_yaw, 0.523599, pose_x, pose_y, ob_x, ob_y, ROBOT_RADIUS) == 1)
+		{
+			bestpath = fplist[i];
+			break;
+		}
+		// bestpath = fplist[i];
+		// break;
+	}
+
+	return bestpath;
+}
+
+//class constructor which generates paths
+Fplist::Fplist(double c_speedc, double c_dc, double c_d_dc, double c_d_ddc, double s00)
+{
+	int cnt111 = 0;
+	int cnt222 = 0;
+	c_speed = c_speedc;
+	c_d = c_dc;
+	c_d_d = c_d_dc;
+	c_d_dd = c_d_ddc;
+	s0 = s00;
+
+	if (SPATIAL_AVOIDANCE_ENABLED)
+	{
+		const double di_lo = -(MAX_ROAD_WIDTH_RIGHT > 0.0 ? MAX_ROAD_WIDTH_RIGHT : MAX_ROAD_WIDTH);
+		const double di_hi =  (MAX_ROAD_WIDTH_LEFT  > 0.0 ? MAX_ROAD_WIDTH_LEFT  : MAX_ROAD_WIDTH);
+		std::vector<double> grid;
+		for (double di = di_lo; di <= di_hi + 1e-6; di += D_ROAD_W)
+			grid.push_back(di);
+		// 다단 후보 전환점(SPATIAL_SWITCH_S 주석). 가까운 두 묶음까지만 본다.
+		std::vector<double> sw;
+		for (double x : SPATIAL_SWITCH_S)
+			if (x > s0 + 1.0) sw.push_back(x);
+		std::sort(sw.begin(), sw.end());
+		if (sw.size() > 2) sw.resize(2);
+		const double step2 = std::max(D_ROAD_W, SPATIAL_STAGE_D_STEP);
+		std::vector<double> grid2;   // 둘째 묶음 옆 오프셋(0 제외)
+		for (double d = -step2; d >= di_lo - 1e-6; d -= step2) grid2.push_back(d);
+		for (double d = step2; d <= di_hi + 1e-6; d += step2) grid2.push_back(d);
+		auto generate = [&](bool gentle)
+		{
+			for (double di : grid)
+				fplist_lat.push_back(calc_spatial(di, gentle));
+			// ★ 다단(S자/복귀) 후보. 전환점은 노드가 장애물 위치로 정한다.
+			if (sw.empty())
+				return;
+			for (double d1 : grid)
+			{
+				if (std::abs(d1) < 0.2)
+					continue;   // 첫 묶음 옆을 d=0 으로 지나는 건 단일 후보와 같다
+				// (a) 첫 묶음을 지나고 기준선 복귀
+				fplist_lat.push_back(calc_spatial_stages({d1, 0.0}, {s0, sw[0]}, gentle));
+				// 급한 예비 후보는 단일·(a) 까지만(후보 3000 개 -> 평가 최대 71 ms 였다).
+				if (sw.size() < 2 || !gentle)
+					continue;
+				// (b) 두 묶음 모두 d1 으로 지나고 복귀
+				fplist_lat.push_back(calc_spatial_stages({d1, 0.0}, {s0, sw[1]}, gentle));
+				for (double d2 : grid2)
+				{
+					if (std::abs(d2 - d1) < 0.2)
+						continue;
+					// (c) 첫 묶음 뒤 d2 로 옮겨 둘째 묶음을 지나고 복귀 (S자)
+					fplist_lat.push_back(calc_spatial_stages({d1, d2, 0.0}, {s0, sw[0], sw[1]}, gentle));
+					// (d) 첫 묶음 뒤 d2 로 옮겨 유지 (둘째 뒤가 지평 밖이거나 막힌 경우)
+					fplist_lat.push_back(calc_spatial_stages({d1, d2}, {s0, sw[0]}, gentle));
+				}
+			}
+		};
+		generate(true);
+		// 느릴 때만 현재 속도 기준 급한 후보를 예비로 추가(비용 +SPATIAL_SHARP_COST).
+		if (c_speed < SPATIAL_LENGTH_MIN_SPEED - 0.5)
+			generate(false);
+		return;
+	}
+
+	//latitudinal part of the FrenetPath object is sampled and stored in fplist_lat
+	if (STOP_CAR)
+	{
+
+		const double di_lo = -(MAX_ROAD_WIDTH_RIGHT > 0.0 ? MAX_ROAD_WIDTH_RIGHT : MAX_ROAD_WIDTH);
+		const double di_hi =  (MAX_ROAD_WIDTH_LEFT  > 0.0 ? MAX_ROAD_WIDTH_LEFT  : MAX_ROAD_WIDTH);
+		for (double di = di_lo; di < di_hi; di += D_ROAD_W)
+		{
+			for (double Ti = MINT; Ti < MAXT; Ti += DT)
+			{
+				FrenetPath temp = calc_lat(di, Ti, 0.0);
+				for (int p = 0; p < samples_tv; p++)
+				{	
+					fplist_lat.push_back(temp);
+				}
+			}
+		}
+	}
+	else
+	{
+
+		const double di_lo = -(MAX_ROAD_WIDTH_RIGHT > 0.0 ? MAX_ROAD_WIDTH_RIGHT : MAX_ROAD_WIDTH);
+		const double di_hi =  (MAX_ROAD_WIDTH_LEFT  > 0.0 ? MAX_ROAD_WIDTH_LEFT  : MAX_ROAD_WIDTH);
+		for (double di = di_lo; di < di_hi; di += D_ROAD_W)
+		{
+			for (double Ti = MINT; Ti < MAXT; Ti += DT)
+			{
+				cnt111++;
+				for (double Di_d = -MAX_LAT_VEL; Di_d < MAX_LAT_VEL + 0.001; Di_d += D_D_NS)
+				{
+					FrenetPath temp = calc_lat(di, Ti, Di_d);
+					for (int p = 0; p < samples_tv; p++)
+					{
+						FrenetPath temp = calc_lat(di, Ti, 0.0);
+						fplist_lat.push_back(temp);
+					}
+				}
+			}
+		}
+		//cout << "cnt111 : " << cnt111 << endl;
+	}
+
+	//longitudinal part of the FrenetPath object is sampled and stored in fplist_lon
+	if (STOP_CAR)
+	{
+
+		for (double Ti = MINT; Ti < MAXT; Ti += DT)
+		{
+			fplist_lon.push_back(calc_lon(TARGET_SPEED, Ti));
+		}
+	}
+	else
+	{
+
+		for (double Ti = MINT; Ti < MAXT; Ti += DT)
+		{
+			for (double tv = TARGET_SPEED - D_T_S * N_S_SAMPLE; tv < TARGET_SPEED + D_T_S * N_S_SAMPLE; tv += D_T_S)
+			{
+				cnt222++;
+				fplist_lon.push_back(calc_lon(tv, Ti));
+			}
+		}
+	}
+	//cout << "cnt222 : " << cnt222 << endl;
+
+	//copy longitudinal part of the FrenetPath object to corresponding paths in fplist_lat
+	for (int i = 0; i < fplist_lat.size(); i += samples_tv)
+	{
+		copy(i);
+	}
+
+	//cost calculated as a weighted sum of longitudinal and latitudinal path costs
+	for (int i = 0; i < fplist_lat.size(); i++)
+	{
+		calc_cost(i);
+	}
+}
+
+// calculates latitudinal part of FrenetPath object using the sampling parameters passed
+FrenetPath Fplist::calc_lat(double di, double Ti, double Di_d)
+{
+	FrenetPath fp;
+
+	// Ti 는 '회피를 끝내는 시간'이지 '경로를 그리는 길이'가 아니다. 예전에는
+	// n = 1 + Ti/DT 로 둘을 묶어놔서 서로를 배제했다: 짧은 Ti 는 제때 비키지만
+	// 경로가 장애물까지 닿지 않아 충돌검사를 무의미하게 통과했고, 긴 Ti 는
+	// 장애물에 닿지만 그 지점에서 아직 안 비켜져 있어 전부 충돌했다.
+	// 실측 2026-09-07(3.9m/s, 장애물 5.2m): Ti=1.0 은 3.9m 까지만 그려져 장애물에
+	// 미달, Ti>=3.0 은 전 후보 충돌(min_clearance 0.00~0.22m) -> 1400 후보 전탈락.
+	// 이제 모든 후보를 공통 지평까지 그리고, Ti 이후는 완료된 오프셋을 유지한다.
+	const double horizon = max(Ti, PLAN_HORIZON_T);
+	int n = 1 + (int)std::lround(horizon / DT);
+	fp.t.resize(n);
+	fp.d.resize(n);
+	fp.d_d.resize(n);
+	fp.d_dd.resize(n);
+	fp.d_ddd.resize(n);
+
+	quintic lat_qp(c_d, c_d_d, c_d_dd, di, Di_d, 0.0, Ti);
+
+	for (int te = 0; te < n; te++)
+	{
+		double t = te * DT;
+		// Ti 이후에는 quintic 을 외삽하지 않는다(발산한다). 목표 오프셋에
+		// 도달한 상태를 그대로 유지해 '비킨 채로 지나간다'를 표현한다.
+		double tq = min(t, Ti);
+		fp.t[te] = t;
+		fp.d[te] = lat_qp.calc_point(tq);
+		fp.d_d[te] = (t <= Ti) ? lat_qp.calc_first_derivative(tq) : 0.0;
+		fp.d_dd[te] = (t <= Ti) ? lat_qp.calc_second_derivative(tq) : 0.0;
+		fp.d_ddd[te] = (t <= Ti) ? lat_qp.calc_third_derivative(tq) : 0.0;
+	}
+
+	vecD d_ddd_vec = fp.d_ddd;
+	fp.Jp = (inner_product(d_ddd_vec.begin(), d_ddd_vec.end(), d_ddd_vec.begin(), 0));
+	fp.Ti = (Ti);
+	fp.cd = (KJ * fp.Jp + KT * Ti + KD * std::pow((fp.d).back(), 2));
+	return fp;
+}
+
+// calculates longitudinal part of FrenetPath object using the sampling parameters passed
+FrenetPath Fplist::calc_lon(double tv, double Ti)
+{
+	FrenetPath fp;
+	// ★ 종방향 목표를 '실제로 갈 수 있는 거리'로 둔다.
+	//   예전에는 Ti 안에 무조건 25m(하드캡)를 가도록 강제했다. 그러면 Ti=1.0
+	//   일 때 평균 25m/s, Ti=3.4 에서도 7.4m/s 가 되어, 실제 주행속도(4m/s
+	//   안팎)와 무관하게 s 가 앞질러 간다. 그 결과 횡방향이 Ti 에 전이를
+	//   끝내도 그 시점의 s 는 이미 19~23m 앞이고, 5~10m 에 있는 장애물
+	//   구간에서는 아직 거의 비켜나지 않은 경로가 된다.
+	//     실측 2026-09-09(15:11): d_end=-3.5 를 골랐는데 장애물이 있는 s=5~10m
+	//     에서 d 는 -0.44~-0.61 뿐이었고(완료는 s=30m), 차는 그 경로를 정확히
+	//     따라가 장애물에 접촉했다. Ti/mint 를 줄여도 효과가 없던 이유가 이것이다.
+	//   등속 근사(c_speed~tv)로 도달 거리를 잡고, s_dest/25m 는 상한으로만 쓴다.
+	const double s_reach = 0.5 * (max(c_speed, 0.5) + max(tv, 0.5)) * Ti;
+	const double s_target = min(s0 + min(s_reach, 25.0), s_dest);
+	quintic lon_qp(s0, c_speed, 0.0, s_target, tv, 0.0, Ti);	// 도착 지점 거리 설정
+
+	// 횡방향과 같은 지평으로 그려야 한다. 길이가 다르면 check_collision 의
+	// s.size() != x.size() 가드에 걸려 그 후보는 무조건 충돌로 처리된다.
+	const double horizon = max(Ti, PLAN_HORIZON_T);
+	int n = 1 + (int)std::lround(horizon / DT);
+	fp.t.resize(n);
+	fp.s.resize(n);
+	fp.s_d.resize(n);
+	fp.s_dd.resize(n);
+	fp.s_ddd.resize(n);
+
+	for (int te = 0; te < n; te++)
+	{
+		double t = te * DT;
+		fp.t[te] = t;
+		if (t <= Ti)
+		{
+			fp.s[te] = lon_qp.calc_point(t);
+			fp.s_d[te] = lon_qp.calc_first_derivative(t);
+			fp.s_dd[te] = lon_qp.calc_second_derivative(t);
+			fp.s_ddd[te] = lon_qp.calc_third_derivative(t);
+		}
+		else
+		{
+			// Ti 이후는 도달 속도로 등속 전진. quintic 외삽은 s 가 되돌아가거나
+			// 발산해서 경로가 꼬인다.
+			double sv = lon_qp.calc_first_derivative(Ti);
+			fp.s[te] = lon_qp.calc_point(Ti) + sv * (t - Ti);
+			fp.s_d[te] = sv;
+			fp.s_dd[te] = 0.0;
+			fp.s_ddd[te] = 0.0;
+		}
+	}
+	fp.Ti = (Ti);
+	vecD s_ddd_vec = fp.s_ddd;
+	fp.Js = (inner_product(s_ddd_vec.begin(), s_ddd_vec.end(), s_ddd_vec.begin(), 0));
+	fp.dss = std::pow((TARGET_SPEED - (fp.s_d.empty() ? 0.0 : fp.s_d.back())), 2);
+	fp.cv = (KJ * fp.Js + KT * fp.Ti + KD * fp.dss);
+	return fp;
+}
+
+// calc_lat/calc_lon 결과를 후보군 탐색 없이 그대로 하나로 합친다 (부드러운 복귀용)
+FrenetPath Fplist::calc_direct(double di, double Ti, double tv)
+{
+	FrenetPath lat = calc_lat(di, Ti, 0.0);
+	FrenetPath lon = calc_lon(tv, Ti);
+	lat.s = lon.s;
+	lat.s_d = lon.s_d;
+	lat.s_dd = lon.s_dd;
+	lat.s_ddd = lon.s_ddd;
+	lat.Js = lon.Js;
+	lat.cv = lon.cv;
+	lat.cf = (KLAT * lat.cd + KLON * lat.cv);
+	return lat;
+}
+
+FrenetPath Fplist::calc_spatial(double di, bool gentle)
+{
+	return calc_spatial_stages(std::vector<double>{di}, std::vector<double>{s0}, gentle);
+}
+
+FrenetPath Fplist::calc_spatial_stages(const std::vector<double> &targets,
+	const std::vector<double> &starts, bool gentle)
+{
+	FrenetPath fp;
+	if (targets.empty())
+		return fp;
+	const double v = std::max(0.5, c_speed);
+	// For h(q)=10q^3-15q^4+6q^5, max |h''| ~= 5.774 and
+	// max |h'''| = 60. Convert acceleration/jerk bounds to time,
+	// then to travelled distance using the measured vehicle speed.
+	// 전환 길이에 쓰는 속도(SPATIAL_LENGTH_MIN_SPEED 주석). 시간 축(t)은 실제 속도.
+	const double v_len = gentle ? std::max(v, SPATIAL_LENGTH_MIN_SPEED) : v;
+	auto transition_length = [v_len](double shift) {
+		const double ta = std::sqrt(5.774 * shift / std::max(0.1, SPATIAL_MAX_LAT_ACCEL));
+		const double tj = std::cbrt(60.0 * shift / std::max(0.1, SPATIAL_MAX_LAT_JERK));
+		const double transition_t = std::max(0.8, std::max(ta, tj));
+		return std::max(SPATIAL_MIN_TRANSITION_M,
+			std::min(SPATIAL_MAX_TRANSITION_M, v_len * transition_t));
+	};
+	const double length = transition_length(std::abs(targets[0] - c_d));
+	double horizon = std::max(std::max(length + 12.0, v * PLAN_HORIZON_T),
+		SPATIAL_MIN_HORIZON_M);
+	// ★ 지평을 남은 기준경로 길이로 자른다.
+	//   /final_waypoint 는 자차 앞 49.8 m 뿐인데 지평이 v*7.0 s 라,
+	//   7.1 m/s 를 넘으면 모든 후보가 스플라인 끝을 넘었다. 넘은 후보는
+	//   adding_global_path 에서 잘리고(s.size()!=x.size()), collision_fraction
+	//   이 그걸 1.0(완전 막힘)으로 본다 - 즉 후보 전량 탈락 -> 회피 실패 ->
+	//   AEB 1.0 제동.
+	//     실측 2026-09-23(16:04 두 주행): 실패 6회 중 4회가 v 7.47~9.68 m/s
+	//     에서 났고, 그 중 2회는 31 m 앞 장애물을 처음 본 순간이었다
+	//     (9.7 -> 5.9 m/s 급제동). 30 km/h 회피를 막던 직접 원인이다.
+	//   s_dest 는 전역 스플라인 끝이다. 0.5 m 여유를 둔다.
+	if (s_dest > s0)
+		horizon = std::min(horizon, std::max(2.0 * SPATIAL_SAMPLE_DS, s_dest - s0 - 0.5));
+	// ★ 초기 횡기울기/곡률을 현재 상태에서 이어받는다.
+	//   예전 h(q) 는 시작점 기울기·곡률이 0 이라, 매 재계획(20 Hz)마다 경로가
+	//   '지금 이 자리에서는 기준선과 평행'으로 시작했다. 차는 이미 옆으로
+	//   움직이는 중인데 경로가 곧게 가라고 하니 MPC 가 되돌려 조향했고,
+	//   횡이동이 쌓이지 않았다.
+	//     실측 2026-09-23(16:04:23 백): 발행 경로의 시작 1 m 기울기는
+	//     +0.005~0.013 인데 차량 실제 횡이동률은 +0.10~0.15 (m/m) 였다.
+	//     그 결과 d_end +3.00 을 1.8 s 유지했는데도 차는 +0.70 에 머물렀고,
+	//     (16:04:54) 장애물 4 m 앞에서 +1.91 (필요 2.67) -> 후보 전부
+	//     충돌 -> 정지. 그 직전 d_end 2.75 -> 3.25 로 키운 것이 '한 번
+	//     과회피'로 보였다.
+	//   c_d_d / c_d_dd 는 시간 미분이다(노드가 직전 계획에서 이어 붙여 준다).
+	//   공간 미분으로 바꿔 5차식 경계조건으로 쓴다.
+	const double slope0 = std::max(-0.35, std::min(0.35, c_d_d / v));
+	const double curv0 = std::max(-0.12, std::min(0.12, c_d_dd / (v * v)));
+	// 전환 구간들. 0번은 지금 위치에서 targets[0] 으로, k번은 starts[k] 이후
+	// (앞 전환이 끝나기 전이면 끝난 뒤) targets[k-1] -> targets[k] 로 간다.
+	// 전환 사이에는 앞 목표를 그대로 유지한다.
+	std::vector<quintic> seg_q;
+	std::vector<double> seg_u0, seg_len;
+	seg_q.emplace_back(c_d, slope0, curv0, targets[0], 0.0, 0.0, length);
+	seg_u0.push_back(0.0);
+	seg_len.push_back(length);
+	for (size_t k = 1; k < targets.size(); ++k)
+	{
+		const double start_u = std::max(
+			(k < starts.size() ? starts[k] : s0) - s0,
+			seg_u0.back() + seg_len.back());
+		const double len = transition_length(std::abs(targets[k] - targets[k - 1]));
+		seg_q.emplace_back(targets[k - 1], 0.0, 0.0, targets[k], 0.0, 0.0, len);
+		seg_u0.push_back(start_u);
+		seg_len.push_back(len);
+	}
+	const double ds_step = std::max(0.1, SPATIAL_SAMPLE_DS);
+	const int n = 1 + static_cast<int>(std::ceil(horizon / ds_step));
+	fp.t.reserve(n); fp.d.reserve(n); fp.d_d.reserve(n);
+	fp.d_dd.reserve(n); fp.d_ddd.reserve(n); fp.s.reserve(n);
+	fp.s_d.reserve(n); fp.s_dd.reserve(n); fp.s_ddd.reserve(n);
+	double jerk_sum = 0.0;
+	size_t seg = 0;
+	for (int i = 0; i < n; ++i)
+	{
+		const double u = std::min(horizon, i * ds_step);
+		while (seg + 1 < seg_q.size() && u >= seg_u0[seg + 1])
+			++seg;
+		const double uu = u - seg_u0[seg];
+		const bool in_transition = uu < seg_len[seg];
+		quintic &lat = seg_q[seg];
+		fp.t.push_back(u / v);
+		fp.d.push_back(in_transition ? lat.calc_point(uu) : targets[seg]);
+		fp.d_d.push_back(in_transition ? lat.calc_first_derivative(uu) * v : 0.0);
+		fp.d_dd.push_back(in_transition ? lat.calc_second_derivative(uu) * v * v : 0.0);
+		fp.d_ddd.push_back(in_transition ? lat.calc_third_derivative(uu) * v * v * v : 0.0);
+		fp.s.push_back(s0 + u);
+		fp.s_d.push_back(v); fp.s_dd.push_back(0.0); fp.s_ddd.push_back(0.0);
+		jerk_sum += fp.d_ddd.back() * fp.d_ddd.back();
+	}
+	fp.stage_d = targets;
+	fp.stage_s.clear();
+	for (double u0 : seg_u0)
+		fp.stage_s.push_back(s0 + u0);
+	fp.stage_end_s = s0 + seg_u0.back() + seg_len.back();
+	fp.first_len = seg_len[0];
+	fp.Ti = length / v;
+	fp.Jp = jerk_sum;
+	fp.Js = 0.0;
+	fp.dss = std::pow(TARGET_SPEED - v, 2);
+	fp.cd = KJ * fp.Jp + KT * fp.Ti + KD * targets[0] * targets[0];
+	fp.cv = KD * fp.dss;
+	fp.cf = KLAT * fp.cd + KLON * fp.cv;
+	fp.sharp = !gentle && v_len < std::max(v, SPATIAL_LENGTH_MIN_SPEED) - 1e-6;
+	if (fp.sharp)
+		fp.cf += SPATIAL_SHARP_COST;
+	return fp;
+}
+
+//crossproduct of sampled latitudinal and longitudinal parts
+void Fplist::copy(int i)
+{
+	int index_start = ((fplist_lat[i]).Ti - MINT) * samples_tv;
+
+	for (int j = 0; j < samples_tv; j++)
+	{
+		fplist_lat[i + j].s = (fplist_lon[index_start + j].s);
+		fplist_lat[i + j].s_d = (fplist_lon[index_start + j].s_d);
+		fplist_lat[i + j].s_dd = (fplist_lon[index_start + j].s_dd);
+		fplist_lat[i + j].s_ddd = (fplist_lon[index_start + j].s_ddd);
+		fplist_lat[i + j].Js = (fplist_lon[index_start + j].Js);
+		fplist_lat[i + j].dss = (fplist_lon[index_start + j].dss);
+		fplist_lat[i + j].cv = (fplist_lon[index_start + j].cv);
+	}
+}
+
+//calculate final cost of path as weighted sum of latitudinal and longitudinal path costs
+void Fplist::calc_cost(int i)
+{
+	fplist_lat[i].cf = (KLAT * fplist_lat[i].cd + KLON * fplist_lat[i].cv);
+}

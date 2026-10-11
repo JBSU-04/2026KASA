@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/ApolloAuto/apollo",
+  "commit": "d53aa3da47a06a08e6d0cd175d5623a34fa0d6aa",
+  "files": {
+    "modules/planning/planning_base/math/piecewise_jerk/piecewise_jerk_problem.h": "bdde797aceef0a1fe93944f90d549efb11264ceed9de4ce1cf9407f135a382c0",
+    "modules/planning/planning_base/math/piecewise_jerk/piecewise_jerk_problem.cc": "f196f28f33128a480bbb85a3d450385dcb4a2303f563faa471163af89aa2dd7b",
+    "modules/planning/planning_base/math/piecewise_jerk/piecewise_jerk_path_problem.h": "31488df0f21d39041043d3d83d6728cc5a82cb85326018004e45b0738fc73b2a",
+    "modules/planning/planning_base/math/piecewise_jerk/piecewise_jerk_path_problem.cc": "59cf7a2e773c3729b39c36e70903237d0e5d11464b761cce87e75276eb705b9a",
+    "LICENSE": "bfeea761e813af3e836f7be407ac39b98a742d419879059bcaea15b56d9a2e90",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/reeds_shepp_path.cc": "fcf903d1009c9a85676358e98ea9136d6020ed4d6bbda280b59bdc59b3460d75",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/hybrid_a_star.h": "2e093cc66377ff51133a60000b456b35065f093a5523ad89140506b9c690402f",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/grid_search.h": "bba146fb50841ce789b077e75bbe801dd36167e60dd4897d305762d0c3eb6c17",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/node3d.h": "b480c550f005ea324d65553fc2ee80505b5cfb6c1d1c4a42e222d81daeb0fa00",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/grid_search.cc": "5da5c95fdf4a33b6589fa161a38d3450239244726b820a6946649dfc18e4784b",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/reeds_shepp_path.h": "44cc933ece28ec7465d40f74afb15cb02ac13fd7db9e8eae58d4e7920b5f1901",
+    "modules/planning/planning_open_space/coarse_trajectory_generator/hybrid_a_star.cc": "0649593b3ea5a21d24dea708982d1b9c348a9d621e14e3b2c5766fc97b6513af"
+  }
+}

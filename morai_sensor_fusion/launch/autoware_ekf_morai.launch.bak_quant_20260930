@@ -1,0 +1,154 @@
+<launch>
+  <arg name="gps_topic" default="/gps"/>
+  <arg name="imu_topic" default="/imu"/>
+  <arg name="speed_topic" default="/Competition_topic"/>
+  <arg name="cur_speed_topic" default="/cur_speed"/>
+  <arg name="use_full_utm" default="true"/>
+  <arg name="imu_ned" default="false"/>
+  <arg name="east_offset" default="302595.0"/>
+  <arg name="north_offset" default="4124145.0"/>
+  <arg name="gps_lever_x" default="0.08"/>
+  <arg name="gps_lever_y" default="0.0"/>
+  <arg name="config" default="$(find morai_sensor_fusion)/config/high_speed_gaussian.yaml"/>
+
+  <node pkg="morai_sensor_fusion" type="morai_measurement_adapter.py"
+        name="morai_measurement_adapter" output="screen" required="true">
+    <param name="gps_topic" value="$(arg gps_topic)"/>
+    <param name="imu_topic" value="$(arg imu_topic)"/>
+    <param name="speed_topic" value="$(arg speed_topic)"/>
+    <param name="cur_speed_topic" value="$(arg cur_speed_topic)"/>
+    <param name="use_full_utm" value="$(arg use_full_utm)"/>
+    <param name="imu_ned" value="$(arg imu_ned)"/>
+    <param name="east_offset" value="$(arg east_offset)"/>
+    <param name="north_offset" value="$(arg north_offset)"/>
+    <param name="gps_lever_x" value="$(arg gps_lever_x)"/>
+    <param name="gps_lever_y" value="$(arg gps_lever_y)"/>
+    <!-- MORAI competition sensors are configured without measurement noise.
+         Retain small numerical floors, but let valid measurements dominate. -->
+    <param name="gps_position_stddev" value="0.03"/>
+    <param name="imu_yaw_stddev" value="0.003"/>
+    <param name="speed_stddev" value="0.03"/>
+    <param name="yaw_rate_stddev" value="0.001"/>
+    <param name="timestamp_stddev" value="0.002"/>
+    <param name="gps_timeout" value="1.0"/>
+    <param name="imu_timeout" value="0.20"/>
+    <param name="speed_timeout" value="0.35"/>
+    <!-- Fresh status/timestamps are insufficient in a shaded area: MORAI can
+         repeat one GPS coordinate while the independent vehicle speed moves. -->
+    <param name="gps_freeze_min_speed" value="1.0"/>
+    <param name="gps_freeze_step_ratio" value="0.15"/>
+    <param name="gps_freeze_abs_step" value="0.03"/>
+    <param name="gps_freeze_confirm_hits" value="4"/>
+    <param name="gps_recover_min_step_ratio" value="0.25"/>
+    <param name="gps_recover_max_step_ratio" value="2.5"/>
+    <param name="gps_recover_step_margin" value="0.25"/>
+    <param name="gps_recover_confirm_hits" value="5"/>
+    <!-- 2026-09-29: 재획득 보정을 진행/횡으로 분리. 진행오차는 1.5 m/s 로 빨리,
+         횡오차는 0.35 m/s 로(터널 벽 오프셋 감쇠 0.3 m/s 와 비슷하게) 옮긴다.
+         시작점은 EKF 출력 위치(reacquire_start_from_ekf) - /odom 이 튀지 않게. -->
+    <param name="gps_reacquire_correction_rate_mps" value="0.35"/>
+    <param name="gps_reacquire_along_rate_mps" value="1.5"/>
+    <param name="reacquire_start_from_ekf" value="true"/>
+    <param name="gps_reacquire_finish_error_m" value="0.05"/>
+    <!-- 시뮬 멈춤(센서 전부 0.1~0.22 s 끊김) 동안 DR 이 벽시계 dt 로 앞서가지 않게
+         한 스텝 dt 상한. 20:57 백: 0.215 s 멈춤 한 번에 재획득 진행오차 +1.57 m. -->
+    <param name="dr_max_step_dt" value="0.05"/>
+    <!-- IMU yaw(진북) -> UTM 격자 yaw. auto = 기준점에서 pyproj 로 계산(-1.347 deg). -->
+    <param name="grid_convergence_correction" value="true"/>
+    <param name="grid_convergence_deg" value="auto"/>
+    <!-- GPS 정상 구간에서 GPS course - (IMU yaw + bicycle beta)를 학습한다.
+         음영구간은 절대 IMU yaw와 실제 조향각을 이용해 진행방향을 적분한다. -->
+    <param name="course_correction_enabled" value="true"/>
+    <!-- course bias 적용 여부. 기본 false(끔).
+         bias 는 상수가 아니라 주행 구간마다 변한다 - 실측(2026-09-17):
+           15:35 백 구간별 평균 +0.000 / +0.468 / -0.137 / -0.375 deg
+           15:56 백 hold 가 -0.863 deg 선택 -> 그 값이 만들 오차 -1.80 m,
+                   실제 복귀오차 0.69 m (다른 오차와 우연히 상쇄된 것)
+         잘못 잡으면 오차를 만드는 쪽으로 작용하므로 끈다.
+         sideslip(bicycle beta)은 물리 모델이라 계속 쓴다. -->
+    <!-- 2026-09-17 실측으로 true 로 되돌림.
+           false(끔)  : 복귀오차 2.755 m, 복귀 직후 조향이 +-0.698 rad
+                        (조향 한계)로 포화되며 좌우 발산
+           true(hold) : 복귀오차 0.687 m
+         bias 가 우연히 상쇄되는 것이라 봤지만, 실제로는 없으면 더 나빴다.
+         IMU yaw 자체는 정확하므로(ground truth 대비 중앙값 0.04 deg)
+         이 bias 는 GPS 변위방향과 차체방향 사이의 실재하는 오프셋이다. -->
+    <!-- 2026-09-29: true -> false. 위의 '없으면 더 나빴다'는 hold 값이 IMU(진북)-UTM 격자
+         수렴각 1.35 deg 를 우연히 일부 흡수했기 때문이다. 이제 수렴각을 직접 보정하므로
+         (grid_convergence_correction) bias 는 0 이 맞고, 잡음 섞인 hold 값은 넣지 않는다. -->
+    <param name="course_bias_apply" value="false"/>
+    <param name="steering_in_degrees" value="true"/>
+    <param name="steering_sign" value="-1.0"/>
+    <!-- 2026-09-29: 0.50 -> 0.0 (sideslip 끔).
+         실측(09-29 백 전부, 1718 샘플): GPS 진행방향 - 격자 yaw 는 조향과 무관하게
+         ~0 deg (조향 +4.1 deg 에서 +0.03, -3.4 deg 에서 -0.27). MORAI 위치 기준점에는
+         옆미끄럼이 없다. 0.50 모델은 같은 조향에서 -2.06/+1.68 deg 로 부호까지
+         반대였고, 터널 출구 곡선 DR 이 1.5 s 동안 우측으로 ~0.3 m 밀렸다. -->
+    <param name="rear_axle_fraction" value="0.0"/>
+    <param name="course_bias_min_speed_mps" value="2.0"/>
+    <param name="course_bias_min_distance_m" value="1.5"/>
+    <param name="course_bias_max_dt_sec" value="1.5"/>
+    <param name="course_bias_alpha" value="0.18"/>
+    <param name="course_bias_max_abs_deg" value="5.0"/>
+    <!-- DR pose는 GPS pose와 같은 입력으로 넣되, 시간에 따라 위치 공분산을
+         키운다. yaw는 노이즈 없는 IMU 절대 자세를 계속 사용한다. -->
+    <param name="dr_pose_rate" value="20.0"/>
+    <param name="dr_position_stddev" value="0.15"/>
+    <param name="dr_position_stddev_rate" value="0.03"/>
+    <param name="dr_position_stddev_max" value="1.50"/>
+    <!-- 터널 카메라 소실점(VP) 헤딩 보정 활성화
+         2026-09-18 실측 피팅: -151.90 deg 적용 시 4회 주행 평균 횡오차 0.092m,
+         출구 실제 CTE -0.055m로 완벽한 중심선 추종 달성 -->
+    <!-- 2026-09-29: 터널 헤딩 기준(카메라 VP / 라이다 벽) 끔 -> 격자 보정 IMU yaw 그대로.
+         IMU yaw 는 참값(GT 대비 0.01 deg)이었고, 터널에서 틀렸던 건 진북/격자 1.35 deg 뿐.
+         격자 보정 IMU yaw 만으로 오프라인 DR(09-29 6 개 음영구간, 11~31 s):
+           재획득 횡오차 -0.14 ~ +0.09 m  (기존 벽/카메라 헤딩 + sideslip: -0.5 ~ -0.8 m)
+         벽 헤딩은 참값 대비 +-0.3~0.6 deg 잡음이라 오히려 오차를 더했다.
+         벽 기반 횡 오프셋(/tunnel/wall_offset, 플래너)은 안전망으로 그대로 둔다. -->
+    <param name="tunnel_camera_yaw_enabled" value="false"/>
+    <param name="tunnel_wall_yaw_enabled" value="false"/>
+    <param name="tunnel_nominal_heading_deg" value="-151.84"/>
+    <param name="camera_yaw_timeout" value="0.5"/>
+    <param name="tunnel_exit_x_utm" value="302530.0"/>
+    <param name="tunnel_entry_x_utm" value="302635.0"/>
+    <param name="tunnel_min_y_utm" value="4123550.0"/>
+    <param name="tunnel_max_y_utm" value="4123750.0"/>
+  </node>
+
+  <!-- 터널 카메라 소실점(Vanishing Point) 기반 헤딩(Yaw) 검출 노드 -->
+  <node pkg="morai_sensor_fusion" type="tunnel_camera_yaw_detector.py"
+        name="tunnel_camera_yaw_detector" output="screen" respawn="true">
+    <param name="image_topic" value="/image_jpeg/compressed"/>
+    <param name="gps_mode_topic" value="/localization/gps_mode"/>
+    <param name="odom_topic" value="/odom"/>
+    <param name="tunnel_nominal_heading_deg" value="-151.84"/>
+    <param name="camera_hfov_deg" value="90.0"/>
+    <param name="downsample_factor" value="1.0"/>
+    <param name="ema_alpha" value="0.25"/>
+    <param name="max_delta_jump_deg" value="3.0"/>
+    <param name="tunnel_min_x" value="302530.0"/>
+    <param name="tunnel_max_x" value="302635.0"/>
+    <param name="tunnel_min_y" value="4123550.0"/>
+    <param name="tunnel_max_y" value="4123750.0"/>
+    <param name="only_when_gps_frozen" value="true"/>
+    <param name="publish_debug_image" value="true"/>
+  </node>
+
+  <node pkg="ekf_localizer" type="ekf_localizer"
+        name="ekf_localizer" output="screen" required="true">
+    <rosparam command="load" file="$(arg config)"/>
+    <param name="pose_frame_id" value="map"/>
+    <param name="output_frame_id" value="base_link"/>
+    <remap from="in_pose_with_covariance" to="/in_pose_with_covariance"/>
+    <remap from="in_twist_with_covariance" to="/in_twist_with_covariance"/>
+  </node>
+
+  <node pkg="morai_sensor_fusion" type="ekf_odom_output.py"
+        name="ekf_odom_output" output="screen" required="true">
+    <param name="rate" value="50.0"/>
+    <param name="output_timeout" value="0.20"/>
+    <param name="max_position_variance" value="25.0"/>
+    <remap from="ekf_pose_with_covariance" to="/ekf_pose_with_covariance"/>
+    <remap from="ekf_twist_with_covariance" to="/ekf_twist_with_covariance"/>
+  </node>
+</launch>

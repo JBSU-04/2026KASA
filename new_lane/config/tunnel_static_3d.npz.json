@@ -1,0 +1,23 @@
+{
+  "empty_drives": [
+    [
+      "bags/competition_2026-10-09-16-47-53.bag",
+      "bags/competition_heavy_2026-10-09-16-47-52.bag"
+    ],
+    [
+      "bags/competition_2026-10-09-16-48-33.bag",
+      "bags/competition_heavy_2026-10-09-16-48-33.bag"
+    ]
+  ],
+  "included_scans": 344,
+  "points": 1751921,
+  "floor_points": 399135,
+  "origin": [
+    302665.26383715635,
+    4123727.0398684195,
+    0.0
+  ],
+  "resolution": 0.05,
+  "minimum_distinct_scans": 1,
+  "notes": "Only user-confirmed empty M8 drives including measured lane3 approach/exit. Untouched historical maps retained. Unsampled cells UNKNOWN. Coordinates local to double-precision origin."
+}

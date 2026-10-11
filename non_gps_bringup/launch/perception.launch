@@ -1,0 +1,10 @@
+<launch>
+  <arg name="run_twinlitenet" default="true"/>
+  <arg name="use_rviz" default="true"/>
+  <include file="$(find lane_perception_pkg)/launch/lane_perception.launch">
+    <arg name="run_twinlitenet" value="$(arg run_twinlitenet)"/>
+  </include>
+  <include file="$(find lidar_perception_pkg)/launch/lidar_perception.launch">
+    <arg name="use_rviz" value="$(arg use_rviz)"/>
+  </include>
+</launch>

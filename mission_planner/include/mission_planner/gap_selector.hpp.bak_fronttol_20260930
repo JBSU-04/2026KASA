@@ -1,0 +1,82 @@
+#pragma once
+
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace mission_planner {
+
+// 합류 흐름(원형 차로 등)을 1차원으로 편 좌표에서 차량 사이 틈(gap)을 고른다.
+//   pos: 합류점(충돌점) = 0, 진행 방향 + (하류/지나감), - (상류/다가옴) [m]
+//   ROS 와 회전교차로 기하에 의존하지 않는다 - 호출자가 좌표를 편다.
+//
+// 틈 = (앞차 leader, 뒤차 follower) 쌍. 각 틈마다 '지금부터 몇 초 뒤에
+// 출발하면 들어갈 수 있는지'(depart_delay)를 예측으로 구한다.
+//   - 흐름 차량: 등속 예측(앞차는 속도 -margin, 뒤차는 +margin 으로 불리하게)
+//   - 자차: 지금 속도에서 accel 로 max_speed 까지(정지 출발이면 start_delay 후)
+//   - 자차 앞끝이 합류 구역에 들어간 뒤 check_horizon 동안
+//       앞차와: 간격 >= standstill_gap + front_headway * v_ego
+//       뒤차와: 간격 >= standstill_gap + rear_headway * v_follower
+struct StreamVehicle {
+  int id = -1;
+  double pos = 0.0;
+  double speed = 0.0;
+  double length = 4.5;
+};
+
+struct EgoEntryModel {
+  double distance_to_merge = 0.0;  // 자차 중심 -> 합류점 경로 거리 [m]
+  double speed = 0.0;              // 현재 속도 [m/s]
+  double accel = 2.2;              // 출발 가속 [m/s^2]
+  double max_speed = 8.0;          // 합류 속도 상한 [m/s]
+  double start_delay = 0.2;        // 정지 출발 반응 지연 [s]
+  double length = 4.6;             // 자차 길이 [m]
+};
+
+struct GapSelectorParams {
+  double front_headway = 1.0;      // 앞차와 시간 간격 [s]
+  double rear_headway = 1.2;       // 뒤차와 시간 간격 [s]
+  double standstill_gap = 2.0;     // 범퍼 간 최소 거리 [m]
+  double check_horizon = 3.0;      // 합류 뒤 검사 시간 [s]
+  double speed_margin = 0.5;       // 흐름 차량 속도 불확실성 [m/s]
+  double entry_zone = 1.0;         // 자차 앞끝이 합류점 이만큼 앞이면 합류 구역 [m]
+  double max_wait = 12.0;          // 출발 지연 탐색 범위 [s]
+  double search_step = 0.1;        // 출발 지연 탐색 간격 [s]
+  double sample_dt = 0.1;          // 검사 시간 간격 [s]
+  double ring_length = 0.0;        // 원형이면 둘레 [m] (0 = 직선 흐름)
+  double leader_follow_range = 30.0; // 이 안의 앞차는 합류 뒤 속도 상한으로 본다 [m]
+};
+
+struct GapCandidate {
+  int leader_id = -1;      // -1 = 앞차 없음
+  int follower_id = -1;    // -1 = 뒤차 없음
+  int wrap = 0;            // 원형 한 바퀴 이동: +1 앞차, -1 뒤차 (래치 구분용)
+  bool feasible = false;
+  double depart_delay = std::numeric_limits<double>::infinity();
+  double merge_time = std::numeric_limits<double>::infinity();
+  double leader_pos = 0.0, leader_speed = 0.0, leader_length = 0.0;
+  double follower_pos = 0.0, follower_speed = 0.0, follower_length = 0.0;
+  // depart_delay=0 으로 출발했을 때 가장 부족한 쪽과 그 부족분 [m]
+  std::string limit_side;  // "front" / "rear" / ""
+  double limit_shortfall = 0.0;
+};
+
+class GapSelector {
+ public:
+  // 모든 틈을 평가한다(앞차가 먼저, 즉 하류 쪽 틈부터).
+  static std::vector<GapCandidate> evaluate(
+      const std::vector<StreamVehicle>& vehicles, const EgoEntryModel& ego,
+      const GapSelectorParams& params);
+
+  // depart_delay 로 출발했을 때 이 틈이 되는지. 부족하면 side/shortfall 채움.
+  static bool feasibleAt(const GapCandidate& gap, const EgoEntryModel& ego,
+                         const GapSelectorParams& params, double depart_delay,
+                         double* merge_time, std::string* side,
+                         double* shortfall);
+
+  // 자차가 출발 뒤 t 초에 간 거리와 속도(출발 지연 포함).
+  static void egoProfile(const EgoEntryModel& ego, double t_since_depart,
+                         double* s, double* v);
+};
+
+}  // namespace mission_planner

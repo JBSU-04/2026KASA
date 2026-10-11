@@ -1,0 +1,27 @@
+<launch>
+  <arg name="simulator_ip" default="192.168.0.1"/>
+  <arg name="lidar1_port" default="2368"/>
+  <arg name="lidar2_port" default="2370"/>
+  <arg name="lidar1_topic" default="/lidar3d_0"/>
+  <arg name="lidar2_topic" default="/lidar3d_1"/>
+
+  <group ns="morai_lidar_0">
+    <remap from="velodyne_points" to="$(arg lidar1_topic)"/>
+    <include file="$(find velodyne_pointcloud)/launch/VLP16_points.launch">
+      <arg name="device_ip" value="$(arg simulator_ip)"/>
+      <arg name="port" value="$(arg lidar1_port)"/>
+      <arg name="frame_id" value="lidar1"/>
+      <arg name="manager" value="morai_lidar0_manager"/>
+    </include>
+  </group>
+
+  <group ns="morai_lidar_1">
+    <remap from="velodyne_points" to="$(arg lidar2_topic)"/>
+    <include file="$(find velodyne_pointcloud)/launch/VLP16_points.launch">
+      <arg name="device_ip" value="$(arg simulator_ip)"/>
+      <arg name="port" value="$(arg lidar2_port)"/>
+      <arg name="frame_id" value="lidar2"/>
+      <arg name="manager" value="morai_lidar1_manager"/>
+    </include>
+  </group>
+</launch>

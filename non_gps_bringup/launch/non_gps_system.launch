@@ -1,0 +1,10 @@
+<launch>
+  <arg name="run_twinlitenet" default="true"/>
+  <arg name="use_rviz" default="true"/>
+  <include file="$(find non_gps_bringup)/launch/perception.launch">
+    <arg name="run_twinlitenet" value="$(arg run_twinlitenet)"/>
+    <arg name="use_rviz" value="$(arg use_rviz)"/>
+  </include>
+  <include file="$(find mission_pkg)/launch/mission.launch"/>
+  <include file="$(find control_pkg)/launch/control.launch"/>
+</launch>

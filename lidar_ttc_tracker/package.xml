@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>lidar_ttc_tracker</name>
+  <version>0.1.0</version>
+  <description>
+    Velodyne 점군 + MORAI Ego_topic/IMU 기반 장애물 검출-추적(칼만+헝가리안)-TTC 계산 패키지.
+    /odom 파이프라인 없이 단독 실행 가능.
+  </description>
+  <maintainer email="secondbabydinosaur@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>message_generation</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>apollo_motion_bridge</exec_depend>
+</package>

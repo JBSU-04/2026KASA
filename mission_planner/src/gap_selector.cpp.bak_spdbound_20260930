@@ -1,0 +1,290 @@
+#include "mission_planner/gap_selector.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace mission_planner {
+
+void GapSelector::egoProfile(const EgoEntryModel& ego, double t, double* s,
+                             double* v) {
+  const double v0 = std::max(0.0, ego.speed);
+  const double vmax = std::max(v0, ego.max_speed);
+  const double a = std::max(0.1, ego.accel);
+  // 거의 서 있으면 반응 지연 뒤 출발한다.
+  const double delay = v0 < 0.5 ? std::max(0.0, ego.start_delay) : 0.0;
+  const double tt = t - delay;
+  if (tt <= 0.0) {
+    *s = v0 * std::max(0.0, t);
+    *v = v0;
+    return;
+  }
+  const double t_acc = (vmax - v0) / a;
+  const double s_delay = v0 * delay;
+  if (tt <= t_acc) {
+    *s = s_delay + v0 * tt + 0.5 * a * tt * tt;
+    *v = v0 + a * tt;
+  } else {
+    *s = s_delay + v0 * t_acc + 0.5 * a * t_acc * t_acc + vmax * (tt - t_acc);
+    *v = vmax;
+  }
+}
+
+bool GapSelector::feasibleAt(const GapCandidate& gap, const EgoEntryModel& ego,
+                             const GapSelectorParams& p, double td,
+                             double* merge_time, std::string* side,
+                             double* shortfall, double* front_shortfall,
+                             double* rear_shortfall) {
+  const double dt = std::max(0.02, p.sample_dt);
+  const double half_ego = 0.5 * std::max(0.1, ego.length);
+  const double zone = std::max(0.0, p.entry_zone);
+  // 기다리는 동안 자차는 서 있다(출발 지연 td 뒤 정지 출발). td=0 이면
+  // 현재 속도에서 바로 가속한다.
+  EgoEntryModel model = ego;
+  if (td > 1e-6)
+    model.speed = 0.0;
+  const double lead_v = std::max(0.0, gap.leader_speed - p.speed_margin);
+  // 가까운 앞차가 있으면 합류 뒤 자차는 그 속도를 넘지 않는다(ACC 추종).
+  //   이걸 빼면 자차가 느린 앞차를 계속 가속해 따라잡는 것으로 계산돼
+  //   앞차 간격이 몇 초 뒤 무너지고, 뒤차 간격은 실제보다 낙관적이 된다.
+  if (gap.leader_id >= 0 && gap.leader_pos < p.leader_follow_range)
+    model.max_speed = std::min(model.max_speed, std::max(1.0, lead_v));
+  const double foll_v = std::max(0.0, gap.follower_speed + p.speed_margin);
+  const double half_lead = 0.5 * std::max(0.1, gap.leader_length);
+  const double half_foll = 0.5 * std::max(0.1, gap.follower_length);
+
+  double t_in = -1.0;
+  double worst = 0.0;
+  double worst_front = 0.0, worst_rear = 0.0;
+  std::string worst_side;
+  bool ok = true;
+  // 합류 구역 진입 시각을 찾고, 그때부터 check_horizon 동안 검사한다.
+  const double t_limit = td + 30.0;
+  for (double t = td; t <= t_limit; t += dt) {
+    double s = 0.0, v = 0.0;
+    egoProfile(model, t - td, &s, &v);
+    const double pe = s - ego.distance_to_merge;  // 자차 중심의 흐름 좌표
+    if (t_in < 0.0) {
+      if (pe + half_ego < -zone)
+        continue;
+      t_in = t;
+    }
+    if (t > t_in + p.check_horizon)
+      break;
+    if (gap.leader_id >= 0) {
+      const double pl = gap.leader_pos + lead_v * t;
+      const double g = (pl - half_lead) - (pe + half_ego);
+      const double need = p.standstill_gap + p.front_headway * v;
+      if (g < need) {
+        ok = false;
+        worst_front = std::max(worst_front, need - g);
+        if (need - g > worst) { worst = need - g; worst_side = "front"; }
+      }
+    }
+    if (gap.follower_id >= 0) {
+      const double pf = gap.follower_pos + foll_v * t;
+      const double g = (pe - half_ego) - (pf + half_foll);
+      const double need = p.standstill_gap + p.rear_headway * foll_v;
+      if (g < need) {
+        ok = false;
+        worst_rear = std::max(worst_rear, need - g);
+        if (need - g > worst) { worst = need - g; worst_side = "rear"; }
+      }
+    }
+  }
+  if (merge_time) *merge_time = t_in;
+  if (side) *side = worst_side;
+  if (shortfall) *shortfall = worst;
+  if (front_shortfall) *front_shortfall = worst_front;
+  if (rear_shortfall) *rear_shortfall = worst_rear;
+  return ok && t_in >= 0.0;
+}
+
+std::vector<GapCandidate> GapSelector::evaluate(
+    const std::vector<StreamVehicle>& vehicles_in, const EgoEntryModel& ego,
+    const GapSelectorParams& p) {
+  std::vector<StreamVehicle> v = vehicles_in;
+  // 하류(앞) -> 상류(뒤) 순.
+  std::sort(v.begin(), v.end(), [](const StreamVehicle& a,
+                                   const StreamVehicle& b) {
+    return a.pos > b.pos;
+  });
+  std::vector<GapCandidate> gaps;
+  const size_t n = v.size();
+  auto make = [&](const StreamVehicle* lead, double lead_shift,
+                  const StreamVehicle* foll, double foll_shift) {
+    GapCandidate g;
+    if (lead) {
+      g.leader_id = lead->id;
+      g.leader_pos = lead->pos + lead_shift;
+      g.leader_speed = lead->speed;
+      g.leader_length = lead->length;
+    }
+    if (foll) {
+      g.follower_id = foll->id;
+      g.follower_pos = foll->pos + foll_shift;
+      g.follower_speed = foll->speed;
+      g.follower_length = foll->length;
+    }
+    g.wrap = lead_shift > 0.0 ? 1 : (foll_shift < 0.0 ? -1 : 0);
+    gaps.push_back(g);
+  };
+  const bool ring = p.ring_length > 1.0 && n > 0;
+  // 맨 앞 틈: 앞차 = (원형이면) 맨 뒤 차가 한 바퀴 앞, 뒤차 = 맨 앞 차.
+  if (n == 0) {
+    make(nullptr, 0.0, nullptr, 0.0);
+  } else {
+    make(ring ? &v[n - 1] : nullptr, ring ? p.ring_length : 0.0, &v[0], 0.0);
+    for (size_t k = 1; k < n; ++k)
+      make(&v[k - 1], 0.0, &v[k], 0.0);
+    // 맨 뒤 틈: 앞차 = 맨 뒤 차, 뒤차 = (원형이면) 맨 앞 차가 한 바퀴 뒤.
+    make(&v[n - 1], 0.0, ring ? &v[0] : nullptr,
+         ring ? -p.ring_length : 0.0);
+  }
+  // 원형에서 차가 한 대면 두 틈이 같은 차량 쌍이다: '그 차 앞'(뒤차=그 차)과
+  // '그 차 뒤'(앞차=그 차). 둘 다 남기고 wrap 으로 구분한다.
+
+  const double step = std::max(0.02, p.search_step);
+  for (GapCandidate& g : gaps) {
+    double mt = 0.0, sf = 0.0;
+    std::string side;
+    // 지금 출발할 때의 부족분(표시용).
+    feasibleAt(g, ego, p, 0.0, &mt, &g.limit_side, &g.limit_shortfall,
+               &g.front_shortfall_now, &g.rear_shortfall_now);
+    for (double td = 0.0; td <= p.max_wait + 1e-9; td += step) {
+      if (feasibleAt(g, ego, p, td, &mt, &side, &sf)) {
+        g.feasible = true;
+        g.depart_delay = td;
+        g.merge_time = mt;
+        break;
+      }
+    }
+  }
+  return gaps;
+}
+
+double GapSelector::timeToZone(const EgoEntryModel& ego,
+                               const GapSelectorParams& p) {
+  const double need = ego.distance_to_merge - 0.5 * std::max(0.1, ego.length) -
+                      std::max(0.0, p.entry_zone);
+  if (need <= 0.0) return 0.0;
+  const double dt = 0.02;
+  for (double t = 0.0; t <= 30.0; t += dt) {
+    double s = 0.0, v = 0.0;
+    egoProfile(ego, t, &s, &v);
+    if (s >= need) return t;
+  }
+  return 30.0;
+}
+
+SequentialResult GapSelector::evaluateSequential(
+    const std::vector<StreamVehicle>& vehicles, const EgoEntryModel& ego,
+    const GapSelectorParams& p, const SequentialParams& seq, int target_leader) {
+  SequentialResult out;
+  std::vector<StreamVehicle> up, down;
+  for (const StreamVehicle& v : vehicles) {
+    (v.pos < 0.0 ? up : down).push_back(v);
+  }
+  // 상류: 가까운 것부터(pos 큰 것부터), 하류: 가까운 것부터.
+  std::sort(up.begin(), up.end(),
+            [](const StreamVehicle& a, const StreamVehicle& b) { return a.pos > b.pos; });
+  std::sort(down.begin(), down.end(),
+            [](const StreamVehicle& a, const StreamVehicle& b) { return a.pos < b.pos; });
+  auto find = [](const std::vector<StreamVehicle>& list, int id) -> int {
+    for (size_t i = 0; i < list.size(); ++i)
+      if (list[i].id == id) return static_cast<int>(i);
+    return -1;
+  };
+  int target = target_leader;
+  if (target == -2 || (target >= 0 && find(up, target) < 0 && find(down, target) < 0)) {
+    target = down.empty() ? -1 : down.front().id;
+  }
+  out.resolved_leader = target;
+  const double t_zone = timeToZone(ego, p);
+  const double s0 = p.standstill_gap;
+  const double half_ego = 0.5 * std::max(0.1, ego.length);
+  const double zone = std::max(0.0, p.entry_zone);
+  for (int iter = 0; iter <= seq.max_skip; ++iter) {
+    const StreamVehicle* ld = nullptr;
+    const StreamVehicle* fl = nullptr;
+    if (target < 0) {
+      if (!up.empty()) fl = &up.front();
+    } else {
+      const int ku = find(up, target);
+      if (ku >= 0) {
+        ld = &up[ku];
+        if (ku + 1 < static_cast<int>(up.size())) fl = &up[ku + 1];
+      } else {
+        ld = &down[find(down, target)];
+        if (!up.empty()) fl = &up.front();
+      }
+    }
+    if (iter == 0) out.resolved_follower = fl != nullptr ? fl->id : -1;
+    // 앞차가 합류점을 s0 만큼 지나는 시각(현재 속도 - margin)
+    double t_clear = 0.0;
+    double lead_v = 0.0;
+    if (ld != nullptr) {
+      lead_v = std::max(0.0, ld->speed - p.speed_margin);
+      const double dist = s0 + 0.5 * std::max(0.1, ld->length) - ld->pos;
+      if (dist > 0.0) t_clear = dist / std::max(0.5, lead_v);
+    }
+    double td = std::max(0.0, t_clear - t_zone);
+    if (ld != nullptr && seq.leader_start_distance > 0.0 &&
+        ld->pos < -seq.leader_start_distance) {
+      td = std::max(td, (-seq.leader_start_distance - ld->pos) / std::max(0.5, lead_v));
+    }
+    // 뒤차 검사: 진입 시각 t_in(+late) 부터 horizon 동안.
+    double rear_margin = 1e9, rear_ttc = 1e9;
+    bool ok = true;
+    if (fl != nullptr) {
+      const double t_in = td + t_zone + std::max(0.0, seq.late_margin);
+      EgoEntryModel model = ego;
+      if (td > 1e-6) model.speed = 0.0;
+      double v_cap = std::max(model.speed, ego.max_speed);
+      if (ld != nullptr && ld->pos < p.leader_follow_range)
+        v_cap = std::min(v_cap, std::max(1.0, lead_v));
+      double s = 0.0, v = 0.0;
+      egoProfile(model, std::max(0.0, t_in - seq.late_margin - td), &s, &v);
+      v = std::min(v, v_cap);
+      double pe = -zone - half_ego;  // 합류 구역 진입 순간 자차 중심
+      const double vf = fl->speed + p.speed_margin;
+      const double half_f = 0.5 * std::max(0.1, fl->length);
+      const double dt = std::max(0.02, p.sample_dt);
+      for (double t = t_in; t <= t_in + p.check_horizon + 1e-9; t += dt) {
+        const double pf = fl->pos + vf * t;
+        const double gap = (pe - half_ego) - (pf + half_f);
+        const double need = s0 + p.rear_headway * vf;
+        rear_margin = std::min(rear_margin, gap - need);
+        if (vf > v + 1e-6) rear_ttc = std::min(rear_ttc, std::max(0.0, gap) / (vf - v));
+        v = std::min(v_cap, v + ego.accel * dt);
+        pe += v * dt;
+      }
+      ok = rear_margin >= 0.0 && rear_ttc >= seq.ttc_rear;
+    }
+    if (ok) {
+      out.feasible = true;
+      out.target_leader = target;
+      GapCandidate& g = out.gap;
+      g.feasible = true;
+      g.depart_delay = td;
+      g.merge_time = td + t_zone;
+      if (ld) {
+        g.leader_id = ld->id; g.leader_pos = ld->pos;
+        g.leader_speed = ld->speed; g.leader_length = ld->length;
+      }
+      if (fl) {
+        g.follower_id = fl->id; g.follower_pos = fl->pos;
+        g.follower_speed = fl->speed; g.follower_length = fl->length;
+      }
+      out.rear_margin = rear_margin;
+      out.rear_ttc = rear_ttc;
+      return out;
+    }
+    // 패스: 뒤차의 뒤 공간
+    out.skipped.push_back(fl->id);
+    target = fl->id;
+  }
+  out.target_leader = target;
+  return out;
+}
+
+}  // namespace mission_planner

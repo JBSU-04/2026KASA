@@ -1,0 +1,23 @@
+<launch>
+  <!-- ctrl_cmd 전용 ROS Bridge. 이 ROS PC의 컨트롤러가 이미 ctrl_cmd
+       (morai_msgs/CtrlCmd)를 정상 발행하므로 타입 등록용 더미 subscriber는
+       필요 없다: rosbridge가 기존 publisher에서 타입을 바로 알아낸다.
+       MORAI 쪽 NetworkInfo의 Ego Ctrl Cmd 항목을, RosBridgeServerUrl은
+       이 PC의 websocket 주소(ws 프로토콜, port 9090)로, Topic은 ctrl_cmd로
+       맞춰야 한다 (apply_morai_udp_config.py 의 destination ip 옵션 참고). -->
+  <arg name="port" default="9090" />
+  <arg name="address" default="127.0.0.1" />
+
+  <node pkg="rosbridge_server" type="rosbridge_websocket"
+        name="ctrl_rosbridge_websocket" output="screen">
+    <param name="port" value="$(arg port)" />
+    <param name="address" value="$(arg address)" />
+    <!-- Noetic rosbridge_server parses these as bracketed strings itself.
+         Using <rosparam> creates YAML lists and crashes rosbridge_websocket. -->
+    <param name="topics_glob" type="str" value="[/ctrl_cmd]" />
+    <!-- An empty glob means unrestricted in this rosbridge version. Use an
+         intentionally impossible application namespace to deny access. -->
+    <param name="services_glob" type="str" value="[/__ctrl_bridge_disabled__]" />
+    <param name="params_glob" type="str" value="[/__ctrl_bridge_disabled__]" />
+  </node>
+</launch>

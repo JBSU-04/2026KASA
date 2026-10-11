@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Early M2 static-obstacle proposals from gravity-aligned raw LiDAR.
+
+GroundGrid remains the authoritative near-field detector.  This node only
+recovers sparse, above-ground returns at 12--40 m by accumulating them in the
+map frame for a short time.  A proposal needs evidence from multiple scans and
+must overlap the reference-path corridor, so a single road return cannot start
+an avoidance manoeuvre.
+"""
+
+import json
+import math
+from collections import deque
+
+import numpy as np
+import rospy
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
+from waypoint_maker.msg import Lane
+from mission_supervisor.msg import SectionState
+
+try:
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
+
+
+def _yaw(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def _xyz(msg):
+    """Zero-copy xyz extraction for ordinary PointCloud2 layouts."""
+    fields = {f.name: f for f in msg.fields}
+    if not all(k in fields for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), np.float32)
+    endian = '>' if msg.is_bigendian else '<'
+    names, formats, offsets = [], [], []
+    for k in ('x', 'y', 'z'):
+        f = fields[k]
+        if f.datatype != 7:  # sensor_msgs/PointField.FLOAT32
+            return np.empty((0, 3), np.float32)
+        names.append(k); formats.append(endian + 'f4'); offsets.append(f.offset)
+    dtype = np.dtype({'names': names, 'formats': formats,
+                      'offsets': offsets, 'itemsize': msg.point_step})
+    count = msg.width * msg.height
+    arr = np.frombuffer(msg.data, dtype=dtype, count=count)
+    out = np.column_stack((arr['x'], arr['y'], arr['z'])).astype(np.float32, copy=False)
+    return out[np.isfinite(out).all(axis=1)]
+
+
+class FarStaticDetector:
+    def __init__(self):
+        self.active_sections = set(rospy.get_param('~active_sections', ['M2']))
+        self.x_min = float(rospy.get_param('~x_min_m', 12.0))
+        self.x_max = float(rospy.get_param('~x_max_m', 40.0))
+        self.y_max = float(rospy.get_param('~y_half_m', 4.5))
+        self.ground_z = float(rospy.get_param('~ground_z', -1.765))
+        self.sensor_x = float(rospy.get_param('~sensor_x_m', 1.1))
+        self.sensor_y = float(rospy.get_param('~sensor_y_m', 0.0))
+        self.h_min = float(rospy.get_param('~min_height_m', 0.10))
+        self.h_max = float(rospy.get_param('~max_height_m', 2.8))
+        self.path_half = float(rospy.get_param('~path_corridor_half_width_m', 1.9))
+        self.window = float(rospy.get_param('~accumulation_sec', 0.55))
+        self.voxel = float(rospy.get_param('~voxel_m', 0.16))
+        self.eps = float(rospy.get_param('~cluster_eps_m', 0.65))
+        self.min_points = int(rospy.get_param('~min_accumulated_points', 5))
+        self.min_scans = int(rospy.get_param('~min_distinct_scans', 2))
+        self.max_extent = float(rospy.get_param('~max_cluster_extent_m', 7.0))
+        self.section = ''
+        self.pose = None
+        self.route = np.empty((0, 2), np.float64)
+        self.route_tree = None
+        self.frames = deque()
+        self.scan_seq = 0
+        self.pub = rospy.Publisher('/obstacle_info_far', String, queue_size=2)
+        self.marker_pub = rospy.Publisher('/obstacle_markers_far', MarkerArray, queue_size=1)
+        rospy.Subscriber('/mission/active_section', SectionState, self._section, queue_size=1)
+        rospy.Subscriber('/odom', Odometry, self._odom, queue_size=1)
+        rospy.Subscriber('/final_waypoint', Lane, self._route, queue_size=1)
+        rospy.Subscriber('/perception/points_gravity', PointCloud2, self._cloud,
+                         queue_size=1, buff_size=8 * 1024 * 1024)
+
+    def _section(self, msg):
+        if msg.section_id != self.section and msg.section_id not in self.active_sections:
+            self.frames.clear()
+        self.section = msg.section_id
+
+    def _odom(self, msg):
+        self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y,
+                     _yaw(msg.pose.pose.orientation))
+
+    def _route(self, msg):
+        pts = [(w.pose.pose.position.x, w.pose.pose.position.y) for w in msg.waypoints]
+        self.route = np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 2))
+        self.route_tree = cKDTree(self.route) if cKDTree is not None and len(self.route) else None
+
+    def _empty(self, stamp):
+        self.pub.publish(String(data=json.dumps({
+            'stamp': stamp, 'mission_mode': 'static', 'obstacles': [],
+            'collision_objects': [], 'source': 'raw_temporal_far'})))
+        self.marker_pub.publish(MarkerArray(markers=[]))
+
+    def _cloud(self, msg):
+        stamp = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        if self.section not in self.active_sections or self.pose is None or len(self.route) < 2:
+            self._empty(stamp); return
+        p = _xyz(msg)
+        if not len(p):
+            self._empty(stamp); return
+        height = p[:, 2] - self.ground_z
+        keep = ((p[:, 0] >= self.x_min) & (p[:, 0] <= self.x_max) &
+                (np.abs(p[:, 1]) <= self.y_max) &
+                (height >= self.h_min) & (height <= self.h_max))
+        p = p[keep]
+        if len(p):
+            # One sample per voxel per scan prevents a dense scan from satisfying
+            # the temporal confirmation rule by itself.
+            key = np.floor(p / self.voxel).astype(np.int32)
+            _, take = np.unique(key, axis=0, return_index=True)
+            p = p[take]
+        x0, y0, yaw = self.pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        # points_gravity keeps the LiDAR origin. Convert to base_link before
+        # map compensation and before reporting position_ego.
+        if len(p):
+            p[:, 0] += self.sensor_x
+            p[:, 1] += self.sensor_y
+        world = np.empty_like(p, dtype=np.float64)
+        if len(p):
+            world[:, 0] = x0 + c * p[:, 0] - s * p[:, 1]
+            world[:, 1] = y0 + s * p[:, 0] + c * p[:, 1]
+            world[:, 2] = p[:, 2]
+            if self.route_tree is not None:
+                d, _ = self.route_tree.query(world[:, :2], k=1)
+            else:
+                d = np.sqrt(((world[:, None, :2] - self.route[None, :, :]) ** 2).sum(2)).min(1)
+            world = world[d <= self.path_half]
+        self.scan_seq += 1
+        if len(world):
+            scans = np.full((len(world), 1), self.scan_seq, dtype=np.float64)
+            self.frames.append((stamp, np.hstack((world, scans))))
+        while self.frames and stamp - self.frames[0][0] > self.window:
+            self.frames.popleft()
+        proposals = self._cluster(stamp, x0, y0, yaw)
+        payload = {'stamp': stamp, 'mission_mode': 'static', 'obstacles': proposals,
+                   'collision_objects': list(proposals), 'source': 'raw_temporal_far'}
+        self.pub.publish(String(data=json.dumps(payload, separators=(',', ':'))))
+        self._markers(msg.header, proposals)
+
+    def _cluster(self, stamp, x0, y0, yaw):
+        if cKDTree is None or not self.frames:
+            return []
+        a = np.vstack([v for _, v in self.frames])
+        if len(a) < self.min_points:
+            return []
+        tree = cKDTree(a[:, :2])
+        pairs = tree.query_pairs(self.eps)
+        parent = np.arange(len(a))
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]; i = parent[i]
+            return i
+        for i, j in pairs:
+            ri, rj = root(i), root(j)
+            if ri != rj: parent[rj] = ri
+        groups = {}
+        for i in range(len(a)): groups.setdefault(root(i), []).append(i)
+        out = []
+        c, s = math.cos(yaw), math.sin(yaw)
+        for ids in groups.values():
+            q = a[ids]
+            if len(q) < self.min_points or len(np.unique(q[:, 3])) < self.min_scans:
+                continue
+            xy = q[:, :2]
+            span = np.ptp(xy, axis=0)
+            if float(np.hypot(span[0], span[1])) > self.max_extent:
+                continue
+            center = np.median(xy, axis=0)
+            dx, dy = center[0] - x0, center[1] - y0
+            ex, ey = c * dx + s * dy, -s * dx + c * dy
+            if ex < self.x_min - 1.0 or ex > self.x_max + 1.0:
+                continue
+            # Express dimensions in the ego/path axes. Sparse distant returns
+            # get conservative minimum dimensions until GroundGrid takes over.
+            relx = c * (xy[:, 0] - center[0]) + s * (xy[:, 1] - center[1])
+            rely = -s * (xy[:, 0] - center[0]) + c * (xy[:, 1] - center[1])
+            # Sparse far returns expose only part of the object. A conservative
+            # 0.8 m minimum avoids beginning an under-sized manoeuvre that has
+            # to jump outward when the near detector later sees the full box.
+            length = max(0.8, min(6.0, float(np.ptp(relx)) + self.voxel))
+            width = max(0.8, min(2.6, float(np.ptp(rely)) + self.voxel))
+            top = float(np.max(q[:, 2]) - self.ground_z)
+            oid = 900000 + (abs(hash((round(center[0], 1), round(center[1], 1)))) % 90000)
+            out.append({
+                'id': int(oid), 'class_name': 'obstacle',
+                'position_ego': [round(ex, 3), round(ey, 3), round(float(np.median(q[:, 2])), 3)],
+                'position_world': [round(float(center[0]), 3), round(float(center[1]), 3)],
+                'length': round(length, 3), 'width': round(width, 3),
+                'radius': round(0.5 * math.hypot(length, width), 3),
+                'speed': 0.0, 'velocity': [0.0, 0.0], 'motion_state': 'static',
+                'velocity_valid': False, 'confirmed': True, 'passed': False,
+                'in_trigger_corridor': True, 'top_elevation': round(top, 3),
+                'last_seen': stamp, 'source': 'raw_temporal_far',
+                'evidence_scans': int(len(np.unique(q[:, 3]))),
+                'evidence_points': int(len(q))})
+        return sorted(out, key=lambda z: z['position_ego'][0])
+
+    def _markers(self, header, obstacles):
+        ma = MarkerArray()
+        clear = Marker(); clear.action = Marker.DELETEALL; ma.markers.append(clear)
+        for i, o in enumerate(obstacles):
+            m = Marker(); m.header = header; m.header.frame_id = 'map'
+            m.ns = 'far_static_proposal'; m.id = i; m.type = Marker.CUBE; m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y = o['position_world']
+            m.pose.position.z = self.ground_z + max(0.2, o['top_elevation']) * 0.5
+            m.pose.orientation.w = 1.0
+            m.scale.x, m.scale.y, m.scale.z = o['length'], o['width'], max(0.2, o['top_elevation'])
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.45, 0.0, 0.8
+            m.lifetime = rospy.Duration(0.35); ma.markers.append(m)
+        self.marker_pub.publish(ma)
+
+
+if __name__ == '__main__':
+    rospy.init_node('far_static_obstacle_detector')
+    FarStaticDetector()
+    rospy.spin()

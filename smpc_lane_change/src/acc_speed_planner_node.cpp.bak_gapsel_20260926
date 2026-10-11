@@ -1,0 +1,1834 @@
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <nav_msgs/Odometry.h>
+#include <ros/ros.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
+#include <std_msgs/String.h>
+#include <visualization_msgs/MarkerArray.h>
+
+#include <smpc_lane_change/BehaviorLongitudinalRequest.h>
+#include <smpc_lane_change/BehaviorLongitudinalStatus.h>
+#include <smpc_lane_change/LaneChangeDecision.h>
+#include <smpc_lane_change/LaneChangeStatus.h>
+#include <smpc_lane_change/TargetVehicle.h>
+#include <smpc_lane_change/TargetVehicleSet.h>
+
+class AccSpeedPlanner {
+ public:
+  AccSpeedPlanner() : nh_(), pnh_("~") {
+    pnh_.param("ego_length_m", ego_length_m_, 4.8);
+    pnh_.param("ego_width_m", ego_width_m_, 1.9);
+    pnh_.param("acc_max_range_m", acc_max_range_m_, 35.0);
+    pnh_.param("standstill_gap_m", standstill_gap_m_, 8.0);
+    pnh_.param("time_headway_sec", time_headway_sec_, 2.2);
+    pnh_.param("gap_gain", gap_gain_, 0.65);
+    pnh_.param("closing_speed_gap_time_sec", closing_speed_gap_time_sec_, 0.8);
+    pnh_.param("braking_decel_mps2", braking_decel_mps2_, 4.5);
+    pnh_.param("soft_ttc_sec", soft_ttc_sec_, 4.0);
+    pnh_.param("hard_ttc_sec", hard_ttc_sec_, 1.8);
+    pnh_.param("min_speed_mps", min_speed_mps_, 0.0);
+    pnh_.param("max_accel_mps2", max_accel_mps2_, 1.5);
+    pnh_.param("lane_change_max_accel_mps2", lane_change_max_accel_mps2_, 3.5);
+    pnh_.param("max_decel_mps2", max_decel_mps2_, 5.0);
+    pnh_.param("highway_follow_max_decel_mps2", highway_follow_max_decel_mps2_, 1.5);
+    pnh_.param("highway_closing_decel_boost_scale",
+               highway_closing_decel_boost_scale_, 2.5);
+    highway_closing_decel_boost_scale_ =
+        std::max(1.0, highway_closing_decel_boost_scale_);
+    pnh_.param("highway_closing_decel_boost_scale_lane_change",
+               highway_closing_decel_boost_scale_lane_change_, 1.3);
+    highway_closing_decel_boost_scale_lane_change_ =
+        std::max(1.0, highway_closing_decel_boost_scale_lane_change_);
+    pnh_.param("lead_max_velocity_std_mps", lead_max_velocity_std_mps_, 3.0);
+    pnh_.param("lead_speed_hold_sec", lead_speed_hold_sec_, 1.0);
+    pnh_.param("lead_unknown_speed_margin_mps",
+               lead_unknown_speed_margin_mps_, 4.0);
+    pnh_.param("lead_max_speed_jump_mps2", lead_max_speed_jump_mps2_, 6.0);
+    pnh_.param("gap_closing_enabled", gap_closing_enabled_, true);
+    pnh_.param("gap_closing_alpha", gap_closing_alpha_, 0.35);
+    pnh_.param("gap_closing_max_dt_sec", gap_closing_max_dt_sec_, 0.4);
+    pnh_.param("gap_closing_max_jump_mps", gap_closing_max_jump_mps_, 25.0);
+    pnh_.param("highway_max_follow_speed_drop_mps", highway_max_follow_speed_drop_mps_, 1.5);
+    pnh_.param("closing_decel_boost_enabled",
+               closing_decel_boost_enabled_, true);
+    pnh_.param("closing_decel_boost_start_mps",
+               closing_decel_boost_start_mps_, 5.0);
+    pnh_.param("closing_decel_boost_full_mps",
+               closing_decel_boost_full_mps_, 15.0);
+    pnh_.param("closing_decel_boost_max_decel_mps2",
+               closing_decel_boost_max_decel_mps2_, 8.0);
+    pnh_.param("hard_brake_decel_mps2", hard_brake_decel_mps2_, 9.0);
+    pnh_.param("hard_brake_bypass_filter", hard_brake_bypass_filter_, true);
+    pnh_.param("emergency_gap_m", emergency_gap_m_, 8.0);
+    pnh_.param("critical_gap_m", critical_gap_m_, 2.5);
+    pnh_.param("emergency_stop_gap_m", emergency_stop_gap_m_, 3.5);
+    pnh_.param("critical_ttc_sec", critical_ttc_sec_, 0.7);
+    pnh_.param("rapid_lead_brake_enabled", rapid_lead_brake_enabled_, true);
+    pnh_.param("rapid_lead_ttc_sec", rapid_lead_ttc_sec_, 3.0);
+    pnh_.param("rapid_lead_min_closing_speed_mps",
+               rapid_lead_min_closing_speed_mps_, 4.0);
+    pnh_.param("rapid_lead_required_decel_mps2",
+               rapid_lead_required_decel_mps2_, 5.0);
+    pnh_.param("max_follow_speed_drop_mps", max_follow_speed_drop_mps_, 5.0);
+    pnh_.param("lead_moving_speed_thresh_mps", lead_moving_speed_thresh_mps_, 2.0);
+    pnh_.param("target_timeout_sec", target_timeout_sec_, 0.8);
+    pnh_.param("decision_request_timeout_sec", decision_request_timeout_sec_, 0.5);
+    pnh_.param("publish_rate_hz", publish_rate_hz_, 20.0);
+    pnh_.param<std::string>("mission_speed_topic",
+                            mission_speed_topic_,
+                            "/control_feedback/mission_speed_target_mps");
+    pnh_.param("mission_speed_timeout_sec", mission_speed_timeout_sec_, 0.5);
+    pnh_.param("mission_speed_fallback_mps", mission_speed_fallback_mps_, 10.0);
+    pnh_.param("behavior_request_enabled", behavior_request_enabled_, false);
+    pnh_.param<std::string>("behavior_request_topic", behavior_request_topic_,
+                            "/smpc/behavior_longitudinal_request");
+    pnh_.param("behavior_request_timeout_sec", behavior_request_timeout_sec_, 0.35);
+    pnh_.param<std::string>("behavior_status_topic", behavior_status_topic_,
+                            "/smpc/behavior_longitudinal_status");
+    pnh_.param("behavior_request_apply_while_lane_change",
+               behavior_request_apply_while_lane_change_, false);
+    pnh_.param("behavior_request_apply_accel", behavior_request_apply_accel_, false);
+    pnh_.param("accel_after_yield_release_enabled",
+               accel_after_yield_release_enabled_, true);
+    pnh_.param("accel_release_window_sec", accel_release_window_sec_, 1.5);
+    // 양보 후 따라가기(yieldFollowTargetFront 주석)
+    pnh_.param("yield_follow_enabled", yield_follow_enabled_, true);
+    pnh_.param("lc_target_lead_soft_from_start", lc_target_lead_soft_from_start_, true);
+    pnh_.param("yield_follow_standstill_gap_m", yield_follow_standstill_gap_m_, 4.0);
+    pnh_.param("yield_follow_time_gap_sec", yield_follow_time_gap_sec_, 0.3);
+    pnh_.param("yield_follow_gap_gain", yield_follow_gap_gain_, 0.4);
+    pnh_.param("yield_follow_close_gap_gain", yield_follow_close_gap_gain_, 0.2);
+    pnh_.param("yield_follow_min_desired_gap_m", yield_follow_min_desired_gap_m_, 8.5);
+    pnh_.param("yield_follow_max_catchup_mps", yield_follow_max_catchup_mps_, 2.0);
+    pnh_.param("yield_follow_max_accel_mps2", yield_follow_max_accel_mps2_, 2.4);
+    pnh_.param("yield_follow_min_gap_m", yield_follow_min_gap_m_, 2.0);
+    pnh_.param("yield_follow_min_rel_speed_mps", yield_follow_min_rel_speed_mps_, 0.0);
+    pnh_.param("yield_follow_release_rel_speed_mps", yield_follow_release_rel_speed_mps_, -0.5);
+    // A path-end connector is only intended for the short, low-speed handoff
+    // from an exhausted source CSV to the already-loaded target-lane CSV.
+    // Its Bool topic has no header, so freshness is measured at receipt time.
+    pnh_.param("endpoint_connector_speed_cap_mps",
+               endpoint_connector_speed_cap_mps_, 2.0);
+    pnh_.param("endpoint_connector_max_accel_mps2",
+               endpoint_connector_max_accel_mps2_, max_accel_mps2_);
+    pnh_.param("endpoint_connector_status_timeout_sec",
+               endpoint_connector_status_timeout_sec_, 0.5);
+    pnh_.param("min_target_front_gap_m", min_target_front_gap_m_, 11.0);
+    pnh_.param("min_target_rear_gap_m", min_target_rear_gap_m_, 6.0);
+    pnh_.param("target_front_acc_requires_target_lane_entry",
+               target_front_acc_requires_target_lane_entry_, true);
+    pnh_.param("target_front_acc_entry_abs_d_m",
+               target_front_acc_entry_abs_d_m_, 0.75);
+    pnh_.param("target_front_preentry_soft_acc_enabled",
+               target_front_preentry_soft_acc_enabled_, false);
+    pnh_.param("target_front_preentry_soft_acc_distance_to_end_m",
+               target_front_preentry_soft_acc_distance_to_end_m_, 120.0);
+    pnh_.param("target_front_overlap_soft_acc_enabled",
+               target_front_overlap_soft_acc_enabled_, false);
+    pnh_.param("target_front_overlap_soft_acc_start_abs_d_m",
+               target_front_overlap_soft_acc_start_abs_d_m_, 2.7);
+    pnh_.param("target_front_overlap_soft_max_decel_mps2",
+               target_front_overlap_soft_max_decel_mps2_, 1.5);
+    pnh_.param("merge_priority_enabled", merge_priority_enabled_, true);
+    pnh_.param("merge_priority_rear_safe_gap_m", merge_priority_rear_safe_gap_m_, 4.5);
+    pnh_.param("merge_priority_rear_min_gap_m", merge_priority_rear_min_gap_m_, 4.0);
+    pnh_.param("merge_priority_rear_max_closing_mps",
+               merge_priority_rear_max_closing_mps_, 3.5);
+    pnh_.param("merge_priority_rear_min_ttc_sec",
+               merge_priority_rear_min_ttc_sec_, 1.8);
+    pnh_.param("ego_lane_priority_enabled", ego_lane_priority_enabled_, true);
+    pnh_.param("ego_lane_priority_current_max_abs_d_m",
+               ego_lane_priority_current_max_abs_d_m_, 1.25);
+    pnh_.param("ego_lane_priority_front_hard_gap_m",
+               ego_lane_priority_front_hard_gap_m_, 8.0);
+    pnh_.param("lane_end_stop_margin_m", lane_end_stop_margin_m_, 2.0);
+    pnh_.param("lane_end_comfort_decel_mps2", lane_end_comfort_decel_mps2_, 2.5);
+    pnh_.param("lane_end_merge_creep_speed_mps", lane_end_merge_creep_speed_mps_, 4.0);
+    pnh_.param("lane_end_hard_stop_distance_m", lane_end_hard_stop_distance_m_, 6.0);
+    pnh_.param("lane_end_merge_wait_stop_enabled",
+               lane_end_merge_wait_stop_enabled_, true);
+    pnh_.param("lane_end_merge_wait_stop_distance_m",
+               lane_end_merge_wait_stop_distance_m_, 35.0);
+    pnh_.param("stop_at_lane_end_enabled", stop_at_lane_end_enabled_, true);
+    pnh_.param("lane_end_stop_prepare_distance_m", lane_end_stop_prepare_distance_m_, 45.0);
+    pnh_.param("lane_end_stop_prepare_time_sec", lane_end_stop_prepare_time_sec_, 4.0);
+    pnh_.param("use_nearby_vehicles", use_nearby_vehicles_, true);
+    pnh_.param("use_nearby_overlap_as_acc_lead",
+               use_nearby_overlap_as_acc_lead_,
+               false);
+    pnh_.param("nearby_acc_overlap_only", nearby_acc_overlap_only_, false);
+    pnh_.param("nearby_overlap_lateral_margin_m",
+               nearby_overlap_lateral_margin_m_,
+               0.20);
+    pnh_.param("nearby_acc_lead_max_abs_d_m",
+               nearby_acc_lead_max_abs_d_m_,
+               1.35);
+    pnh_.param("nearby_merge_front_range_m", nearby_merge_front_range_m_, 120.0);
+    pnh_.param("nearby_merge_rear_range_m", nearby_merge_rear_range_m_, 20.0);
+    pnh_.param("use_all_nearby_when_lane_end_pressure",
+               use_all_nearby_when_lane_end_pressure_, true);
+    pnh_.param("lane_end_wait_gap_front_only",
+               lane_end_wait_gap_front_only_, true);
+    pnh_.param("merge_keep_rolling_enabled",
+               merge_keep_rolling_enabled_, true);
+    pnh_.param("merge_keep_rolling_min_speed_mps",
+               merge_keep_rolling_min_speed_mps_, 6.0);
+    pnh_.param("merge_keep_rolling_front_block_gap_m",
+               merge_keep_rolling_front_block_gap_m_, 8.0);
+    pnh_.param("merge_keep_rolling_low_speed_lead_mps",
+               merge_keep_rolling_low_speed_lead_mps_, 3.0);
+    pnh_.param("merge_keep_rolling_low_speed_lead_max_gap_m",
+               merge_keep_rolling_low_speed_lead_max_gap_m_, 80.0);
+    if (!pnh_.getParam("lane_end_stop_lane_ids", lane_end_stop_lane_ids_)) {
+      lane_end_stop_lane_ids_ = {3};
+    }
+    std::sort(lane_end_stop_lane_ids_.begin(), lane_end_stop_lane_ids_.end());
+    lane_end_stop_lane_ids_.erase(
+        std::unique(lane_end_stop_lane_ids_.begin(), lane_end_stop_lane_ids_.end()),
+        lane_end_stop_lane_ids_.end());
+
+    targets_sub_ = nh_.subscribe("/smpc/targets", 10, &AccSpeedPlanner::targetsCallback, this);
+    odom_sub_ = nh_.subscribe("/odom", 10, &AccSpeedPlanner::odomCallback, this);
+    mission_speed_sub_ =
+        nh_.subscribe(mission_speed_topic_, 10, &AccSpeedPlanner::missionSpeedCallback, this);
+    status_sub_ = nh_.subscribe("/smpc/lane_change_status", 10, &AccSpeedPlanner::statusCallback, this);
+    decision_sub_ = nh_.subscribe("/smpc/decision", 10, &AccSpeedPlanner::decisionCallback, this);
+    behavior_request_sub_ = nh_.subscribe(
+        behavior_request_topic_, 10, &AccSpeedPlanner::behaviorRequestCallback, this);
+    endpoint_connector_active_sub_ = nh_.subscribe(
+        "/path_switch_connector_active", 10,
+        &AccSpeedPlanner::endpointConnectorActiveCallback, this);
+
+    speed_pub_ = nh_.advertise<std_msgs::Float64>("/smpc/target_speed_mps", 10);
+    raw_speed_pub_ = nh_.advertise<std_msgs::Float64>("/smpc/acc_raw_target_speed_mps", 10);
+    active_lead_pub_ = nh_.advertise<std_msgs::String>("/smpc/acc_active_lead", 10);
+    acc_target_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/smpc/acc_target_marker", 1);
+    behavior_status_pub_ = nh_.advertise<smpc_lane_change::BehaviorLongitudinalStatus>(
+        behavior_status_topic_, 10);
+
+    const double period = 1.0 / std::max(1.0, publish_rate_hz_);
+    timer_ = nh_.createTimer(ros::Duration(period), &AccSpeedPlanner::timerCallback, this);
+    filtered_speed_mps_ = mission_speed_fallback_mps_;
+  }
+
+ private:
+  void targetsCallback(const smpc_lane_change::TargetVehicleSet::ConstPtr& msg) {
+    targets_ = *msg;
+    targets_stamp_ = ros::Time::now();
+    have_targets_ = true;
+    // 신뢰할 수 있는 앞차 속도만 기억해 둔다(leadTrustedSpeedMps 의 짧은 홀드용).
+    updateLeadSpeedMemory(targets_.current_front);
+    // 간격 미분 폐쇄속도 갱신(gapDerivedClosingSpeed 참고).
+    updateGapHistory(targets_.current_front);
+  }
+
+  void odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
+    ego_speed_mps_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+    have_ego_speed_ = true;
+  }
+
+  void missionSpeedCallback(const std_msgs::Float64::ConstPtr& msg) {
+    if (!std::isfinite(msg->data)) return;
+    mission_speed_target_mps_ = std::max(0.0, msg->data);
+    mission_speed_stamp_ = ros::Time::now();
+    have_mission_speed_target_ = true;
+  }
+
+  void statusCallback(const smpc_lane_change::LaneChangeStatus::ConstPtr& msg) {
+    lane_change_active_ = msg->active;
+  }
+
+  void endpointConnectorActiveCallback(const std_msgs::Bool::ConstPtr& msg) {
+    endpoint_connector_active_ = msg->data;
+    endpoint_connector_active_stamp_ = ros::Time::now();
+    have_endpoint_connector_status_ = true;
+  }
+
+  void decisionCallback(const smpc_lane_change::LaneChangeDecision::ConstPtr& msg) {
+    lane_change_requested_ =
+        msg->request &&
+        msg->mode == smpc_lane_change::LaneChangeDecision::CHANGE_LEFT;
+    requested_decision_current_lane_id_ = msg->current_lane_id;
+    requested_decision_target_lane_id_ = msg->target_lane_id;
+    decision_stamp_ = ros::Time::now();
+    // KEEP is a normal receding-horizon result, including WAIT_FOR_GAP and
+    // HOLD_THEN_CHANGE preparation.  LaneChangeDecision has no explicit
+    // rejection state, so it must never be converted into a lane-end stop.
+    // A fresh CHANGE_NOW command supersedes any earlier preparation cap even
+    // if the two topics are delivered in a different order.
+    if (lane_change_requested_) have_behavior_request_ = false;
+  }
+
+  void behaviorRequestCallback(
+      const smpc_lane_change::BehaviorLongitudinalRequest::ConstPtr& msg) {
+    const ros::Time now = ros::Time::now();
+    // An explicit inactive message is cancellation, not a request that may
+    // linger until the timeout.  Reject source-stale/future requests here as
+    // well as in the predicate below: receiver time alone is unsafe when a
+    // queued message arrives late.
+    if (!msg->active || msg->header.stamp.isZero() ||
+        msg->header.stamp > now + ros::Duration(0.05) ||
+        (behavior_request_timeout_sec_ > 0.0 &&
+         (now - msg->header.stamp).toSec() > behavior_request_timeout_sec_)) {
+      have_behavior_request_ = false;
+      return;
+    }
+    // 양보 -> 비양보 전이 시각을 기록한다(accel_after_yield_release 용).
+    const bool was_yield = have_behavior_request_ &&
+        behavior_request_.action ==
+            smpc_lane_change::BehaviorLongitudinalRequest::YIELD;
+    const bool now_yield =
+        msg->action == smpc_lane_change::BehaviorLongitudinalRequest::YIELD;
+    if (was_yield && !now_yield) {
+      last_yield_release_stamp_ = now;
+      had_recent_yield_ = true;
+    }
+    behavior_request_ = *msg;
+    behavior_request_stamp_ = now;
+    have_behavior_request_ = true;
+  }
+
+  bool recentLaneChangeRequest() const {
+    if (!lane_change_requested_) return false;
+    if (decision_request_timeout_sec_ > 0.0 &&
+        (ros::Time::now() - decision_stamp_).toSec() > decision_request_timeout_sec_) {
+      return false;
+    }
+    // A delayed CHANGE_LEFT for a previous lane pair must never suppress
+    // current-lane endpoint/merge-stop protection.
+    return requested_decision_current_lane_id_ == targets_.current_lane_id &&
+           requested_decision_target_lane_id_ == targets_.target_lane_id;
+  }
+
+  bool laneChangeIntentActive() const {
+    // A preparation plan is deliberately not a lane-change reservation.
+    // Endpoint/merge-stop protection remains active until the supervisor has
+    // a fresh CHANGE_LEFT command or reports an active maneuver.
+    return lane_change_active_ || recentLaneChangeRequest();
+  }
+
+  bool behaviorPreparationActive() const {
+    if (!behavior_request_enabled_ || !have_behavior_request_ ||
+        !behavior_request_.active || !have_targets_) {
+      return false;
+    }
+    if (behavior_request_timeout_sec_ > 0.0 &&
+        (ros::Time::now() - behavior_request_stamp_).toSec() >
+            behavior_request_timeout_sec_) {
+      return false;
+    }
+    const ros::Time now = ros::Time::now();
+    if (behavior_request_.header.stamp.isZero() ||
+        behavior_request_.header.stamp > now + ros::Duration(0.05) ||
+        (behavior_request_timeout_sec_ > 0.0 &&
+         (now - behavior_request_.header.stamp).toSec() >
+             behavior_request_timeout_sec_)) {
+      return false;
+    }
+    if (!std::isfinite(behavior_request_.speed_cap_mps) ||
+        !std::isfinite(behavior_request_.requested_accel_mps2)) {
+      return false;
+    }
+    if (behavior_request_.current_lane_id != targets_.current_lane_id ||
+        behavior_request_.target_lane_id != targets_.target_lane_id) {
+      return false;
+    }
+    if ((lane_change_active_ || recentLaneChangeRequest()) &&
+        !behavior_request_apply_while_lane_change_) {
+      return false;
+    }
+    const uint8_t action = behavior_request_.action;
+    if (action != smpc_lane_change::BehaviorLongitudinalRequest::YIELD &&
+        action != smpc_lane_change::BehaviorLongitudinalRequest::HOLD &&
+        action != smpc_lane_change::BehaviorLongitudinalRequest::ACCELERATE &&
+        action != smpc_lane_change::BehaviorLongitudinalRequest::WAIT_FOR_GAP) {
+      return false;
+    }
+    if (action == smpc_lane_change::BehaviorLongitudinalRequest::ACCELERATE) {
+      // ACCELERATE 는 기본적으로 막혀 있다(behavior_request_apply_accel).
+      // 다만 '양보를 막 해제한 직후'에는 짧게 허용한다.
+      //
+      // 양보로 속도를 내준 뒤 앞차가 안전영역을 벗어나 길이 열렸는데도
+      // 가속을 못 하면, 낮아진 속도 그대로 합류하거나 기회를 놓친다.
+      // 창을 짧게(accel_release_window_sec) 두어 '밀어붙이는 가속'이
+      // 되지 않게 하고, 그 뒤 새 뒤차가 들어오면 SMPC 가 다시 YIELD/
+      // WAIT 를 보내므로 이 경로는 자연히 닫힌다.
+      if (behavior_request_apply_accel_) return true;
+      if (!accel_after_yield_release_enabled_) return false;
+      const double since =
+          (ros::Time::now() - last_yield_release_stamp_).toSec();
+      return had_recent_yield_ && since <= accel_release_window_sec_;
+    }
+    return true;
+  }
+
+  // ★ 양보 후 따라가기(2026-09-25, 19:34 백).
+  //   SMPC 가 옆 차로 차량에 양보(YIELD)하거나 틈을 기다리는(HOLD/WAIT) 동안,
+  //   그 차가 이미 자차 앞으로 나가 더 빠르게 멀어지고 있어도 양보 상한이 계속
+  //   걸려 자차는 느려지기만 했다. 계속 느려지면 목표 차로의 다음 뒤차가 다시
+  //   안전영역에 들어와 양보가 끝없이 반복될 수 있다.
+  //     실측: 25.5~27.5 s 목표 차로 앞차 3.2 -> 12 m, 18.6~19.5 m/s 로 멀어지는데
+  //     yield_side_vehicle_ttc 상한으로 15.6 -> 12.1 m/s 까지 감속한 뒤 합류.
+  //   목표 차로 앞차가 자차 앞(범퍼 간격 >= min_gap)에 있고 자차보다
+  //   min_rel_speed 이상 빠르면 양보 상한 대신 그 차를 앞차로 ACC 한다.
+  //   우리 차로 앞차도 있으면 기존 ACC 가 둘 중 낮은 목표를 쓴다(=느린 쪽 추종).
+  //   목표 차로 뒤차는 차선변경 안전 판단에서 처리한다. 뒤차가 가까워졌다고
+  //   앞차 추종을 끄고 다시 감속하면 뒤차와의 속도차만 커진다.
+  //   차선변경 실행 여부는 SMPC 안전 판단이 그대로 정한다.
+  bool yieldFollowTargetFront() {
+    if (!yield_follow_enabled_ || !have_targets_ ||
+        targets_.current_lane_id == targets_.target_lane_id) {
+      yield_follow_active_ = false;
+      return false;
+    }
+    const auto& tf = targets_.target_front;
+    if (!tf.valid || !leadIsInFront(tf) || !tf.velocity_valid ||
+        !std::isfinite(tf.v_long)) {
+      yield_follow_active_ = false;
+      return false;
+    }
+    const double gap = frontBumperGap(tf);
+    const double rel = tf.v_long - ego_speed_mps_;
+    // 앞차가 완전히 앞으로 빠지고 속도가 자차 이상이면 추종을 시작한다.
+    // 추종 중에는 작은 상대속도 흔들림에 꺼지지 않도록 히스테리시스를 둔다.
+    const bool enter = gap >= yield_follow_min_gap_m_ &&
+        rel >= yield_follow_min_rel_speed_mps_;
+    const bool stay = yield_follow_active_ && gap >= 0.5 * yield_follow_min_gap_m_ &&
+        rel >= yield_follow_release_rel_speed_mps_;
+    const bool follow = enter || stay;
+    yield_follow_active_ = follow;
+    return follow;
+  }
+
+  // 양보 중 옆 차가 이미 자차보다 중심이 앞서고(delta_s > 0) 더 빠르게 지나가는
+  // 중이면 더 감속할 이유가 없다 - 현재 속도를 유지하며 지나가게 둔다.
+  // 뒷범퍼가 앞범퍼를 min_gap 이상 앞서면 yieldFollowTargetFront 로 넘어간다.
+  bool yieldHoldPassingSideVehicle() const {
+    if (!yield_follow_enabled_ || !have_targets_ ||
+        targets_.current_lane_id == targets_.target_lane_id) return false;
+    const auto& tf = targets_.target_front;
+    if (!tf.valid || !tf.velocity_valid || !std::isfinite(tf.v_long) ||
+        tf.delta_s <= 0.0 ||
+        tf.v_long - ego_speed_mps_ < yield_follow_min_rel_speed_mps_) return false;
+    return true;
+  }
+
+  // 합류용 간격 추종 속도. 목표 간격 = standstill + time_gap * 자차속도,
+  // 속도 = 앞차속도 + gain * (간격 - 목표간격), 앞차속도 + max_catchup 이하.
+  // 앞차가 멀어지는 동안은 따라 가속하고, 간격이 목표보다 좁으면 앞차보다 느리게 간다.
+  double yieldFollowSpeed(const smpc_lane_change::TargetVehicle& lead,
+                          double cruise_speed_mps) const {
+    const double gap = frontBumperGap(lead);
+    const double desired = std::max(yield_follow_min_desired_gap_m_,
+        yield_follow_standstill_gap_m_ +
+        yield_follow_time_gap_sec_ * ego_speed_mps_);
+    // 간격이 부족해도 앞차가 멀어지면 앞차 속도에 가까이 따라간다.
+    // 간격이 목표보다 넓을 때만 큰 게인으로 따라붙는다. CHANGE_LEFT 의
+    // 앞/뒤차 범퍼 간격 및 미래 궤적 검사는 별도로 계속 적용된다.
+    const double gain = gap < desired
+        ? yield_follow_close_gap_gain_ : yield_follow_gap_gain_;
+    double v = lead.v_long + gain * (gap - desired);
+    v = std::min(v, lead.v_long + yield_follow_max_catchup_mps_);
+    return std::clamp(v, min_speed_mps_, cruise_speed_mps);
+  }
+
+  bool endpointConnectorActive() const {
+    // A missing, false, reset-time, or stale Bool must never retain the
+    // connector speed cap.  The publisher therefore needs to refresh true
+    // while the generated connector is actually being followed.
+    if (!have_endpoint_connector_status_ || !endpoint_connector_active_ ||
+        endpoint_connector_status_timeout_sec_ <= 0.0) {
+      return false;
+    }
+    const double age_sec =
+        (ros::Time::now() - endpoint_connector_active_stamp_).toSec();
+    return age_sec >= 0.0 && age_sec <= endpoint_connector_status_timeout_sec_;
+  }
+
+  bool waitForGapActive() const {
+    // WAIT_FOR_GAP is a fresh, lane-matched SMPC state: the merge is required
+    // but neither CHANGE_NOW nor a safe future t_LC exists yet.  It is not a
+    // lead-vehicle ACC command, but it must re-arm the CSV-endpoint fallback
+    // once the lane-change deadline becomes urgent.
+    return behaviorPreparationActive() &&
+           behavior_request_.action ==
+               smpc_lane_change::BehaviorLongitudinalRequest::WAIT_FOR_GAP;
+  }
+
+  const char* behaviorActionName() const {
+    switch (behavior_request_.action) {
+      case smpc_lane_change::BehaviorLongitudinalRequest::YIELD: return "behavior_yield";
+      case smpc_lane_change::BehaviorLongitudinalRequest::HOLD: return "behavior_hold";
+      case smpc_lane_change::BehaviorLongitudinalRequest::ACCELERATE: return "behavior_accel";
+      case smpc_lane_change::BehaviorLongitudinalRequest::WAIT_FOR_GAP:
+        return "behavior_wait_for_gap";
+      case smpc_lane_change::BehaviorLongitudinalRequest::NONE:
+      default: return "behavior_none";
+    }
+  }
+
+  double currentCruiseSpeedMps() const {
+    if (have_mission_speed_target_ &&
+        (mission_speed_timeout_sec_ <= 0.0 ||
+         (ros::Time::now() - mission_speed_stamp_).toSec() <= mission_speed_timeout_sec_)) {
+      return mission_speed_target_mps_;
+    }
+    return mission_speed_fallback_mps_;
+  }
+
+  double leadHalfS(const smpc_lane_change::TargetVehicle& lead) const {
+    return lead.half_s > 1e-3 ? lead.half_s : 0.5 * lead.length;
+  }
+
+  double leadFrontDeltaS(const smpc_lane_change::TargetVehicle& lead) const {
+    return lead.front_delta_s != 0.0 ? lead.front_delta_s : lead.delta_s + leadHalfS(lead);
+  }
+
+  double leadRearDeltaS(const smpc_lane_change::TargetVehicle& lead) const {
+    return lead.rear_delta_s != 0.0 ? lead.rear_delta_s : lead.delta_s - leadHalfS(lead);
+  }
+
+  double frontBumperGap(const smpc_lane_change::TargetVehicle& lead) const {
+    return leadRearDeltaS(lead) - 0.5 * ego_length_m_;
+  }
+
+  double rearBumperGap(const smpc_lane_change::TargetVehicle& rear) const {
+    return -leadFrontDeltaS(rear) - 0.5 * ego_length_m_;
+  }
+
+  bool leadIsInFront(const smpc_lane_change::TargetVehicle& lead) const {
+    return lead.valid && leadFrontDeltaS(lead) > -0.5 * ego_length_m_;
+  }
+
+  // 앞차 종방향 속도. 추정 신뢰도를 반영한 단일 창구다.
+  //
+  // LiDAR 트래커는 원거리/부분가림에서 velocity_valid=false 와 함께 사실상
+  // 무의미한 v_long 을 낸다. 실측(2026-09-15 18:01 백) t=282.5 에 v_long=4.3
+  // (velocity_std=45), t=284.5 에 -0.7(std=45) 이 그대로 ACC 로 들어갔고,
+  // 하필 간격이 가장 좁아지던 두 프레임이었다. v_long 이 실제보다 낮게
+  // 잡히면 폐쇄속도를 과대평가해 불필요한 급제동을, 높게 잡히면 반대로
+  // 제동을 늦춘다.
+  //
+  // SMPC 쪽은 이미 target_front_early_yield_max_velocity_std_mps(3.0) 로
+  // 같은 방어를 하고 있었다 - ACC 만 무방비였다.
+  //
+  // 신뢰할 수 없으면 직전 유효값을 짧은 시간 유지하고, 그것도 없으면
+  // ego 속도로 가정한다(= 폐쇄속도 0, 추가 감속 요구 없음). 이 폴백은
+  // 거리 기반 게이트(gap_err, braking_limit)를 무력화하지 않는다.
+  double leadTrustedSpeedMps(const smpc_lane_change::TargetVehicle& lead) const {
+    const bool std_ok = !std::isfinite(lead.velocity_std) ||
+        lead_max_velocity_std_mps_ <= 0.0 ||
+        lead.velocity_std <= lead_max_velocity_std_mps_;
+    if (std::isfinite(lead.v_long) && lead.velocity_valid && std_ok) {
+      // velocity_valid=true / std 통과인데도 값이 틀린 경우가 있다.
+      //   실측(2026-09-16 15:18 백 t=19.15~19.38): std=1.6~2.0 으로 문턱을
+      //   통과했는데 v_long 이 2.7 m/s - 실제(약 11)의 1/4 이었다. 신뢰도
+      //   지표 자체가 틀린 경우라 std 필터로는 못 거른다.
+      // 직전 유효값 대비 물리적으로 불가능한 점프면 버리고 홀드값을 쓴다.
+      // 앞차가 실제로 급감속하면 간격이 빠르게 줄어 gap 기반 게이트가 잡는다.
+      const double dt =
+          (ros::Time::now() - last_trusted_speed_stamp_).toSec();
+      const bool have_recent = std::isfinite(last_trusted_speed_mps_) &&
+          dt <= lead_speed_hold_sec_;
+      if (have_recent && lead_max_speed_jump_mps2_ > 0.0) {
+        const double allowed =
+            lead_max_speed_jump_mps2_ * std::max(dt, 0.05);
+        if (std::abs(lead.v_long - last_trusted_speed_mps_) > allowed) {
+          return last_trusted_speed_mps_;
+        }
+      }
+      return lead.v_long;
+    }
+    // 직전 유효값은 트랙 ID 가 바뀌어도 쓴다.
+    //
+    // LiDAR 트래커는 원거리에서 같은 차를 새 ID 로 재취득하는 일이 잦고
+    // (실측 2026-09-16 15:18 백: id18 -> id20), 새 ID 는 velocity_std=45 로
+    // 시작해 수렴까지 1.4 초가 걸린다. ID 일치를 요구하면 그 구간이 통째로
+    // 폴백으로 빠지므로, 최근 값이면 ID 가 달라도 유지한다.
+    if (std::isfinite(last_trusted_speed_mps_) &&
+        (ros::Time::now() - last_trusted_speed_stamp_).toSec() <=
+            lead_speed_hold_sec_) {
+      return last_trusted_speed_mps_;
+    }
+    // 속도를 전혀 모를 때의 폴백.
+    //
+    // 여기서 ego_speed_mps_ 를 쓰면 폐쇄속도가 0 이 되어 '앞차가 나와 같은
+    // 속도로 간다' = 가장 낙관적인 가정이 된다. 그러면 목표 간격에서
+    // closing_speed 항이 사라지고 gap_err 가 커져 ACC 가 오히려 가속한다.
+    //   실측(2026-09-16 15:18 백 t=18.8~20.2): 앞차를 27 m 에서 정상
+    //   인식했는데 velocity_std=45 로 신뢰 불가라 ego(15.6)로 대체됐고,
+    //   목표간격이 24.2 -> 20.5 m 로 줄며 gap_err +6.6 으로 판정돼
+    //   accel 0.39 -> 0.76 으로 가속했다. 그 결과 간격이 0.38 m 까지
+    //   무너져 충돌했다.
+    // 간격 미분으로 폐쇄속도를 알 수 있으면 그것으로 앞차 속도를 역산한다.
+    // 이쪽이 임의의 margin 가정보다 정확하다 - 거리는 직접 측정이라
+    // 속도 추정과 달리 신뢰할 수 있다.
+    const double from_gap = gapDerivedClosingSpeed();
+    if (std::isfinite(from_gap)) {
+      return std::max(0.0, ego_speed_mps_ - from_gap);
+    }
+    // 그것마저 없으면 보수적으로 '앞차가 느리다'고 본다. 여기서 ego 를
+    // 그대로 쓰면 폐쇄속도가 0 이 되어 ACC 가 오히려 가속한다(2026-09-16
+    // 15:18 백 충돌의 직접 원인).
+    return std::max(0.0, ego_speed_mps_ - lead_unknown_speed_margin_mps_);
+  }
+
+  void updateLeadSpeedMemory(const smpc_lane_change::TargetVehicle& lead) {
+    if (!lead.valid) return;
+    const bool std_ok = !std::isfinite(lead.velocity_std) ||
+        lead_max_velocity_std_mps_ <= 0.0 ||
+        lead.velocity_std <= lead_max_velocity_std_mps_;
+    if (std::isfinite(lead.v_long) && lead.velocity_valid && std_ok) {
+      last_trusted_speed_id_ = lead.unique_id;
+      last_trusted_speed_mps_ = lead.v_long;
+      last_trusted_speed_stamp_ = ros::Time::now();
+    }
+  }
+
+  double leadSpeedMps(const smpc_lane_change::TargetVehicle& lead,
+                      double cruise_speed_mps) const {
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    return std::clamp(lead_speed, 0.0, std::max(0.0, cruise_speed_mps));
+  }
+
+  double leadTtcSec(const smpc_lane_change::TargetVehicle& lead) const {
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    const double closing_speed = ego_speed_mps_ - std::max(0.0, lead_speed);
+    if (closing_speed <= 0.1) return std::numeric_limits<double>::infinity();
+    return frontBumperGap(lead) / closing_speed;
+  }
+
+  // 간격 미분으로 구한 폐쇄속도. 유효하지 않으면 NaN.
+  //
+  // 왜 이게 더 나은가. 폐쇄속도는 원래 (자차속도 - 앞차속도)인데, 앞차
+  // 속도는 LiDAR 칼만 추정이라 오차가 크다(실측 RMS 1.05~1.8 m/s, 새
+  // 트랙은 수렴까지 1.4 s). 반면 '간격'은 거리 직접 측정이라 정확하고,
+  // 그 시간 미분이 곧 폐쇄속도다. 두 속도를 각각 추정해 빼는 것보다
+  // 오차가 작고, 트랙 ID 가 갈려도(id18 -> id20) 같은 차로 앞에 있는 한
+  // 간격 자체는 연속이므로 영향을 덜 받는다.
+  //
+  // 주의: 앞차가 바뀌면(컷인, 다른 차로 차량이 대표로 선정) 간격이
+  // 불연속으로 점프한다. 그 경우는 gap 점프 한도로 걸러 NaN 을 낸다.
+  double gapDerivedClosingSpeed() const {
+    if (!gap_closing_enabled_) return std::numeric_limits<double>::quiet_NaN();
+    if (!std::isfinite(prev_gap_m_)) return std::numeric_limits<double>::quiet_NaN();
+    const double dt = (ros::Time::now() - prev_gap_stamp_).toSec();
+    if (!(dt > 1e-3) || dt > gap_closing_max_dt_sec_) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    return gap_closing_filtered_;
+  }
+
+  // 간격 이력 갱신. targets 수신마다 호출한다.
+  void updateGapHistory(const smpc_lane_change::TargetVehicle& lead) {
+    const ros::Time now = ros::Time::now();
+    if (!lead.valid || !leadIsInFront(lead)) {
+      prev_gap_m_ = std::numeric_limits<double>::quiet_NaN();
+      gap_closing_filtered_ = 0.0;
+      return;
+    }
+    const double gap = frontBumperGap(lead);
+    const double dt = (now - prev_gap_stamp_).toSec();
+    if (std::isfinite(prev_gap_m_) && dt > 1e-3 && dt <= gap_closing_max_dt_sec_) {
+      const double d_gap = gap - prev_gap_m_;
+      // 앞차 교체로 인한 간격 점프는 물리적 변화가 아니므로 버린다.
+      if (std::abs(d_gap) <= gap_closing_max_jump_mps_ * dt) {
+        const double raw = -d_gap / dt;   // 간격이 줄면(+) 폐쇄
+        const double a = std::clamp(gap_closing_alpha_, 0.0, 1.0);
+        gap_closing_filtered_ = (1.0 - a) * gap_closing_filtered_ + a * raw;
+      } else {
+        gap_closing_filtered_ = 0.0;
+      }
+    }
+    prev_gap_m_ = gap;
+    prev_gap_stamp_ = now;
+  }
+
+  double leadClosingSpeedMps(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!leadIsInFront(lead)) return 0.0;
+    // 간격 미분이 유효하면 그것을 우선한다.
+    const double from_gap = gapDerivedClosingSpeed();
+    if (std::isfinite(from_gap)) return std::max(0.0, from_gap);
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    return std::max(0.0, ego_speed_mps_ - std::max(0.0, lead_speed));
+  }
+
+  bool hardBrakeRequiredForLead(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!leadIsInFront(lead)) return false;
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    const bool is_moving_lead = lead_speed > lead_moving_speed_thresh_mps_;
+    const double gap = frontBumperGap(lead);
+    const bool is_highway = targets_.current_lane_id >= 0;
+    if (!is_moving_lead) {
+      if (gap <= (is_highway ? emergency_stop_gap_m_ : critical_gap_m_)) return true;
+      if (!is_highway && leadTtcSec(lead) <= critical_ttc_sec_) return true;
+    }
+    // 주행 중인 앞차는 초근접(emergency_stop_gap_m_)이며 빠르게 좁혀질 때만 하드 브레이크
+    const double closing = leadClosingSpeedMps(lead);
+    return (gap <= emergency_stop_gap_m_ && closing > 0.5);
+  }
+
+  double requiredDecelForLead(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!leadIsInFront(lead)) return 0.0;
+    const double closing_speed = leadClosingSpeedMps(lead);
+    const double clearance = frontBumperGap(lead) - standstill_gap_m_;
+    if (closing_speed <= 1e-3) return 0.0;
+    if (clearance <= 1e-3) return std::numeric_limits<double>::infinity();
+    return closing_speed * closing_speed / (2.0 * clearance);
+  }
+
+  bool rapidBrakeRequiredForLead(const smpc_lane_change::TargetVehicle& lead) const {
+    // A newly appearing lead has no previous ACC gap history.  If maintaining
+    // the standstill gap already needs a strong brake, bypass the target-speed
+    // slew limiter immediately instead of waiting for the normal critical TTC.
+    if (!rapid_lead_brake_enabled_ || !leadIsInFront(lead)) return false;
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    const bool is_moving_lead = lead_speed > lead_moving_speed_thresh_mps_;
+    if (is_moving_lead) return false; // 주행 중인 앞차는 급제동 바이패스 제외
+    const double closing_speed = leadClosingSpeedMps(lead);
+    if (closing_speed < rapid_lead_min_closing_speed_mps_) return false;
+    if (leadTtcSec(lead) <= rapid_lead_ttc_sec_) return true;
+    return requiredDecelForLead(lead) >= rapid_lead_required_decel_mps2_;
+  }
+
+  double speedForLead(const smpc_lane_change::TargetVehicle& lead,
+                      double cruise_speed_mps) const {
+    if (!leadIsInFront(lead)) return cruise_speed_mps;
+
+    const double bumper_gap = frontBumperGap(lead);
+    // Ignore a valid lead only beyond the configured look-ahead range.
+    if (bumper_gap > acc_max_range_m_) return cruise_speed_mps;
+
+    const double lead_speed = leadSpeedMps(lead, cruise_speed_mps);
+    const bool is_moving_lead = lead_speed > lead_moving_speed_thresh_mps_;
+    const double closing_speed = std::max(0.0, ego_speed_mps_ - lead_speed);
+
+    const bool is_highway = targets_.current_lane_id >= 0;
+
+    // 완전 정지(0.0 m/s)는 앞차가 실제로 정지/극서행 중이거나,
+    // 주행 중이라도 초근접(emergency_stop_gap_m_ 이하)이며 빠르게 좁혀질 때만 발동.
+    if (!is_moving_lead) {
+      if (bumper_gap <= (is_highway ? emergency_stop_gap_m_ : critical_gap_m_)) return 0.0;
+    } else {
+      if (bumper_gap <= emergency_stop_gap_m_ && closing_speed > 0.5) return 0.0;
+    }
+
+    // 주행 중인 앞차를 추종할 때 앞차 속도 대비 최대 감속 폭
+    // 고주로에서는 highway_max_follow_speed_drop_mps_(1.5m/s = 5.4km/h)로 제한하여 앞차 속도 대비 과도한 급감속 방지
+    const double effective_follow_drop = (is_highway && is_moving_lead)
+        ? std::max(0.5, highway_max_follow_speed_drop_mps_)
+        : std::max(0.0, max_follow_speed_drop_mps_);
+    const double follow_floor =
+        std::max(0.0, lead_speed - effective_follow_drop);
+
+    double commanded = cruise_speed_mps;
+    if (is_highway && is_moving_lead) {
+      // 고주로 주행 중인 앞차 거리 유지 (~15m 목표):
+      // 순간 급감속을 없애고 부드러운 속도 제어로 15m 간격을 안정적으로 유지
+      // 목표 간격에도 폐쇄속도를 반영한다. 정속 추종 중에는 closing_speed 가
+      // 0 이라 기존과 동일하고, 빠르게 다가가는 중에만 목표가 앞으로 밀린다.
+      //   실측(2026-09-15 20:33 백 t=16.0): ego 14.9 / 앞차 9.6 / 간격 29.7 에서
+      //   목표간격이 19.9 m 뿐이라 '9.8 m 여유'로 판정돼 가속했다. 폐쇄속도
+      //   5.3 m/s 면 19.9 m 까지 1.8 초거리인데도 그랬다.
+      const double nominal_gap = standstill_gap_m_ +
+          time_headway_sec_ * ego_speed_mps_ +
+          closing_speed_gap_time_sec_ * closing_speed;
+      const double gap_err = bumper_gap - nominal_gap;
+      double speed_adjustment = 0.0;
+      if (gap_err < 0.0) {
+        // 목표 간격(약 15m)보다 가까울 때: 최대 effective_follow_drop(1.5m/s) 한도로만 서행하여
+        // 앞차 속도보다 급격하게 떨어지지 않도록 완만하게 간격 확보
+        speed_adjustment = std::clamp(gap_gain_ * gap_err - 0.25 * closing_speed,
+                                      -effective_follow_drop, 0.0);
+      } else {
+        // 목표 간격보다 여유 있을 때: 크루즈 속도 한도 내에서 완만하게 가속.
+        // 감속 분기와 달리 여기에는 폐쇄속도 항이 없어서, '지금은 멀다'만 보고
+        // '빠르게 다가가는 중'을 무시했다 - 20:33 백에서 앞차를 29.7 m 에
+        // 정상 인식하고도 accel 0.20~0.50 으로 가속해 간격이 -0.3 m 까지
+        // 무너졌다(첫 브레이크는 9.9 m 에서야 들어갔다). 같은 항을 넣어
+        // 접근 중에는 가속량이 줄고, 충분히 빠르면 0 이 되게 한다.
+        speed_adjustment = std::clamp(gap_gain_ * gap_err - 0.25 * closing_speed,
+                                      0.0, cruise_speed_mps - lead_speed);
+      }
+      commanded = lead_speed + speed_adjustment;
+      commanded = std::max(commanded, follow_floor);
+    } else {
+      const double closing_brake_gap =
+          (braking_decel_mps2_ > 1e-3)
+              ? (closing_speed * closing_speed) / (2.0 * braking_decel_mps2_)
+              : 0.0;
+      const double desired_gap = standstill_gap_m_ +
+          time_headway_sec_ * ego_speed_mps_ +
+          closing_speed_gap_time_sec_ * closing_speed +
+          closing_brake_gap;
+      const double gap_error = bumper_gap - desired_gap;
+      commanded = lead_speed + gap_gain_ * gap_error;
+      commanded = std::max(commanded, follow_floor);
+    }
+
+    // Braking-distance guard: do not command a speed that would require more
+    // than braking_decel_mps2 to settle behind the lead vehicle.
+    if (braking_decel_mps2_ > 1e-3 && (!is_highway || !is_moving_lead)) {
+      const double braking_clearance = std::max(0.0, bumper_gap - standstill_gap_m_);
+      const double braking_limit =
+          std::sqrt(lead_speed * lead_speed +
+                    2.0 * braking_decel_mps2_ * braking_clearance);
+      commanded = std::min(commanded, braking_limit);
+      if (is_moving_lead) {
+        commanded = std::max(commanded, follow_floor);
+      }
+    }
+
+    // TTC guard: if ego is closing, keep predicted TTC above soft_ttc_sec.
+    // If critical_ttc_sec is already violated:
+    // - 정지 물체면 즉시 0.0 m/s 정지 요구
+    // - 주행 중인 앞차면 follow_floor로 감속하여 간격을 벌림
+    const double ttc = leadTtcSec(lead);
+    if (std::isfinite(ttc)) {
+      if (ttc <= critical_ttc_sec_) {
+        if (!is_moving_lead && !is_highway) return 0.0;
+        commanded = std::min(commanded, follow_floor);
+      } else {
+        const double ttc_clearance = std::max(0.0, bumper_gap - emergency_gap_m_);
+        const double ttc_limit = lead_speed + ttc_clearance / std::max(0.1, soft_ttc_sec_);
+        commanded = std::min(commanded, ttc_limit);
+        if (ttc <= hard_ttc_sec_) {
+          commanded = std::min(commanded, lead_speed);
+        }
+      }
+    }
+
+    return std::clamp(commanded, min_speed_mps_, cruise_speed_mps);
+  }
+
+  bool isRearVehicle(const smpc_lane_change::TargetVehicle& vehicle) const {
+    return vehicle.role.find("rear") != std::string::npos;
+  }
+
+  bool isNearbyOverlapVehicle(const smpc_lane_change::TargetVehicle& vehicle) const {
+    return vehicle.role.find("nearby_overlap") != std::string::npos;
+  }
+
+  // nearby_overlap denotes longitudinal bbox overlap on the lane to which the
+  // object was projected.  It must also overlap ego laterally before it is
+  // treated as an ACC lead; otherwise a vehicle beside ego in an adjacent lane
+  // could cause unnecessary braking.
+  bool nearbyOverlapOccupiesEgoCorridor(
+      const smpc_lane_change::TargetVehicle& vehicle) const {
+    if (!isNearbyOverlapVehicle(vehicle) || !std::isfinite(vehicle.d)) return false;
+
+    double ego_d = std::numeric_limits<double>::quiet_NaN();
+    if (vehicle.lane_id == targets_.current_lane_id) {
+      ego_d = targets_.ego_d_current;
+    } else if (vehicle.lane_id == targets_.target_lane_id) {
+      ego_d = targets_.ego_d_target;
+    }
+    if (!std::isfinite(ego_d)) return false;
+
+    const double lateral_overlap_extent =
+        0.5 * ego_width_m_ + std::max(0.0, vehicle.half_d) +
+        std::max(0.0, nearby_overlap_lateral_margin_m_);
+    return std::abs(vehicle.d - ego_d) <= lateral_overlap_extent;
+  }
+
+  bool laneEndPressureActive() const {
+    return targets_.lane_change_prepare ||
+           targets_.lane_change_urgent ||
+           targets_.emergency_stop_required;
+  }
+
+  bool mergePriorityRearEligible(const smpc_lane_change::TargetVehicle& rear) const {
+    if (!merge_priority_enabled_ || !laneEndPressureActive() || !rear.valid) return false;
+    if (!isRearVehicle(rear)) return false;
+
+    const double gap = rearBumperGap(rear);
+    if (!std::isfinite(gap) || gap < merge_priority_rear_min_gap_m_) return false;
+
+    const double rear_speed = std::isfinite(rear.v_long) ? rear.v_long : 0.0;
+    const double closing = std::max(0.0, rear_speed - ego_speed_mps_);
+    const double ttc = closing > 0.1
+        ? gap / closing
+        : std::numeric_limits<double>::infinity();
+    if (closing > merge_priority_rear_max_closing_mps_ &&
+        ttc < merge_priority_rear_min_ttc_sec_) {
+      return false;
+    }
+    return true;
+  }
+
+  double effectiveTargetRearGapRequirement() const {
+    if (!mergePriorityRearEligible(targets_.target_rear)) return min_target_rear_gap_m_;
+    return std::min(min_target_rear_gap_m_,
+                    std::max(0.0, merge_priority_rear_safe_gap_m_));
+  }
+
+  bool targetLaneEntryEstablished() const {
+    // waypoint_system changes /gps_state lane_number as soon as the frozen
+    // blend is armed.  During an active maneuver equal lane IDs therefore do
+    // not prove that the vehicle body has reached the target lane yet.
+    if (!lane_change_active_ &&
+        targets_.current_lane_id == targets_.target_lane_id) return true;
+    if (!std::isfinite(targets_.ego_d_target)) return false;
+    return std::abs(targets_.ego_d_target) <=
+           std::max(0.0, target_front_acc_entry_abs_d_m_);
+  }
+
+  bool targetFrontHardAccAllowed() const {
+    if (!target_front_acc_requires_target_lane_entry_) return true;
+    return targetLaneEntryEstablished();
+  }
+
+  // ego_d_target is measured from the target-lane center.  For a 3.5 m lane
+  // and an IONIQ 5 width of about 1.9 m, |d_target| <= 2.7 m means the ego
+  // footprint has started to occupy the target lane.  This is deliberately
+  // distinct from targetLaneEntryEstablished(): it enables gentle following
+  // as the maneuver starts, while full TTC/hard-brake authority remains
+  // reserved for the later target-lane-entry phase.
+  bool targetLaneFootprintOverlapsTargetLane() const {
+    if (!lane_change_active_ &&
+        targets_.current_lane_id == targets_.target_lane_id) return true;
+    if (!std::isfinite(targets_.ego_d_target)) return false;
+    return std::abs(targets_.ego_d_target) <=
+           std::max(0.0, target_front_overlap_soft_acc_start_abs_d_m_);
+  }
+
+  bool targetFrontOverlapSoftAccAllowed() const {
+    return target_front_overlap_soft_acc_enabled_ && lane_change_active_ &&
+           !targetLaneEntryEstablished() &&
+           targetLaneFootprintOverlapsTargetLane();
+  }
+
+  bool targetFrontPreEntrySoftAccAllowed() const {
+    if (!target_front_preentry_soft_acc_enabled_) return false;
+    if (targetLaneEntryEstablished()) return true;
+    // Lanes 0/1/2 are mandatory left-merge lanes.  Their target-front vehicle
+    // is part of the planned driving corridor from the start, so soft ACC must
+    // not wait for the lane-end urgent zone or physical lane overlap.  This is
+    // deliberately only a soft lead: full hard/TTC authority still comes from
+    // targetFrontHardAccAllowed() after target-lane entry.
+    if (!targets_.lane_change_required) return false;
+    const double max_distance = target_front_preentry_soft_acc_distance_to_end_m_;
+    return max_distance <= 0.0 || targets_.distance_to_lane_end <= max_distance;
+  }
+
+  bool targetFrontAccAllowed() const {
+    return targetFrontHardAccAllowed() || targetFrontOverlapSoftAccAllowed() ||
+           targetFrontPreEntrySoftAccAllowed();
+  }
+
+  bool currentFrontRepresentsTargetLaneDuringChange() const {
+    return lane_change_active_ &&
+           targets_.current_lane_id == targets_.target_lane_id;
+  }
+
+  bool shouldUseNearbyLead(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!use_nearby_vehicles_ || !lead.valid || isRearVehicle(lead)) return false;
+    const bool nearby_overlap = isNearbyOverlapVehicle(lead);
+    if (nearby_overlap && !use_nearby_overlap_as_acc_lead_) {
+      return false;
+    }
+    if (nearby_acc_overlap_only_ && !nearby_overlap) return false;
+    if (lead.role.find("nearby") != std::string::npos &&
+        !nearby_overlap &&
+        nearby_acc_lead_max_abs_d_m_ > 0.0 &&
+        std::abs(lead.d) > nearby_acc_lead_max_abs_d_m_) {
+      return false;
+    }
+    if (leadFrontDeltaS(lead) <= -0.5 * ego_length_m_) return false;
+
+    // A longitudinally overlapping nearby vehicle is a lead only when its
+    // lateral bbox reaches ego's current physical corridor. This bypasses
+    // lane-ID/pre-entry gating because it is an immediate overlap hazard.
+    if (nearby_overlap) return nearbyOverlapOccupiesEgoCorridor(lead);
+
+    if (lead.lane_id == targets_.current_lane_id) {
+      return !egoLanePrioritySuppressesLead(lead);
+    }
+    if (lane_change_active_ && lead.lane_id == targets_.target_lane_id) {
+      return targetFrontAccAllowed();
+    }
+
+    if (use_all_nearby_when_lane_end_pressure_ && laneEndPressureActive()) {
+      if (egoLanePrioritySuppressesLead(lead)) return false;
+      return lead.delta_s >= -nearby_merge_rear_range_m_ &&
+             lead.delta_s <= nearby_merge_front_range_m_;
+    }
+    return false;
+  }
+
+  bool egoLanePrioritySuppressesLead(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!ego_lane_priority_enabled_ || !lead.valid) return false;
+
+    // Lane-ownership priority is only for ordinary merge traffic.  A lead
+    // that has already crossed the critical gap/TTC boundary must always be
+    // passed to ACC, even if its lateral projection is slightly off-center.
+    if (hardBrakeRequiredForLead(lead)) return false;
+
+    const bool current_front = lead.role.find("current_front") != std::string::npos;
+    const bool nearby = lead.role.find("nearby") != std::string::npos;
+    if (!current_front && !nearby) return false;
+
+    const double front_gap = frontBumperGap(lead);
+    if (std::isfinite(front_gap) &&
+        front_gap <= ego_lane_priority_front_hard_gap_m_) {
+      return false;
+    }
+
+    if (current_front) {
+      return std::abs(lead.d) > ego_lane_priority_current_max_abs_d_m_;
+    }
+
+    if (lead.lane_id == targets_.current_lane_id &&
+        std::abs(lead.d) <= ego_lane_priority_current_max_abs_d_m_) {
+      return false;
+    }
+    if (lead.lane_id == targets_.current_lane_id &&
+        std::abs(lead.d) > ego_lane_priority_current_max_abs_d_m_) {
+      return true;
+    }
+    if (lead.lane_id == targets_.target_lane_id &&
+        lead.lane_id != targets_.current_lane_id) {
+      return false;
+    }
+
+    return laneEndPressureActive();
+  }
+
+  void applyLeadLimit(const smpc_lane_change::TargetVehicle& lead,
+                      const std::string& label,
+                      double cruise_speed_mps,
+                      double& raw_target,
+                      std::string& active_lead,
+                      bool& hard_brake_active,
+                      double& max_active_closing_speed_mps,
+                      bool allow_hard_brake = true,
+                      bool soft_target_front_acc = false,
+                      bool* soft_target_front_limited_speed = nullptr,
+                      smpc_lane_change::TargetVehicle* out_active_veh = nullptr,
+                      bool* out_have_active_veh = nullptr) const {
+    const double candidate_speed = speedForLead(lead, cruise_speed_mps);
+    if (lead.valid && candidate_speed < raw_target) {
+      raw_target = candidate_speed;
+      max_active_closing_speed_mps =
+          std::max(max_active_closing_speed_mps, leadClosingSpeedMps(lead));
+      const bool hard_brake = allow_hard_brake && hardBrakeRequiredForLead(lead);
+      const bool rapid_brake = allow_hard_brake && !hard_brake &&
+          rapidBrakeRequiredForLead(lead);
+      hard_brake_active = hard_brake_active || hard_brake || rapid_brake;
+      if (soft_target_front_limited_speed != nullptr) {
+        *soft_target_front_limited_speed = soft_target_front_acc;
+      }
+      if (out_active_veh != nullptr && out_have_active_veh != nullptr) {
+        *out_active_veh = lead;
+        *out_have_active_veh = true;
+      }
+      active_lead = label + ":" + std::to_string(lead.unique_id);
+      if (hard_brake) active_lead += ":hard";
+      if (rapid_brake) active_lead += ":rapid";
+      if (soft_target_front_acc) {
+        active_lead += targetFrontOverlapSoftAccAllowed()
+            ? ":overlap_soft"
+            : ":preentry_soft";
+      } else if (!allow_hard_brake && hardBrakeRequiredForLead(lead)) {
+        active_lead += ":preentry_soft";
+      }
+    }
+  }
+
+  void publishAccTargetMarkers(const smpc_lane_change::TargetVehicle& lead,
+                               bool have_lead,
+                               bool hard_brake,
+                               double closing_speed,
+                               double commanded_speed) const {
+    visualization_msgs::MarkerArray marker_array;
+    const ros::Time now = ros::Time::now();
+    if (!have_lead || !lead.valid) {
+      visualization_msgs::Marker del;
+      del.header.frame_id = "map";
+      del.header.stamp = now;
+      del.action = visualization_msgs::Marker::DELETEALL;
+      marker_array.markers.push_back(del);
+      acc_target_marker_pub_.publish(marker_array);
+      return;
+    }
+
+    const double bumper_gap = frontBumperGap(lead);
+    const double ttc = leadTtcSec(lead);
+
+    // 1. 3D Bounding Box around target vehicle
+    visualization_msgs::Marker box_marker;
+    box_marker.header.frame_id = "map";
+    box_marker.header.stamp = now;
+    box_marker.ns = "acc_target_box";
+    box_marker.id = 0;
+    box_marker.type = visualization_msgs::Marker::CUBE;
+    box_marker.action = visualization_msgs::Marker::ADD;
+    box_marker.pose.position.x = lead.x;
+    box_marker.pose.position.y = lead.y;
+    box_marker.pose.position.z = 0.8;
+    const double half_yaw = lead.yaw * 0.5;
+    box_marker.pose.orientation.z = std::sin(half_yaw);
+    box_marker.pose.orientation.w = std::cos(half_yaw);
+    box_marker.scale.x = std::max(2.0, lead.length + 0.4);
+    box_marker.scale.y = std::max(1.6, lead.width + 0.4);
+    box_marker.scale.z = 1.6;
+
+    if (hard_brake) {
+      box_marker.color.r = 1.0f; box_marker.color.g = 0.1f; box_marker.color.b = 0.1f; box_marker.color.a = 0.55f;
+    } else if (bumper_gap <= 11.0 || (ttc < 4.0 && closing_speed > 0.5)) {
+      box_marker.color.r = 1.0f; box_marker.color.g = 0.7f; box_marker.color.b = 0.1f; box_marker.color.a = 0.45f;
+    } else {
+      box_marker.color.r = 0.0f; box_marker.color.g = 0.9f; box_marker.color.b = 1.0f; box_marker.color.a = 0.40f;
+    }
+    box_marker.lifetime = ros::Duration(0.3);
+    marker_array.markers.push_back(box_marker);
+
+    // 2. HUD text above vehicle
+    visualization_msgs::Marker text_marker;
+    text_marker.header.frame_id = "map";
+    text_marker.header.stamp = now;
+    text_marker.ns = "acc_target_text";
+    text_marker.id = 1;
+    text_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    text_marker.action = visualization_msgs::Marker::ADD;
+    text_marker.pose.position.x = lead.x;
+    text_marker.pose.position.y = lead.y;
+    text_marker.pose.position.z = 2.8;
+    text_marker.pose.orientation.w = 1.0;
+    text_marker.scale.z = 0.85;
+    text_marker.color.r = 1.0f;
+    text_marker.color.g = 1.0f;
+    text_marker.color.b = 1.0f;
+    text_marker.color.a = 0.95f;
+    text_marker.lifetime = ros::Duration(0.3);
+
+    std::ostringstream ss;
+    ss.setf(std::ios::fixed);
+    ss.precision(1);
+    ss << "[ACC TARGET] ID:" << lead.unique_id << " (" << lead.role << ")\n";
+    ss << "Dist: " << bumper_gap << "m (Target: ~15m) | V_lead: " << (lead.v_long * 3.6) << "km/h\n";
+    if (std::isfinite(ttc) && ttc < 90.0) {
+      ss << "TTC: " << ttc << "s | Closing: " << closing_speed << "m/s";
+    } else {
+      ss << "TTC: Safe | Follow: " << (commanded_speed * 3.6) << "km/h";
+    }
+    text_marker.text = ss.str();
+    marker_array.markers.push_back(text_marker);
+
+    acc_target_marker_pub_.publish(marker_array);
+  }
+
+  double closingAwareDecelLimit(double base_decel_mps2,
+                                double closing_speed_mps,
+                                double max_boost_cap = -1.0) const {
+    const double base = std::max(0.0, base_decel_mps2);
+    if (!closing_decel_boost_enabled_) return base;
+    if (closing_speed_mps <= closing_decel_boost_start_mps_) return base;
+
+    const double full =
+        std::max(closing_decel_boost_start_mps_ + 1e-3,
+                 closing_decel_boost_full_mps_);
+    const double ratio = std::clamp(
+        (closing_speed_mps - closing_decel_boost_start_mps_) /
+            (full - closing_decel_boost_start_mps_),
+        0.0,
+        1.0);
+    double target_boost = closing_decel_boost_max_decel_mps2_;
+    if (max_boost_cap > 0.0) {
+      target_boost = std::min(target_boost, max_boost_cap);
+    }
+    const double boosted =
+        base + ratio * std::max(0.0, target_boost - base);
+    return std::max(base, boosted);
+  }
+
+
+  bool targetGapSafe() const {
+    const double rear_gap_requirement = effectiveTargetRearGapRequirement();
+    const bool front_safe = !targets_.target_front.valid ||
+        frontBumperGap(targets_.target_front) > min_target_front_gap_m_;
+    const bool rear_safe = !targets_.target_rear.valid ||
+        rearBumperGap(targets_.target_rear) > rear_gap_requirement;
+    return front_safe && rear_safe;
+  }
+
+  bool targetFrontBlocksMerge() const {
+    return targets_.target_front.valid &&
+           leadIsInFront(targets_.target_front) &&
+           frontBumperGap(targets_.target_front) <= min_target_front_gap_m_;
+  }
+
+  bool shouldWaitAtLaneEndForGap() const {
+    if (lane_end_wait_gap_front_only_) {
+      return targetFrontBlocksMerge();
+    }
+    return !targetGapSafe();
+  }
+
+  // On lanes that must merge before their CSV endpoint, stop at a safe buffer
+  // when SMPC cannot approve the merge.  This preserves enough local-path
+  // points for MPC while target gaps and trajectory risk continue updating.
+  bool mergeWaitStopRequired() const {
+    if (!lane_end_merge_wait_stop_enabled_ || laneChangeIntentActive()) return false;
+    if (!targets_.lane_change_required || !targets_.lane_change_urgent) return false;
+    // Ordinary KEEP_CRUISE is not a rejection.  A fresh WAIT_FOR_GAP is
+    // different: no safe merge exists and the current CSV must not be run
+    // through at cruise speed.  Start the existing endpoint speed profile in
+    // the urgent zone; a new HOLD/CHANGE_NOW cancels this on the next cycle.
+    return shouldWaitAtLaneEndForGap() || waitForGapActive();
+  }
+
+  double laneEndSpeedLimit() const {
+    const double usable_distance = std::max(
+        0.0, targets_.distance_to_lane_end - lane_end_stop_margin_m_);
+    return std::sqrt(2.0 * lane_end_comfort_decel_mps2_ * usable_distance);
+  }
+
+  double mandatoryMergeLaneEndLimit() const {
+    const double stop_distance = lane_end_merge_wait_stop_enabled_
+        ? std::max(0.0, lane_end_merge_wait_stop_distance_m_)
+        : std::max(0.0, lane_end_hard_stop_distance_m_);
+    const double usable_distance =
+        std::max(0.0, targets_.distance_to_lane_end - stop_distance);
+    const double endpoint_limit =
+        std::sqrt(2.0 * lane_end_comfort_decel_mps2_ * usable_distance);
+    if (targets_.distance_to_lane_end <= stop_distance) {
+      return 0.0;
+    }
+    return endpoint_limit;
+  }
+
+  bool shouldStopAtLaneEnd() const {
+    if (!stop_at_lane_end_enabled_ || !std::isfinite(targets_.distance_to_lane_end)) return false;
+    if (lane_end_stop_lane_ids_.empty()) return true;
+    return std::find(lane_end_stop_lane_ids_.begin(), lane_end_stop_lane_ids_.end(),
+                     targets_.current_lane_id) != lane_end_stop_lane_ids_.end();
+  }
+
+  bool vehicleBlocksMergeRolling(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!lead.valid || isRearVehicle(lead) || !leadIsInFront(lead)) return false;
+    const double front_gap = frontBumperGap(lead);
+    return std::isfinite(front_gap) &&
+           front_gap <= merge_keep_rolling_front_block_gap_m_;
+  }
+
+  bool mergeRollingFrontBlocked() const {
+    if (!egoLanePrioritySuppressesLead(targets_.current_front) &&
+        vehicleBlocksMergeRolling(targets_.current_front)) {
+      return true;
+    }
+    if (vehicleBlocksMergeRolling(targets_.target_front)) {
+      return true;
+    }
+    for (const auto& lead : targets_.nearby_vehicles) {
+      if (shouldUseNearbyLead(lead) && vehicleBlocksMergeRolling(lead)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool lowSpeedLeadBlocksMergeRolling(const smpc_lane_change::TargetVehicle& lead) const {
+    if (!lead.valid || isRearVehicle(lead) || !leadIsInFront(lead)) return false;
+    const double front_gap = frontBumperGap(lead);
+    if (!std::isfinite(front_gap) || front_gap < 0.0 ||
+        front_gap > merge_keep_rolling_low_speed_lead_max_gap_m_) {
+      return false;
+    }
+    const double lead_speed = leadTrustedSpeedMps(lead);
+    return std::max(0.0, lead_speed) <= merge_keep_rolling_low_speed_lead_mps_;
+  }
+
+  bool mergeRollingLowSpeedLeadBlocked() const {
+    // A stopped/slow current-lane vehicle must be allowed to pull ACC below
+    // the merge rolling floor well before the close-gap emergency threshold.
+    if (lowSpeedLeadBlocksMergeRolling(targets_.current_front)) return true;
+    if (lowSpeedLeadBlocksMergeRolling(targets_.target_front)) return true;
+    for (const auto& lead : targets_.nearby_vehicles) {
+      if (shouldUseNearbyLead(lead) && lowSpeedLeadBlocksMergeRolling(lead)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool mergeKeepRollingActive() const {
+    if (!merge_keep_rolling_enabled_) return false;
+    if (merge_keep_rolling_min_speed_mps_ <= 1e-3) return false;
+    if (!(laneChangeIntentActive() || laneEndPressureActive())) return false;
+    if (shouldStopAtLaneEnd()) return false;
+    if (mergeWaitStopRequired()) return false;
+    return !mergeRollingFrontBlocked() && !mergeRollingLowSpeedLeadBlocked();
+  }
+
+  void applyMergeRollingFloor(double cruise_speed_mps,
+                              double& raw_target,
+                              std::string& active_lead,
+                              bool& soft_target_front_limited_speed) const {
+    if (lane_change_active_) return;
+    if (!mergeKeepRollingActive()) return;
+    if (active_lead.find("target_front") != std::string::npos) return;
+    const double rolling_floor =
+        std::min(std::max(0.0, merge_keep_rolling_min_speed_mps_),
+                 std::max(0.0, cruise_speed_mps));
+    if (rolling_floor <= 1e-3 || raw_target >= rolling_floor) return;
+    raw_target = rolling_floor;
+    soft_target_front_limited_speed = false;
+    active_lead = active_lead == "none"
+        ? "merge_keep_rolling"
+        : active_lead + ":merge_keep_rolling";
+  }
+
+  void timerCallback(const ros::TimerEvent& event) {
+    if (!have_ego_speed_) return;
+
+    const double cruise_speed_mps = currentCruiseSpeedMps();
+    double raw_target = cruise_speed_mps;
+    std::string active_lead = "none";
+    bool hard_brake_active = false;
+    double max_active_closing_speed_mps = 0.0;
+    bool behavior_yield_slew_active = false;
+    double behavior_yield_decel_limit_mps2 = 0.0;
+    bool behavior_cap_applied = false;
+    bool external_speed_limit_active = false;
+    bool soft_target_front_limited_speed = false;
+    double applied_behavior_cap_mps = std::numeric_limits<double>::quiet_NaN();
+    smpc_lane_change::TargetVehicle active_lead_veh;
+    bool have_active_lead_veh = false;
+
+    const bool fresh_targets = have_targets_ &&
+        (ros::Time::now() - targets_stamp_).toSec() <= target_timeout_sec_;
+    const bool behavior_preparation_active =
+        fresh_targets && behaviorPreparationActive();
+    const bool endpoint_connector_active = endpointConnectorActive();
+    // 양보 후 따라가기(yieldFollowTargetFront 주석). 판정을 먼저 해 두고, 켜져
+    // 있으면 목표 차로 앞차는 일반 ACC(정속 추종 간격) 대신 합류용 간격으로 따른다.
+    // 뒤차를 먼저 보내는 양보(reason ..._pass) 중에는 목표 차로 앞차 추종으로 양보
+    // 상한을 풀지 않는다. 풀면 자차가 뒤차보다 빨라져 그 차가 영영 앞으로 못 나간다
+    // (2026-09-26, 13:48 백: 느린 옆 뒤차 양보). 그 차가 앞으로 나가면 SMPC 가
+    // 양보 사유를 바꾸고, 그때부터 그 차를 따라간다.
+    const bool yield_rear_pass_request =
+        behavior_request_.action == smpc_lane_change::BehaviorLongitudinalRequest::YIELD &&
+        behavior_request_.reason.size() >= 5 &&
+        behavior_request_.reason.compare(behavior_request_.reason.size() - 5, 5, "_pass") == 0;
+    const bool yield_follow = fresh_targets && behavior_preparation_active &&
+        !yield_rear_pass_request &&
+        (behavior_request_.action == smpc_lane_change::BehaviorLongitudinalRequest::YIELD ||
+         behavior_request_.action == smpc_lane_change::BehaviorLongitudinalRequest::HOLD ||
+         behavior_request_.action ==
+             smpc_lane_change::BehaviorLongitudinalRequest::WAIT_FOR_GAP) &&
+        yieldFollowTargetFront();
+    if (!behavior_preparation_active || yield_rear_pass_request) yield_follow_active_ = false;
+
+    if (fresh_targets) {
+      if (lane_change_active_) {
+        // /gps_state switches to the target CSV when the blend starts.  In
+        // that state current_front and target_front both represent the target
+        // lane, so apply the same staged entry gate to both and avoid early
+        // duplicate target-lane ACC.  If lane IDs still differ, current_front
+        // remains the source-lane lead and keeps full ACC authority.
+        const bool current_is_target = currentFrontRepresentsTargetLaneDuringChange();
+        const bool target_hard_acc = targetFrontHardAccAllowed();
+        const bool target_soft_acc = targetFrontOverlapSoftAccAllowed();
+        // ★ 차선변경 시작부터 새 차로 앞차를 약하게 추종(2026-09-25, 19:34 백).
+        //   예전엔 자차가 목표 차로에 1.8 m 걸칠 때(|d_target|<=2.7)까지 이 앞차를
+        //   전혀 안 봐서, 5 m/s 느린 앞차가 21 m 앞에 있는데도 순항 목표로
+        //   가속했다(14.3~16.1 s, 14.5 -> 16.5 m/s). 간격 21 -> 8.8 m 뒤에야 정상
+        //   추종이 켜져 18.5 s 에 3.6 m 까지 붙었다.
+        //   처음부터 약한 추종(감속 target_front_overlap_soft_max_decel 이하,
+        //   급제동 없음)으로 가속만 막고 필요한 만큼 줄인다. 차로에 걸치기 시작하면
+        //   (targetLaneFootprintOverlapsTargetLane) 급제동 권한도 준다.
+        const bool early_soft = lc_target_lead_soft_from_start_ && current_is_target &&
+            !target_hard_acc && !target_soft_acc;
+        const bool current_acc_allowed = !current_is_target ||
+            target_hard_acc || target_soft_acc || early_soft;
+        if (current_acc_allowed && targets_.current_front.valid &&
+            leadIsInFront(targets_.current_front)) {
+          applyLeadLimit(targets_.current_front, "current_front",
+                         cruise_speed_mps, raw_target, active_lead, hard_brake_active,
+                         max_active_closing_speed_mps,
+                         !current_is_target || target_hard_acc ||
+                             (lc_target_lead_soft_from_start_ &&
+                              targetLaneFootprintOverlapsTargetLane()),
+                         current_is_target && (target_soft_acc || early_soft),
+                         &soft_target_front_limited_speed,
+                         &active_lead_veh, &have_active_lead_veh);
+        }
+        if (targetFrontAccAllowed() && targets_.target_front.valid &&
+            leadIsInFront(targets_.target_front)) {
+          applyLeadLimit(targets_.target_front, "target_front",
+                         cruise_speed_mps, raw_target, active_lead, hard_brake_active,
+                         max_active_closing_speed_mps,
+                         target_hard_acc, target_soft_acc,
+                         &soft_target_front_limited_speed,
+                         &active_lead_veh, &have_active_lead_veh);
+        }
+      } else {
+        // current_front is the representative vehicle on the source/current lane.
+        const bool ego_diverging_from_current = lane_change_active_ &&
+            (std::abs(targets_.ego_d_current) > 0.8 || std::abs(targets_.ego_d_target) < 2.5);
+        if (!ego_diverging_from_current) {
+          applyLeadLimit(targets_.current_front, "current_front",
+                         cruise_speed_mps, raw_target, active_lead, hard_brake_active,
+                         max_active_closing_speed_mps, true, false,
+                         &soft_target_front_limited_speed,
+                         &active_lead_veh, &have_active_lead_veh);
+        } else {
+          applyLeadLimit(targets_.current_front, "current_front",
+                         cruise_speed_mps, raw_target, active_lead, hard_brake_active,
+                         max_active_closing_speed_mps, false, true,
+                         &soft_target_front_limited_speed,
+                         &active_lead_veh, &have_active_lead_veh);
+        }
+
+        if (yield_follow) {
+          // ★ 합류용 간격 추종(2026-09-25, 19:58 백). 정속 추종 간격(~15 m+)을 쓰면
+          //   멀어지는 앞차 뒤 3~11 m 에서 가속하지 않아 12.2 m/s 로 합류했다.
+          const double v_follow = yieldFollowSpeed(targets_.target_front, cruise_speed_mps);
+          if (v_follow < raw_target) {
+            raw_target = v_follow;
+            active_lead = "yield_follow_target_front:" +
+                std::to_string(targets_.target_front.unique_id);
+            active_lead_veh = targets_.target_front;
+            have_active_lead_veh = true;
+          }
+        } else if ((laneChangeIntentActive() || behavior_preparation_active ||
+             laneEndPressureActive()) &&
+            targetFrontAccAllowed()) {
+          const bool target_front_hard_acc = targetFrontHardAccAllowed();
+          const bool target_front_soft_acc = !target_front_hard_acc;
+          applyLeadLimit(targets_.target_front, "target_front",
+                         cruise_speed_mps, raw_target, active_lead, hard_brake_active,
+                         max_active_closing_speed_mps,
+                         target_front_hard_acc, target_front_soft_acc,
+                         &soft_target_front_limited_speed,
+                         &active_lead_veh, &have_active_lead_veh);
+        }
+      }
+
+      for (const auto& lead : targets_.nearby_vehicles) {
+        if (!shouldUseNearbyLead(lead)) continue;
+        if (yield_follow && lead.unique_id == targets_.target_front.unique_id) continue;
+        const bool nearby_overlap =
+            isNearbyOverlapVehicle(lead) && nearbyOverlapOccupiesEgoCorridor(lead);
+        const bool target_lane_preentry =
+            lead.lane_id == targets_.target_lane_id &&
+            targets_.target_lane_id != targets_.current_lane_id &&
+            !targetFrontHardAccAllowed();
+        // A real bbox overlap is a collision hazard now, not merely a
+        // target-lane pre-entry case.  It must retain normal hard/rapid brake
+        // authority even before ego reaches the target-lane center.
+        const bool allow_hard_brake = nearby_overlap || !target_lane_preentry;
+        applyLeadLimit(lead, lead.role, cruise_speed_mps,
+                       raw_target, active_lead, hard_brake_active,
+                       max_active_closing_speed_mps,
+                       allow_hard_brake, false,
+                       &soft_target_front_limited_speed,
+                       &active_lead_veh, &have_active_lead_veh);
+      }
+
+      // A lane endpoint is a merge deadline for lanes 0,1,2. If target-front
+      // space is blocked, or SMPC explicitly reports WAIT_FOR_GAP, follow the
+      // existing endpoint profile to the holding line.  WAIT_FOR_GAP keeps
+      // normal ACC running upstream; this only starts in the urgent zone.
+      if (!laneChangeIntentActive() &&
+          targets_.lane_change_urgent &&
+          mergeWaitStopRequired()) {
+        const double endpoint_limit = mandatoryMergeLaneEndLimit();
+        if (endpoint_limit < raw_target) {
+          raw_target = endpoint_limit;
+          soft_target_front_limited_speed = false;
+          active_lead = targetFrontBlocksMerge()
+              ? "lane_end_wait_front_gap"
+              : "lane_end_wait_no_safe_gap";
+          if (raw_target <= 0.01 && !mergeKeepRollingActive()) {
+            hard_brake_active = true;
+          }
+        }
+      }
+
+      // Treat configured CSV endpoints as stop targets, independent of the
+      // lane-change deadline logic.
+      if (!laneChangeIntentActive() && shouldStopAtLaneEnd() &&
+          (targets_.distance_to_lane_end <= lane_end_stop_prepare_distance_m_ ||
+           targets_.time_to_lane_end <= lane_end_stop_prepare_time_sec_)) {
+        const double endpoint_limit = laneEndSpeedLimit();
+        if (endpoint_limit < raw_target) {
+          raw_target = endpoint_limit;
+          soft_target_front_limited_speed = false;
+          active_lead = "lane_end_stop";
+        }
+      }
+
+      if (!laneChangeIntentActive() &&
+          targets_.emergency_stop_required &&
+          mergeWaitStopRequired()) {
+        const double endpoint_limit = mandatoryMergeLaneEndLimit();
+        if (endpoint_limit < raw_target) {
+          raw_target = endpoint_limit;
+          soft_target_front_limited_speed = false;
+          if (targetFrontBlocksMerge()) {
+            active_lead = raw_target <= 0.01
+                ? "lane_end_emergency_stop"
+                : "lane_end_emergency_creep";
+          } else {
+            active_lead = raw_target <= 0.01
+                ? "lane_end_wait_no_safe_gap:stop"
+                : "lane_end_wait_no_safe_gap:creep";
+          }
+          if (raw_target <= 0.01 && !mergeKeepRollingActive()) {
+            hard_brake_active = true;
+          }
+        }
+      }
+
+      if (!hard_brake_active) {
+        applyMergeRollingFloor(cruise_speed_mps, raw_target, active_lead,
+                                soft_target_front_limited_speed);
+      }
+
+      // Capture the non-behavior arbitration result before a preparation cap
+      // changes its debug label.  This acknowledgement is fed back to SMPC so
+      // it never mistakes a genuine lead/lane-end brake for its own YIELD.
+      external_speed_limit_active =
+          active_lead != "none" && active_lead != "merge_keep_rolling";
+
+      // This is deliberately after the merge rolling floor.  A selected
+      // YIELD/HOLD candidate must be able to lower speed even when ordinary
+      // merge logic prefers to preserve momentum.  It can never relax an
+      // existing lead, TTC, hard-brake, lane-end, or mission-speed limit.
+    // 양보 후 따라가기 중에는 양보 상한을 걸지 않는다(위에서 합류 간격으로 추종).
+    if (behavior_preparation_active && !yield_follow &&
+        behavior_request_.action !=
+            smpc_lane_change::BehaviorLongitudinalRequest::WAIT_FOR_GAP) {
+        double behavior_cap = std::clamp(
+            behavior_request_.speed_cap_mps, min_speed_mps_, cruise_speed_mps);
+        // 옆 차가 앞서 지나가는 중이면 양보 감속을 멈추고 현재 속도 유지.
+        // 뒤차를 보내는 양보 중에는 앞쪽 차 때문에 현재 속도로 버티지 않는다.
+        if (!yield_rear_pass_request && yieldHoldPassingSideVehicle())
+          behavior_cap = std::max(behavior_cap,
+              std::min(ego_speed_mps_, cruise_speed_mps));
+        if (behavior_cap < raw_target) {
+          behavior_cap_applied = true;
+          applied_behavior_cap_mps = behavior_cap;
+          // If this extra cap is the only source of deceleration, honor the
+          // planner's requested YIELD rate.  Existing lead/lane-end/rapid
+          // braking keeps its original (possibly stronger) safety authority.
+          const bool no_external_speed_limit =
+              active_lead == "none" || active_lead == "merge_keep_rolling";
+          const bool requested_yield =
+              behavior_request_.action ==
+                  smpc_lane_change::BehaviorLongitudinalRequest::YIELD &&
+              behavior_request_.requested_accel_mps2 < -1e-3;
+          if (!hard_brake_active && no_external_speed_limit && requested_yield) {
+            behavior_yield_slew_active = true;
+            behavior_yield_decel_limit_mps2 =
+                std::abs(behavior_request_.requested_accel_mps2);
+          }
+          raw_target = behavior_cap;
+          soft_target_front_limited_speed = false;
+          active_lead = active_lead == "none"
+              ? behaviorActionName()
+              : active_lead + ":" + behaviorActionName();
+        }
+      }
+    }
+
+    // This cap is applied after all ordinary ACC lead/TTC/lane-end arbitration
+    // and its merge rolling floor.  It is only a minimum operation: a stricter
+    // normal safety target (including a hard stop) always remains in force.
+    // Do not retain it after the Bool stops being refreshed by the path node.
+    if (endpoint_connector_active) {
+      const double connector_cap = std::clamp(
+          endpoint_connector_speed_cap_mps_, min_speed_mps_, cruise_speed_mps);
+      if (connector_cap < raw_target) {
+        raw_target = connector_cap;
+        soft_target_front_limited_speed = false;
+        active_lead = active_lead == "none"
+            ? "endpoint_connector"
+            : active_lead + ":endpoint_connector";
+      }
+    }
+
+    double dt = (event.current_real - event.last_real).toSec();
+    if (!(dt > 0.0 && dt < 1.0)) dt = 1.0 / std::max(1.0, publish_rate_hz_);
+
+    const bool is_highway = targets_.current_lane_id >= 0;
+    // 고주로 주행 중 비긴급(일반 거리 유지) 시에는 highway_follow_max_decel_mps2_(1.5m/s^2)를 기본 감속 비율로 적용하여
+    // 앞차 추종 시 순간 급감속 충격을 완전히 제거하고 편안하고 부드러운 감속 비율 유지
+    const double base_decel = (is_highway && !hard_brake_active)
+        ? highway_follow_max_decel_mps2_
+        : max_decel_mps2_;
+    // 고주로 부스트 상한 배수.
+    //
+    // 1.3 이면 base 1.2 기준 1.56 m/s^2 이 상한인데, 도심은 같은 함수를 상한
+    // 없이 써서 3.0 까지 올라간다 - 더 빠른 고주로가 더 약하게 제동하는
+    // 역전이었다.
+    //   실측(2026-09-15 18:01 백, t=280~284): 앞차가 자차보다 4.6 m/s 느린데
+    //   목표속도가 16.1 -> 12.7 로 내려가는 데 2.6 초가 걸렸고, 그 사이
+    //   24 m 간격을 다 소진해 4.3 m 에서 hard brake(0.47)가 걸렸다.
+    // 이 배수는 closing_decel_boost_start_mps(3.0) 를 넘는 폐쇄속도에서만
+    // 효과가 있으므로, 정속 추종 중 승차감은 base 그대로 유지된다.
+    // 차선변경을 준비/진행 중이면 부스트를 낮춘 배수로 제한한다.
+    //
+    // 두 상황은 요구가 반대다.
+    //   일반 추종: 강하게 줄여야 앞차에 안 붙는다. 실측(20:25 백 t=18~22)
+    //     앞차가 8.4 m/s 느린데 1.3 배(1.56 m/s^2)로는 18.6 -> 10.2 수렴에
+    //     5.4 초가 걸려 보유 간격 23.5 m 를 거의 다 쓰고 1.9 m 까지 붙었다.
+    //   변경 판단 중: 강하게 줄이면 자차 속도가 무너져 블렌드 경로 자체가
+    //     안 만들어진다. 실측(20:17 백) 2.5 배에서 10.8 -> 5.9 m/s 로 끌려
+    //     내려가며 ref_pts 357 -> 100, ref_preview 가 0(무효)이 됐다.
+    // 그래서 같은 값을 쓰지 않고 상태별로 나눈다.
+    const double closing_boost_scale = behavior_preparation_active
+        ? highway_closing_decel_boost_scale_lane_change_
+        : highway_closing_decel_boost_scale_;
+    const double decel_limit =
+        hard_brake_active ? std::max(max_decel_mps2_, hard_brake_decel_mps2_)
+                          : (is_highway
+                              ? closingAwareDecelLimit(
+                                    base_decel, max_active_closing_speed_mps,
+                                    base_decel * closing_boost_scale)
+                              : closingAwareDecelLimit(base_decel, max_active_closing_speed_mps));
+    double effective_decel_limit = decel_limit;
+    if (behavior_yield_slew_active) {
+      // The decision node has already bounded a YIELD request by its comfort
+      // limit and, for a close target-front vehicle, calculated the braking
+      // rate required by the remaining distance.  This branch is active only
+      // when no ordinary ACC/lane-end/hard-brake source owns the target, so
+      // apply that requested slew exactly.  Taking min(base, request) here
+      // silently reduced an adaptive 2.5 m/s^2 request to the highway default
+      // 1.2 m/s^2 and made side-zone yielding start too weakly.
+      effective_decel_limit =
+          std::max(0.0, behavior_yield_decel_limit_mps2);
+    }
+    if (soft_target_front_limited_speed && !hard_brake_active) {
+      effective_decel_limit = std::min(
+          effective_decel_limit,
+          std::max(0.0, target_front_overlap_soft_max_decel_mps2_));
+    }
+    // 주행 중인 앞차 추종 시 또는 고주로에서는 하드브레이크 필터 바이패스를 제한하여
+    // 뒤따르는 후방 차량에게 급제동 충격을 주지 않고 매끄럽게 감속.
+    // 신뢰할 수 없는 v_long 이 0 근처로 튀면 '정지한 앞차'로 오인해 바이패스가
+    // 열린다. leadTrustedSpeedMps 를 거쳐 그 경로를 막는다.
+    const bool allow_bypass = !is_highway && hard_brake_active && hard_brake_bypass_filter_ &&
+        (!targets_.current_front.valid ||
+         leadTrustedSpeedMps(targets_.current_front) <= lead_moving_speed_thresh_mps_);
+    if (allow_bypass) {
+      filtered_speed_mps_ = raw_target;
+    } else {
+      // CHANGE_LEFT 요청이 나온 순간부터(경로 노드의 active 응답을 기다리지
+      // 않고) 후방 차량과의 속도차를 줄인다. 일반 ACC/front/TTC가 만든
+      // raw_target은 그대로 우선하므로 앞차가 있으면 가속하지 않는다.
+      const bool merge_accel_active = laneChangeIntentActive();
+      double accel_limit = std::max(0.0, max_accel_mps2_);
+      if (merge_accel_active) {
+        accel_limit = std::max(accel_limit, lane_change_max_accel_mps2_);
+      } else if (yield_follow) {
+        accel_limit = std::max(accel_limit, yield_follow_max_accel_mps2_);
+      } else if (endpoint_connector_active) {
+        accel_limit = std::max(0.0, endpoint_connector_max_accel_mps2_);
+      }
+      const double upper = filtered_speed_mps_ + accel_limit * dt;
+      const double lower = filtered_speed_mps_ - effective_decel_limit * dt;
+      filtered_speed_mps_ = std::clamp(raw_target, lower, upper);
+    }
+    filtered_speed_mps_ = std::clamp(filtered_speed_mps_, min_speed_mps_, cruise_speed_mps);
+
+    std_msgs::Float64 speed_msg;
+    speed_msg.data = filtered_speed_mps_;
+    speed_pub_.publish(speed_msg);
+
+    std_msgs::Float64 raw_msg;
+    raw_msg.data = raw_target;
+    raw_speed_pub_.publish(raw_msg);
+
+    std_msgs::String lead_msg;
+    lead_msg.data = active_lead;
+    active_lead_pub_.publish(lead_msg);
+
+    smpc_lane_change::BehaviorLongitudinalStatus behavior_status;
+    behavior_status.header.stamp = ros::Time::now();
+    behavior_status.plan_id = behavior_preparation_active ? behavior_request_.plan_id : 0;
+    behavior_status.command_revision =
+        behavior_preparation_active ? behavior_request_.command_revision : 0;
+    behavior_status.behavior_cap_applied = behavior_cap_applied;
+    behavior_status.external_speed_limit_active = external_speed_limit_active;
+    behavior_status.current_lane_id = fresh_targets ? targets_.current_lane_id : -1;
+    behavior_status.target_lane_id = fresh_targets ? targets_.target_lane_id : -1;
+    behavior_status.applied_speed_cap_mps = applied_behavior_cap_mps;
+    behavior_status.final_target_speed_mps = filtered_speed_mps_;
+    behavior_status.reason = active_lead;
+    behavior_status_pub_.publish(behavior_status);
+
+    publishAccTargetMarkers(active_lead_veh, have_active_lead_veh, hard_brake_active,
+                            max_active_closing_speed_mps, filtered_speed_mps_);
+  }
+
+  ros::NodeHandle nh_, pnh_;
+  ros::Subscriber targets_sub_, odom_sub_, mission_speed_sub_, status_sub_, decision_sub_;
+  ros::Subscriber behavior_request_sub_, endpoint_connector_active_sub_;
+  ros::Publisher speed_pub_, raw_speed_pub_, active_lead_pub_, behavior_status_pub_;
+  ros::Publisher acc_target_marker_pub_;
+  ros::Timer timer_;
+
+  smpc_lane_change::TargetVehicleSet targets_;
+  ros::Time targets_stamp_;
+  bool have_targets_{false};
+  bool have_ego_speed_{false};
+  bool lane_change_active_{false};
+  bool lane_change_requested_{false};
+  bool have_mission_speed_target_{false};
+  bool have_behavior_request_{false};
+  bool have_endpoint_connector_status_{false};
+  bool endpoint_connector_active_{false};
+  double ego_speed_mps_{0.0};
+  double filtered_speed_mps_{0.0};
+
+  std::string mission_speed_topic_{"/control_feedback/mission_speed_target_mps"};
+  double mission_speed_timeout_sec_{0.5};
+  double mission_speed_fallback_mps_{10.0};
+  double mission_speed_target_mps_{10.0};
+  ros::Time mission_speed_stamp_;
+  smpc_lane_change::BehaviorLongitudinalRequest behavior_request_;
+  ros::Time behavior_request_stamp_;
+  bool behavior_request_enabled_{false};
+  std::string behavior_request_topic_{"/smpc/behavior_longitudinal_request"};
+  double behavior_request_timeout_sec_{0.35};
+  std::string behavior_status_topic_{"/smpc/behavior_longitudinal_status"};
+  bool behavior_request_apply_while_lane_change_{false};
+  bool behavior_request_apply_accel_{false};
+  // 양보 해제 직후 짧은 가속 허용(behaviorRequestUsable 참고).
+  bool accel_after_yield_release_enabled_{true};
+  bool yield_follow_enabled_{true};
+  bool lc_target_lead_soft_from_start_{true};
+  double yield_follow_standstill_gap_m_{4.0};
+  double yield_follow_time_gap_sec_{0.3};
+  double yield_follow_gap_gain_{0.4};
+  double yield_follow_close_gap_gain_{0.2};
+  double yield_follow_min_desired_gap_m_{8.5};
+  double yield_follow_max_catchup_mps_{2.0};
+  double yield_follow_max_accel_mps2_{2.4};
+  bool yield_follow_active_{false};
+  double yield_follow_min_gap_m_{2.0};
+  double yield_follow_min_rel_speed_mps_{0.0};
+  double yield_follow_release_rel_speed_mps_{-0.5};
+  double accel_release_window_sec_{1.5};
+  bool had_recent_yield_{false};
+  ros::Time last_yield_release_stamp_{};
+  double endpoint_connector_speed_cap_mps_{2.0};
+  double endpoint_connector_max_accel_mps2_{1.5};
+  double endpoint_connector_status_timeout_sec_{0.5};
+  ros::Time endpoint_connector_active_stamp_;
+  double ego_length_m_{4.8};
+  double ego_width_m_{1.9};
+  double acc_max_range_m_{35.0};
+  double standstill_gap_m_{8.0};
+  double time_headway_sec_{2.2};
+  double gap_gain_{0.65};
+  double closing_speed_gap_time_sec_{0.8};
+  double braking_decel_mps2_{4.5};
+  double soft_ttc_sec_{4.0};
+  double hard_ttc_sec_{1.8};
+  double min_speed_mps_{0.0};
+  double max_accel_mps2_{1.5};
+  double lane_change_max_accel_mps2_{3.5};
+  double max_decel_mps2_{5.0};
+  double highway_follow_max_decel_mps2_{1.5};
+  double highway_closing_decel_boost_scale_{2.5};
+  double highway_closing_decel_boost_scale_lane_change_{1.3};
+  // 앞차 속도 추정 신뢰도(leadTrustedSpeedMps 참고).
+  double lead_max_velocity_std_mps_{3.0};
+  double lead_speed_hold_sec_{1.0};
+  // 앞차 속도를 전혀 모를 때, ego 대비 이만큼 느리다고 가정한다(보수적).
+  double lead_unknown_speed_margin_mps_{4.0};
+  // 간격 미분 기반 폐쇄속도(gapDerivedClosingSpeed).
+  bool gap_closing_enabled_{true};
+  double gap_closing_alpha_{0.35};
+  double gap_closing_max_dt_sec_{0.4};
+  double gap_closing_max_jump_mps_{25.0};
+  double prev_gap_m_{std::numeric_limits<double>::quiet_NaN()};
+  double gap_closing_filtered_{0.0};
+  ros::Time prev_gap_stamp_{};
+  // 직전 유효값 대비 허용 가속도(m/s^2). 초과하는 점프는 추정 오류로 본다.
+  double lead_max_speed_jump_mps2_{6.0};
+  int last_trusted_speed_id_{-1};
+  double last_trusted_speed_mps_{std::numeric_limits<double>::quiet_NaN()};
+  ros::Time last_trusted_speed_stamp_{};
+  double highway_max_follow_speed_drop_mps_{1.5};
+  bool closing_decel_boost_enabled_{true};
+  double closing_decel_boost_start_mps_{5.0};
+  double closing_decel_boost_full_mps_{15.0};
+  double closing_decel_boost_max_decel_mps2_{8.0};
+  double hard_brake_decel_mps2_{9.0};
+  bool hard_brake_bypass_filter_{true};
+  double emergency_gap_m_{8.0};
+  double critical_gap_m_{2.5};
+  double emergency_stop_gap_m_{3.5};
+  double critical_ttc_sec_{0.7};
+  bool rapid_lead_brake_enabled_{true};
+  double rapid_lead_ttc_sec_{3.0};
+  double rapid_lead_min_closing_speed_mps_{4.0};
+  double rapid_lead_required_decel_mps2_{5.0};
+  double max_follow_speed_drop_mps_{5.0};
+  double lead_moving_speed_thresh_mps_{2.0};
+  double target_timeout_sec_{0.8};
+  double decision_request_timeout_sec_{0.5};
+  double publish_rate_hz_{20.0};
+  ros::Time decision_stamp_;
+  int requested_decision_current_lane_id_{-1};
+  int requested_decision_target_lane_id_{-1};
+  double min_target_front_gap_m_{11.0};
+  double min_target_rear_gap_m_{6.0};
+  bool target_front_acc_requires_target_lane_entry_{true};
+  double target_front_acc_entry_abs_d_m_{0.75};
+  bool target_front_preentry_soft_acc_enabled_{false};
+  double target_front_preentry_soft_acc_distance_to_end_m_{120.0};
+  bool target_front_overlap_soft_acc_enabled_{false};
+  double target_front_overlap_soft_acc_start_abs_d_m_{2.7};
+  double target_front_overlap_soft_max_decel_mps2_{1.5};
+  bool merge_priority_enabled_{true};
+  double merge_priority_rear_safe_gap_m_{4.5};
+  double merge_priority_rear_min_gap_m_{4.0};
+  double merge_priority_rear_max_closing_mps_{3.5};
+  double merge_priority_rear_min_ttc_sec_{1.8};
+  bool ego_lane_priority_enabled_{true};
+  double ego_lane_priority_current_max_abs_d_m_{1.25};
+  double ego_lane_priority_front_hard_gap_m_{8.0};
+  double lane_end_stop_margin_m_{2.0};
+  double lane_end_comfort_decel_mps2_{2.5};
+  double lane_end_merge_creep_speed_mps_{4.0};
+  double lane_end_hard_stop_distance_m_{6.0};
+  bool lane_end_merge_wait_stop_enabled_{true};
+  double lane_end_merge_wait_stop_distance_m_{35.0};
+  bool stop_at_lane_end_enabled_{true};
+  std::vector<int> lane_end_stop_lane_ids_{3};
+  double lane_end_stop_prepare_distance_m_{45.0};
+  double lane_end_stop_prepare_time_sec_{4.0};
+  bool use_nearby_vehicles_{true};
+  bool use_nearby_overlap_as_acc_lead_{false};
+  bool nearby_acc_overlap_only_{false};
+  double nearby_overlap_lateral_margin_m_{0.20};
+  double nearby_acc_lead_max_abs_d_m_{1.35};
+  double nearby_merge_front_range_m_{120.0};
+  double nearby_merge_rear_range_m_{20.0};
+  bool use_all_nearby_when_lane_end_pressure_{true};
+  bool lane_end_wait_gap_front_only_{true};
+  bool merge_keep_rolling_enabled_{true};
+  double merge_keep_rolling_min_speed_mps_{6.0};
+  double merge_keep_rolling_front_block_gap_m_{8.0};
+  double merge_keep_rolling_low_speed_lead_mps_{3.0};
+  double merge_keep_rolling_low_speed_lead_max_gap_m_{80.0};
+};
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "smpc_acc_speed_planner");
+  AccSpeedPlanner node;
+  ros::spin();
+  return 0;
+}

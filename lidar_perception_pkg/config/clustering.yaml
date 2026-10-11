@@ -1,0 +1,27 @@
+pointcloud_topic: /nonground
+cluster_tolerance: 1.0
+cluster_minsize: 3
+cluster_maxsize: 800
+x_min_st: 0.5
+x_max_st: 25.0
+y_min_st: -20.0
+y_max_st: 20.0
+z_min_st: -10.0
+z_max_st: 4.0
+obstacle_x_min: 0.5
+obstacle_x_max: 25.0
+# Vehicle frame: +y is left. ROI 1 is always the ego lane.
+obstacle_roi_0_y_min: 2.1
+obstacle_roi_0_y_max: 5.9
+obstacle_roi_1_y_min: -1.9
+obstacle_roi_1_y_max: 1.9
+obstacle_roi_2_y_min: -5.9
+obstacle_roi_2_y_max: -2.1
+obstacle_z_min: -1.13   # 실측 지면(-1.730)+0.60
+obstacle_z_max: 1.57    # 실측 지면(-1.730)+3.30
+obstacle_min_height: 0.0
+obstacle_max_height: 3.0
+obstacle_confirm_frames: 2
+obstacle_clear_frames: 2
+str_: 0.6
+sepe: 1000.0

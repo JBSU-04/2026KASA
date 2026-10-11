@@ -1,0 +1,29 @@
+<launch>
+  <arg name="config_file" default="$(find morai_udp_bridge)/config/morai_25s4.yaml"/>
+  <arg name="enable_camera" default="false"/>
+  <arg name="enable_lidar" default="true"/>
+  <arg name="lidar1_port" default="2368"/>
+  <arg name="lidar2_port" default="2370"/>
+  <arg name="lidar1_topic" default="/lidar3d_0"/>
+  <arg name="lidar2_topic" default="/lidar3d_1"/>
+  <arg name="simulator_ip" default="192.168.0.1"/>
+
+  <include file="$(find morai_udp_bridge)/launch/morai_udp_bridge.launch">
+    <arg name="config_file" value="$(arg config_file)"/>
+    <arg name="enable_camera" value="$(arg enable_camera)"/>
+    <!-- CtrlCmd is never sent by this UDP-only launch. -->
+    <arg name="enable_control" value="false"/>
+    <arg name="simulator_ip" value="$(arg simulator_ip)"/>
+  </include>
+
+  <!-- 두 MORAI VLP-16 데이터는 제조사 호환 드라이버가 직접 UDP를 해석한다. -->
+  <group if="$(arg enable_lidar)">
+    <include file="$(find morai_udp_bridge)/launch/morai_udp_2lidar.launch">
+      <arg name="simulator_ip" value="$(arg simulator_ip)"/>
+      <arg name="lidar1_port" value="$(arg lidar1_port)"/>
+      <arg name="lidar2_port" value="$(arg lidar2_port)"/>
+      <arg name="lidar1_topic" value="$(arg lidar1_topic)"/>
+      <arg name="lidar2_topic" value="$(arg lidar2_topic)"/>
+    </include>
+  </group>
+</launch>

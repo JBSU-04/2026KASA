@@ -1,0 +1,433 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /🚗 1. 3D 자차 &amp; 홀로그램 HUD1
+        - /🛣️ 2. 3D 내비게이션 주행 유도로1
+        - /🎯 3. MPC 최적 예측 궤적1
+        - /🗺️ 6. HD 로드맵 (차선·정지선)1
+        - /🚘 7. 3D 주변 차량 &amp; 타겟1
+        - /📡 9. 라이다 서라운드 점군1
+      Splitter Ratio: 0.55
+    Tree Height: 780
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.50
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.15
+      Cell Size: 10
+      Class: rviz/Grid
+      Color: 35; 45; 65
+      Enabled: true
+      Line Style: {Line Width: 0.03, Value: Lines}
+      Name: 0. 기준 그리드 (Dark Grid)
+      Normal Cell Count: 0
+      Offset: {X: 0, Y: 0, Z: 0}
+      Plane: XY
+      Plane Cell Count: 100
+      Reference Frame: <Fixed Frame>
+      Value: true
+
+    # ================= 1. 3D 자차 & 조명 & HUD =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🚗 1. 3D 자차 & 홀로그램 HUD
+      Displays:
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /navigation_3d/ego_vehicle_markers
+          Name: 3D 자차 본체 & 전조등 빔 & 상단 HUD
+          Namespaces: {}
+          Queue Size: 10
+          Value: true
+
+        - Class: rviz/TF
+          Enabled: false
+          Frame Timeout: 15
+          Frames:
+            All Enabled: false
+            base_link: {Value: true}
+            map: {Value: true}
+            velodyne: {Value: true}
+          Marker Alpha: 0.8
+          Marker Scale: 1.5
+          Name: (참고) TF 좌표축
+          Show Arrows: false
+          Show Axes: true
+          Show Names: false
+          Value: false
+
+    # ================= 2. 3D 주행 유도로 카펫 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🛣️ 2. 3D 내비게이션 주행 유도로
+      Displays:
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /navigation_3d/drive_carpet_markers
+          Name: 3D 주행 유도로 카펫 (2.2m 폭 리본)
+          Namespaces: {}
+          Queue Size: 10
+          Value: true
+
+    # ================= 3. MPC 최적 예측 궤적 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🎯 3. MPC 최적 예측 궤적
+      Displays:
+        - Alpha: 0.95
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 255; 195; 0
+          Enabled: true
+          Head Diameter: 0
+          Line Style: Billboards
+          Line Width: 0.35
+          Name: MPC 예측 타이어 궤적 (rviz_predicted_path)
+          Offset: {X: 0, Y: 0, Z: 0.08}
+          Pose Style: None
+          Shaft Diameter: 0
+          Topic: /rviz_predicted_path
+          Unreliable: false
+          Value: true
+
+        - Alpha: 0.85
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 0; 215; 255
+          Enabled: true
+          Head Diameter: 0
+          Line Style: Billboards
+          Line Width: 0.25
+          Name: 기준 경로 중심선 (local_path)
+          Offset: {X: 0, Y: 0, Z: 0.06}
+          Pose Style: None
+          Shaft Diameter: 0
+          Topic: /local_path
+          Unreliable: false
+          Value: true
+
+    # ================= 4. 전체 계획 경로 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🏁 4. 전체 계획 경로
+      Displays:
+        - Alpha: 0.45
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 90; 120; 165
+          Enabled: true
+          Head Diameter: 0
+          Line Style: Billboards
+          Line Width: 0.35
+          Name: 전체 루트 경로 (global_path)
+          Offset: {X: 0, Y: 0, Z: 0.02}
+          Pose Style: None
+          Shaft Diameter: 0
+          Topic: /global_path
+          Unreliable: false
+          Value: true
+
+    # ================= 5. 지나온 주행 궤적 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: ⏱️ 5. 지나온 주행 궤적
+      Displays:
+        - Alpha: 0.40
+          Buffer Length: 1
+          Class: rviz/Path
+          Color: 46; 204; 113
+          Enabled: true
+          Head Diameter: 0
+          Line Style: Billboards
+          Line Width: 0.20
+          Name: 주행 이력 궤적 (trajectory_path)
+          Offset: {X: 0, Y: 0, Z: 0.03}
+          Pose Style: None
+          Shaft Diameter: 0
+          Topic: /trajectory_path
+          Unreliable: false
+          Value: true
+
+    # ================= 6. HD 로드맵 (차선·정지선) =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🗺️ 6. HD 로드맵 (차선·정지선)
+      Displays:
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /mgeo_map_markers
+          Name: 1. mgeo 정밀 HD맵 (차선·정지선·신호등·횡단보도)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /localization/map_markers
+          Name: 2. 로컬라이저 링크 정합 맵
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/Marker
+          Enabled: true
+          Marker Topic: /localization/stop_marker
+          Name: 3. 신호등 정지선
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+    # ================= 7. 3D 주변 차량 & 타겟 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🚘 7. 3D 주변 차량 & 타겟
+      Displays:
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /navigation_3d/surrounding_markers
+          Name: 1. 3D 주변 차량 & 장애물 클리어런스 헤일로
+          Namespaces: {}
+          Queue Size: 10
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /smpc/target_markers
+          Name: 2. 고주로 SMPC 타겟 차량 (front/rear/nearby)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /smpc/yield_zone_markers
+          Name: 3. 고주로 차선변경 안전구간 (앞10m/뒤15m 세이프티 박스)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /smpc/acc_target_marker
+          Name: 4. ACC 타겟 추종 HUD (15m 목표/TTC)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: false
+          Marker Topic: /tracked_objects_markers
+          Name: 5. (참고) 원본 TTC 트래커 박스
+          Namespaces: {}
+          Queue Size: 100
+          Value: false
+
+    # ================= 8. 미션 안전 코리도 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 🛑 8. 미션 안전 코리도
+      Displays:
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /obstacle_stop/visualization
+          Name: 1. 동적장애물 정지 코리도 (경로 좌우 1.5m)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /mission/roundabout/markers
+          Name: 2. 회전교차로 (원·양보선)
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /obstacle_avoidance/tunnel_zone_markers
+          Name: 2-2. 터널 벽 제한영역 / 라이다 선감속
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: true
+          Marker Topic: /mission/roundabout/gap_markers
+          Name: 2-1. 회전교차로 틈 선택
+          Namespaces: {}
+          Queue Size: 100
+          Value: true
+
+        - Class: rviz/MarkerArray
+          Enabled: false
+          Marker Topic: /perception/roundabout/tracker_markers
+          Name: 3. (참고) 회전교차로 추적 박스
+          Namespaces: {}
+          Queue Size: 100
+          Value: false
+
+    # ================= 9. 라이다 서라운드 점군 =================
+    - Class: rviz/Group
+      Enabled: true
+      Name: 📡 9. 라이다 서라운드 점군
+      Displays:
+        - Alpha: 0.65
+          Autocompute Intensity Bounds: true
+          Class: rviz/PointCloud2
+          Color: 0; 240; 200
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: GroundGrid 비지면 점군 (/nonground)
+          Position Transformer: XYZ
+          Queue Size: 5
+          Selectable: false
+          Size (Pixels): 3
+          Size (m): 0.05
+          Style: Points
+          Topic: /nonground
+          Unreliable: false
+          Use Fixed Frame: true
+          Value: true
+
+        - Alpha: 0.35
+          Autocompute Intensity Bounds: true
+          Class: rviz/PointCloud2
+          Color Transformer: AxisColor
+          Decay Time: 0
+          Enabled: false
+          Name: (참고) 원본 velodyne_points (지면 포함)
+          Position Transformer: XYZ
+          Queue Size: 5
+          Selectable: false
+          Size (Pixels): 2
+          Size (m): 0.03
+          Style: Points
+          Topic: /velodyne_points
+          Unreliable: false
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+
+  Enabled: true
+  Global Options:
+    Background Color: 10; 13; 20
+    Default Light: true
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 21.0
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 4.5
+        Y: 0
+        Z: 0.8
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: "★ 3D 내비게이션 추종 뷰 (메인)"
+      Near Clip Distance: 0.01
+      Pitch: 0.40
+      Target Frame: base_link
+      Value: Orbit (rviz)
+      Yaw: 3.14159
+    Saved:
+      - Class: rviz/Orbit
+        Distance: 21.0
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.06
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
+        Focal Point:
+          X: 4.5
+          Y: 0
+          Z: 0.8
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: "★ 3D 내비게이션 추종 뷰 (메인)"
+        Near Clip Distance: 0.01
+        Pitch: 0.40
+        Target Frame: base_link
+        Value: Orbit (rviz)
+        Yaw: 3.14159
+
+      - Class: rviz/Orbit
+        Distance: 10.5
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.06
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
+        Focal Point:
+          X: 6.0
+          Y: 0
+          Z: 0.6
+        Focal Shape Fixed Size: true
+        Focal Shape Size: 0.05
+        Invert Z Axis: false
+        Name: "★ 3D 콕핏/보닛 드라이빙 뷰"
+        Near Clip Distance: 0.01
+        Pitch: 0.22
+        Target Frame: base_link
+        Value: Orbit (rviz)
+        Yaw: 3.14159
+
+      - Angle: 0
+        Class: rviz/TopDownOrtho
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.06
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
+        Invert Z Axis: false
+        Name: "★ 탑뷰 버드아이 추종 뷰"
+        Near Clip Distance: 0.01
+        Scale: 9.0
+        Target Frame: base_link
+        Value: TopDownOrtho (rviz)
+        X: 0
+        Y: 0
+
+      - Angle: 0
+        Class: rviz/TopDownOrtho
+        Enable Stereo Rendering:
+          Stereo Eye Separation: 0.06
+          Stereo Focal Distance: 1
+          Swap Stereo Eyes: false
+          Value: false
+        Invert Z Axis: false
+        Name: "★ K-City 전체 HD 지도 뷰"
+        Near Clip Distance: 0.01
+        Scale: 0.7
+        Target Frame: map
+        Value: TopDownOrtho (rviz)
+        X: 302560
+        Y: 4124100
+  Value: true
+Window Geometry:
+  Height: 1040
+  Width: 1720
+  Displays: {collapsed: false}

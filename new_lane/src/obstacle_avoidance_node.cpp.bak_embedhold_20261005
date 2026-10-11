@@ -1,0 +1,4375 @@
+// 기존 미션 판단을 유지하는 정적 회피 노드: embedded Apollo / explicit Frenet rollback
+//
+// 입력:
+//   /final_waypoint  (waypoint_maker::Lane)  - 기준 전역 경로
+//   /odom            (nav_msgs::Odometry)    - 현재 차량 world pose + 속도
+//   /obstacle_info   (std_msgs::String, JSON)- 인지 노드가 발행하는 장애물 목록
+// 출력:
+//   /local_path      (nav_msgs::Path)        - MPC가 그대로 추종하는 회피 경로
+//
+// 미션·신호등·동적 hold·터널 안전 가드는 이 노드가 유지한다.
+// occupancy 백엔드는 내부 어댑터의 원시 점유 형상과 Apollo 경로를 사용한다.
+// Frenet 생성기는 명시적인 설정 복구용이며 실행 중 자동 대체하지 않는다.
+
+#include <ros/ros.h>
+#include <array>
+#include <ros/callback_queue.h>
+#include <boost/bind.hpp>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <std_msgs/String.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
+#include <std_msgs/Float32MultiArray.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <tf/transform_datatypes.h>
+#include <jsoncpp/json/json.h>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <cmath>
+#include <mutex>
+#include <set>
+
+#include "occupancy_avoidance/ros_adapter.hpp"
+#include "new_lane/frenet_optimal_trajectory.hpp"
+#include "new_lane/cubic_spline_planner.hpp"
+#include "new_lane/frenetROS_obst.hpp"   // initial_conditions_new()
+#include "waypoint_maker/Lane.h"
+#include "lidar_ttc_tracker/TrackedObjectArray.h"
+#include <morai_msgs/EgoVehicleStatus.h>
+
+class ObstacleAvoidanceNode
+{
+public:
+	ObstacleAvoidanceNode() : pnh_("~")
+	{
+		loadParams();
+        pnh_.param<std::string>("avoidance_backend",avoidance_backend_,"occupancy");
+        if(avoidance_backend_!="occupancy"&&avoidance_backend_!="frenet")
+            throw std::runtime_error("avoidance_backend must be occupancy or frenet");
+
+		local_path_pub_ = nh_.advertise<nav_msgs::Path>("/local_path", 1);
+		global_path_pub_ = nh_.advertise<nav_msgs::Path>("/global_path", 1, true);  // latched
+		avoidance_failed_pub_ = nh_.advertise<std_msgs::Bool>("/avoidance_failed", 1);
+		// 회피/복귀 중일 때만 target_speed_(TARGET_SPEED)를 실어 보냄.
+		// mpc_path_tracking이 curvature_speed_limit과 같은 방식(min(ref_v, 이 값))으로
+		// 적용해서 실제 주행속도를 낮춘다. 평소(패스스루)에는 무제한(사실상 미적용)
+		// 값을 보내 mission_speed/curvature_speed 로직을 그대로 둔다.
+		avoidance_speed_pub_ = nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/target_speed_mps", 1);
+		// 정적(또는 unknown) 장애물이 confirmed 되는 즉시(거리/corridor 판단 없이)
+		// 원래 속도의 70%로 감속. 회피 판단 로직과 무관하게 단순하게 동작.
+		static_speed_scale_pub_ = nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/static_speed_scale", 1);
+		validation_debug_pub_ = nh_.advertise<std_msgs::String>("/obstacle_avoidance/validation_debug", 1);
+        coverage_sub_=nh_.subscribe("/obstacle_stop/path_speed_limit_mps",1,&ObstacleAvoidanceNode::coverageCallback,this);
+        static_preview_pub_ = nh_.advertise<nav_msgs::Path>("/obstacle_avoidance/preview_path", 1);
+
+		waypoint_sub_ = nh_.subscribe("/final_waypoint", 1, &ObstacleAvoidanceNode::waypointCallback, this);
+		odom_sub_ = nh_.subscribe("/odom", 1, &ObstacleAvoidanceNode::odomCallback, this);
+		// queue_size=100이면 콜백 처리가 잠깐 밀렸을 때 쌓인 메시지를 한꺼번에
+		// 몰아서 처리하느라(버스트) planLoop/카메라 감지 같은 다른 콜백이 순간적으로
+		// 밀리는 원인이 될 수 있음. 필요한 건 항상 "가장 최신 속도값"뿐이라
+		// 오래된 메시지는 그냥 버리는 게 맞음 -> queue_size=1로 낮춤.
+		competition_sub_ = nh_.subscribe("/Competition_topic", 1, &ObstacleAvoidanceNode::competitionCallback, this);
+		// 신호+회피 안전 로직 입력(kcity_localizer/map_localizer).
+		stop_ahead_sub_ = nh_.subscribe("/localization/stop_ahead", 1,
+			&ObstacleAvoidanceNode::stopAheadCallback, this);
+		stop_required_sub_ = nh_.subscribe("/localization/stop_required", 1,
+			&ObstacleAvoidanceNode::stopRequiredCallback, this);
+		obstacle_sub_ = nh_.subscribe("/obstacle_info", 1, &ObstacleAvoidanceNode::obstacleInfoCallback, this);
+		// 대향 차량 감지용. /obstacle_info 는 경로 코리도(1.4m)로 걸러진 뒤라
+		// 반대 차선(3~5m)이 안 올라온다. TTC 트래커는 roi_y_half 5.5m 로 그쪽을
+		// 본다.
+		tracked_sub_ = nh_.subscribe("/tracked_objects", 1,
+			&ObstacleAvoidanceNode::trackedObjectsCallback, this);
+		// 카메라(세그멘테이션)가 훨씬 멀리서부터 장애물을 "감지"만 해서 알려주는
+		// 신호. 라이다 확정보다 먼저 들어와서 감속을 미리 걸어주는 용도로만 쓰고,
+		// 회피 경로 계산(ob_x/ob_y)에는 전혀 관여하지 않는다.
+		// planLoop가 무거운 Frenet 계산(사이클당 수백 개 후보 충돌체크) 중일 때
+		// 기본 큐(싱글스레드)를 쓰면 이 콜백이 그 뒤에서 순서를 기다려야 해서
+		// "카메라는 바로 감지했는데 킥은 늦게 걸리는" 지연이 생겼음. 이 구독만
+		// 별도 큐+전용 스레드로 분리해서 무거운 계산과 무관하게 항상 즉시 처리되게 함.
+		ros::SubscribeOptions camera_ops = ros::SubscribeOptions::create<std_msgs::Bool>(
+			"/camera_detection/obstacle_present", 1,
+			boost::bind(&ObstacleAvoidanceNode::cameraDetectionCallback, this, _1),
+			ros::VoidConstPtr(), &camera_queue_);
+		camera_detection_sub_ = nh_.subscribe(camera_ops);
+		camera_spinner_.reset(new ros::AsyncSpinner(1, &camera_queue_));
+		camera_spinner_->start();
+
+		tunnel_offset_sub_ = nh_.subscribe("/tunnel/wall_offset", 1, &ObstacleAvoidanceNode::tunnelOffsetCallback, this);
+		tunnel_limits_sub_ = nh_.subscribe("/tunnel/wall_limits", 1, &ObstacleAvoidanceNode::tunnelLimitsCallback, this);
+		tunnel_lidar_kick_sub_ = nh_.subscribe("/tunnel/lidar_obstacle_ahead", 1, &ObstacleAvoidanceNode::tunnelLidarKickCallback, this);
+		dyn_state_sub_ = nh_.subscribe("/obstacle_stop/dynamic_state", 1, &ObstacleAvoidanceNode::dynStateCallback, this);
+		bg_ids_sub_ = nh_.subscribe("/tunnel/background_ids", 1, &ObstacleAvoidanceNode::bgIdsCallback, this);
+		// ★ 2026-10-05 새 점유 엔진(occupancy_avoidance)은 서비스 모드로 인지(누적 footprint)와
+		//   후보 경로만 준다. 판단(구간/회피 시작/방향 고정/실패 히스테리시스/속도)은 이 노드 그대로.
+		pnh_.param("occupancy_perception_enabled", occupancy_perception_enabled_, true);
+		pnh_.param("occupancy_path_enabled", occupancy_path_enabled_, true);
+		pnh_.param("occupancy_match_m", occupancy_match_m_, 1.0);
+		pnh_.param("occupancy_candidate_timeout", occupancy_candidate_timeout_, 0.3);
+		pnh_.param("occupancy_check_length_m", occupancy_check_length_m_, 40.0);
+		// 인지 물체와 매칭 안 된 엔진 점유를 충돌 목록에 추가할지. 기본 false: 기존 인지/벽·분리봉 필터를
+		// 거치지 않은 원시 점유(중앙분리봉, 터널 벽)가 섞여 회피 실패가 났다(14:52 재생 134.7/323.9 s).
+		pnh_.param("occupancy_add_unmatched", occupancy_add_unmatched_, false);
+		// ★ 2026-10-05 회피 경로 주체 = 엔진(Apollo piecewise-jerk QP). M2/M8 회피 중 엔진 후보가 유효하면
+		//   그것을 기본 경로로 내고 Frenet 은 엔진이 occupancy_primary_switch_sec 이상 연속 무효일 때만 쓴다
+		//   (16:13 백: 두 출처가 프레임마다 번갈아 나와 복귀 중 조향이 흔들리고, Frenet 단일 유지 후보로 +4.85 m 과회피).
+		//   판단(구간/트리거/정지선 hold/속도/실패 카운트)은 이 노드 그대로. false 면 이전 동작(Frenet 주, 엔진 대체).
+		pnh_.param("occupancy_path_primary", occupancy_path_primary_, true);
+		pnh_.param("occupancy_primary_switch_sec", occupancy_primary_switch_sec_, 0.5);
+		pnh_.param("occupancy_primary_hold_sec", occupancy_primary_hold_sec_, 0.5);
+		occ_obstacles_sub_ = nh_.subscribe("/occupancy_avoidance/obstacles", 1, &ObstacleAvoidanceNode::occObstaclesCallback, this);
+		occ_candidate_sub_ = nh_.subscribe("/occupancy_avoidance/candidate_path", 1, &ObstacleAvoidanceNode::occCandidateCallback, this);
+        planning_obstacles_pub_=nh_.advertise<std_msgs::String>("/obstacle_avoidance/planning_obstacles",1);
+        selection_pub_=nh_.advertise<std_msgs::String>("/obstacle_avoidance/selection_state",1);
+        boundary_profile_pub_=nh_.advertise<std_msgs::String>("/obstacle_avoidance/boundary_profile",1,true);
+        divider_boundary_sub_=nh_.subscribe("/perception/divider_boundary",1,&ObstacleAvoidanceNode::dividerBoundaryCallback,this);
+		occ_state_sub_ = nh_.subscribe("/occupancy_avoidance/candidate_state", 1, &ObstacleAvoidanceNode::occStateCallback, this);
+		tunnel_zone_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/obstacle_avoidance/tunnel_zone_markers", 1);
+		frenet_d_pub_ = nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/frenet_d", 1);
+
+        if(avoidance_backend_=="occupancy"){
+            occupancy_perception_enabled_=false;occupancy_path_primary_=false;occupancy_path_enabled_=true;
+            pnh_.setParam("occupancy_path_enabled",true); // joint reverse requires an actual forward owner
+            occ_obstacles_sub_.shutdown();occ_candidate_sub_.shutdown();occ_state_sub_.shutdown();
+            embedded_engine_.reset(new occupancy_avoidance::RosAdapter(ros::NodeHandle(pnh_,"embedded_engine")));
+        }
+		plan_timer_ = nh_.createTimer(ros::Duration(1.0 / plan_rate_hz_),
+									   &ObstacleAvoidanceNode::planLoop, this);
+
+		ROS_INFO("[obstacle_avoidance] started. plan_rate=%.1fHz, path_corridor_radius=%.2fm, "
+				 "정적 회피 구간 idx %s~%d",
+				 plan_rate_hz_, path_corridor_radius_,
+				 static_zone_min_idx_ >= 0 ? std::to_string(static_zone_min_idx_).c_str() : "처음",
+				 static_dynamic_split_idx_);
+	}
+
+private:
+	// ---------------- 파라미터 로드 (전부 launch에서 조정 가능) ----------------
+	void loadParams()
+	{
+		pnh_.param("plan_rate_hz", plan_rate_hz_, 10.0);
+		pnh_.param("spline_ds", spline_ds_, 0.5);
+		// CSV 웨이포인트 idx 기준: 0~이 값은 정적 미션 구간(회피), 이후는 동적
+		// 미션 구간(obstacle_stop_node가 정지 전담, 여긴 회피 안 함).
+		pnh_.param("static_dynamic_split_idx", static_dynamic_split_idx_, 1430);
+		// 정적 미션 구간의 시작 idx. 원본 코스는 출발부터가 정적 구간이라
+		// 하한이 없었지만, 전체 랩에서는 앞쪽에 일반 주행 구간이 길게 있고
+		// 거기서 잡히는 노변 구조물까지 회피/감속 대상이 되어버린다.
+		// 음수면 하한 없음 == 원본과 동일한 거동.
+		pnh_.param("static_zone_min_idx", static_zone_min_idx_, -1);
+		pnh_.param("dynamic_zone_max_idx", dynamic_zone_max_idx_, -1);
+		// ★ 2026-10-01 M3(동적 장애물 구간) 정적 전환 회피: obstacle_stop_node 가 '동적이었다가
+		//   경로 위에 멈춘' 물체를 static_ids 로 넘기면 그 물체만 회피한다(그 밖은 패스스루).
+		pnh_.param("m3_static_avoid_enabled", m3_static_avoid_enabled_, true);
+		// 회피 트리거 코리도. '물체 몸통 가장자리 ~ 기준경로' 거리 기준이며,
+		// 인지의 path_corridor_half_width 와 같은 값이어야 한다(같은 양을 잰다).
+		pnh_.param("path_corridor_radius", path_corridor_radius_, 1.5);
+		// 충돌 검사용 반경. 트리거보다 넓게 잡아야 회피 경로가 지나가는 자리의
+		// 장애물을 프레넷이 본다. max_road_width_left(4.5) + robot_radius 여유.
+		pnh_.param("collision_corridor_radius", collision_corridor_radius_, 4.0);
+		// 필요량 초과 1m 당 비용. cf(45만 규모)보다 크고 충돌(2e7)보다 작아야 한다.
+		pnh_.param("avoid_excess_cost", avoid_excess_cost_, 3.0e5);
+		pnh_.param("avoid_side_flip_cost", avoid_side_flip_cost_, 5.0e6);
+		pnh_.param("avoid_side_preference_cost", avoid_side_preference_cost_, 4.0e6);
+		pnh_.param("primary_release_behind_idx", primary_release_behind_idx_, 20);
+		pnh_.param("primary_switch_min_idx", primary_switch_min_idx_, 50);
+		pnh_.param("primary_group_span_idx", primary_group_span_idx_, 30);
+		pnh_.getParam("road_width_zones", road_width_zones_);
+		if (!road_width_zones_.empty() && road_width_zones_.size() % 4 != 0)
+		{
+			ROS_WARN("[obstacle_avoidance] road_width_zones needs groups of 4 "
+					 "[start,end,right,left]; got %zu values -> ignored",
+					 road_width_zones_.size());
+			road_width_zones_.clear();
+		}
+		// 연속 곡선 형태(권장). 있으면 road_width_zones 대신 이걸 쓴다.
+		pnh_.getParam("road_width_profile", road_width_profile_);
+		if (!road_width_profile_.empty() && road_width_profile_.size() % 3 != 0)
+		{
+			ROS_WARN("[obstacle_avoidance] road_width_profile needs groups of 3 "
+					 "[idx,right,left]; got %zu values -> ignored", road_width_profile_.size());
+			road_width_profile_.clear();
+		}
+		for (std::size_t k = 3; k < road_width_profile_.size(); k += 3)
+			if (road_width_profile_[k] < road_width_profile_[k - 3])
+			{
+				ROS_WARN("[obstacle_avoidance] road_width_profile idx must be ascending -> ignored");
+				road_width_profile_.clear();
+				break;
+			}
+		ROS_INFO("[obstacle_avoidance] road width: %zu profile knots, %zu zones",
+			road_width_profile_.size() / 3, road_width_zones_.size() / 4);
+		pnh_.param("max_d_step_per_cycle", max_d_step_per_cycle_, 0.4);   // 사이클당 허용 d 변화량(m)
+		pnh_.param("max_d_step_outward_per_cycle", max_d_step_outward_per_cycle_, 1.0);
+		// 장애물이 앞에 있는 동안 이미 확보한 회피량이 이만큼 넘게 줄어들면
+		// 되돌린다. 0 이면 완전 고정(장애물 크기 재추정으로 실제 덜 피해도
+		// 되는 경우까지 막음), 크면 요동을 못 잡는다.
+		// 커밋 중 후보 배제 시 허용할 '안쪽' 여유(m). 수치 흔들림 정도는 통과시킨다.
+		pnh_.param("avoid_inward_margin", avoid_inward_margin_, 0.1);
+		// 좌측(중앙선 넘는 방향) 회피 폭. 대향 차량이 없을 때만 여기까지 쓴다.
+		pnh_.param("max_road_width_left", max_road_width_left_, 3.5);
+		// 대향 차량이 있으면 이 폭까지만 나간다(자기 차로 안).
+		pnh_.param("max_road_width_left_blocked", max_road_width_left_blocked_, 1.2);
+		pnh_.param("max_road_width_right", max_road_width_right_, 3.5);
+		// 대향 차량 판정: 이 거리 안 + 이 속도 이상으로 다가오는 차량
+		pnh_.param("oncoming_check_range_m", oncoming_check_range_m_, 60.0);
+		pnh_.param("oncoming_min_closing_mps", oncoming_min_closing_mps_, 2.0);
+		// 좌측(양수 y) 이 값 이상 떨어진 트랙만 '대향 차선' 으로 본다.
+		pnh_.param("oncoming_min_lateral_m", oncoming_min_lateral_m_, 1.5);
+		// 한 번 보이면 이 시간(s) 동안 유지 - 순간 미검출로 폭이 튀지 않게.
+		pnh_.param("oncoming_hold_sec", oncoming_hold_sec_, 2.0);
+		pnh_.param("oncoming_check_outside_tunnel", oncoming_check_outside_tunnel_, false);
+		pnh_.param("right_curb_skip_enabled", right_curb_skip_enabled_, true);
+		pnh_.param("side_slack_margin", side_slack_margin_, 0.4);
+		pnh_.param("decision_range_m", decision_range_m_, 30.0);
+		// 다단(S자/복귀) 후보(frenet SPATIAL_SWITCH_S 주석 참조)
+		pnh_.param("stage_candidates_enabled", stage_candidates_enabled_, true);
+		pnh_.param("stage_switch_corridor_m", stage_switch_corridor_m_, 1.7);
+		pnh_.param("stage_switch_margin_m", stage_switch_margin_m_, 2.0);
+		pnh_.param("stage_cluster_gap_m", stage_cluster_gap_m_, 3.0);
+		pnh_.param("spatial_stage_d_step", SPATIAL_STAGE_D_STEP, 0.5);
+		pnh_.param("avoid_final_cost_ratio", AVOID_FINAL_COST_RATIO, 0.5);
+		pnh_.param("spatial_eval_budget_ms", SPATIAL_EVAL_BUDGET_MS, 40.0);
+		pnh_.param("spatial_length_min_speed", SPATIAL_LENGTH_MIN_SPEED, 6.0);
+		pnh_.param("spatial_sharp_cost", SPATIAL_SHARP_COST, 2.0e5);
+		pnh_.param("spatial_min_horizon_m", SPATIAL_MIN_HORIZON_M, 40.0);
+		pnh_.param("spatial_plan_change_cost", SPATIAL_PLAN_CHANGE_COST, 1.5e5);
+		// 높은 물체(버스·트럭류) 길이 가정(아래 TallObs 주석)
+		pnh_.param("tall_obstacle_min_top_m", tall_obstacle_min_top_m_, 1.9);
+		pnh_.param("tall_obstacle_min_width_m", tall_obstacle_min_width_m_, 0.9);
+		pnh_.param("tall_obstacle_assumed_length_m", tall_obstacle_assumed_length_m_, 12.0);
+		pnh_.param("tall_latch_sec", tall_latch_sec_, 5.0);
+		pnh_.param("tl_guard_enabled", tl_guard_enabled_, true);
+		pnh_.param("tl_guard_range_m", tl_guard_range_m_, 80.0);
+		pnh_.param("tl_hold_gap_m", tl_hold_gap_m_, 20.0);          // 최대(한가운데)
+		pnh_.param("tl_hold_gap_min_m", tl_hold_gap_min_m_, 8.0);   // 최소(꽤 벗어남)
+		pnh_.param("tl_gap_shift_min_m", tl_gap_shift_min_m_, 0.35);
+		pnh_.param("tl_gap_shift_max_m", tl_gap_shift_max_m_, 1.85);
+		pnh_.param("tl_hold_decel_mps2", tl_hold_decel_mps2_, 1.5);
+		pnh_.param("tl_offset_tolerance_m", tl_offset_tolerance_m_, 0.4);
+		pnh_.param("tl_input_timeout_sec", tl_input_timeout_sec_, 0.7);
+		// 정지 목표는 traffic_light_mission 과 같은 식으로 계산한다(같은 파라미터).
+		nh_.param("/traffic_light_mission/front_axle_offset_m", tl_front_axle_offset_m_, 3.845);
+		nh_.param("/traffic_light_mission/stop_buffer_m", tl_stop_buffer_m_, 3.0);
+		pnh_.param("side_switch_min_forward_m", side_switch_min_forward_m_, 8.0);
+		pnh_.param("side_switch_on_blocked_enabled", side_switch_on_blocked_enabled_, true);
+		pnh_.param("side_switch_max_ego_offset_m", side_switch_max_ego_offset_m_, 0.5);
+		pnh_.param("side_switch_blocked_cycles", side_switch_blocked_cycles_, 3);
+		pnh_.param("side_select_corridor_enabled", side_select_corridor_enabled_, true);
+		pnh_.param("side_select_lookback_m", side_select_lookback_m_, 15.0);
+		pnh_.param("curb_corridor_check_enabled", curb_corridor_check_enabled_, true);
+		pnh_.param("curb_clearance_m", curb_clearance_m_, 1.10);
+		pnh_.param("right_curb_skip_margin", right_curb_skip_margin_, 0.0);
+		pnh_.param("vehicle_half_width", vehicle_half_width_, 0.95);
+		pnh_.param("obstacle_hold_sec", obstacle_hold_sec_, 0.5);   // 장애물이 안 잡혀도 이 시간(s) 동안은 최근 목록 유지
+		pnh_.param("passed_release_margin", passed_release_margin_, 1.0);   // 이 값(m)만큼 앞에 남아있어도 "지나간 것"으로 보고 hold 조기 해제
+		// 플래너는 20Hz지만 장애물 기하는 라이다(설정 10Hz, 최근 실측
+		// 6.8~7.1Hz)에서만 새로 생긴다. 같은 스캔을 여러 번 실패로 세지 않고,
+		// 서로 다른 관측이 이 횟수만큼 연속 실패할 때 정지를 요청한다.
+		pnh_.param("max_avoidance_fail_observations",
+			max_avoidance_fail_observations_, 3);
+		pnh_.param("failure_no_observation_timeout_sec",
+			failure_no_observation_timeout_sec_, 0.6);
+		// 이미 회피 방향을 따라 물체 옆까지 온 상태에서는 새 후보가 잠깐
+		// 사라져도 급정지하지 않고 직전 유효 경로로 통과한다. 장애물 경계의
+		// 가장 앞 점이 이 거리 이내일 때만 적용한다.
+		pnh_.param("side_pass_continue_front_m",
+			side_pass_continue_front_m_, 1.5);
+		pnh_.param("near_pass_robot_radius", near_pass_robot_radius_, 0.9);
+		pnh_.param("near_pass_window_m", near_pass_window_m_, 8.0);
+		pnh_.param("return_ti", return_ti_, 6.0);   // 복귀 경로를 완주하는 데 걸리는 시간(s), 길수록 완만하게 복귀
+		// return_ti_는 버스처럼 긴 물체 기준으로 튜닝된 값(그대로 유지). 이보다
+		// 짧은 물체를 지나칠 땐 이 길이(m)를 기준으로 비례해서 복귀시간을 줄인다
+		// (물체 길이가 이 값 이상이면 return_ti_ 그대로, 짧을수록 비례해서 감소).
+		pnh_.param("return_ti_ref_length", return_ti_ref_length_, 8.0);
+		// 아무리 짧은 물체라도 복귀가 너무 급격해서 오실이 생기지 않도록 하는 하한(s)
+		pnh_.param("min_return_ti", min_return_ti_, 2.0);
+		pnh_.param("return_lat_time_scale", return_lat_time_scale_, 1.8);
+		pnh_.param("return_heading_threshold_deg", return_heading_threshold_deg_, 3.5);
+		pnh_.param("obstacle_boundary_samples", obstacle_boundary_samples_, 8);
+		pnh_.param("require_confirmed", require_confirmed_, true);
+
+		// 회피 경로가 이 곡률(1/m)을 넘으면(=너무 급하게 꺾으면) 채택하지 않고
+		// 이전 경로를 유지한다. curvature_limit = 1 / 최소 회전반경(m).
+		// 예: 0.5 -> 최소 회전반경 2m 이하로 꺾는 경로는 거부.
+		pnh_.param("curvature_limit", curvature_limit_, 0.5);
+
+		// 관련 장애물이 없을 때 패스스루로 내보낼 기준경로 길이(m).
+		// Frenet 출력 길이(MAXT*TARGET_SPEED)와 비슷하게 맞춰서 전환 시 급격한
+		// 경로 길이 변화가 없도록 한다.
+		pnh_.param("passthrough_length_m", passthrough_length_m_, 45.0);
+
+		// Frenet 샘플링 / 비용 파라미터 (frenet_optimal_trajectory.cpp의 extern 전역값)
+		pnh_.param("max_speed", MAX_SPEED, 15.0);
+		pnh_.param("max_accel", MAX_ACCEL, 3.0);
+		pnh_.param("max_curvature", MAX_CURVATURE, 1.0);
+		pnh_.param("max_road_width", MAX_ROAD_WIDTH, 1.5);   // 기준선에서 좌우로 최대 얼마나 벗어날지
+		pnh_.param("d_road_w", D_ROAD_W, 0.25);              // d 샘플링 간격
+		pnh_.param("dt", DT, 0.2);
+		pnh_.param("maxt", MAXT, 3.0);
+		pnh_.param("mint", MINT, 1.5);
+		// 모든 후보를 그리는 공통 지평(초). Ti(회피 완료 시간)와 분리돼 있어야
+		// 짧은 Ti 로 빠르게 비킨 경로도 장애물 너머까지 이어져 제대로 검사된다.
+		// 장애물 최대 관심거리 / 주행속도 보다 커야 한다(예: 30m / 8m/s ~ 3.8s).
+		pnh_.param("plan_horizon_t", PLAN_HORIZON_T, 4.0);
+		pnh_.param("spatial_avoidance_enabled", SPATIAL_AVOIDANCE_ENABLED, true);
+		pnh_.param("spatial_max_lat_accel", SPATIAL_MAX_LAT_ACCEL, 3.0);
+		pnh_.param("spatial_max_lat_jerk", SPATIAL_MAX_LAT_JERK, 8.0);
+		pnh_.param("spatial_min_transition_m", SPATIAL_MIN_TRANSITION_M, 10.0);
+		pnh_.param("spatial_max_transition_m", SPATIAL_MAX_TRANSITION_M, 32.0);
+		pnh_.param("spatial_return_gentle_enabled", SPATIAL_RETURN_GENTLE_ENABLED, true);
+		pnh_.param("spatial_return_max_lat_accel", SPATIAL_RETURN_MAX_LAT_ACCEL, 1.5);
+		pnh_.param("spatial_return_max_lat_jerk", SPATIAL_RETURN_MAX_LAT_JERK, 8.0);
+		pnh_.param("spatial_return_min_speed", SPATIAL_RETURN_MIN_SPEED, 4.5);
+		pnh_.param("spatial_return_sharp_cost", SPATIAL_RETURN_SHARP_COST, 1.0e5);
+		pnh_.param("spatial_sample_ds", SPATIAL_SAMPLE_DS, 0.25);
+		pnh_.param("stitch_max_offset_m", stitch_max_offset_m_, 0.5);
+		nh_.param("/speed_limit/avoidance_mps", TARGET_SPEED, 4.5);
+		pnh_.param("target_speed", TARGET_SPEED, TARGET_SPEED);
+		pnh_.param("dynamic_speed_cap_enabled", dynamic_speed_cap_enabled_, true);
+		pnh_.param("avoidance_min_speed_mps", avoidance_min_speed_mps_, 4.5);
+		pnh_.param("avoidance_front_clearance_m", avoidance_front_clearance_m_, 3.5);
+		pnh_.param("avoidance_speed_safety_factor", avoidance_speed_safety_factor_, 0.90);
+		double speed_kick_target_kmh = 17.0;
+		double camera_kick_mps = 17.0 / 3.6;
+		if (nh_.getParam("/speed_limit/camera_kick_mps", camera_kick_mps)) {
+			speed_kick_target_kmh = camera_kick_mps * 3.6;
+		}
+		pnh_.param("speed_kick_target_kmh", speed_kick_target_kmh, speed_kick_target_kmh);
+		speed_kick_target_mps_ = speed_kick_target_kmh / 3.6;
+		pnh_.param("tunnel_camera_kick_enabled", tunnel_camera_kick_enabled_, true);
+		pnh_.param("tunnel_max_road_width_left", tunnel_max_road_width_left_, 4.2);
+		pnh_.param("tunnel_wall_limits_enabled", tunnel_wall_limits_enabled_, true);
+		pnh_.param("tunnel_wall_clearance", tunnel_wall_clearance_, 1.10);
+		// 터널 차체 모서리 검사(frenet TUNNEL_BODY_CHECK 주석 참조).
+		pnh_.param("tunnel_body_check_enabled", tunnel_body_check_enabled_, true);
+		pnh_.param("tunnel_body_half_width", tunnel_body_half_width_, 0.95);
+		pnh_.param("tunnel_body_front_m", tunnel_body_front_m_, 3.85);
+		pnh_.param("tunnel_body_rear_m", tunnel_body_rear_m_, 0.79);
+		pnh_.param("tunnel_body_margin", tunnel_body_margin_, 0.15);
+		pnh_.param("tunnel_body_recover_m", tunnel_body_recover_m_, 6.0);
+		pnh_.param("tunnel_wall_limits_timeout", tunnel_wall_limits_timeout_, 0.5);
+		pnh_.param("tunnel_lidar_kick_enabled", tunnel_lidar_kick_enabled_, true);
+		pnh_.param("tunnel_kick_range_m", tunnel_kick_range_m_, 20.0);
+		pnh_.param("tunnel_kick_target_mps", tunnel_kick_target_mps_, 6.5);
+		pnh_.param("tunnel_wall_piece_filter_enabled", tunnel_wall_piece_filter_enabled_, true);
+		pnh_.param("tunnel_wall_piece_margin", tunnel_wall_piece_margin_, 0.3);
+		// M8 진입 직후에는 인지 프로파일과 실시간 벽 경계가 준비되는 순서가
+		// 한두 스캔 어긋날 수 있다. 그 짧은 동안 입구 벽을 장애물로 커밋하지 않는다.
+		pnh_.param("tunnel_entry_grace_sec", tunnel_entry_grace_sec_, 0.8);
+		pnh_.param("tunnel_mode_hold_sec", tunnel_mode_hold_sec_, 1.0);
+		{
+			std::vector<double> prof;
+			if (pnh_.getParam("tunnel_wall_profile", prof) && prof.size() % 3 == 0)
+				tunnel_wall_profile_ = prof;
+			ROS_INFO("[obstacle_avoidance] tunnel wall profile: %zu knots", tunnel_wall_profile_.size() / 3);
+		}
+		pnh_.param("tunnel_kick_zone_inset", tunnel_kick_zone_inset_, 0.9);
+		pnh_.param("front_lock_enabled", front_lock_enabled_, true);
+		pnh_.param("front_lock_approach_min_ahead_m", front_lock_approach_min_ahead_m_, 5.5);
+		pnh_.param("front_lock_tolerance_m", front_lock_tolerance_m_, 0.15);
+		pnh_.param("front_lock_match_m", front_lock_match_m_, 2.0);
+		pnh_.param("front_lock_timeout_sec", front_lock_timeout_sec_, 3.0);
+		pnh_.param("tunnel_stage_candidates_enabled", tunnel_stage_candidates_enabled_, true);
+		pnh_.param("camera_kick_static_zone_enabled", camera_kick_static_zone_enabled_, false);
+		pnh_.param("kick_release_on_restart", kick_release_on_restart_, true);
+		pnh_.param("kick_stop_speed", kick_stop_speed_, 0.3);
+		pnh_.param("kick_restart_speed", kick_restart_speed_, 1.0);
+		pnh_.param("kick_min_stop_sec", kick_min_stop_sec_, 0.5);
+		pnh_.param("kick_restart_window_sec", kick_restart_window_sec_, 3.0);
+		pnh_.param("speed_kick_duration_sec", speed_kick_duration_sec_, 3.0);
+		pnh_.param("d_t_s", D_T_S, 1.0);
+		pnh_.param("n_s_sample", N_S_SAMPLE, 1.0);
+		pnh_.param("robot_radius", ROBOT_RADIUS, 0.6);       // 차량 자체 반폭 여유 (장애물 반경과 별개)
+		pnh_.param("escape_tolerance_enabled", ESCAPE_TOLERANCE_ENABLED, true);
+		pnh_.param("escape_min_radius", ESCAPE_MIN_RADIUS, 1.05);
+		pnh_.param("escape_margin", ESCAPE_MARGIN, 0.05);
+		pnh_.param("robot_circle_offset", ROBOT_CIRCLE_OFFSET, 1.2); // 차체 중심 전/후 원 간격
+		pnh_.param("robot_footprint_center_offset", ROBOT_FOOTPRINT_CENTER_OFFSET, 1.35); // base_link -> 차체 중심
+		pnh_.param("min_lat_vel", MIN_LAT_VEL, -0.5);
+		pnh_.param("max_lat_vel", MAX_LAT_VEL, 0.5);
+		pnh_.param("d_d_ns", D_D_NS, 1.0);
+		pnh_.param("max_shift_d", MAX_SHIFT_D, 1.5);
+
+		pnh_.param("kj", KJ, 0.1);
+		pnh_.param("kt", KT, 0.1);
+		pnh_.param("kd", KD, 1.0);
+		pnh_.param("kd_v", KD_V, 1.0);
+		pnh_.param("klat", KLAT, 1.0);
+		pnh_.param("klon", KLON, 1.0);
+	}
+
+	// ---------------- 콜백 ----------------
+	void waypointCallback(const waypoint_maker::Lane::ConstPtr &msg)
+	{
+		if (msg->waypoints.size() < 2)
+			return;
+
+		// CSV idx 기준 0~static_dynamic_split_idx_는 정적 미션 구간, 그 이후는
+		// 동적 미션 구간으로 코스가 고정되어 있음. 매 콜백 갱신(스플라인 재계산
+		// 캐시 체크보다 먼저) - 아래 캐시로 조기 return 되어도 최신 값 유지.
+		current_waypoint_idx_ = msg->waypoints.front().waypoint_index;
+		current_lane_number_ = msg->waypoints.front().lane_number;
+
+		// waypoint_loader가 odom 콜백마다(수십 Hz) /final_waypoint를 재발행하므로,
+		// 실제로 내용이 바뀐 경우에만 스플라인을 재계산한다 (안 그러면 매번 무거운
+		// calc_spline_course가 돌아서 planLoop 타이머가 계속 밀림).
+		const double fx = msg->waypoints.front().pose.pose.position.x;
+		const double fy = msg->waypoints.front().pose.pose.position.y;
+		const double bx = msg->waypoints.back().pose.pose.position.x;
+		const double by = msg->waypoints.back().pose.pose.position.y;
+		if (have_path_ &&
+			msg->waypoints.size() == last_wp_count_ &&
+			std::abs(fx - last_wp_front_x_) < 1e-3 && std::abs(fy - last_wp_front_y_) < 1e-3 &&
+			std::abs(bx - last_wp_back_x_) < 1e-3 && std::abs(by - last_wp_back_y_) < 1e-3)
+		{
+			return;
+		}
+		last_wp_count_ = msg->waypoints.size();
+		last_wp_front_x_ = fx; last_wp_front_y_ = fy;
+		last_wp_back_x_ = bx; last_wp_back_y_ = by;
+		path_wp_x_.clear();
+		path_wp_y_.clear();
+		path_wp_indices_.clear();
+		path_wp_x_.reserve(msg->waypoints.size());
+		path_wp_y_.reserve(msg->waypoints.size());
+		path_wp_indices_.reserve(msg->waypoints.size());
+		for (const auto &wp : msg->waypoints)
+		{
+			path_wp_x_.push_back(wp.pose.pose.position.x);
+			path_wp_y_.push_back(wp.pose.pose.position.y);
+			path_wp_indices_.push_back(wp.waypoint_index);
+		}
+
+		vecD wx, wy;
+		wx.reserve(msg->waypoints.size());
+		wy.reserve(msg->waypoints.size());
+		for (const auto &wp : msg->waypoints)
+		{
+			wx.push_back(wp.pose.pose.position.x);
+			wy.push_back(wp.pose.pose.position.y);
+		}
+
+		vecD rx, ry, ryaw, rk;
+		Spline2D new_csp = calc_spline_course(wx, wy, rx, ry, ryaw, rk, spline_ds_);
+
+		rx_ = rx;
+		ry_ = ry;
+		ryaw_ = ryaw;
+		rk_ = rk;
+		csp_.reset(new Spline2D(new_csp));
+
+		global_s_.assign(rx_.size(), 0.0);
+		double s = 0.0;
+		for (size_t i = 1; i < rx_.size(); ++i)
+		{
+			s += dist(rx_[i], ry_[i], rx_[i - 1], ry_[i - 1]);
+			global_s_[i] = s;
+		}
+		s_dest = global_s_.empty() ? 0.0 : global_s_.back();
+
+		have_path_ = true;
+
+		publishGlobalPath();
+	}
+
+	void publishGlobalPath()
+	{
+		nav_msgs::Path msg;
+		msg.header.stamp = ros::Time::now();
+		msg.header.frame_id = "map";
+		for (size_t i = 0; i < rx_.size(); ++i)
+		{
+			geometry_msgs::PoseStamped ps;
+			ps.header = msg.header;
+			ps.pose.position.x = rx_[i];
+			ps.pose.position.y = ry_[i];
+			double yaw = (i < ryaw_.size()) ? ryaw_[i] : 0.0;
+			tf::Quaternion q = tf::createQuaternionFromYaw(yaw);
+			ps.pose.orientation.x = q.x();
+			ps.pose.orientation.y = q.y();
+			ps.pose.orientation.z = q.z();
+			ps.pose.orientation.w = q.w();
+			msg.poses.push_back(ps);
+		}
+		global_path_pub_.publish(msg);
+	}
+
+	void cameraDetectionCallback(const std_msgs::Bool::ConstPtr &msg)
+	{
+		// 이제 별도 스레드(camera_spinner_)에서 실행됨 - planLoop(메인 스레드)와
+		// 동시에 speed_kick_* 상태를 건드릴 수 있어서 락으로 보호한다.
+		std::lock_guard<std::mutex> lock(speed_kick_mutex_);
+		camera_obstacle_present_ = msg->data;
+		last_camera_detection_time_ = ros::Time::now();
+		// 카메라 감지 즉시 반응. 예전엔 이 트리거 판단/발행이 obstacleInfoCallback
+		// 안에 있어서 /obstacle_info(라이다 클러스터링, 실측 0.6~0.7초 간격)가
+		// 들어와야만 평가됐음 -> 카메라는 바로 감지해도 킥은 최대 0.6~0.7초 뒤에야
+		// 걸리는 지연이 있었음. 여기서 바로 평가/발행해서 트리거 뜨자마자 반응하게 함.
+		updateSpeedKickLocked();
+	}
+
+	void tunnelOffsetCallback(const std_msgs::Float64::ConstPtr &msg)
+	{
+		tunnel_lateral_offset_ = msg->data;
+		last_tunnel_offset_stamp_ = ros::Time::now();
+		tunnel_wall_offset_valid_ = true;
+	}
+
+	// ★ 터널 벽 제한(2026-09-29). tunnel_wall_detector 가 벽을 curb_inset 만큼
+	//   안쪽으로 옮긴 '연석선'까지 실제 자차 기준 수직거리를 준다:
+	//   [valid, 우측 연석선 거리, 좌측 연석선 거리, 우 기울기, 좌 기울기].
+	void tunnelLimitsCallback(const std_msgs::Float64MultiArray::ConstPtr &msg)
+	{
+		if (msg->data.size() < 3)
+			return;
+		tunnel_limits_valid_ = msg->data[0] > 0.5;
+		tunnel_r_curb_ = msg->data[1];
+		tunnel_l_curb_ = msg->data[2];
+		tunnel_limits_stamp_ = ros::Time::now();
+	}
+
+	// ★ 라이다 선감속(2026-09-29). 터널 연석선 안쪽 + 전방 20 m 안 물체.
+	//   카메라 선감속(tunnel_camera_kick_enabled)을 대신한다.
+	void tunnelLidarKickCallback(const std_msgs::Bool::ConstPtr &msg)
+	{
+		std::lock_guard<std::mutex> lock(speed_kick_mutex_);
+		lidar_obstacle_present_ = msg->data;
+		if (msg->data)
+			last_lidar_detection_time_ = ros::Time::now();
+		updateSpeedKickLocked();
+	}
+
+	// ★ 2026-09-29 (20:27 백): 터널 벽/턱 조각 판정(config/tunnel_wall_profile.yaml).
+	//   근거리 인지가 벽·턱 조각을 차로 안 물체로 올렸다 - 자차가 회피 복귀로 기울거나
+	//   추측항법이 흘러 벽 쪽에 붙으면 자차 기준 y 로는 차로 안에 들어온다(ego y -1.7~-2.4).
+	//   기준경로 idx 별 실측 경계(우 턱 -3.5~-3.9 / 좌 +6.9~7.5)와 물체의 실제 횡위치
+	//   (추측항법 횡거리 - 벽 보정)를 비교해, 경계 안쪽 tunnel_wall_piece_margin 이내 또는
+	//   바깥이면 벽 조각으로 보고 회피/충돌/선감속 대상에서 뺀다.
+	bool tunnelWallProfileAt(int idx, double &right, double &left) const
+	{
+		right = 0.0; left = 0.0;
+		const std::size_t n = tunnel_wall_profile_.size() / 3;
+		if (n < 2 || idx < tunnel_wall_profile_[0] || idx > tunnel_wall_profile_[(n - 1) * 3])
+			return false;
+		std::size_t lo = 0, hi = n - 1;
+		while (hi - lo > 1)
+		{
+			const std::size_t mid = (lo + hi) / 2;
+			if (tunnel_wall_profile_[mid * 3] <= idx) lo = mid; else hi = mid;
+		}
+		const double i0 = tunnel_wall_profile_[lo * 3], i1 = tunnel_wall_profile_[hi * 3];
+		const double f = (i1 > i0) ? (idx - i0) / (i1 - i0) : 0.0;
+		const double r0 = tunnel_wall_profile_[lo * 3 + 1], r1 = tunnel_wall_profile_[hi * 3 + 1];
+		const double l0 = tunnel_wall_profile_[lo * 3 + 2], l1 = tunnel_wall_profile_[hi * 3 + 2];
+		// 한쪽이 0(경계 없음)이면 보간하지 않고 그 쪽은 경계 없음으로 본다.
+		if (r0 < 0.0 && r1 < 0.0) right = r0 + f * (r1 - r0);
+		if (l0 > 0.0 && l1 > 0.0) left = l0 + f * (l1 - l0);
+		return right < 0.0 || left > 0.0;
+	}
+
+	static std::set<int> jsonIds(const Json::Value &arr)
+	{
+		std::set<int> out;
+		if (arr.isArray())
+			for (const auto &v : arr) out.insert(v.asInt());
+		return out;
+	}
+
+	void dynStateCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		Json::CharReaderBuilder builder;
+		Json::Value root;
+		std::string errs;
+		std::istringstream ss(msg->data);
+		if (!Json::parseFromStream(builder, ss, &root, &errs)) return;
+		dyn_hold_ = root.get("hold", false).asBool();
+		dyn_ids_ = jsonIds(root["dynamic_ids"]);
+		restatic_ids_ = jsonIds(root["static_ids"]);
+		dyn_state_stamp_ = ros::Time::now();
+	}
+
+	void bgIdsCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		Json::CharReaderBuilder builder;
+		Json::Value root;
+		std::string errs;
+		std::istringstream ss(msg->data);
+		if (!Json::parseFromStream(builder, ss, &root, &errs)) return;
+		bg_ids_ = jsonIds(root["ids"]);
+		bg_ids_stamp_ = ros::Time::now();
+	}
+
+	// M3(0.csv, static_dynamic_split_idx 초과 ~ dynamic_zone_max_idx) 안인가
+	bool inM3Zone() const
+	{
+		return !tunnel_mode_ && current_lane_number_ == 0 && current_waypoint_idx_ >= 0 &&
+			current_waypoint_idx_ > static_dynamic_split_idx_ &&
+			(dynamic_zone_max_idx_ < 0 || current_waypoint_idx_ <= dynamic_zone_max_idx_);
+	}
+
+	// M3 정적 전환 회피 모드: 정지 노드가 static_ids 를 넘겼거나, 그 회피에서 아직 복귀 중
+	bool m3AvoidMode() const
+	{
+		if (!m3_static_avoid_enabled_ || !inM3Zone())
+			return false;
+		return m3_avoid_latched_ || (dynStateFresh() && !restatic_ids_.empty());
+	}
+
+	bool dynStateFresh() const
+	{
+		return !dyn_state_stamp_.isZero() && (ros::Time::now() - dyn_state_stamp_).toSec() < 0.5;
+	}
+
+	bool isTunnelWallPiece(const Json::Value &obs) const
+	{
+		if (!tunnel_mode_ || !tunnel_wall_piece_filter_enabled_)
+			return false;
+		if (!obs.isMember("position_world") || obs["position_world"].size() < 2)
+			return false;
+		int idx = -1;
+		double lat = 0.0;
+		if (!obstaclePathLocation(obs["position_world"][0].asDouble(),
+				obs["position_world"][1].asDouble(), idx, lat))
+			return false;
+		const double off = tunnel_wall_offset_valid_ ? tunnel_lateral_offset_ : 0.0;
+		const double lat_true = lat - off;
+		if (obs.get("observed_motion_valid", false).asBool() &&
+			obs.get("observation_age", 1e9).asDouble() >= 0.0 &&
+			obs.get("observation_age", 1e9).asDouble() <= 0.3 &&
+			obs.isMember("observed_velocity") && obs["observed_velocity"].size() >= 2)
+		{
+			size_t j=0; double best=1e18;
+			for(size_t i=0;i<path_wp_x_.size();++i) {
+				const double d=std::hypot(path_wp_x_[i]-obs["position_world"][0].asDouble(),path_wp_y_[i]-obs["position_world"][1].asDouble());
+				if(d<best){best=d;j=i;}
+			}
+			if(path_wp_x_.size()<2) return false;
+			const size_t a=std::min(j,path_wp_x_.size()-2), b=a+1;
+			const double yaw=std::atan2(path_wp_y_[b]-path_wp_y_[a],path_wp_x_[b]-path_wp_x_[a]);
+			const double normal_v = -std::sin(yaw) * obs["observed_velocity"][0].asDouble() +
+				std::cos(yaw) * obs["observed_velocity"][1].asDouble();
+			if (-std::copysign(1.0, lat_true) * normal_v >= 0.5)
+				return false; // coherent inward crossing is not background
+		}
+		if (!bg_ids_stamp_.isZero() && (ros::Time::now() - bg_ids_stamp_).toSec() < 0.5 &&
+			bg_ids_.count(obs.get("id", -1).asInt()))
+			return true;
+		double right = 0.0, left = 0.0;
+		const bool have_profile = tunnelWallProfileAt(idx, right, left);
+		bool piece = have_profile &&
+			((right < 0.0 && lat_true <= right + tunnel_wall_piece_margin_) ||
+			 (left > 0.0 && lat_true >= left - tunnel_wall_piece_margin_));
+
+		// 입구(3.csv 7201~7299)와 프로파일의 0 구간은 고정 경계가 없다.
+		// 이때 tunnel_wall_detector가 같은 시각에 측정한 연석선을 경로 좌표로
+		// 옮겨 벽 조각을 제거한다. 기존에는 이 구간에서 필터가 바로 false가 되어
+		// 입구 벽이 회피 트리거가 되고 조향이 좌우로 튈 수 있었다.
+		const bool live_limits = tunnel_limits_valid_ && !tunnel_limits_stamp_.isZero() &&
+			(ros::Time::now() - tunnel_limits_stamp_).toSec() <= tunnel_wall_limits_timeout_;
+		if (!piece && live_limits)
+		{
+			int vehicle_idx=-1; double vehicle_d=0.;
+			if(!obstaclePathLocation(pose_x_,pose_y_,vehicle_idx,vehicle_d)) return false;
+			const double vehicle_true_d = vehicle_d - off;
+			const double live_right = vehicle_true_d - tunnel_r_curb_;
+			const double live_left = vehicle_true_d + tunnel_l_curb_;
+			piece = lat_true <= live_right + tunnel_wall_piece_margin_ ||
+				lat_true >= live_left - tunnel_wall_piece_margin_;
+			if (piece)
+			{
+				right = live_right;
+				left = live_left;
+			}
+		}
+		if (piece)
+			ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] tunnel wall piece ignored: id=%d idx=%d "
+				"lat %.2f (boundary R %.2f / L %.2f%s)", obs.get("id", -1).asInt(), idx,
+				lat_true, right, left, live_limits ? ", live available" : "");
+		return piece;
+	}
+
+	void clearAvoidanceGeometryForTunnelEntry()
+	{
+		latest_ob_x_.clear();
+		latest_ob_y_.clear();
+		held_trigger_ob_x_.clear();
+		held_trigger_ob_y_.clear();
+		stage_switch_pts_.clear();
+		primary_obstacle_idx_ = -1;
+		primary_env_half_len_ = 0.0;
+		primary_env_from_near_ = false;
+		primary_obstacle_min_d_ = 0.0;
+		primary_obstacle_max_d_ = 0.0;
+		nearest_trigger_forward_m_ = 1e18;
+		primary_forward_m_ = 1e18;
+		preferred_avoid_side_ = 0;
+		committed_avoid_side_ = 0;
+		pending_avoid_side_ = 0;
+		pending_avoid_side_scans_ = 0;
+		stage_switch_pts_.clear();
+	}
+
+	// ★ 2026-09-29 (19:49 백): 터널 선감속을 /obstacle_info(원거리 제안 + 근거리)로도 건다.
+	//   낮은 장애물(윗면 0.33~0.44 m)은 원본 점 판정(tunnel_wall_detector)이 12~16 m 에서야
+	//   잡았지만, 원거리 검출은 경로 기준 횡범위로 바꾼 뒤 24~26 m 에서 제안한다.
+	//   조건: 자차 앞 3 m ~ tunnel_kick_range_m, 물체 중심이 벽에서 1.0 m 안쪽(벽 제한이
+	//   있으면 그것으로, 없으면 기준경로 횡 -3.2 ~ +6.2).
+	void evaluateTunnelObstacleKick(const Json::Value &root)
+	{
+		const Json::Value &list = root.isMember("collision_objects")
+			? root["collision_objects"] : root["obstacles"];
+		const bool limits_ok = tunnel_limits_active_;
+		const double off = tunnel_wall_offset_valid_ ? tunnel_lateral_offset_ : 0.0;
+		const double y_true = last_c_d_ - off;
+		for (const auto &obs : list)
+		{
+			if (obs.get("passed", false).asBool()) continue;
+			if (!obs.isMember("position_ego") || obs["position_ego"].size() < 2) continue;
+			if (!obs.isMember("position_world") || obs["position_world"].size() < 2) continue;
+			if (isTunnelWallPiece(obs)) continue;
+			const double half_len = 0.5 * obs.get("length", 0.0).asDouble();
+			const double fwd = obs["position_ego"][0].asDouble() - half_len;
+			if (fwd < 3.0 || fwd > tunnel_kick_range_m_) continue;
+			int idx = -1;
+			double lat = 0.0;
+			if (!obstaclePathLocation(obs["position_world"][0].asDouble(),
+					obs["position_world"][1].asDouble(), idx, lat))
+				continue;
+			const double lat_true = lat - off;
+			double lo, hi;
+			if (limits_ok)
+			{
+				lo = y_true - tunnel_r_curb_ + tunnel_kick_zone_inset_;
+				hi = y_true + tunnel_l_curb_ - tunnel_kick_zone_inset_;
+			}
+			else
+			{
+				lo = -3.2;
+				hi = 6.2;
+			}
+			// 중심이 영역 안이어야 한다. 폭으로 겹침을 보면 벽 아래 턱 조각(경로 횡
+			// -3.5~-3.6 m, 폭 0.5)이 걸려 46 m 전부터 선감속했다(19:49 리플레이).
+			if (lat_true < lo || lat_true > hi) continue;
+			std::lock_guard<std::mutex> lock(speed_kick_mutex_);
+			tunnel_obstacle_kick_time_ = ros::Time::now();
+			ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] tunnel obstacle kick: id=%d %.1f m ahead, "
+				"path lat %.2f (zone %.2f~%.2f)", obs.get("id", -1).asInt(), fwd, lat_true, lo, hi);
+			updateSpeedKickLocked();
+			return;
+		}
+	}
+
+	// 터널 제한(연석선 - 차 반폭 - 여유)을 계획 좌표(실제 위치 = c_d - 추측항법 보정)로.
+	void updateTunnelWallLimits(double c_d)
+	{
+		last_c_d_ = c_d;
+		tunnel_limits_active_ = false;
+		if (!tunnel_mode_ || !tunnel_wall_limits_enabled_ || !tunnel_limits_valid_ ||
+			(ros::Time::now() - tunnel_limits_stamp_).toSec() > tunnel_wall_limits_timeout_)
+			return;
+		const double off = tunnel_wall_offset_valid_ ? tunnel_lateral_offset_ : 0.0;
+		const double y_true = c_d - off;
+		tunnel_right_limit_ = std::max(0.0, tunnel_r_curb_ - y_true - tunnel_wall_clearance_);
+		tunnel_left_limit_ = std::max(0.0, tunnel_l_curb_ + y_true - tunnel_wall_clearance_);
+		// 연석선 자체의 d (제한과 같은 좌표). 차체 모서리 검사에 쓴다.
+		tunnel_curb_right_d_ = y_true - tunnel_r_curb_;
+		tunnel_curb_left_d_ = y_true + tunnel_l_curb_;
+		tunnel_limits_active_ = true;
+		ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] tunnel wall limits R=%.2f L=%.2f "
+			"(curb R %.2f / L %.2f, true d %.2f)", tunnel_right_limit_, tunnel_left_limit_,
+			tunnel_r_curb_, tunnel_l_curb_, y_true);
+	}
+
+	// 터널 제한영역 시각화(map). 표시 좌표는 추측항법 자세 기준(점군 표시와 일치).
+	//   노랑 = 연석선, 빨강/초록 = 우/좌 경로 한계, 선감속 영역(3~20 m): 감지 시 빨강
+	void publishTunnelZoneMarkers(double s0, double c_d)
+	{
+		visualization_msgs::MarkerArray arr;
+		visualization_msgs::Marker del;
+		del.header.frame_id = "map";
+		del.header.stamp = ros::Time::now();
+		del.action = visualization_msgs::Marker::DELETEALL;
+		arr.markers.push_back(del);
+		if (!tunnel_mode_ || !csp_)
+		{
+			if (tunnel_zone_markers_shown_)
+				tunnel_zone_marker_pub_.publish(arr);
+			tunnel_zone_markers_shown_ = false;
+			return;
+		}
+		tunnel_zone_markers_shown_ = true;
+		const double off = tunnel_wall_offset_valid_ ? tunnel_lateral_offset_ : 0.0;
+		const bool active = tunnel_limits_active_;
+		// 표시 d (추측항법 프레임): 실제 프레임 d + off
+		const double d_rc = active ? c_d - tunnel_r_curb_ : off - (1.5 + tunnel_wall_clearance_);
+		const double d_lc = active ? c_d + tunnel_l_curb_ : off + tunnel_max_road_width_left_ + tunnel_wall_clearance_;
+		const double d_rl = active ? d_rc + tunnel_wall_clearance_ : off - 1.5;
+		const double d_ll = active ? d_lc - tunnel_wall_clearance_ : off + tunnel_max_road_width_left_;
+		auto line = [&](int id, const std::string &ns, double d, double s_a, double s_b,
+						float r, float g, float b, double width) {
+			visualization_msgs::Marker m;
+			m.header.frame_id = "map";
+			m.header.stamp = ros::Time::now();
+			m.ns = ns;
+			m.id = id;
+			m.type = visualization_msgs::Marker::LINE_STRIP;
+			m.action = visualization_msgs::Marker::ADD;
+			m.pose.orientation.w = 1.0;
+			m.scale.x = width;
+			m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = active ? 0.95f : 0.4f;
+			m.lifetime = ros::Duration(0.5);
+			for (double s = s_a; s <= s_b + 1e-6; s += 1.0)
+			{
+				double x, y;
+				csp_->calc_position(x, y, s);
+				if (x == NONE) { if (m.points.empty()) continue; break; }
+				const double yaw = csp_->calc_yaw(s);
+				geometry_msgs::Point p;
+				p.x = x - d * std::sin(yaw);
+				p.y = y + d * std::cos(yaw);
+				p.z = 0.3;
+				m.points.push_back(p);
+			}
+			if (m.points.size() >= 2)
+				arr.markers.push_back(m);
+		};
+		// 지역 스플라인은 자차 부근에서 시작한다(s0 앞은 NONE) - s0 부터 그린다.
+		const double sa = s0, sb = s0 + 40.0;
+		line(0, "tunnel_curb", d_rc, sa, sb, 1.0f, 0.85f, 0.1f, 0.12);
+		line(1, "tunnel_curb", d_lc, sa, sb, 1.0f, 0.85f, 0.1f, 0.12);
+		line(2, "tunnel_limit", d_rl, sa, sb, 1.0f, 0.2f, 0.2f, 0.08);
+		line(3, "tunnel_limit", d_ll, sa, sb, 0.2f, 1.0f, 0.3f, 0.08);
+		// idx 별 실측 벽/턱 경계(tunnel_wall_profile.yaml, 자홍색). 경계 없는 idx 는 끊는다.
+		if (!tunnel_wall_profile_.empty() && current_waypoint_idx_ >= 0)
+		{
+			for (int side = 0; side < 2; ++side)
+			{
+				visualization_msgs::Marker m;
+				m.header.frame_id = "map";
+				m.header.stamp = ros::Time::now();
+				m.ns = "tunnel_wall_profile";
+				m.id = side;
+				m.type = visualization_msgs::Marker::LINE_LIST;
+				m.action = visualization_msgs::Marker::ADD;
+				m.pose.orientation.w = 1.0;
+				m.scale.x = 0.10;
+				m.color.r = 1.0f; m.color.g = 0.2f; m.color.b = 1.0f; m.color.a = 0.9f;
+				m.lifetime = ros::Duration(0.5);
+				bool have_prev = false;
+				geometry_msgs::Point prev;
+				for (double s = sa; s <= sb + 1e-6; s += 1.0)
+				{
+					const int idx = current_waypoint_idx_ + static_cast<int>(std::lround((s - s0) * 10.0));
+					double r = 0.0, l = 0.0;
+					tunnelWallProfileAt(idx, r, l);
+					const double dv = side == 0 ? r : l;
+					double x, y;
+					csp_->calc_position(x, y, s);
+					if (x == NONE || (side == 0 ? dv >= 0.0 : dv <= 0.0)) { have_prev = false; continue; }
+					const double yaw = csp_->calc_yaw(s);
+					geometry_msgs::Point pt;
+					pt.x = x - (dv + off) * std::sin(yaw);
+					pt.y = y + (dv + off) * std::cos(yaw);
+					pt.z = 0.4;
+					if (have_prev) { m.points.push_back(prev); m.points.push_back(pt); }
+					prev = pt; have_prev = true;
+				}
+				if (!m.points.empty())
+					arr.markers.push_back(m);
+			}
+		}
+		// 라이다 선감속 영역(연석선 안쪽, 자차 앞 3~kick_range m)
+		bool lidar_recent = false;
+		{
+			std::lock_guard<std::mutex> lock(speed_kick_mutex_);
+			lidar_recent = (lidar_obstacle_present_ &&
+				(ros::Time::now() - last_lidar_detection_time_).toSec() < 0.5) ||
+				(!tunnel_obstacle_kick_time_.isZero() &&
+				 (ros::Time::now() - tunnel_obstacle_kick_time_).toSec() < 0.8);
+		}
+		if (active && tunnel_lidar_kick_enabled_)
+		{
+			visualization_msgs::Marker z;
+			z.header.frame_id = "map";
+			z.header.stamp = ros::Time::now();
+			z.ns = "tunnel_kick_zone";
+			z.id = 0;
+			z.type = visualization_msgs::Marker::TRIANGLE_LIST;
+			z.action = visualization_msgs::Marker::ADD;
+			z.pose.orientation.w = 1.0;
+			z.scale.x = z.scale.y = z.scale.z = 1.0;
+			z.color.r = lidar_recent ? 1.0f : 0.2f;
+			z.color.g = lidar_recent ? 0.2f : 0.9f;
+			z.color.b = 0.2f;
+			z.color.a = lidar_recent ? 0.35f : 0.12f;
+			z.lifetime = ros::Duration(0.5);
+			// 선감속 영역 = 벽에서 1.0 m(= 제한선 0.1 + 0.9) 안쪽(tunnel_wall_detector 와 같은 값)
+			const double dr = d_rc + tunnel_kick_zone_inset_, dl = d_lc - tunnel_kick_zone_inset_;
+			for (double s = s0 + 3.0; s < s0 + tunnel_kick_range_m_ - 1e-6; s += 1.0)
+			{
+				const double s2 = std::min(s + 1.0, s0 + tunnel_kick_range_m_);
+				double x1, y1, x2, y2;
+				csp_->calc_position(x1, y1, s);
+				csp_->calc_position(x2, y2, s2);
+				if (x1 == NONE || x2 == NONE) break;
+				const double yw1 = csp_->calc_yaw(s), yw2 = csp_->calc_yaw(s2);
+				auto P = [](double x, double y, double yw, double d) {
+					geometry_msgs::Point p;
+					p.x = x - d * std::sin(yw); p.y = y + d * std::cos(yw); p.z = 0.15;
+					return p;
+				};
+				const auto a = P(x1, y1, yw1, dr), b = P(x1, y1, yw1, dl);
+				const auto c = P(x2, y2, yw2, dl), d = P(x2, y2, yw2, dr);
+				z.points.push_back(a); z.points.push_back(b); z.points.push_back(c);
+				z.points.push_back(a); z.points.push_back(c); z.points.push_back(d);
+			}
+			if (!z.points.empty())
+				arr.markers.push_back(z);
+		}
+		tunnel_zone_marker_pub_.publish(arr);
+	}
+
+	void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
+	{
+		pose_x_ = msg->pose.pose.position.x;
+		pose_y_ = msg->pose.pose.position.y;
+
+		tf::Quaternion q(msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+						  msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+		tf::Matrix3x3 m(q);
+		double roll, pitch;
+		m.getRPY(roll, pitch, bot_yaw_);
+
+		// /odom의 twist.linear가 MORAI에서는 항상 0으로 들어와서 c_speed가 계속
+		// 0으로 계산되던 진짜 원인이었음. mpc_path_tracking이 이미 같은 이유로
+		// /odom 대신 /Competition_topic의 velocity를 실제 속도로 쓰고 있어서,
+		// 여기서도 그쪽을 우선 사용한다(competitionCallback에서 갱신).
+		// /odom은 이제 위치/자세(pose, yaw)만 사용.
+		if (!have_competition_speed_)
+		{
+			bot_speed_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+		}
+		have_odom_ = true;
+	}
+
+	void stopAheadCallback(const std_msgs::Float32MultiArray::ConstPtr &msg)
+	{
+		tl_stop_dist_ = msg->data.empty() ? -1.0 : msg->data[0];
+		tl_stop_dist_time_ = ros::Time::now();
+	}
+
+	void stopRequiredCallback(const std_msgs::Bool::ConstPtr &msg)
+	{
+		tl_stop_required_ = msg->data;
+		tl_stop_required_time_ = ros::Time::now();
+	}
+
+	// ★ 신호 + 회피 안전 로직.
+	//   정지선 바로 앞뒤에 장애물이 있으면 회피 구간과 신호 미션 구간이 겹친다.
+	//   빨간불(정지 필요)인데 정지선 전에 옆으로 나가기 시작하면, 신호 정지는
+	//   그대로 걸리므로 차선을 밟거나 옆 차선에 걸친 채 멈추게 된다.
+	//     실측 2026-09-23(17:47:53): 정지선 idx ~3094, 장애물 idx 3107~3115
+	//     (정지선 1.3~2 m 뒤). 회피는 31 m 앞(idx ~2796)에서 시작됐다.
+	//   정지가 필요하고 차가 정지선 전에 있을 때:
+	//     - 회피+복귀가 신호 정지 지점 전에 끝나면 그대로 회피한다.
+	//     - 아니면 회피를 시작하지 않고 차선 중앙을 유지한다(hold).
+	//       장애물이 정지선 근처면 초록불 뒤 정지 상태에서 회피할 여유가
+	//       필요하므로 장애물 tl_hold_gap_m 앞에서 먼저 선다.
+	//     - 이미 옆으로 나가 있으면(|c_d| > tl_offset_tolerance_m) 중간에
+	//       뒤집지 않고 진행한다(신호 정지는 MPC 속도상한으로 그대로 걸린다).
+	//   반환: hold 해야 하면 true, out_cap 은 장애물 앞 정지용 속도상한
+	//   (음수면 신호 정지에 맡긴다).
+	bool trafficLightHold(double c_d, double c_speed, double &out_cap)
+	{
+		out_cap = -1.0;
+		if (!tl_guard_enabled_ || tunnel_mode_ || latest_ob_x_.empty())
+			return false;
+		const ros::Time now = ros::Time::now();
+		if (tl_stop_dist_time_.isZero() || tl_stop_required_time_.isZero() ||
+			(now - tl_stop_dist_time_).toSec() > tl_input_timeout_sec_ ||
+			(now - tl_stop_required_time_).toSec() > tl_input_timeout_sec_)
+			return false;
+		if (!tl_stop_required_ || tl_stop_dist_ < 0.0 || tl_stop_dist_ > tl_guard_range_m_)
+			return false;
+		// 회피 대상(트리거) 물체의 전방 범위
+		const double c = std::cos(bot_yaw_), s = std::sin(bot_yaw_);
+		double near_fwd = 1e18, far_fwd = -1e18;
+		for (size_t i = 0; i < held_trigger_ob_x_.size(); ++i)
+		{
+			const double f = c * (held_trigger_ob_x_[i] - pose_x_) + s * (held_trigger_ob_y_[i] - pose_y_);
+			near_fwd = std::min(near_fwd, f);
+			far_fwd = std::max(far_fwd, f);
+		}
+		if (far_fwd < -1e17 || near_fwd <= 0.0)
+			return false;   // 이미 장애물 옆/뒤 - 진행 중인 회피를 방해하지 않는다
+		if (std::abs(c_d) > tl_offset_tolerance_m_)
+		{
+			ROS_WARN_THROTTLE(1.0, "[obstacle_avoidance] red light while already offset (c_d=%.2f) "
+				"- continuing current avoidance, traffic-light stop still applies", c_d);
+			return false;
+		}
+		const double stop_target = tl_stop_dist_ - tl_front_axle_offset_m_ - tl_stop_buffer_m_;
+		const double left_req = std::max(0.0, primary_obstacle_max_d_ + ROBOT_RADIUS);
+		const double right_req = std::max(0.0, ROBOT_RADIUS - primary_obstacle_min_d_);
+		const double need = std::max(1.0, std::min(left_req, right_req));
+		const double v = std::max(3.0, c_speed);
+		const double t_ret = std::min(return_ti_ * 1.2,
+			std::max(min_return_ti_, need * return_lat_time_scale_));
+		const double return_end = far_fwd - passed_release_margin_ + v * t_ret;
+		if (return_end <= stop_target)
+		{
+			tl_hold_logged_ = false;
+			return false;   // 회피하고 정지 지점 전에 복귀까지 끝난다
+		}
+		// ★ 정지 거리를 장애물이 기준경로를 침범한 정도에 맞춘다.
+		//   침범 정도 = 피하려면 옮겨야 하는 최소 횡거리(좌/우 중 작은 쪽).
+		//   한가운데를 막은 물체는 정지 상태에서 크게 옆으로 가야 하니 멀리
+		//   (tl_hold_gap_max_m), 경로에서 꽤 벗어난 물체는 조금만 비키면 되니
+		//   가까이(tl_hold_gap_min_m) 선다. 그 사이는 선형.
+		const double shift_need = std::min(left_req, right_req);
+		const double ratio = std::min(1.0, std::max(0.0,
+			(shift_need - tl_gap_shift_min_m_) /
+			std::max(0.05, tl_gap_shift_max_m_ - tl_gap_shift_min_m_)));
+		const double hold_gap = tl_hold_gap_min_m_ + ratio * (tl_hold_gap_m_ - tl_hold_gap_min_m_);
+		const double hold_stop = near_fwd - hold_gap;
+		if (hold_stop < stop_target)
+			out_cap = std::sqrt(2.0 * tl_hold_decel_mps2_ * std::max(0.0, hold_stop));
+		if (!tl_hold_logged_)
+		{
+			ROS_WARN("[obstacle_avoidance] RED light: stop line %.1f m, obstacle %.1f~%.1f m, "
+				"avoid+return would end at %.1f m > stop point %.1f m -> hold lane center%s "
+				"(shift need %.2f m -> hold gap %.1f m)",
+				tl_stop_dist_, near_fwd, far_fwd, return_end, stop_target,
+				out_cap >= 0.0 ? ", stopping before obstacle" : "", shift_need, hold_gap);
+			tl_hold_logged_ = true;
+		}
+		return true;
+	}
+
+	void competitionCallback(const morai_msgs::EgoVehicleStatus::ConstPtr &msg)
+	{
+		bot_speed_ = std::hypot(msg->velocity.x, msg->velocity.y);
+		have_competition_speed_ = true;
+	}
+
+	// 점 하나가 기준경로(rx_, ry_)에서 얼마나 떨어져 있는지 (최근접점 거리, 근사)
+
+	double distToPath(double x, double y) const
+	{
+		double best = 1e18;
+		for (size_t i = 0; i < rx_.size(); ++i)
+		{
+			double dd = dist(rx_[i], ry_[i], x, y);
+			if (dd < best)
+				best = dd;
+		}
+		return best;
+	}
+
+	// 장애물 근처 기준경로의 진행방향(yaw)을 반환. 장애물의 길이(length, 진행
+	// 방향)/폭(width, 좌우) 직사각형을 도로 방향에 맞춰 배치하는 데 쓴다.
+	double nearestPathYaw(double x, double y) const
+	{
+		double best = 1e18;
+		double yaw = 0.0;
+		for (size_t i = 0; i < rx_.size(); ++i)
+		{
+			double dd = dist(rx_[i], ry_[i], x, y);
+			if (dd < best)
+			{
+				best = dd;
+				yaw = (i < ryaw_.size()) ? ryaw_[i] : 0.0;
+			}
+		}
+		return yaw;
+	}
+
+	// 현재 /final_waypoint 원본에서 장애물과 가장 가까운 CSV index와 부호 있는
+	// 횡거리(d>0 왼쪽, d<0 오른쪽)를 구한다. 연석 제한은 자차 위치가 아니라
+	// 실제로 피해야 할 장애물 위치의 도로 단면에 적용해야 한다.
+	// ===== 정면 폭 고정(2026-09-28, 12:55 백) =====
+	//   정적 장애물의 경로 쪽 끝(안쪽 끝)은 정면으로 접근할 때 가장 잘 잰다. 옆을
+	//   지날 때는 옆면이 보이며 박스가 경로 쪽으로 부풀어(12:55 id21 안쪽 끝
+	//   1.03 -> 0.85 m, 점유 합집합 0.27 m) 회피 경로 전체가 충돌 판정 -> 정지했다.
+	//   접근(물체 뒤끝이 front_lock_approach_min_ahead_m 보다 앞) 중 근거리 관측의
+	//   안쪽 끝을 기록하고, 통과 단계에서는 안쪽 끝이 (기록값 - 허용오차)보다 경로
+	//   쪽으로 못 오게 자른다. 바깥 끝·길이는 새 측정 그대로. 경로를 가로지르는
+	//   물체는 제외. 정적 구간(M2)/터널에서만.
+	struct FrontLock
+	{
+		double cx, cy;      // 마지막으로 매칭된 물체 중심(world)
+		int side;           // +1 경로 왼쪽, -1 오른쪽
+		double inner;       // 정면에서 잰 안쪽 끝(부호 있는 횡거리)
+		ros::Time last;
+		bool passing;
+	};
+	std::vector<FrontLock> front_locks_;
+
+	FrontLock *findFrontLock(double wx, double wy)
+	{
+		FrontLock *best = nullptr;
+		double best_d = front_lock_match_m_;
+		for (auto &L : front_locks_)
+		{
+			const double d = std::hypot(L.cx - wx, L.cy - wy);
+			if (d <= best_d) { best_d = d; best = &L; }
+		}
+		return best;
+	}
+
+	void pruneFrontLocks()
+	{
+		const ros::Time now = observation_stamp_.isZero() ? ros::Time::now() : observation_stamp_;
+		front_locks_.erase(std::remove_if(front_locks_.begin(), front_locks_.end(),
+			[&](const FrontLock &L) { return (now - L.last).toSec() > front_lock_timeout_sec_; }),
+			front_locks_.end());
+	}
+
+	// 물체 박스(중심 wx,wy / 경로 횡방향 반폭 hw)에 정면 폭 고정을 적용한다.
+	// update=true 면 접근 단계에서 기록을 갱신한다(충돌 목록 루프에서만).
+	// 반환: 박스를 잘랐으면 true.
+	bool applyFrontLock(double &wx, double &wy, double &hw, double ex, double hl,
+		bool far, bool update)
+	{
+		if (!front_lock_enabled_) return false;
+		int o_idx = -1;
+		double lat = 0.0;
+		if (!obstaclePathLocation(wx, wy, o_idx, lat)) return false;
+		const double lo = lat - hw, hi = lat + hw;
+		FrontLock *L = findFrontLock(wx, wy);
+		const int side = L ? L->side : (lo > 0.0 ? 1 : (hi < 0.0 ? -1 : 0));
+		if (side == 0) return false;
+		const bool approach = (ex - hl) > front_lock_approach_min_ahead_m_;
+		const double inner = side > 0 ? lo : hi;
+		const ros::Time now = observation_stamp_.isZero() ? ros::Time::now() : observation_stamp_;
+		if (!L)
+		{
+			if (update && approach && !far)
+				front_locks_.push_back({wx, wy, side, inner, now, false});
+			return false;
+		}
+		if (update) { L->last = now; L->cx = wx; L->cy = wy; }
+		if (approach && !L->passing)
+		{
+			if (update && !far)
+				L->inner = side > 0 ? std::min(L->inner, inner) : std::max(L->inner, inner);
+			return false;
+		}
+		if (update && !approach) L->passing = true;
+		const double tol = std::max(0.0, front_lock_tolerance_m_);
+		double new_lo = lo, new_hi = hi;
+		if (side > 0 && lo < L->inner - tol) new_lo = L->inner - tol;
+		if (side < 0 && hi > L->inner + tol) new_hi = L->inner + tol;
+		if (new_lo == lo && new_hi == hi) return false;
+		if (new_hi - new_lo < 0.1)
+		{
+			if (side > 0) new_hi = new_lo + 0.1; else new_lo = new_hi - 0.1;
+		}
+		const double new_lat = 0.5 * (new_lo + new_hi);
+		const double shift = new_lat - lat;
+		const double yaw = nearestPathYaw(wx, wy);
+		wx += shift * (-std::sin(yaw));
+		wy += shift * std::cos(yaw);
+		hw = 0.5 * (new_hi - new_lo);
+		ROS_INFO_THROTTLE(0.5, "[obstacle_avoidance] front lock: inner %.2f -> %.2f (locked %.2f, side %s)",
+			inner, side > 0 ? new_lo : new_hi, L->inner, side > 0 ? "LEFT" : "RIGHT");
+		return true;
+	}
+
+	bool obstaclePathLocation(double x, double y, int &waypoint_idx, double &lateral) const
+	{
+		if (path_wp_x_.empty() || path_wp_x_.size() != path_wp_indices_.size())
+			return false;
+		size_t best_i = 0;
+		double best = 1e18;
+		for (size_t i = 0; i < path_wp_x_.size(); ++i)
+		{
+			const double dx = x - path_wp_x_[i];
+			const double dy = y - path_wp_y_[i];
+			const double d2 = dx * dx + dy * dy;
+			if (d2 < best) { best = d2; best_i = i; }
+		}
+		double yaw = 0.0;
+		if (best_i + 1 < path_wp_x_.size())
+			yaw = std::atan2(path_wp_y_[best_i + 1] - path_wp_y_[best_i],
+				path_wp_x_[best_i + 1] - path_wp_x_[best_i]);
+		else if (best_i > 0)
+			yaw = std::atan2(path_wp_y_[best_i] - path_wp_y_[best_i - 1],
+				path_wp_x_[best_i] - path_wp_x_[best_i - 1]);
+		waypoint_idx = path_wp_indices_[best_i];
+		lateral = -(x - path_wp_x_[best_i]) * std::sin(yaw)
+			+ (y - path_wp_y_[best_i]) * std::cos(yaw);
+		return true;
+	}
+
+	// 카메라 감지 여부만 보고 speed_kick_active_ 갱신 + 발행. cameraDetectionCallback
+	// (별도 스레드, 즉시 반응)과 planLoop(메인 스레드 10Hz, duration 만료를 라이다
+	// 콜백 도착과 무관하게 체크) 양쪽에서 호출하므로 락으로 감싼다.
+	void updateSpeedKick()
+	{
+		std::lock_guard<std::mutex> lock(speed_kick_mutex_);
+		updateSpeedKickLocked();
+	}
+
+	// speed_kick_mutex_를 이미 잡은 상태에서만 호출할 것 (cameraDetectionCallback,
+	// updateSpeedKick() 내부에서만 사용)
+	void updateSpeedKickLocked()
+	{
+		if (externalOccupancyOwnsPath()) return;
+		// 고주로 차선(1/2/3.csv) 및 도심 기본경로 외 구간에서는 카메라 감속 절대 비활성화.
+		// 고주로 갓길 라바콘 등을 카메라가 인지하여 고속 주행 중 20km/h로 급감속하는 문제를 차단한다.
+		// 단 터널(M8, 3.csv)은 예외다 - 거기도 랜덤 정적·동적 장애물을 M2/M3 와
+		// 같은 파이프라인으로 처리하므로 선 감속이 똑같이 필요하다. 터널 판정은
+		// mission_mode 로 하므로 고주로 일반 주행에는 영향이 없다.
+		//   실측 2026-09-13(16:08 백): M8 1951 프레임 내내 static_speed_scale 이
+		//   9999.0(비활성)이었다. camera_speed_kick_node 는 M8 을 이미 허용
+		//   목록에 갖고 있는데(section_id in M2/M3/M8), 소비 측 이 게이트가
+		// 터널(M8)에서 카메라 선감속을 쓸지 (tunnel_camera_kick_enabled).
+		// 카메라로 전방 장애물(정적/동적) 인지 시 선감속을 걸어 여유로운 회피/정지 궤적 확보.
+		const bool tunnel_kick_ok = tunnel_mode_ &&
+			(tunnel_camera_kick_enabled_ || tunnel_lidar_kick_enabled_);
+		if (current_lane_number_ != 0 && !tunnel_kick_ok)
+		{
+			speed_kick_active_ = false;
+			std_msgs::Float64 scale_msg;
+			scale_msg.data = 9999.0;
+			static_speed_scale_pub_.publish(scale_msg);
+			return;
+		}
+
+		bool camera_recent = camera_obstacle_present_ &&
+			(ros::Time::now() - last_camera_detection_time_).toSec() < 0.5;
+		// 터널에서는 0.csv 기준 idx 구간(static_zone_min/dynamic_zone_max)이
+		// 의미가 없다 - 3.csv 는 인덱스가 따로 돌기 때문이다. 구간 판정은
+		// 이미 mission_mode=tunnel 이 해주므로 그대로 허용한다.
+		// ★ 2026-09-25: 0.csv 에서는 동적 장애물 구간(M3: static_dynamic_split_idx
+		//   초과 ~ dynamic_zone_max_idx)에서만 건다. 정적 장애물 구간(M2)은
+		//   라이다 원거리 검출 + 경로 기반 속도캡이 감속을 맡으므로 카메라
+		//   선감속이 회피 속도(30 km/h)를 불필요하게 깎았다.
+		//   camera_kick_static_zone_enabled:=true 면 예전처럼 M2 도 포함.
+		//   idx 를 모르면(위치추정 전) 걸지 않는다.
+		const int kick_min_idx = camera_kick_static_zone_enabled_
+			? static_zone_min_idx_ : static_dynamic_split_idx_ + 1;
+		const bool zone_known = current_waypoint_idx_ >= 0 && kick_min_idx >= 0;
+		bool in_camera_zone = tunnel_kick_ok ||
+			((current_lane_number_ == 0) && zone_known &&
+			current_waypoint_idx_ >= kick_min_idx &&
+			(dynamic_zone_max_idx_ < 0 || current_waypoint_idx_ <= dynamic_zone_max_idx_));
+		bool trigger = camera_recent && in_camera_zone;
+		// 터널: 카메라 대신(또는 함께) 라이다 연석선 안쪽 물체로 선감속한다.
+		if (tunnel_mode_)
+		{
+			const bool lidar_recent = tunnel_lidar_kick_enabled_ &&
+				((lidar_obstacle_present_ &&
+				  (ros::Time::now() - last_lidar_detection_time_).toSec() < 0.5) ||
+				 (!tunnel_obstacle_kick_time_.isZero() &&
+				  (ros::Time::now() - tunnel_obstacle_kick_time_).toSec() < 0.8));
+			trigger = (tunnel_camera_kick_enabled_ && camera_recent) || lidar_recent;
+		}
+		ros::Time now = ros::Time::now();
+
+		// ★ 정지 후 출발 시 선감속 유지 해제(2026-09-25).
+		//   유지 시간은 '마지막 카메라 감지 후' 로 센다. 장애물 앞에서 서서 기다리는
+		//   동안 계속 감지되므로, 출발하고 나서도 유지 시간이 통째로 남아 선감속
+		//   속도에 묶였다(19:21 백: 출발 후 4 초간 19.8 km/h).
+		//   정지(kick_stop_speed 미만이 kick_min_stop_sec 이상) 뒤 출발(kick_restart_speed
+		//   초과)하면, 그 뒤 kick_restart_window_sec 안에 카메라 감지가 끊기는 순간
+		//   남은 유지 시간을 버린다. 새로 감지되면 다시 걸린다.
+		if (kick_release_on_restart_)
+		{
+			const double v = bot_speed_;
+			if (v < kick_stop_speed_)
+			{
+				if (kick_stop_since_.isZero()) kick_stop_since_ = now;
+			}
+			else if (v > kick_restart_speed_)
+			{
+				if (!kick_stop_since_.isZero() &&
+					(now - kick_stop_since_).toSec() >= kick_min_stop_sec_)
+					kick_restart_time_ = now;
+				kick_stop_since_ = ros::Time();
+			}
+		}
+
+		if (trigger)
+		{
+			speed_kick_active_ = true;
+			speed_kick_active_until_ = now + ros::Duration(speed_kick_duration_sec_);
+		}
+		else if (speed_kick_active_ && kick_release_on_restart_ && !kick_restart_time_.isZero() &&
+			(now - kick_restart_time_).toSec() <= kick_restart_window_sec_)
+		{
+			ROS_INFO("[obstacle_avoidance] camera speed kick released after restart "
+				"(%.1fs of hold left)", (speed_kick_active_until_ - now).toSec());
+			speed_kick_active_ = false;
+			kick_restart_time_ = ros::Time();
+		}
+		else if (speed_kick_active_ && now >= speed_kick_active_until_)
+		{
+			speed_kick_active_ = false;
+		}
+
+		// 배율(%)이 아니라 절대 목표속도(m/s)를 보낸다. mpc 쪽에서 min(ref_v, 이 값)으로
+		// 적용하기 때문에, 이미 이 속도보다 느리면 자동으로 무시(더 안 줄임)되고,
+		// 다시 이 속도보다 빨라지면 그때 다시 걸리는 게 자연스럽게 된다.
+		std_msgs::Float64 scale_msg;
+		// 터널(음영구간)은 선감속 속도를 따로 둔다(tunnel_kick_target_mps).
+		const double kick_target = tunnel_mode_ ? tunnel_kick_target_mps_ : speed_kick_target_mps_;
+		scale_msg.data = speed_kick_active_ ? kick_target : 9999.0;
+		static_speed_scale_pub_.publish(scale_msg);
+	}
+
+	// 좌측(대향) 차선에서 다가오는 차량이 있는지 본다.
+	// 좌측 회피는 중앙선을 넘는 방향이라, 대향 차량이 있으면 자기 차로 안으로만
+	// 피해야 한다. 판정은 보수적으로 - 하나라도 있으면 막는다.
+	void trackedObjectsCallback(const lidar_ttc_tracker::TrackedObjectArray::ConstPtr &msg)
+	{
+		last_oncoming_observation_ = msg->header.stamp;
+		if (!have_odom_)
+			return;
+		const double c = std::cos(-bot_yaw_), sn = std::sin(-bot_yaw_);
+		for (const auto &o : msg->objects)
+		{
+			if (!o.is_vehicle)
+				continue;
+			// map -> ego 좌표
+			const double dx = o.x - pose_x_, dy = o.y - pose_y_;
+			const double fx = c * dx - sn * dy;      // 전방
+			const double fy = sn * dx + c * dy;      // 좌측(+)
+			if (fx <= 0.0 || fx > oncoming_check_range_m_)
+				continue;
+			if (fy < oncoming_min_lateral_m_)
+				continue;   // 내 차로이거나 우측
+			// 다가오는가: 자차 진행방향 성분이 음수(마주봄)
+			const double vfx = c * o.vx - sn * o.vy;
+			if (o.velocity_valid && o.observation_age < 0.3 &&
+				vfx > -oncoming_min_closing_mps_)
+				continue;
+			last_oncoming_seen_ = ros::Time::now();
+			ROS_INFO_THROTTLE(1.0,
+				"[obstacle_avoidance] oncoming vehicle id=%u at fwd=%.1f left=%.1f "
+				"closing=%.1f m/s -> left avoid width limited to %.2f m",
+				o.id, fx, fy, -vfx, max_road_width_left_blocked_);
+			return;
+		}
+	}
+
+	bool oncomingBlocked() const
+	{
+		if (tunnel_mode_)
+			return !tunnel_oncoming_ids_.empty();
+		// 대회 규정상 정적/동적 장애물 구간(M2/M3)에는 NPC 차량이 없다.
+		// 여기서 대향차량 판정이 켜지면 좌측 회피폭이 1.2 m 로 줄어드는데,
+		// 그 판정은 노변 구조물·오검출 트랙만으로도 걸릴 수 있다. 터널(M8)
+		// 에서만 쓰고, 다른 구간은 oncoming_check_outside_tunnel 로만 켠다.
+		if (!oncoming_check_outside_tunnel_)
+			return false;
+		if (last_oncoming_seen_.isZero())
+			return false;
+		return (ros::Time::now() - last_oncoming_seen_).toSec() < oncoming_hold_sec_;
+	}
+
+	void obstacleInfoCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		if (!have_path_)
+			return;
+
+		Json::CharReaderBuilder builder;
+		Json::Value root;
+		std::string errs;
+		std::istringstream ss(msg->data);
+		if (!Json::parseFromStream(builder, ss, &root, &errs))
+		{
+			ROS_WARN_THROTTLE(5.0, "[obstacle_avoidance] failed to parse /obstacle_info: %s", errs.c_str());
+			return;
+		}
+
+        if(!embedded_engine_)applyOccupancyFootprints(root);
+        clipDividerGeometry(root);
+        // Stable parent geometry selects avoidance direction/offset. Collision
+        // geometry also includes current newly measured physical occupancy.
+        for(const char* key : {"obstacles", "collision_objects"}) {
+            for(auto& o : root[key]) {
+                const auto& poly=(std::string(key)=="obstacles" && o["planning_footprint_world"].isArray())
+                    ? o["planning_footprint_world"] : o["footprint_world"];
+                if(!poly.isArray() || poly.size()<3) continue;
+                const double yaw=nearestPathYaw(o["position_world"][0].asDouble(),o["position_world"][1].asDouble());
+                const double c=std::cos(yaw),sn=std::sin(yaw);
+                double lo=1e100,hi=-1e100,left=1e100,right=-1e100;bool outside=true;
+                for(const auto& q:poly) {
+                    const double x=q[0].asDouble(),y=q[1].asDouble(),a=c*x+sn*y,b=-sn*x+c*y;
+                    lo=std::min(lo,a);hi=std::max(hi,a);left=std::min(left,b);right=std::max(right,b);
+                    int idx=-1;double lat=0.;
+                    outside=outside && obstaclePathLocation(x,y,idx,lat) && beyondRightCurb(idx,lat,0.);
+                }
+                o["background_excluded"]=o.get("background_excluded",false).asBool() || outside;
+                o["length"]=hi-lo;o["width"]=right-left;
+                o["position_world"][0]=c*(lo+hi)*.5-sn*(left+right)*.5;
+                o["position_world"][1]=sn*(lo+hi)*.5+c*(left+right)*.5;
+            }
+        }
+        root["planning_geometry_world"]=true;
+        Json::Value planning_root=root;
+        for(const char* list:{"obstacles","collision_objects"})for(auto& o:planning_root[list]){
+            if(!o["position_world"].isArray()||o["position_world"].size()<2)continue;
+            double dx=o["position_world"][0].asDouble()-pose_x_,dy=o["position_world"][1].asDouble()-pose_y_;
+            o["position_ego"][0]=std::cos(bot_yaw_)*dx+std::sin(bot_yaw_)*dy;
+            o["position_ego"][1]=-std::sin(bot_yaw_)*dx+std::cos(bot_yaw_)*dy;
+        }
+        std_msgs::String planning_objects;planning_objects.data=Json::FastWriter().write(planning_root);planning_obstacles_pub_.publish(planning_objects);
+		static_preview_ = root.get("mission_mode", "").asString() == "static_preview" && current_lane_number_ == 0;
+        vecD ob_x, ob_y;
+		validation_points_by_id_.clear();
+        retained_occupancy_ids_.clear();
+		vecD trigger_ob_x, trigger_ob_y;
+		const ros::Time mode_now = ros::Time::now();
+		const bool tunnel_requested =
+			root.get("mission_mode", "").asString() == "tunnel" && current_lane_number_ == 3;
+		const bool was_tunnel = tunnel_mode_;
+		if (tunnel_requested)
+		{
+			last_tunnel_mode_signal_ = mode_now;
+			tunnel_mode_ = true;
+		}
+		else
+		{
+			const bool hold = tunnel_mode_ && current_lane_number_ == 3 &&
+				!last_tunnel_mode_signal_.isZero() &&
+				(mode_now - last_tunnel_mode_signal_).toSec() < tunnel_mode_hold_sec_;
+			tunnel_mode_ = hold;
+		}
+		if (tunnel_mode_ && !was_tunnel)
+		{
+			tunnel_enter_time_ = mode_now;
+			clearAvoidanceGeometryForTunnelEntry();
+			ROS_INFO("[obstacle_avoidance] tunnel mode entered; waiting briefly for live wall boundary");
+		}
+		observation_stamp_ = ros::Time::now();
+		tunnel_unresolved_ = false;
+		if (!tunnel_mode_)
+		{
+			tunnel_oncoming_ids_.clear();
+			oncoming_id_last_seen_.clear();
+		}
+		else if (tunnel_lidar_kick_enabled_)
+		{
+			evaluateTunnelObstacleKick(root);
+		}
+		const bool live_wall_ready = tunnel_limits_valid_ && !tunnel_limits_stamp_.isZero() &&
+			(mode_now - tunnel_limits_stamp_).toSec() <= tunnel_wall_limits_timeout_;
+		if (tunnel_mode_ && !tunnel_enter_time_.isZero() && !live_wall_ready &&
+			(mode_now - tunnel_enter_time_).toSec() < tunnel_entry_grace_sec_)
+		{
+			clearAvoidanceGeometryForTunnelEntry();
+			ROS_INFO_THROTTLE(0.5, "[obstacle_avoidance] tunnel entry settling: wall boundary not ready");
+			return;
+		}
+		// ★ 목록 분리(인지 측과 쌍).
+		//   obstacles         : 기준경로 코리도 1.4m 안 - "회피를 시작할까"(트리거)
+		//   collision_objects : 코리도 6.0m 안 전체   - "이 경로가 안전한가"(충돌)
+		//   충돌 검사는 넓은 목록으로 해야 한다. 트리거 목록만 쓰면, 회피를
+		//   시작한 뒤 회피 경로가 지나가는 자리(기준경로에서 2~4m 옆)의
+		//   장애물이 프레넷에 안 보여서 그 위로 경로를 그린다(실제 충돌).
+		//   반대로 트리거를 넓은 목록으로 하면 옆 차로/노견 물체에도 회피가
+		//   걸리므로, 트리거는 좁은 목록 그대로 둔다.
+		const bool has_split = root.isMember("collision_objects");
+		const Json::Value &obs_list =
+			has_split ? root["collision_objects"] : root["obstacles"];
+
+		// 회피 방향과 도로 폭은 가장 가까운 '다음' 트리거 장애물을 기준으로
+		// 정한다. 자차 idx만 쓰면 20~30m 앞 연석 제한 구간의 버스를 보고도
+		// 제한이 적용되기 전까지 우측 경로를 만들게 된다. 반대로 모든 원거리
+		// 물체 중 가장 엄격한 제한을 쓰면 첫 장애물을 피하기도 전에 두 번째
+		// 구간 제한이 개입하므로, 현재 장애물보다 뒤 2m 이내부터 가장 작은
+		// CSV idx를 가진 물체 하나를 primary로 잡는다.
+		struct TriggerGeometry
+		{
+			int idx;
+			double lateral;
+			double half_width;
+			double area;
+			double wx, wy;        // 물체 중심 world 좌표(envelope 기준점용)
+			double half_length;
+			bool far;             // far_static_obstacle_detector 의 원거리 제안
+            bool world_parent;
+		};
+		std::vector<TriggerGeometry> trigger_geometry;
+		const Json::Value &trigger_list = root["obstacles"];
+		for (const auto &obs : trigger_list)
+		{
+            if(obs.get("background_excluded",false).asBool()) continue;
+            if (require_confirmed_ && !obs.get("confirmed", false).asBool()) continue;
+			if (tunnel_mode_ && isTunnelWallPiece(obs)) continue;
+			if (obs.get("passed", false).asBool()) continue;
+			if (!obs.isMember("position_world") || obs["position_world"].size() < 2) continue;
+			int idx = -1;
+			double lateral = 0.0;
+			if (!obstaclePathLocation(obs["position_world"][0].asDouble(),
+				obs["position_world"][1].asDouble(), idx, lateral)) continue;
+			if (current_waypoint_idx_ >= 0 &&
+				idx < current_waypoint_idx_ - primary_release_behind_idx_) continue;
+			double width = obs.get("width", 0.35).asDouble();
+			double length = obs.get("length", 0.35).asDouble();
+			// 판단(방향 선택·신호 정지 거리)은 decision_range_m 안 추정부터 쓴다.
+			if (obs.isMember("position_ego") && obs["position_ego"].size() >= 1 &&
+				obs["position_ego"][0].asDouble() - 0.5 * length > decision_range_m_) continue;
+			width = std::max(width, 0.35);
+			length = std::max(length, 0.35);
+			if (!obs["footprint_world"].isArray() && beyondRightCurb(idx, lateral, 0.5 * width)) continue;
+			double gwx = obs["position_world"][0].asDouble();
+			double gwy = obs["position_world"][1].asDouble();
+			double ghw = 0.5 * width;
+			const bool g_far = obs.get("source", "").asString() == "raw_temporal_far";
+			// 정면 폭 고정: primary 점유 범위(합집합)에도 옆에서 부푼 값이 안 들어가게.
+			if (obs.isMember("position_ego") && obs["position_ego"].size() >= 1 &&
+				!obs["footprint_world"].isArray() && !obs.get("static_occupancy", false).asBool() &&
+                applyFrontLock(gwx, gwy, ghw, obs["position_ego"][0].asDouble(),
+					0.5 * length, g_far, false))
+			{
+				int nidx = -1;
+				double nlat = lateral;
+				if (obstaclePathLocation(gwx, gwy, nidx, nlat)) { lateral = nlat; idx = nidx; }
+			}
+			trigger_geometry.push_back({idx, lateral, ghw, 2.0 * ghw * length,
+				gwx, gwy, 0.5 * length, g_far, obs.isMember("static_parent_id")});
+		}
+		int candidate_primary_idx = -1;
+		double candidate_primary_min_d = 0.0;
+		double candidate_primary_max_d = 0.0;
+		double candidate_half_len = 0.0;
+		bool candidate_from_near = false;
+        bool candidate_world_parent = false;
+		double candidate_base_x = 0.0, candidate_base_y = 0.0, candidate_base_yaw = 0.0;
+		if (!trigger_geometry.empty())
+		{
+			int foremost_idx = trigger_geometry.front().idx;
+			for (const auto &g : trigger_geometry)
+				foremost_idx = std::min(foremost_idx, g.idx);
+
+			// 같은 물체가 여러 클러스터로 갈라져도 가장 큰 조각을 대표로 삼고,
+			// 그 전후 primary_group_span_idx 안의 조각은 하나의 점유 폭으로 합친다.
+			const TriggerGeometry *representative = nullptr;
+			for (const auto &g : trigger_geometry)
+				if (std::abs(g.idx - foremost_idx) <= 10 &&
+					(!representative || g.area > representative->area))
+					representative = &g;
+			if (representative)
+			{
+				candidate_primary_idx = representative->idx;
+				candidate_primary_min_d = 1e18;
+				candidate_primary_max_d = -1e18;
+				candidate_half_len = 0.0;
+				// 근거리(GroundGrid) 관측이 하나라도 있으면 폭은 그것만으로 잰다.
+				// 원거리 제안은 최소치수 0.8 m·누적 번짐 때문에 통과쪽 끝을
+				// 0.15~0.35 m 크게 본다(16:04 두 백: 원거리 +1.40~1.51 / +1.48,
+				// 근거리 +1.01~1.15 / +1.32). 조기 판단용으로만 쓴다.
+				bool group_has_near = false;
+				for (const auto &g : trigger_geometry)
+					if (std::abs(g.idx - candidate_primary_idx) <= primary_group_span_idx_ && !g.far)
+						group_has_near = true;
+				candidate_from_near = group_has_near;
+                candidate_world_parent = representative->world_parent;
+				for (const auto &g : trigger_geometry)
+				{
+					if (std::abs(g.idx - candidate_primary_idx) > primary_group_span_idx_) continue;
+					if (group_has_near && g.far) continue;
+					candidate_primary_min_d = std::min(candidate_primary_min_d,
+						g.lateral - g.half_width);
+					candidate_primary_max_d = std::max(candidate_primary_max_d,
+						g.lateral + g.half_width);
+					candidate_half_len = std::max(candidate_half_len, g.half_length);
+				}
+				// 기준경로 위의 발(foot) 점. 물체 중심에서 횡거리만큼 되돌린 점이라
+				// 조각이 바뀌어도 거의 움직이지 않는다.
+				const double ry = nearestPathYaw(representative->wx, representative->wy);
+				candidate_base_x = representative->wx + representative->lateral * std::sin(ry);
+				candidate_base_y = representative->wy - representative->lateral * std::cos(ry);
+				candidate_base_yaw = ry;
+			}
+		}
+		if (candidate_primary_idx >= 0)
+		{
+			const bool first_primary = primary_obstacle_idx_ < 0;
+			const bool old_primary_passed = current_waypoint_idx_ >= 0 &&
+				current_waypoint_idx_ > primary_obstacle_idx_ + primary_release_behind_idx_;
+			const bool advanced_to_next = primary_obstacle_idx_ >= 0 &&
+				candidate_primary_idx > primary_obstacle_idx_ + primary_switch_min_idx_ &&
+				old_primary_passed;
+			if (first_primary || advanced_to_next)
+			{
+				if (advanced_to_next)
+				{
+					ROS_INFO("[obstacle_avoidance] primary obstacle advanced idx %d -> %d; "
+						"releasing previous side lock", primary_obstacle_idx_, candidate_primary_idx);
+					committed_avoid_side_ = 0;
+					pending_avoid_side_ = 0;
+					pending_avoid_side_scans_ = 0;
+					primary_changed_for_plan_ = true;
+				}
+				primary_obstacle_idx_ = candidate_primary_idx;
+				primary_obstacle_min_d_ = candidate_primary_min_d;
+				primary_obstacle_max_d_ = candidate_primary_max_d;
+				primary_env_half_len_ = candidate_half_len;
+				primary_env_from_near_ = candidate_from_near;
+				primary_base_x_ = candidate_base_x;
+				primary_base_y_ = candidate_base_y;
+				primary_base_yaw_ = candidate_base_yaw;
+			}
+			else if (std::abs(candidate_primary_idx - primary_obstacle_idx_) <= 15)
+			{
+				// ★ 같은 primary 인 동안 횡 점유폭을 줄이지 않는다(합집합 유지).
+				//   M2 장애물은 정지물이라, 한 번 관측된 부분은 그 뒤에 안 보여도
+				//   그 자리에 있다. 그런데 관측 소스가 바뀔 때마다 보고 폭이 줄었다.
+				//     실측 2026-09-23(16:04:23 백, idx 3260 물체):
+				//       31~15 m  원거리 제안   W 1.8~1.9  점유 [-0.44,+1.40]
+				//       13 m     병합기 dedup 으로 원거리 제안이 빠지고
+				//                근거리 조각 W 0.52 로 교체 -> 좌측 끝 +1.01~1.15
+				//     통과쪽(좌측) 끝이 0.25~0.40 m 줄자 플래너가 |d| 최소를
+				//     찾아 d_end 3.00 -> 2.50 으로 안쪽으로 들어왔다가, 다시
+				//     조각이 커지자 3.50 으로 나갔다. 이게 '크기가 보존이 안 되는
+				//     느낌' 과 근접 시 과회피의 한 원인이었다.
+				//   오래 안 갱신된(stale) 조각을 지우는 방식은 쓰지 않는다. 같은
+				//   백에서 통과쪽 실제 끝(16:04:54 id7)이 2.1 s 동안 갱신 없이
+				//   유지됐는데, 그걸 지우면 피해야 할 모서리가 사라진다.
+				primary_obstacle_idx_ = candidate_primary_idx;
+				if (candidate_world_parent || (candidate_from_near && !primary_env_from_near_))
+				{
+					// World parent already retains supported geometry. Do not latch a
+                    // one-frame expansion again in the planner; current fit remains checked.
+                    // Legacy far -> near handoff still replaces its rough envelope.
+					primary_obstacle_min_d_ = candidate_primary_min_d;
+					primary_obstacle_max_d_ = candidate_primary_max_d;
+					primary_env_half_len_ = candidate_half_len;
+					primary_env_from_near_ = true;
+				}
+				else if (candidate_from_near || !primary_env_from_near_)
+				{
+					primary_obstacle_min_d_ = std::min(primary_obstacle_min_d_, candidate_primary_min_d);
+					primary_obstacle_max_d_ = std::max(primary_obstacle_max_d_, candidate_primary_max_d);
+					primary_env_half_len_ = std::max(primary_env_half_len_, candidate_half_len);
+				}
+				// (근거리 envelope 가 선 뒤에 원거리 제안만 남은 프레임은 무시)
+			}
+
+			// 장애물 크기와 위치가 랜덤이어도 통과 가능한지를 직접 계산한다.
+			// 좌측 통과에 필요한 d는 장애물 좌측 끝 + 차량 충돌 반경,
+			// 우측 통과에 필요한 |d|는 차량 반경 - 장애물 우측이 아닌 좌측 끝이다.
+			double right_limit = tunnel_mode_
+				? (tunnel_limits_active_ ? tunnel_right_limit_ : 1.5) : max_road_width_right_;
+			double left_limit = oncomingBlocked()
+				? max_road_width_left_blocked_ : max_road_width_left_;
+			if (tunnel_mode_)
+				left_limit = std::min(left_limit,
+					tunnel_limits_active_ ? tunnel_left_limit_ : tunnel_max_road_width_left_);
+			// ★ 2026-09-28: 장애물 idx 한 점이 아니라 장애물까지 가는 구간 전체의
+			//   최소 한계로 판단한다. 17:10:31 백: 장애물 idx 3161(교차로 입구,
+			//   우측 개방 3.50)만 보고 우측(필요 1.75)을 골랐는데, 가는 길
+			//   idx 3010~3120 의 한계는 2.05~2.20 이었다. d=-2.00 경로가 연석
+			//   0.1~0.2 m 옆을 지나다 라이다 연석점에 막혀 영구 정지했다.
+			//   구간 최솟값(2.05)이면 여유 0.30 < side_slack_margin -> 좌측.
+			if (side_select_corridor_enabled_ && !tunnel_mode_ && primary_obstacle_idx_ >= 0)
+			{
+				const double idx_per_m = CURB_IDX_PER_M;
+				int from_idx = primary_obstacle_idx_ -
+					static_cast<int>(std::lround(side_select_lookback_m_ * idx_per_m));
+				if (current_waypoint_idx_ >= 0)
+					from_idx = std::max(from_idx, current_waypoint_idx_);
+				const int to_idx = primary_obstacle_idx_ +
+					static_cast<int>(std::lround(std::min(3.0, std::max(0.0, primary_env_half_len_)) * idx_per_m));
+				corridorRoadWidthLimits(from_idx, to_idx, right_limit, left_limit);
+			}
+			else
+				roadWidthLimitsForIdx(primary_obstacle_idx_, right_limit, left_limit);
+			const double left_required = std::max(0.0,
+				primary_obstacle_max_d_ + ROBOT_RADIUS);
+			const double right_required = std::max(0.0,
+				ROBOT_RADIUS - primary_obstacle_min_d_);
+			const bool left_feasible = left_required <= left_limit + 1e-6;
+			const bool right_feasible = right_required <= right_limit + 1e-6;
+			// ★ 여유(slack)까지 보고 방향을 정한다.
+			//   원거리 추정은 다가갈수록 커진다. 한계에 딱 붙은 쪽을 고르면
+			//   몇 m 뒤 그쪽이 불가능해지고, 방향 락 때문에 반대편으로도 못 가서
+			//   멈췄다(17:47:53: 31 m 에서 우측 필요 1.81 / 한계 2.15 로 우측
+			//   고정 -> 장애물 폭 추정이 커져 필요 2.41 -> 24 m 앞에서 영구 정지,
+			//   좌측은 2.67 / 5.50 로 충분했다).
+			//   그래서 한계보다 side_slack_margin 이상 안쪽인 쪽만 '여유 있음'으로
+			//   보고, 여유 있는 쪽이 있으면 그중 이동량이 작은 쪽을 고른다.
+			//   양쪽 다 여유가 없으면 예전 규칙(한계 안이면 가능)으로 돌아간다.
+			const bool left_slack = left_required <= left_limit - side_slack_margin_;
+			const bool right_slack = right_required <= right_limit - side_slack_margin_;
+			last_left_feasible_ = left_feasible;
+			last_right_feasible_ = right_feasible;
+			if (left_slack && right_slack)
+				preferred_avoid_side_ = right_required <= left_required ? -1 : 1;
+			else if (right_slack)
+				preferred_avoid_side_ = -1;
+			else if (left_slack)
+				preferred_avoid_side_ = 1;
+			else if (left_feasible && right_feasible)
+				preferred_avoid_side_ = right_required <= left_required ? -1 : 1;
+			else if (right_feasible)
+				preferred_avoid_side_ = -1;
+			else if (left_feasible)
+				preferred_avoid_side_ = 1;
+			else
+				preferred_avoid_side_ = 0;  // 양쪽 모두 불가능: 플래너가 실패시 정지 요청
+			ROS_INFO_THROTTLE(0.5,
+				"[obstacle_avoidance] primary idx=%d occupied_d=[%.2f,%.2f], "
+				"required right/left=%.2f/%.2f, limits=%.2f/%.2f -> prefer %s",
+				primary_obstacle_idx_, primary_obstacle_min_d_, primary_obstacle_max_d_,
+				right_required, left_required, right_limit, left_limit,
+				preferred_avoid_side_ < 0 ? "RIGHT" :
+				(preferred_avoid_side_ > 0 ? "LEFT" : "NONE"));
+		}
+		if (tunnel_mode_)
+		{
+			last_oncoming_observation_ = observation_stamp_;
+			std::set<int> current_frame_oncoming;
+			for (const auto &obs : obs_list)
+			{
+				if (!obs.isMember("position_ego") || obs["position_ego"].size() < 2 ||
+					obs.get("infrastructure_candidate", false).asBool()) continue;
+				const int id = obs.get("id", -1).asInt();
+				const double x = obs["position_ego"][0].asDouble();
+				const double y = obs["position_ego"][1].asDouble();
+				if (id < 0 || obs.get("observation_age", 1.0).asDouble() > 0.4) continue;
+				if (x < -1.5) continue; // 자차 측면/후방 통과
+				if (obs.get("motion_state", "unknown").asString() == "static") continue;
+				// 대향 차로 횡방향 유효 범위 (1.2m <= y <= 5.5m, 5.5m 초과는 좌측 터널 벽면)
+				if (x <= 0.0 || y < oncoming_min_lateral_m_ || y > 5.5) continue;
+				const bool valid = obs.get("velocity_valid", false).asBool();
+				double forward_velocity = 0.0;
+				if (valid && obs["velocity"].size() >= 2)
+					forward_velocity = std::cos(bot_yaw_)*obs["velocity"][0].asDouble() +
+						std::sin(bot_yaw_)*obs["velocity"][1].asDouble();
+				// Invalid velocity alone is not evidence of an oncoming vehicle;
+				// roadside/static clusters start that way too.  Require either a
+				// valid opposing longitudinal component or measured motion.
+				if ((valid && forward_velocity < -0.3) ||
+					obs.get("speed", 0.0).asDouble() > 1.5)
+				{
+					current_frame_oncoming.insert(id);
+					tunnel_oncoming_ids_.insert(id);
+					oncoming_id_last_seen_[id] = observation_stamp_;
+				}
+			}
+			// 더 이상 관측되지 않거나 통과한 오래된 ID 정리 (Stale ID 방지)
+			for (auto it = tunnel_oncoming_ids_.begin(); it != tunnel_oncoming_ids_.end(); )
+			{
+				int oid = *it;
+				if (current_frame_oncoming.find(oid) == current_frame_oncoming.end())
+				{
+					auto seen_it = oncoming_id_last_seen_.find(oid);
+					if (seen_it == oncoming_id_last_seen_.end() ||
+						(observation_stamp_ - seen_it->second).toSec() > 0.4)
+					{
+						it = tunnel_oncoming_ids_.erase(it);
+						if (seen_it != oncoming_id_last_seen_.end())
+							oncoming_id_last_seen_.erase(seen_it);
+						continue;
+					}
+				}
+				++it;
+			}
+		}
+		int n_total = obs_list.size();
+		int n_after_motion = 0, n_after_confirmed = 0, n_after_pos = 0, n_after_corridor = 0;
+		int n_trigger = 0;   // 이 중 트리거 코리도 안에 있는 개수
+		double nearest_trigger_forward = 1e18;
+		// primary obstacle 의 전방거리를 idx 로 되찾기 위한 임시 표.
+		std::map<int, double> trigger_forward_by_idx;
+		double max_length_this_cycle = 0.0;
+		// 다단 후보 전환점 재료 + 높은 물체 길이 가정 재료.
+		struct StageObs
+		{
+			double front, rear;      // 앞끝/뒤끝 전방거리(ego x)
+			double cx, cy;           // 중심(월드)
+			double fx, fy;           // 경로 진행 방향 단위벡터
+			double hl, hw, lat;      // 반길이/반폭/경로 횡위치
+			bool tall, trig, stage;  // 높은 물체 / 트리거 / 전환점 대상
+		};
+		std::vector<StageObs> stage_obs;
+		double newest_trigger_measurement = 0.0;
+
+		// 동적 미션 구간(코스 설계상 정적 장애물이 없음이 보장됨)에서는 회피 자체를
+		// 하지 않는다 - obstacle_stop_node가 이 구간의 모든 confirmed 장애물을
+		// motion_state 판정 없이 즉시 정지 처리하므로, 여기서 뭔가를 피하려고 조향을
+		// 섞으면 정지 이후 재출발 시 불필요하게 옆으로 밀려난 상태로 남을 수 있음.
+		bool in_dynamic_zone = current_waypoint_idx_ >= 0 &&
+			current_waypoint_idx_ > static_dynamic_split_idx_;
+		// 정적 미션 구간 이전. 회피 대상이 아직 없는 일반 주행 구간이므로
+		// 여기서는 회피도 감속도 걸지 않는다.
+		bool before_static_zone = current_waypoint_idx_ >= 0 &&
+			static_zone_min_idx_ >= 0 &&
+			current_waypoint_idx_ < static_zone_min_idx_ && !static_preview_;
+		// 정적 구간으로 확실히 확인된 경우(웨이포인트 인덱스로 판단됨)엔 코스
+		// 설계상 동적 장애물이 절대 없다고 보장되니까, motion_state가 노이즈로
+		// 잠깐 "dynamic"으로 오판되더라도(크고 가까운 물체일수록 위치 추정이
+		// 흔들려서 실제로 발생함 - 회피 도중 갑자기 회피 대상에서 빠져 위험했음)
+		// 무시하고 그냥 계속 회피 대상으로 취급한다. 아직 구간 판정이 안 된
+		// 상태(current_waypoint_idx_==-1, 폴백)에서만 안전하게 motion_state를 본다.
+		bool confirmed_static_zone = current_waypoint_idx_ >= 0 &&
+			current_waypoint_idx_ <= static_dynamic_split_idx_ &&
+			!before_static_zone;
+		pruneFrontLocks();
+		const bool m3_mode = m3AvoidMode() || (occ_recovery_ && inM3Zone());
+		if (m3_mode && dynStateFresh() && !restatic_ids_.empty() && !m3_avoid_latched_)
+		{
+			m3_avoid_latched_ = true;
+			ROS_WARN("[obstacle_avoidance] M3: stopped dynamic obstacle handed over as static -> avoid");
+		}
+		if (!(tunnel_mode_ || m3_mode || (!in_dynamic_zone && !before_static_zone)))
+			front_locks_.clear();
+		if (tunnel_mode_ || m3_mode || (!in_dynamic_zone && !before_static_zone))
+		{
+		for (const auto &obs : obs_list)
+		{
+			if (tunnel_mode_ && isTunnelWallPiece(obs)) continue;
+			// M3 에서는 정지 노드가 정적으로 넘긴 물체만 회피 대상(나머지는 정지 노드가 정지).
+			if (m3_mode && restatic_ids_.count(obs.get("id", -1).asInt()) == 0) continue;
+			// 터널 모드에서 동적 장애물은 obstacle_stop_node 가 즉시 정지를 전담하므로
+			// 회피 플래너의 정적 회피 목록에서는 배제
+			// ★ 2026-09-30 (12:09/12:07 백): 이 블록이 터널 여부와 상관없이 걸려
+			//   정적 구간(M2)에서도 dynamic 을 뺐다. 아래 confirmed_static_zone 예외
+			//   (정적 구간 확정이면 dynamic 오판이어도 계속 회피)에 도달하지 못했다.
+			//   높이 0.5 m 정적 장애물의 클러스터 중심이 20 m 부근에서 ~1 m 튀어
+			//   2~5 m/s dynamic 으로 오판 -> 13.5 m 에서 회피 대상에서 빠지고 정지,
+			//   2.7 m 앞에 선 뒤 회피 거리가 없어 끝까지 멈췄다.
+			//   터널/정적 구간 미확정일 때만 뺀다(원래 주석 의도대로).
+			// ★ 2026-09-30 (17:53 백): 터널에서 '동적' 판단은 obstacle_stop_node 를 따른다.
+			//   두 노드가 따로 판단해, 정지 노드가 동적 정지를 거는 동안 플래너는 같은
+			//   물체(속도가 줄어 unknown)를 정적 회피 대상으로 넣어 회피 경로를 만들었고,
+			//   정지가 풀리자 그 경로로 벽 쪽으로 틀었다. 또 정적 장애물이 옆에서 dyn
+			//   으로 튀면 여기서 '해결 불가'로 회피 실패를 냈다.
+			//     dynamic_ids -> 동적(정적 회피 대상 아님), static_ids(멈춘 동적) -> 정적,
+			//     그 밖은 트래커가 dynamic 이라 해도 정적(정지 노드가 원거리 정적 자리 +
+			//     실제 이동으로 걸러낸 결과).
+			const int obs_id = obs.get("id", -1).asInt();
+			const bool stop_node_says = (tunnel_mode_ || m3_mode) && dynStateFresh();
+			const bool treat_dynamic = stop_node_says
+				? (dyn_ids_.count(obs_id) > 0 && restatic_ids_.count(obs_id) == 0)
+				: ((tunnel_mode_ || !confirmed_static_zone) &&
+				   obs.isMember("motion_state") && obs["motion_state"].asString() == "dynamic");
+			if (treat_dynamic)
+			{
+				// 한 프레임 box wobble로 static 물체가 dynamic이 되어도
+				// 회피 실패/AEB를 만들지 않는다. 정지 노드와 같은 확정 근거를 쓴다.
+				const bool reliable_dynamic = stop_node_says || (
+					obs.get("dynamic_streak", 0).asInt() >= 2 &&
+					obs.get("speed", 0.0).asDouble() >= 0.8 &&
+					obs.get("observation_age", 9.0).asDouble() <= 1.0);
+				const int dynamic_id = obs.get("id", -1).asInt();
+				const bool is_oncoming = tunnel_oncoming_ids_.find(dynamic_id) !=
+					tunnel_oncoming_ids_.end();
+				// Perception's in_trigger_corridor is the union of the reference-path
+				// and ego-forward corridors.  In a tunnel an opposing-lane vehicle can
+				// therefore set that tag while remaining clear of our route.  It must
+				// constrain left-side avoidance, but must not publish avoidance_failed
+				// and indirectly request AEB.  Re-evaluate against the reference path.
+				if (tunnel_mode_ && reliable_dynamic && !is_oncoming &&
+					obs.isMember("position_world") && obs["position_world"].size() >= 2)
+				{
+					const double wx = obs["position_world"][0].asDouble();
+					const double wy = obs["position_world"][1].asDouble();
+					const double half_extent = 0.5 * std::max(
+						obs.get("length", 0.0).asDouble(),
+						obs.get("width", 0.0).asDouble());
+					const bool reference_path_conflict =
+						(distToPath(wx, wy) - half_extent) <= path_corridor_radius_;
+					if (reference_path_conflict)
+						tunnel_unresolved_ = true;
+				}
+				continue;
+			}
+			// 갓 확정된 장애물은 속도이력이 3프레임 쌓이기 전까지 "unknown"으로
+			// 유지되는데, 이 상태를 무시하면 화면엔 이미 confirmed(초록색)로
+			// 잡히는데도 회피 노드는 몇 프레임(수백ms) 늦게 반응하게 된다.
+			// dynamic만 확실히 걸러내고, unknown은 안전하게 static처럼 취급해서 바로 회피 대상에 포함한다.
+			if (!tunnel_mode_ && !m3_mode && !confirmed_static_zone && obs["motion_state"].asString() == "dynamic")
+				continue;
+			// obstacle_stop_node는 이미 지나친(passed) 장애물을 무시하는데 이 노드는
+			// 안 보고 있었음 -> 지나친 뒤에도 계속 회피 대상으로 남아서 절대 센터로
+			// 복귀를 못 했음(latest_ob_x_가 영원히 안 비게 됨).
+			if (obs.isMember("passed") && obs["passed"].asBool())
+				continue;
+			n_after_motion++;
+			// 감속(obstacle_stop_node의 speed_kick)보다 조향을 늦게 시작하도록
+			// 거리 게이트를 걸었었는데, 그러면 회피가 너무 늦게 시작돼서 오히려
+			// 위험함. 감속은 obstacle_stop_node가 독립적으로 처리하니까, 조향은
+			// 인지되는 즉시(거리 제한 없이) 바로 시작하는 게 맞음.
+			if (require_confirmed_ && !obs["confirmed"].asBool() &&
+                !(embedded_engine_ && obs.get("static_occupancy",false).asBool()))
+				continue;
+			n_after_confirmed++;
+			if (!obs.isMember("position_world") || obs["position_world"].size() < 2)
+				continue;
+			n_after_pos++;
+
+			// 방어적 저상 잔차 필터: ego 기준 z < -1.45m(지면 대비 25cm 이하)인 바닥 잔차는 회피 대상에서 배제
+			if (obs.isMember("position_ego") && obs["position_ego"].size() >= 3)
+			{
+				double ez = obs["position_ego"][2].asDouble();
+				const bool temporal_far =
+					obs.get("source", "").asString() == "raw_temporal_far";
+				if (ez < -1.45 && !tunnel_mode_ && !temporal_far &&
+                    !obs.get("static_occupancy", false).asBool())
+					continue;
+			}
+
+			double wx = obs["position_world"][0].asDouble();
+			double wy = obs["position_world"][1].asDouble();
+
+			double d2p = distToPath(wx, wy);
+			double ex = obs.isMember("position_ego") ? obs["position_ego"][0].asDouble() : -999;
+			int oid = obs.isMember("id") ? obs["id"].asInt() : -1;
+            if(obs.get("static_occupancy",false).asBool()) retained_occupancy_ids_.insert(oid);
+			// Opposing-lane tracks constrain the available left side below, but
+			// must not also be inserted as static collision geometry.  Doing both
+			// squeezed every candidate and produced clear_found=0.
+			if (tunnel_mode_ && tunnel_oncoming_ids_.find(oid) != tunnel_oncoming_ids_.end())
+				continue;
+			// 충돌 반경 밖이면 어떤 후보 경로도 거기로 안 가므로 완전히 버린다.
+			// 그 안이면 기하(ob_x/ob_y)는 만들고, 트리거 반경 안인지는 따로 센다.
+			bool pass_corridor = d2p <= collision_corridor_radius_;
+
+			// ★ 트리거 판정은 '물체 몸통 가장자리' 기준으로 통일한다.
+			//   d2p 는 중심까지의 거리라 그대로 쓰면 폭에 따라 판정이 흔들린다
+			//   (폭 1.0m 물체는 중심 1.75m 여도 가장자리는 1.25m 다).
+			//   회피가 필요한 실제 조건은 '가장자리 < robot_radius' 이므로
+			//   가장자리로 재야 물리적으로 일관된다.
+			//   인지(obstacle_perception)도 같은 양(lateral - half_extent)을
+			//   path_corridor_half_width 로 재서 in_trigger_corridor 태그를
+			//   달아 보낸다. 같은 기준이므로 태그가 있으면 그걸 그대로 쓴다
+			//   - 인지는 /final_waypoint 원본으로, 여기 rx_ 는 그걸 스플라인
+			//   재샘플한 것이라 미세하게 다른데, 둘을 AND 하면 결국 더 좁은
+			//   쪽만 남아서 한쪽 값이 죽은 파라미터가 된다.
+			double half_extent = 0.5 * std::max(
+				obs.get("length", 0.0).asDouble(),
+				obs.get("width", 0.0).asDouble());
+			{
+				int curb_idx = -1;
+				double curb_lat = 0.0;
+				if (!obs["footprint_world"].isArray() && obstaclePathLocation(wx, wy, curb_idx, curb_lat) &&
+					beyondRightCurb(curb_idx, curb_lat,
+						0.5 * std::min(std::max(obs.get("width", 0.35).asDouble(), 0.35), 2.6)))
+				{
+					ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] id=%d idx=%d lateral=%.2f beyond right curb line -> ignored",
+						oid, curb_idx, curb_lat);
+					continue;
+				}
+			}
+			bool in_trigger;
+			if (obs.isMember("in_trigger_corridor"))
+				in_trigger = obs["in_trigger_corridor"].asBool();
+			// ★ 30 m 밖 추정은 회피 대상으로 쓰지 않는다(충돌 검사용으로만 남긴다).
+			//   원거리 추정은 거리가 멀수록 흔들린다(09-23 16개 주행 분석):
+			//     - 30~40 m 저상물 안쪽 끝이 경로 쪽으로 0.67 m 번짐(중심을 덮은
+			//       것처럼 보임), 폭 0.98~2.50 로 흔들림
+			//     - 카고박스는 20~25 m 에서 폭 반토막·중심 0.8 m 이동
+			//   그 추정으로 회피를 시작하면 방향 선택·방향 고정·신호 정지 거리가
+			//   모두 틀린 값으로 정해진다. 물체 앞쪽 끝이 이 거리 안에 들어온 뒤
+			//   판단한다. 이미 회피 중이면 이 물체도 충돌 기하에는 들어간다.
+			if (in_trigger && ex - 0.5 * obs.get("length", 0.35).asDouble() > decision_range_m_)
+				in_trigger = false;
+			else
+				// 구버전 인지(태그 없음) 폴백. 같은 식으로 직접 계산한다.
+				// 여기 length/width 는 인지가 클램핑(0.35~2.2 / 0.35~1.5)한
+				// 값이라 인지의 np.ptp 원본과 미세하게 다를 수 있다. 태그가
+				// 오는 정상 경로에서는 이 분기를 안 타므로 영향은 없다.
+				in_trigger = (d2p - half_extent) <= path_corridor_radius_;
+			// A confirmed track starts as unknown until enough independent scans
+			// establish velocity.  M8 random static obstacles can pass the vehicle
+			// before ever reaching the explicit static state, so unknown must be a
+			// provisional static avoidance trigger.  Explicit dynamic tracks were
+			// already removed above and are handled by obstacle_stop_node.
+			// 쓰로틀(0.2s)이 여러 장애물(노이즈 클러스터 포함)의 로그를 한 줄로
+			// 공유해서, 진짜 타겟 물체가 실제로 더 일찍 corridor를 통과했어도
+			// 다른 장애물 로그에 밀려 기록이 안 남을 수 있었음. id별로 매 프레임
+			// 다 찍어서 진짜 최초 통과 시점을 정확히 본다.
+			// 매 사이클(10Hz) x 장애물마다 스로틀 없이 찍다 보니 CPU를 꽤 잡아먹고
+			// 있었음(이 노드가 100% CPU까지 쓰는 원인 중 하나) - 디버깅용으로 넣어둔
+			// 로그라 이제 스로틀 걸어서 부담 줄임.
+			ROS_INFO_THROTTLE(0.2, "[obstacle_avoidance] DEBUG corridor check: id=%d ego_x=%.1f dist_to_path=%.2f (limit=%.2f) %s",
+				oid, ex, d2p, path_corridor_radius_,
+				!pass_corridor ? "reject" : (in_trigger ? "PASS" : "collision_only"));
+			if (!pass_corridor)
+				continue;   // 회피 폭 밖 - 무시
+			n_after_corridor++;
+			if (in_trigger)
+			{
+				n_trigger++;
+				if (ex > 0.0) nearest_trigger_forward = std::min(nearest_trigger_forward, ex);
+				// ★ 속도캡 전용 거리. nearest_trigger_forward 는 '트리거 코리도
+				//   안의 가장 가까운 물체'라 회피 대상이 아닌 노견 구조물이
+				//   섞이면 그쪽으로 끌려간다.
+				//     실측 2026-09-22(17:19 백): 저상 장애물을 29.6m 에서
+				//     잡았는데 반대편 노견의 elev 2.07m 기둥(id6, y=-2.58)이
+				//     18.3m 에 있어서 캡이 즉시 6.8 -> 4.5 로 바닥을 쳤다.
+				//     차속 9.63 -> 4.31 m/s. 30m 검출의 이점을 전부 잃었다.
+				//   캡이 답해야 할 질문은 "회피를 끝낼 거리가 있는가"이고,
+				//   그건 primary obstacle 의 속성이다. 경로상 다른 물체와의
+				//   충돌은 Frenet 의 collision_fraction 이 따로 본다.
+				//   primary 는 아래에서 idx 로 정해지므로 여기서는 idx 별
+				//   전방거리만 모아 두고, 확정 후 조회한다.
+				int fwd_idx = -1;
+				double fwd_lat = 0.0;
+				if (ex > 0.0 && obstaclePathLocation(wx, wy, fwd_idx, fwd_lat))
+					trigger_forward_by_idx[fwd_idx] = ex;
+			}
+
+			double radius = obs.get("radius", 0.5).asDouble();
+			if (radius <= 0.0)
+				radius = 0.5;
+
+			// 지금까지는 장애물이 완전히 뒤로 넘어갈 때까지(passed) 계속 100%
+			// 회피 상태를 유지하다가, 넘어가는 순간 한번에 복귀로 전환해서 그때는
+			// 이미 많이 밀려나있어 복귀가 급해지는 문제가 있었음. 아직 완전히
+			// 안 지나쳤어도(전방에 남아있어도) "이미 옆(또는 살짝 뒤)까지 와서
+			// 충분히 떨어진 상태"면 더 이상 회피 대상으로 안 보고 조금 더 일찍
+			// 복귀를 시작한다. 전방으로 아직 많이 남아있을 때(멀리서 접근 중)는
+			// 장애물이 자차 후방으로 충분히 빠졌거나(-2.5m 이하), 또는
+			// 횡방향으로 자차 차폭+안전마진을 완전히 벗어난 경우에만 회피 대상에서 제외.
+			// 차체 옆(0 < ego_x < ROBOT_RADIUS)에 아직 물체가 있는데 섣불리 무시하면
+			// 복귀 조향 중 차체 측면/후미 충돌이 발생함.
+			if (obs.isMember("position_ego") && obs["position_ego"].size() >= 2)
+			{
+				double ego_x = obs["position_ego"][0].asDouble();
+				double ego_y = obs["position_ego"][1].asDouble();
+				if (ego_x < -2.5 && std::abs(ego_y) > ROBOT_RADIUS + radius)
+				{
+					if (in_trigger) --n_trigger;
+					continue;
+				}
+			}
+
+			// 장애물을 반지름 하나짜리 원으로 근사하면, 버스처럼 길쭉한 물체는
+			// (길이/폭 대각선 기준) 실제 폭보다 훨씬 큰 원이 되어서 필요 이상으로
+			// 많이 피하게 됨. 대신 실제 길이(진행방향)/폭(좌우) 직사각형을 도로
+			// 방향에 맞춰 배치해서, 회피에 진짜 필요한 만큼(폭 기준)만 피하게 한다.
+			double length = obs.get("length", 2.0 * radius).asDouble();  // 진행방향 전체 길이
+			double width = obs.get("width", 2.0 * radius).asDouble();    // 좌우 전체 폭
+			if (length <= 0.0) length = 2.0 * radius;
+			if (width <= 0.0) width = 2.0 * radius;
+			if (in_trigger)
+				newest_trigger_measurement = std::max(
+					newest_trigger_measurement,
+					obs.get("last_seen", 0.0).asDouble());
+
+			// 방어적 클램핑: 인지에서 비정상적인 크기(연석/인도 병합 등)가 유입되어도
+			// 회피 노드에서 장애물 경계가 차선을 가로막아 후보가 전량 충돌 기각(비상정지)되는 사태 방지
+			// ★ 상한이 실물보다 작으면 '장애물을 실제보다 좁게' 보고 그 위로
+			//   경로를 그린다. 실측 2026-09-09(15:11 주행): 카고박스 실제 폭
+			//   1.75m 가 인지/회피 양쪽 상한 1.5 에 걸려 1.50 으로 깎였고,
+			//   통과 시 장애물이 ego_y=+0.48m (차체 반폭 0.95 안쪽)로 들어와
+			//   차가 박았다. 물체가 클수록 더 많이 깎이므로 큰 장애물에서
+			//   가장 위험하다. 인지와 같은 값으로 올린다.
+			//   거대 클러스터(연석/벽 병합) 방어는 인지의 SVD 형상 필터가 맡는다.
+			width = std::max(width, 0.35);
+			length = std::max(length, 0.35);
+			radius = std::min(std::max(radius, 0.25), 2.0);
+			double hl = length / 2.0, hw = width / 2.0;
+			// 정면 폭 고정(applyFrontLock 주석). 옆에서 부푼 안쪽 끝을 정면 측정값으로 자른다.
+			if (ex > -900.0)
+			{
+				const bool far_src = obs.get("source", "").asString() == "raw_temporal_far";
+				if (!obs["footprint_world"].isArray() && !obs.get("static_occupancy", false).asBool() &&
+                    applyFrontLock(wx, wy, hw, ex, hl, far_src, true))
+					d2p = distToPath(wx, wy);
+			}
+
+			// 복귀 소요시간(return_ti_)을 물체 길이와 무관하게 항상 고정으로 쓰면,
+			// 버스처럼 긴 물체엔 자연스러워도 짧은 물체엔 "다 지나간 지 한참인데도
+			// 계속 옆에 붙어서 천천히 복귀"하는 것처럼 과하게 느껴짐. 지금 사이클에
+			// 실제로 회피 대상인 물체들 중 가장 긴 길이를 기록해서, 나중에 복귀
+			// 시작할 때(calc_direct 호출부) 그 길이에 비례해 복귀시간을 줄인다.
+			max_length_this_cycle = std::max(max_length_this_cycle, length);
+
+			ROS_INFO_THROTTLE(0.2,
+				"[obstacle_avoidance] DEBUG obstacle geom: id=%d radius=%.2f length=%.2f width=%.2f "
+				"(effective clearance needed = robot_radius(%.2f) + half_width(%.2f) = %.2f)",
+				oid, radius, length, width, ROBOT_RADIUS, hw, ROBOT_RADIUS + hw);
+
+			double yaw = nearestPathYaw(wx, wy);
+			double fx = std::cos(yaw), fy = std::sin(yaw);     // 진행방향 단위벡터
+			// 터널에서도 다단 후보(연속 장애물 S자)는 쓴다(tunnel_stage_candidates_enabled).
+			// 높은 물체 12 m 가정은 터널 벽 조각에 걸릴 수 있어 터널에서는 끈다.
+			if ((!tunnel_mode_ || tunnel_stage_candidates_enabled_) && ex > -900.0)
+			{
+				// 높은 물체: 인지 top_elevation(지면 기준 윗면 높이)과 폭으로 판단.
+				//   16:56 백: 카고박스 0.88~1.04 m / 버스 조각 1.95~2.64 m.
+				const double top = obs.get("top_elevation", 0.0).isNumeric()
+					? obs.get("top_elevation", 0.0).asDouble() : 0.0;
+				// 윗면 높이는 20~25 m 에서 프레임마다 흔들린다(16:56 백 버스 앞면
+				// id23: 1.64~2.25 m). 한 번 넘은 id 는 tall_latch_sec 동안 유지한다.
+				// 카고박스 윗면은 최대 1.04 m 라 걸리지 않는다.
+				bool tall_top = top >= tall_obstacle_min_top_m_;
+				if (tall_top)
+					tall_seen_[oid] = observation_stamp_;
+				else
+				{
+					auto it = tall_seen_.find(oid);
+					tall_top = it != tall_seen_.end() && oid >= 0 &&
+						(observation_stamp_ - it->second).toSec() <= tall_latch_sec_;
+				}
+				const bool tall = !tunnel_mode_ && tall_top && width >= tall_obstacle_min_width_m_;
+				const bool stage = (d2p - hw) <= stage_switch_corridor_m_;
+				if (tall || stage)
+				{
+					int o_idx = -1;
+					double o_lat = 0.0;
+					obstaclePathLocation(wx, wy, o_idx, o_lat);
+					stage_obs.push_back({ex - hl, ex + hl, wx, wy, fx, fy, hl, hw, o_lat,
+						tall, in_trigger, stage});
+				}
+			}
+			double lxv = -std::sin(yaw), lyv = std::cos(yaw);  // 좌측 단위벡터
+
+            const auto& poly=obs["footprint_world"];
+            if(poly.isArray() && poly.size()>=3) {
+                auto add=[&](double x,double y) {
+                    ob_x.push_back(x);ob_y.push_back(y);
+                    validation_points_by_id_[oid].first.push_back(x);validation_points_by_id_[oid].second.push_back(y);
+                    if(in_trigger){trigger_ob_x.push_back(x);trigger_ob_y.push_back(y);}
+                };
+                for(Json::ArrayIndex i=0;i<poly.size();++i) {
+                    const auto& a=poly[i];const auto& b=poly[(i+1)%poly.size()];
+                    const double ax=a[0].asDouble(),ay=a[1].asDouble(),dx=b[0].asDouble()-ax,dy=b[1].asDouble()-ay;
+                    const int steps=std::max(1,static_cast<int>(std::ceil(std::hypot(dx,dy)/.25)));
+                    for(int j=0;j<=steps;++j)add(ax+dx*j/steps,ay+dy*j/steps);
+                }
+                // Interior samples prevent a long/wide polygon from being crossed between edges.
+                for(double a=-hl;a<=hl;a+=.5) for(double b=-hw;b<=hw;b+=.5) {
+                    const double x=wx+a*fx+b*lxv,y=wy+a*fy+b*lyv;bool pos=false,neg=false;
+                    for(Json::ArrayIndex j=0;j<poly.size();++j) {
+                        const auto& q=poly[j];const auto& r=poly[(j+1)%poly.size()];
+                        double cr=(r[0].asDouble()-q[0].asDouble())*(y-q[1].asDouble())-
+                                  (r[1].asDouble()-q[1].asDouble())*(x-q[0].asDouble());
+                        pos=pos || cr>1e-8;neg=neg || cr< -1e-8;
+                    }
+                    if(!(pos && neg))add(x,y);
+                }
+            } else {
+			for (int k = 0; k < obstacle_boundary_samples_; ++k)
+			{
+				double t = 2.0 * M_PI * k / obstacle_boundary_samples_;
+				double cx = std::cos(t), cy = std::sin(t);
+				// 원 위의 방향(cx,cy)을 그대로 직사각형 경계까지 투영(반지름 스케일링)
+				double scale = 1.0 / std::max(std::abs(cx) / hl, std::abs(cy) / hw);
+				double local_f = cx * scale;
+				double local_l = cy * scale;
+				const double px = wx + local_f * fx + local_l * lxv;
+				const double py = wy + local_f * fy + local_l * lyv;
+				ob_x.push_back(px);
+				ob_y.push_back(py);
+				validation_points_by_id_[oid].first.push_back(px);
+				validation_points_by_id_[oid].second.push_back(py);
+				if (in_trigger) { trigger_ob_x.push_back(px); trigger_ob_y.push_back(py); }
+			}
+            }
+			ob_x.push_back(wx);
+			ob_y.push_back(wy);
+			validation_points_by_id_[oid].first.push_back(wx);
+			validation_points_by_id_[oid].second.push_back(wy);
+			if (in_trigger) { trigger_ob_x.push_back(wx); trigger_ob_y.push_back(wy); }
+		}
+		}  // !in_dynamic_zone && !before_static_zone
+
+		// 클러스터 파편화로 어느 한 프레임에서만 순간적으로 after_corridor=0이
+		// 되는 경우, 그걸 바로 "장애물이 없어졌다"로 보고 복귀 모드로 넘어가면
+		// 아직 옆을 다 못 지난 상태에서 중앙으로 확 꺾이다가 장애물에 부딪힘
+		// (복귀 오실의 원인). 최근에 실제로 봤으면(obstacle_hold_sec_ 이내)
+		// 이번 프레임이 비어있어도 마지막으로 확인된 장애물 목록을 유지한다.
+		// ★ 트리거 게이트.
+		//   ob_x 에는 충돌 코리도(6m) 안의 모든 물체 기하가 들어있다. 그걸
+		//   그대로 "회피 대상 있음"으로 쓰면, 옆 차로나 노견의 물체만 보여도
+		//   회피가 켜진다(트리거 코리도를 좁게 둔 목적이 사라진다).
+		//   그래서 회피 '시작'은 트리거 코리도 안에 물체가 있을 때만 한다.
+		//   이미 회피 중 트리거가 잠깐 사라지면 마지막 트리거 물체의
+		//   월드 기하만 hold한다. 주변 충돌 전용 물체가 보여도 그 물체로
+		//   회피 대상을 덮어쓰거나 hold 시계를 다시 시작하지 않는다.
+		const ros::Time now = ros::Time::now();
+		const bool avoiding_now = !latest_ob_x_.empty();
+		bool held_trigger_ahead = false;
+		double held_trigger_forward = 1e18;
+		const double cy = std::cos(bot_yaw_), sy = std::sin(bot_yaw_);
+		for (size_t i = 0; i < held_trigger_ob_x_.size(); ++i)
+		{
+			const double dx = held_trigger_ob_x_[i] - pose_x_;
+			const double dy = held_trigger_ob_y_[i] - pose_y_;
+			const double forward = cy * dx + sy * dy;
+			held_trigger_ahead |= forward > passed_release_margin_;
+			if (forward > 0.0) held_trigger_forward = std::min(held_trigger_forward, forward);
+		}
+		const bool keep_trigger = n_trigger == 0 && avoiding_now && held_trigger_ahead &&
+			!last_obstacle_seen_.isZero() &&
+			(now - last_obstacle_seen_).toSec() <= obstacle_hold_sec_;
+		if (keep_trigger)
+		{
+			ob_x.insert(ob_x.end(), held_trigger_ob_x_.begin(), held_trigger_ob_x_.end());
+			ob_y.insert(ob_y.end(), held_trigger_ob_y_.begin(), held_trigger_ob_y_.end());
+		}
+		if (!ob_x.empty() && (n_trigger > 0 || keep_trigger))
+		{
+			// primary 점유폭 합집합(envelope)의 양 끝을 충돌 기하에도 넣는다.
+			// 조각이 바뀌어 지금 목록에 작은 조각만 있어도, 플래너가 이미 본
+			// 모서리 안쪽으로 파고들지 못하게 한다(위 envelope 주석 참조).
+			if (primary_obstacle_idx_ >= 0 && primary_obstacle_max_d_ > primary_obstacle_min_d_)
+			{
+				const double fx = std::cos(primary_base_yaw_), fy = std::sin(primary_base_yaw_);
+				const double lx = -fy, ly = fx;
+				const double base_fwd = cy * (primary_base_x_ - pose_x_) +
+					sy * (primary_base_y_ - pose_y_);
+				const double hl = std::min(1.5, std::max(0.2, primary_env_half_len_));
+				if (base_fwd + hl > passed_release_margin_)
+				{
+					if (!tunnel_mode_ || tunnel_stage_candidates_enabled_)
+						stage_obs.push_back({base_fwd - hl, base_fwd + hl,
+							primary_base_x_, primary_base_y_, fx, fy, hl, 0.0,
+							0.5 * (primary_obstacle_min_d_ + primary_obstacle_max_d_),
+							false, n_trigger > 0, true});
+					for (double f : {-hl, 0.0, hl})
+						for (double dl : {primary_obstacle_min_d_, primary_obstacle_max_d_})
+						{
+							const double px = primary_base_x_ + f * fx + dl * lx;
+							const double py = primary_base_y_ + f * fy + dl * ly;
+							ob_x.push_back(px); ob_y.push_back(py);
+							if (n_trigger > 0) { trigger_ob_x.push_back(px); trigger_ob_y.push_back(py); }
+						}
+				}
+			}
+			if (n_trigger > 0 && !stage_obs.empty())
+			{
+				std::sort(stage_obs.begin(), stage_obs.end(),
+					[](const StageObs &a, const StageObs &b) { return a.front < b.front; });
+				const double L = tall_obstacle_assumed_length_m_;
+				// ★ 높은 물체(버스·트럭류) 길이 가정.
+				//   인지는 버스를 '앞면 조각(길이 0.35~0.6)' 과 옆면 조각 몇 개로 나눠
+				//   본다. 옆면은 가까이 가야(약 20 m) 보이므로 그 전까지 플래너는
+				//   버스를 3 m 짜리로 알고, 앞면 바로 뒤로 복귀하는 경로를 그렸다.
+				//     실측 2026-09-25(16:56 백): 버스 idx 3445~3565(약 12 m) 인데
+				//     70.1 s 계획의 복귀 시작이 idx 3478(버스 한가운데). 옆면 조각이
+				//     74.1 s 에 잡힌 뒤에야 복귀가 뒤로 밀렸다.
+				//   그래서 높은 물체는 경로 방향으로 묶어(앞끝이 묶음 앞끝 + L 안,
+				//   횡위치 2.5 m 안), 묶음의 맨 앞 물체만 앞끝부터 L 까지 늘려
+				//   충돌 기하(가장자리 점 1 m 간격)에 넣는다. 옆면 조각마다 늘리면
+				//   버스 끝 너머까지 과하게 붙잡는다.
+				std::vector<size_t> heads;
+				for (size_t i = 0; i < stage_obs.size(); ++i)
+				{
+					const StageObs &o = stage_obs[i];
+					if (!o.tall) continue;
+					bool covered = false;
+					for (size_t h : heads)
+					{
+						const StageObs &g = stage_obs[h];
+						if (o.front <= g.front + L && std::abs(o.lat - g.lat) < 2.5)
+						{ covered = true; break; }
+					}
+					if (covered) continue;
+					heads.push_back(i);
+					const double lx = -o.fy, ly = o.fx;
+					for (double f = o.hl + 1.0; f <= L - o.hl + 1e-6; f += 1.0)
+						for (double sgn : {-1.0, 1.0})
+						{
+							const double px = o.cx + f * o.fx + sgn * o.hw * lx;
+							const double py = o.cy + f * o.fy + sgn * o.hw * ly;
+							ob_x.push_back(px); ob_y.push_back(py);
+							if (o.trig) { trigger_ob_x.push_back(px); trigger_ob_y.push_back(py); }
+						}
+					max_length_this_cycle = std::max(max_length_this_cycle, L);
+				}
+				// 다단 후보 전환점: 앞뒤 간격이 stage_cluster_gap 이하인 물체는
+				// 한 묶음(사이로 S자를 그릴 거리가 없다)으로 보고 뒤끝만 남긴다.
+				// 높은 물체 묶음의 맨 앞 물체는 뒤끝을 앞끝 + L 로 본다.
+				struct Cluster { double rear, rwx, rwy; };
+				std::vector<Cluster> clusters;
+				for (size_t i = 0; i < stage_obs.size(); ++i)
+				{
+					const StageObs &o = stage_obs[i];
+					if (!o.stage) continue;
+					double rear = o.rear;
+					double rext = o.hl;   // 중심에서 뒤끝까지(진행방향)
+					if (std::find(heads.begin(), heads.end(), i) != heads.end() &&
+						o.front + L > rear)
+					{
+						rear = o.front + L;
+						rext = L - o.hl;
+					}
+					const double rwx = o.cx + rext * o.fx, rwy = o.cy + rext * o.fy;
+					if (!clusters.empty() && o.front <= clusters.back().rear + stage_cluster_gap_m_)
+					{
+						if (rear > clusters.back().rear)
+							clusters.back() = {rear, rwx, rwy};
+					}
+					else
+						clusters.push_back({rear, rwx, rwy});
+				}
+				stage_switch_pts_.clear();
+				for (const auto &c : clusters)
+					stage_switch_pts_.emplace_back(c.rwx, c.rwy);
+			}
+			latest_ob_x_ = ob_x;
+			latest_ob_y_ = ob_y;
+			if (n_trigger > 0)
+			{
+				held_trigger_ob_x_ = trigger_ob_x;
+				held_trigger_ob_y_ = trigger_ob_y;
+				if (newest_trigger_measurement > 0.0)
+				{
+					ros::Time measured;
+					measured.fromSec(newest_trigger_measurement);
+					if (measured > geometry_observation_stamp_)
+					{
+						geometry_observation_stamp_ = measured;
+						last_obstacle_seen_ = now;
+					}
+				}
+				else last_obstacle_seen_ = now;
+				last_obstacle_length_ = max_length_this_cycle;
+			}
+			if (nearest_trigger_forward < 1e17)
+				nearest_trigger_forward_m_ = nearest_trigger_forward;
+			else if (keep_trigger)
+				nearest_trigger_forward_m_ = held_trigger_forward;
+			// 속도캡용 primary 전방거리. primary idx 주변(그룹 span) 조각까지
+			// 같은 물체로 보고 그 중 가장 가까운 전방거리를 쓴다.
+			primary_forward_m_ = 1e18;
+			if (primary_obstacle_idx_ >= 0)
+			{
+				for (const auto &kv : trigger_forward_by_idx)
+					if (std::abs(kv.first - primary_obstacle_idx_) <= primary_group_span_idx_)
+						primary_forward_m_ = std::min(primary_forward_m_, kv.second);
+			}
+			if (keep_trigger && primary_forward_m_ >= 1e17)
+				primary_forward_m_ = held_trigger_forward;
+		}
+		else
+		{
+			// obstacle_hold_sec_(순간적 미검출 버티기 용도)가 길어지면서(버스처럼
+			// 큰 물체가 근접 시 잠깐 안 잡히는 경우를 버티려고 늘림), 반대로
+			// 장애물이 "진짜로" 다 지나갔는데도 그 마지막 world 위치를 계속
+			// 붙들고 있어서 복귀가 그만큼(최대 hold_sec) 불필요하게 늦어지는
+			// 부작용이 생겼음. 붙들고 있는 점들이 이미 차량 뒤쪽(ego 기준 x<0)으로
+			// 넘어갔으면 - 진짜로 지나쳤다는 뜻이므로 - hold_sec 안 지났어도
+			// 즉시 놓아준다. 아직 하나라도 앞쪽에 남아있으면(옆에 있는데 순간
+			// 미검출) 기존대로 hold_sec까지 유지.
+			// x < 0(완전히 뒤로 넘어감)까지 기다리면 그 남은 거리를 다 주행할
+			// 때까지 지연이 생김. 완전히 안 넘어가도 이 여유(m) 이내로
+			// 가까워졌으면 사실상 지나간 걸로 보고 더 일찍 놓아줘서 복귀 지연을 줄임.
+			bool still_ahead = false;
+			double cy = std::cos(bot_yaw_), sy = std::sin(bot_yaw_);
+			for (size_t i = 0; i < latest_ob_x_.size(); ++i)
+			{
+				double dx = latest_ob_x_[i] - pose_x_;
+				double dy = latest_ob_y_[i] - pose_y_;
+				double ego_x = cy * dx + sy * dy;
+				if (ego_x > passed_release_margin_)
+				{
+					still_ahead = true;
+					break;
+				}
+			}
+			if (!still_ahead ||
+				(ros::Time::now() - last_obstacle_seen_).toSec() > obstacle_hold_sec_)
+			{
+				// last_obstacle_length_는 여기서 리셋하지 않는다 - planLoop의 복귀
+				// 경로 계산(calc_direct)이 이 시점 이후에 이 값을 읽어서 복귀시간을
+				// 정하는데, 여기서 미리 0으로 지워버리면 물체 크기와 무관하게 항상
+				// 최소 복귀시간(min_return_ti_)으로 강제돼서 복귀가 너무 급격해지고,
+				// 차가 그 곡선을 다 못 따라가 덜 꺾인 채 차선을 밟는 문제가 생겼음.
+				// 복귀가 실제로 다 끝난(중앙 근접) 시점에만 planLoop에서 리셋한다.
+				latest_ob_x_.clear();
+				latest_ob_y_.clear();
+				held_trigger_ob_x_.clear();
+				held_trigger_ob_y_.clear();
+				stage_switch_pts_.clear();
+				primary_obstacle_idx_ = -1;
+				primary_env_half_len_ = 0.0;
+				primary_env_from_near_ = false;
+				primary_obstacle_min_d_ = 0.0;
+				primary_obstacle_max_d_ = 0.0;
+				nearest_trigger_forward_m_ = 1e18;
+				primary_forward_m_ = 1e18;
+				preferred_avoid_side_ = 0;
+				primary_changed_for_plan_ = false;
+			}
+		}
+
+		// 트리거/발행 로직은 updateSpeedKick()으로 옮김 (cameraDetectionCallback에서
+		// 즉시, planLoop에서 주기적으로 호출). 여기선 더 이상 안 부름 - 이 콜백은
+		// /obstacle_info 도착 주기에 묶이므로 여기서 부르면 카메라의 독립적인
+		// 조기 감속 반응이 그만큼 늦어진다.
+		(void)n_after_corridor;  // 디버그 로그용으로만 유지
+
+		ROS_INFO_THROTTLE(0.2,
+			"[obstacle_avoidance] DEBUG obstacles total=%d after_motion=%d after_confirmed=%d "
+			"after_pos=%d after_corridor=%d trigger=%d (split=%d, corridor trig/coll=%.2f/%.2f)",
+			n_total, n_after_motion, n_after_confirmed, n_after_pos, n_after_corridor,
+			n_trigger, has_split ? 1 : 0,
+			path_corridor_radius_, collision_corridor_radius_);
+	}
+
+	void resetAvoidanceFailureState()
+	{
+		avoidance_fail_count_ = 0;
+		last_failed_geometry_stamp_ = ros::Time(0);
+		avoidance_failure_start_ = ros::Time(0);
+	}
+
+	bool registerAvoidanceFailure()
+	{
+		const ros::Time now = ros::Time::now();
+		if (avoidance_failure_start_.isZero())
+			avoidance_failure_start_ = now;
+
+		// planLoop 호출 횟수가 아니라 라이다가 만든 독립 관측만 센다.
+		if (!geometry_observation_stamp_.isZero() &&
+			(last_failed_geometry_stamp_.isZero() ||
+			 geometry_observation_stamp_ > last_failed_geometry_stamp_))
+		{
+			++avoidance_fail_count_;
+			last_failed_geometry_stamp_ = geometry_observation_stamp_;
+		}
+
+		const bool lidar_stale =
+			(now - avoidance_failure_start_).toSec() >=
+			failure_no_observation_timeout_sec_;
+		return avoidance_fail_count_ >= max_avoidance_fail_observations_ ||
+			lidar_stale;
+	}
+
+	// 후보가 전멸했을 때 재발행하려는 '직전 경로'가 지금 기하로도 여전히
+	// 안전한지 확인한다.
+	//   실측 2026-09-21(18:19:40 백): 방벽이 20m 전부터 계속 보였는데
+	//   폭이 0.73 -> 1.71 m 로 커지는 동안 후보가 전멸했고, 노드는 낡은
+	//   경로를 1.1초간 그대로 재발행했다. 그 경로는 현재 기하 기준
+	//   여유가 0.75~1.02 m 뿐이라 ROBOT_RADIUS(1.35)를 위반했고 결국
+	//   24 km/h 로 충돌했다(감속도 -314 m/s^2). 같은 구조로 3주행 연속.
+	//   '경로가 없음'보다 '안전하지 않은 경로를 확신하며 발행함'이 위험하다.
+	// 반환 true = 재발행해도 되는 경로.
+	// 구간별 회피 폭 상한을 primary 장애물 idx 에 맞춰 적용한다.
+	// road_width_zones: [start, end, right, left] * N (평평한 1차원 배열).
+	// left 를 0 이하로 두면 그 구간에서 좌측은 기존값을 유지한다.
+	// ★ 우측 연석 구간에서, 구간 한계까지 나간 차체도 닿지 않는 곳에 있는
+	//   물체(= 연석/노견 구조물)면 true. 이런 물체는 충돌/트리거 목록에서 뺀다.
+	//   연석은 road_width_zones(한계 = 연석 - 차체반폭 0.95 - 0.15)가 막는다.
+	//   여기서 충돌반경 1.35 로 한 번 더 막으면 한계까지 못 쓰고, 차가 한계
+	//   근처에 있을 때 후보가 전부 막혀 정지했다(16:50:00 백 t=7.4~7.7).
+	//   또 차가 우측으로 나가면 인지의 '차량 진행방향 1.7 m' 규칙 때문에 연석이
+	//   트리거가 되고 primary 로 잡혔다(16:50:41 백: 버스 대신 우측 기둥/연석).
+	//   판정: 물체 안쪽 끝의 우측 거리 >= 구간 한계 + 차체반폭 + margin.
+	//   횡폭은 width/2 로 잰다(노드 경계점도 width=횡, length=종). 연석 조각은
+	//   도로를 따라 길어(length 0.5~1.0) max(L,W) 로 재면 안쪽 끝이 0.3 m
+	//   가까워져 필터를 빠져나갔다(16:50:00 리플레이 t=7.27, 여유 0.03 m).
+	//   개방 구간(우측 0.0)과 터널(zone idx 는 0.csv 기준)에서는 쓰지 않는다.
+    void publishBoundaryProfile() {
+        Json::Value root;root["stamp"]=ros::Time::now().toSec();
+        root["profile"]=Json::Value(Json::arrayValue);
+        for(double v:road_width_profile_)root["profile"].append(v);
+        root["divider_edges"]=divider_edges_;root["max_left"]=max_road_width_left_;
+        root["max_right"]=max_road_width_right_;
+        std_msgs::String out;out.data=Json::FastWriter().write(root);boundary_profile_pub_.publish(out);
+    }
+    void dividerBoundaryCallback(const std_msgs::String::ConstPtr& msg) {
+        Json::Value root;Json::Reader reader;if(!reader.parse(msg->data,root))return;
+        if(divider_base_profile_.empty())divider_base_profile_=road_width_profile_;
+        divider_stamp_=ros::Time::now();divider_edges_=root["edges"];
+        const auto& candidates=root["candidates"];
+        road_width_profile_=divider_base_profile_;
+        for(size_t k=0;k+2<road_width_profile_.size();k+=3){int idx=int(road_width_profile_[k]);
+            for(const auto& e:candidates)if(idx>=e[0].asInt()&&idx<=e[1].asInt())road_width_profile_[k+2]=-1.;
+            if(root.get("active",false).asBool())for(const auto& e:divider_edges_)
+                if(idx>=e[0].asInt()&&idx<=e[1].asInt())road_width_profile_[k+2]=std::max(.1,e[2].asDouble()-vehicle_half_width_-.1);
+        }
+        publishBoundaryProfile();
+    }
+    void clipDividerGeometry(Json::Value& root) const {
+        if(current_lane_number_!=0||divider_stamp_.isZero()||(ros::Time::now()-divider_stamp_).toSec()>1.)return;
+        for(const char* list:{"obstacles","collision_objects"})for(auto& o:root[list]){
+            const auto poly=o["footprint_world"];if(!poly.isArray()||poly.size()<3)continue;
+            int idx=-1;double lat=0;if(!o["position_world"].isArray()||
+                !obstaclePathLocation(o["position_world"][0].asDouble(),o["position_world"][1].asDouble(),idx,lat))continue;
+            double bound=-1;for(const auto& e:divider_edges_)if(idx>=e[0].asInt()&&idx<=e[1].asInt())bound=e[2].asDouble();
+            if(bound<=0)continue;
+            double yaw=nearestPathYaw(o["position_world"][0].asDouble(),o["position_world"][1].asDouble());
+            double nx=-std::sin(yaw),ny=std::cos(yaw);
+            double line=nx*o["position_world"][0].asDouble()+ny*o["position_world"][1].asDouble()-lat+bound;
+            Json::Value clipped(Json::arrayValue);
+            for(unsigned i=0;i<poly.size();++i){auto a=poly[i],b=poly[(i+1)%poly.size()];
+                double da=nx*a[0].asDouble()+ny*a[1].asDouble()-line,db=nx*b[0].asDouble()+ny*b[1].asDouble()-line;
+                if(da<=0)clipped.append(a);
+                if((da<=0)!=(db<=0)){double u=da/(da-db);Json::Value q(Json::arrayValue);
+                    q.append(a[0].asDouble()+u*(b[0].asDouble()-a[0].asDouble()));
+                    q.append(a[1].asDouble()+u*(b[1].asDouble()-a[1].asDouble()));clipped.append(q);}
+            }
+            if(clipped.size()<3){o["background_excluded"]=true;continue;}
+            o["footprint_world"]=clipped;o["planning_footprint_world"]=clipped;
+        }
+    }
+	bool beyondRightCurb(int idx, double lateral, double half_extent) const
+	{
+		if (!right_curb_skip_enabled_ || tunnel_mode_ || idx < 0 || lateral >= 0.0)
+			return false;
+		double right = 0.0, left = 0.0;
+		if (!road_width_at(road_width_profile_, road_width_zones_, idx, right, left))
+			return false;
+		// 0 이하 또는 기본 상한 이상 = 연석 없음(개방)
+		if (right <= 0.0 || right >= max_road_width_right_ - 1e-3)
+			return false;
+		const double inner = -lateral - half_extent;
+		return inner >= right + vehicle_half_width_ + right_curb_skip_margin_;
+	}
+
+	void roadWidthLimitsForIdx(int constraint_idx, double &right_limit,
+								 double &left_limit) const
+	{
+		if (constraint_idx < 0)
+			return;
+		double right = 0.0, left = 0.0;
+		if (!road_width_at(road_width_profile_, road_width_zones_, constraint_idx, right, left))
+			return;
+		if (right > 0.0)
+			right_limit = std::min(right_limit, right);
+		if (left > 0.0)
+			left_limit = std::min(left_limit, left);
+	}
+
+	// [from_idx, to_idx] 구간의 최소 한계(0.5 m 간격 + 끝점).
+	void corridorRoadWidthLimits(int from_idx, int to_idx, double &right_limit,
+								 double &left_limit) const
+	{
+		if (from_idx < 0 || to_idx < 0)
+			return;
+		if (to_idx < from_idx)
+			std::swap(from_idx, to_idx);
+		for (int i = from_idx;; i += 5)
+		{
+			const int k = std::min(i, to_idx);
+			roadWidthLimitsForIdx(k, right_limit, left_limit);
+			if (k >= to_idx)
+				break;
+		}
+	}
+
+	void applyIdxRoadWidth()
+	{
+		const int constraint_idx = primary_obstacle_idx_ >= 0
+			? primary_obstacle_idx_ : current_waypoint_idx_;
+		roadWidthLimitsForIdx(constraint_idx, MAX_ROAD_WIDTH_RIGHT,
+			MAX_ROAD_WIDTH_LEFT);
+		if (constraint_idx < 0)
+			return;
+		ROS_INFO_THROTTLE(1.0,
+			"[obstacle_avoidance] road width at obstacle idx %d (ego idx %d) -> right=%.2f left=%.2f",
+			constraint_idx, current_waypoint_idx_, MAX_ROAD_WIDTH_RIGHT, MAX_ROAD_WIDTH_LEFT);
+	}
+
+	// ★ 공간 회피경로의 초기 횡속도/횡가속을 직전 계획에서 이어받는다
+	//   (trajectory stitching, Apollo 계획기와 같은 방식).
+	//   calc_spatial 은 매 재계획을 현재 횡위치에서 새로 시작한다. 시작
+	//   기울기를 0 으로 두면 20 Hz 마다 '여기선 기준선과 평행'이 되어
+	//   횡이동이 쌓이지 않았다(16:04 백: 경로 시작 기울기 0.005~0.013,
+	//   실제 차량 0.10~0.15 m/m). 직전 계획의 s0 지점 값을 쓰면 계획이
+	//   끊기지 않고 이어진다.
+	//   차가 계획에서 stitch_max_offset_m_ 이상 벗어나 있으면 그 계획은
+	//   더 이상 현실이 아니므로, 헤딩 기반 측정값(v*sin(헤딩오차))으로
+	//   시작하고 횡가속은 0 으로 둔다.
+	//   출력은 시간 미분(d_dot, d_ddot)이다. calc_spatial 이 c_speed 로
+	//   나눠 공간 미분으로 되돌린다.
+	void stitchedLateralState(double s0, double c_speed, double c_d,
+		double measured_d_d, double &d_d_out, double &d_dd_out)
+	{
+		d_d_out = measured_d_d;
+		d_dd_out = 0.0;
+		const vecD ps = last_path_.get_s(), pd = last_path_.get_d();
+		const vecD pdd = last_path_.get_d_d(), pddd = last_path_.get_d_dd();
+		const vecD psd = last_path_.get_s_d();
+		const size_t n = std::min(std::min(ps.size(), pd.size()),
+			std::min(std::min(pdd.size(), pddd.size()), psd.size()));
+		if (n < 2 || s0 < ps.front() || s0 > ps[n - 1])
+			return;
+		size_t i = std::lower_bound(ps.begin(), ps.begin() + n, s0) - ps.begin();
+		if (i == 0) i = 1;
+		if (i >= n) i = n - 1;
+		const double f = (s0 - ps[i - 1]) / std::max(1e-6, ps[i] - ps[i - 1]);
+		auto lerp = [&](const vecD &a) { return a[i - 1] + f * (a[i] - a[i - 1]); };
+		if (std::abs(lerp(pd) - c_d) > stitch_max_offset_m_)
+			return;
+		const double vp = std::max(0.5, lerp(psd));
+		const double v = std::max(0.5, c_speed);
+		d_d_out = lerp(pdd) / vp * v;
+		d_dd_out = lerp(pddd) / (vp * vp) * v * v;
+	}
+
+	// 연석 검사용 복귀 모델을 채운다(frenet 의 CURB_RETURN_* 주석 참조).
+	// 복귀는 지금 회피 중인 트리거 장애물 중 '가장 먼' 것의 뒤끝을 base_link 가
+	// passed_release_margin 만큼 지난 뒤 시작한다 - 장애물이 줄지어 있으면
+	// 마지막 것을 지날 때까지 오프셋이 유지되기 때문이다(가까운 것 기준으로
+	// 자르면 17:19:35 백 C구간 안 장애물 4개 경우를 놓쳤다).
+	// 복귀 시간은 복귀 분기(calc_direct)와 같은 규칙: max(min_return_ti,
+	// return_ti*길이비, |d|*return_lat_time_scale), 상한 return_ti*1.2.
+	// held_trigger_ob_x_ 는 이번(또는 유지 중인) 트리거 물체 경계점 + envelope 점.
+	void setCurbReturnModel(double s0)
+	{
+		CURB_RETURN_START_S = -1.0;
+		if (held_trigger_ob_x_.empty())
+			return;
+		const double c = std::cos(bot_yaw_), s = std::sin(bot_yaw_);
+		double farthest = -1e18;
+		for (size_t i = 0; i < held_trigger_ob_x_.size(); ++i)
+			farthest = std::max(farthest, c * (held_trigger_ob_x_[i] - pose_x_) +
+				s * (held_trigger_ob_y_[i] - pose_y_));
+		if (farthest < 0.0)
+			return;
+		double length_ratio = last_obstacle_length_ / return_ti_ref_length_;
+		length_ratio = std::min(1.0, std::max(0.0, length_ratio));
+		CURB_RETURN_START_S = s0 + farthest - passed_release_margin_;
+		CURB_RETURN_T_MIN = std::max(min_return_ti_, return_ti_ * length_ratio);
+		CURB_RETURN_T_MAX = return_ti_ * 1.2;
+		CURB_RETURN_LAT_SCALE = return_lat_time_scale_;
+	}
+
+	struct PathValidation { double collision=1., curb=1., curvature=1e9; bool clear=false; };
+	PathValidation validateTunnelPath(FrenetPath path, double s0, const char* stage)
+	{
+		PathValidation result;
+		vecD xs=latest_ob_x_, ys=latest_ob_y_;
+		if (tunnel_mode_ && tunnel_wall_offset_valid_)
+			for (size_t i=0;i<xs.size();++i) {
+				xs[i]+=tunnel_lateral_offset_*std::sin(bot_yaw_);
+				ys[i]-=tunnel_lateral_offset_*std::cos(bot_yaw_);
+			}
+		const double saved_origin=CURB_S_ORIGIN, saved_right=MAX_ROAD_WIDTH_RIGHT, saved_left=MAX_ROAD_WIDTH_LEFT;
+		const int saved_idx=CURB_S0_IDX;
+		const double saved_return_start=CURB_RETURN_START_S, saved_return_min=CURB_RETURN_T_MIN;
+		const double saved_return_max=CURB_RETURN_T_MAX, saved_return_scale=CURB_RETURN_LAT_SCALE;
+		CURB_S_ORIGIN=s0; CURB_S0_IDX=current_waypoint_idx_;
+		applyIdxRoadWidth(); setCurbReturnModel(s0);
+		set_escape_context(xs,ys,pose_x_,pose_y_,bot_yaw_);
+		if (!path.get_x().empty()) {
+			result.collision=path.collision_fraction(xs,ys,ROBOT_RADIUS);
+			result.curb=path.curb_violation_fraction()+path.tunnel_body_violation_fraction();
+			result.curvature=path_max_curvature(path);
+			result.clear=result.collision<=1e-9 && result.curb<=1e-9 && result.curvature<=curvature_limit_;
+		}
+		clear_escape_context();
+		CURB_S_ORIGIN=saved_origin; CURB_S0_IDX=saved_idx;
+		MAX_ROAD_WIDTH_RIGHT=saved_right; MAX_ROAD_WIDTH_LEFT=saved_left;
+		CURB_RETURN_START_S=saved_return_start; CURB_RETURN_T_MIN=saved_return_min;
+		CURB_RETURN_T_MAX=saved_return_max; CURB_RETURN_LAT_SCALE=saved_return_scale;
+		Json::Value debug;
+		debug["stage"]=stage; debug["clear"]=result.clear;
+        debug["mission_mode"]=tunnel_mode_ ? "tunnel" : "static";
+        debug["primary_obstacle_idx"]=primary_obstacle_idx_;
+        debug["return_reason"]=latest_ob_x_.empty() ? "no_unpassed_occupancy" : "occupancy_active";
+        debug["candidate_rejection_reason"]=result.clear ? "none" :
+            (result.collision>1e-9 ? "collision" : result.curb>1e-9 ? "road_boundary" : "curvature");
+		debug["radius_m"]=ROBOT_RADIUS; debug["geometry_stamp"]=geometry_observation_stamp_.toSec();
+		debug["collision_fraction"]=result.collision; debug["curb_fraction"]=result.curb;
+		debug["max_curvature"]=result.curvature;
+		debug["collision_obstacle_ids"]=Json::Value(Json::arrayValue);
+		size_t attributed_points=0;
+		for(const auto& item:validation_points_by_id_) attributed_points+=item.second.first.size();
+		debug["attribution_complete"]=(attributed_points==xs.size());
+		debug["geometry_point_count"]=static_cast<Json::UInt64>(xs.size());
+        debug["first_collision_parent_id"]=-1;
+        debug["retained_occupancy_ids"]=Json::Value(Json::arrayValue);
+        for (int id : retained_occupancy_ids_) debug["retained_occupancy_ids"].append(id);
+		// Exact per-ID attribution uses the same footprint-point collision check.
+		if (result.collision>1e-9 && !path.get_x().empty())
+			for (const auto& item:validation_points_by_id_) {
+				vecD ox=item.second.first, oy=item.second.second;
+				if (tunnel_mode_ && tunnel_wall_offset_valid_)
+					for(size_t i=0;i<ox.size();++i){ox[i]+=tunnel_lateral_offset_*std::sin(bot_yaw_);oy[i]-=tunnel_lateral_offset_*std::cos(bot_yaw_);}
+				set_escape_context(ox,oy,pose_x_,pose_y_,bot_yaw_);
+				if(path.collision_fraction(ox,oy,ROBOT_RADIUS)>1e-9) {
+                    debug["collision_obstacle_ids"].append(item.first);
+                    if(debug["first_collision_parent_id"].asInt()<0) debug["first_collision_parent_id"]=item.first;
+                }
+				clear_escape_context();
+			}
+		std_msgs::String msg; Json::StreamWriterBuilder writer;writer["indentation"]="";
+		msg.data=Json::writeString(writer,debug);validation_debug_pub_.publish(msg);
+		return result;
+	}
+
+	bool lastPathStillClear()
+	{
+		if (last_path_.get_x().empty())
+			return false;
+        const vecD ps=last_path_.get_s(), px=last_path_.get_x(), py=last_path_.get_y();
+        if(ps.empty() || ps.size()!=px.size() || py.size()!=px.size()) return false;
+        size_t j=0;double best=1e18;
+        for(size_t i=0;i<px.size();++i){double d=std::hypot(px[i]-pose_x_,py[i]-pose_y_);if(d<best){best=d;j=i;}}
+        return validateTunnelPath(last_path_,ps[j],"previous").clear;
+	}
+
+	bool canContinueCommittedPass()
+	{
+		if (committed_avoid_side_ == 0 || last_path_.get_x().empty() ||
+			latest_ob_x_.empty())
+			return false;
+
+		const double c = std::cos(bot_yaw_);
+		const double s = std::sin(bot_yaw_);
+		double max_forward = -1.0e9;
+		for (size_t i = 0; i < latest_ob_x_.size(); ++i)
+		{
+			const double dx = latest_ob_x_[i] - pose_x_;
+			const double dy = latest_ob_y_[i] - pose_y_;
+			max_forward = std::max(max_forward, c * dx + s * dy);
+		}
+		return max_forward <= side_pass_continue_front_m_;
+	}
+
+	// ---------------- 계획 루프 ----------------
+    void publishEmbeddedPath(bool recovery){
+        occupancy_avoidance::Pose pose;pose.stamp=ros::Time::now().toSec();
+        pose.x=pose_x_;pose.y=pose_y_;pose.yaw=bot_yaw_;pose.speed=bot_speed_;
+        auto out=embedded_engine_->consume(pose,recovery,tunnel_mode_);
+        occ_recovery_=out.recovery;occ_returning_=out.result.returning;
+        occ_plan_id_=out.plan_id;occ_geometry_stamp_=out.geometry_stamp;
+        occ_speed_cap_=out.valid?out.result.speed_cap:0.;occ_state_stamp_=ros::Time::now();
+        Json::Value state;state["source"]="embedded_apollo";state["backend"]=avoidance_backend_;
+        state["stage"]="embedded_output";state["candidate_rejection_reason"]=out.valid?"none":out.rejection;
+        state["idx"]=current_waypoint_idx_;state["mission_mode"]=tunnel_mode_?"tunnel":recovery?"m3_static":"static";
+        state["valid"]=out.valid;state["reason"]=out.valid?out.result.reason:out.rejection;
+        state["plan_id"]=out.plan_id;state["geometry_stamp"]=out.geometry_stamp;
+        state["geometry_digest"]=Json::UInt64(out.geometry_digest);state["plan_stamp"]=out.plan_stamp;
+        state["stamp"]=pose.stamp;state["returning"]=out.result.returning;
+        state["motion_state"]=out.result.motion_state;state["trigger_count"]=out.result.trigger_count;
+        state["trigger_reason"]=out.result.trigger_reason;state["compute_ms"]=out.result.compute_ms;
+        state["speed_cap_mps"]=occ_speed_cap_;state["held"]=out.result.held;
+        std_msgs::String diagnostic;
+        if(!out.valid){diagnostic.data=Json::FastWriter().write(state);selection_pub_.publish(diagnostic);validation_debug_pub_.publish(diagnostic);publishAvoidanceFailed(true);std_msgs::Float64 cap;cap.data=0.;avoidance_speed_pub_.publish(cap);return;}
+        committed_avoid_side_=0;double largest=0.;
+        for(const auto& p:out.result.path){
+            const double yaw=nearestPathYaw(p.x,p.y);size_t near=0;double distance=1e100;
+            for(size_t i=0;i<rx_.size();++i){double d=std::hypot(p.x-rx_[i],p.y-ry_[i]);if(d<distance){distance=d;near=i;}}
+            double d=-(p.x-rx_[near])*std::sin(yaw)+(p.y-ry_[near])*std::cos(yaw);
+            if(std::abs(d)>std::abs(largest))largest=d;
+        }
+        committed_avoid_side_=std::abs(largest)>.3?(largest>0?1:-1):0;
+        resetAvoidanceFailureState();publishAvoidanceFailed(false);
+        // Preserve configured mission targets and the tunnel coverage guard. Geometry-dependent
+        // caps come from the same engine footprint as the path, never a second inflated legacy box.
+        std_msgs::Float64 cap;cap.data=out.result.speed_cap;
+        if(out.result.avoiding||out.result.returning)cap.data=std::min(cap.data,TARGET_SPEED);
+        if(tunnel_mode_&&!coverage_stamp_.isZero()&&(ros::Time::now()-coverage_stamp_).toSec()<=.5)
+            cap.data=std::min(cap.data,coverage_cap_);
+        state["engine_speed_cap_mps"]=out.result.speed_cap;state["speed_cap_mps"]=cap.data;
+        state["side"]=committed_avoid_side_;state["failure_distance_m"]=out.result.failure_distance;
+        diagnostic.data=Json::FastWriter().write(state);selection_pub_.publish(diagnostic);validation_debug_pub_.publish(diagnostic);
+        avoidance_speed_pub_.publish(cap);
+        local_path_pub_.publish(out.path);
+        embedded_engine_->published(out.plan_id); // acknowledge reverse only after final owner adoption
+    }
+	void planLoop(const ros::TimerEvent &)
+	{
+		// New engine owns both path and caps in M2/M8. Other missions keep the
+		// original pass-through, dynamic stop, highway blending and roundabout.
+		if (externalOccupancyOwnsPath()) return;
+		// duration 만료(speed_kick_active_ -> false)가 카메라 재감지 없이도 제때
+		// 반영되도록 10Hz로 주기적으로도 호출. (즉시 트리거는 cameraDetectionCallback)
+		updateSpeedKick();
+
+		if (!have_path_ || !have_odom_ || !csp_)
+			return;
+
+		double s0, c_speed, c_d, c_d_d, c_d_dd;
+		FrenetPath dummy;
+		int min_id = initial_conditions_new(*csp_, global_s_, rx_, ry_, rk_, ryaw_,
+								s0, c_speed, c_d, c_d_d, c_d_dd,
+								bot_yaw_, pose_x_, pose_y_, dummy, bot_speed_);
+
+		updateTunnelWallLimits(c_d);
+		publishTunnelZoneMarkers(s0, c_d);
+
+		double yaw_err = 0.0;
+		if (min_id >= 0 && min_id < static_cast<int>(ryaw_.size()))
+		{
+			yaw_err = bot_yaw_ - ryaw_[min_id];
+			while (yaw_err > M_PI) yaw_err -= 2.0 * M_PI;
+			while (yaw_err < -M_PI) yaw_err += 2.0 * M_PI;
+		}
+
+		std_msgs::Float64 frenet_d_msg;
+		frenet_d_msg.data = c_d;
+		frenet_d_pub_.publish(frenet_d_msg);
+
+		if (tunnel_wall_offset_valid_ && (ros::Time::now() - last_tunnel_offset_stamp_).toSec() > 0.5)
+		{
+			tunnel_lateral_offset_ *= 0.85;
+			if (std::abs(tunnel_lateral_offset_) < 0.01)
+			{
+				tunnel_lateral_offset_ = 0.0;
+				tunnel_wall_offset_valid_ = false;
+			}
+		}
+
+		// M2/M3(정적/동적 회피)는 0.csv 전용 미션이다. 고주로 차선(1/2/3.csv)에서는
+		// 회피 대상도 없고 SMPC가 속도를 전담하므로, 여기서 감속(TARGET_SPEED=6.0)이나
+		// 회피 경로 계산을 걸면 안 된다 - 걸리면 mpc_path_tracking이 min()으로 그대로
+		// 받아서 SMPC ACC 목표(최대 25.0)를 무시하고 6.0에 갇힌다. 다만 이 노드가
+		// use_avoidance:=true 방식에서 /local_path의 유일한 발행자이므로, 그냥 return
+		// 하면 고주로 차선에서 /local_path 자체가 끊겨 MPC가 옛 경로에 멈춘다 -
+		// 반드시 기준경로(새 CSV 중심선) 패스스루는 계속 내보낸다.
+		if (current_lane_number_ != 0 && !tunnel_mode_)
+		{
+			publishAvoidanceFailed(false);
+			publishAvoidanceSpeedLimit(false);
+			publishPassthroughPath(s0);
+			return;
+		}
+		// ★ 2026-09-30 동적 정지 중에는 회피 경로를 새로 만들지 않는다(정지 노드 hold).
+		//   정지가 풀리면(물체가 코리도를 벗어나거나, 멈춰서 정적으로 바뀌면) 그때의
+		//   물체 판단으로 새로 계획한다.
+		if (!inM3Zone())
+			m3_avoid_latched_ = false;
+		const bool m3_mode = m3AvoidMode() || (occ_recovery_ && inM3Zone());
+		if ((tunnel_mode_ || m3_mode) && dynStateFresh() && dyn_hold_)
+		{
+			latest_ob_x_.clear();
+			latest_ob_y_.clear();
+			last_obstacle_length_ = 0.0;
+			committed_avoid_side_ = 0;
+			pending_avoid_side_ = 0;
+			pending_avoid_side_scans_ = 0;
+			resetAvoidanceFailureState();
+			publishAvoidanceFailed(false);
+			ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] dynamic hold (obstacle_stop): no new avoidance");
+			publishPassthroughPath(s0);
+			return;
+		}
+		if (tunnel_mode_ && (tunnel_unresolved_ ||
+			(!observation_stamp_.isZero() && (ros::Time::now()-observation_stamp_).toSec() > 1.0)))
+		{
+			publishAvoidanceFailed(true);
+			return;
+		}
+
+		// 정적 회피 구간(M2: static_zone_min_idx_ ~ static_dynamic_split_idx_) 외의
+		// 구간(신호등 M1, 동적 장애물 M3, 신호등 M4, 회전교차로 M5 등)에서는 회피/감속을
+		// 절대 걸지 않는다. 코너 등에서 |c_d| > 0.3m 편차만 보고 회피 중(6.0m/s, 21.6km/h)으로
+		// 오인해 감속하는 현상을 원천 방지한다.
+		const bool outside_static_zone = (current_waypoint_idx_ >= 0) &&
+			((static_zone_min_idx_ >= 0 && current_waypoint_idx_ < static_zone_min_idx_) ||
+			 (static_dynamic_split_idx_ >= 0 && current_waypoint_idx_ > static_dynamic_split_idx_));
+		if (static_preview_ && !tunnel_mode_ && !m3_mode) {
+            publishAvoidanceFailed(false);publishAvoidanceSpeedLimit(false);publishPassthroughPath(s0);
+            if(!embedded_engine_)publishStaticPreview(s0,c_speed,c_d,c_d_d,c_d_dd);return;
+        }
+        if (outside_static_zone && !tunnel_mode_ && !m3_mode)
+		{
+			latest_ob_x_.clear();
+			latest_ob_y_.clear();
+			last_obstacle_length_ = 0.0;
+			committed_avoid_side_ = 0;
+			pending_avoid_side_ = 0;
+			pending_avoid_side_scans_ = 0;
+			resetAvoidanceFailureState();
+			publishAvoidanceFailed(false);
+			publishAvoidanceSpeedLimit(false);  // 평소 주행: 9999.0 m/s
+			publishPassthroughPath(s0);
+			return;
+		}
+
+		// 장애물이 없어졌다고 바로 기준경로(centerline)로 넘어가면, 아직 옆으로
+		// 밀려나 있는 차 입장에선 목표 경로가 순간적으로 뚝 끊겨서 MPC가 급하게
+		// 꺾어 복귀하게 됨(복귀 오실의 원인). 실제로 거의 중앙(|c_d| 작음)까지
+		// 돌아왔을 때만 패스스루로 전환하고, 그 전까지는 장애물 없이도 Frenet을
+		// 장애물이 없어졌다고 바로 기준경로(centerline)로 넘어가면, 아직 옆으로
+		// 밀려나 있는 차 입장에선 목표 경로가 순간적으로 뚝 끊겨서 MPC가 급하게
+		// 꺾어 복귀하게 됨(복귀 오실의 원인).
+		// 횡방향 편차(|c_d|)가 작을 뿐만 아니라, 차체 헤딩 오차(|yaw_err|)도 정렬되었을 때만
+		// 패스스루로 전환하고, 그 전까지는 Frenet 5차 다항식(d_dot=0 조건)이 끝까지 부드럽게 자세를 정렬하도록 한다.
+		const double kReturnToCenterThreshold = 0.3;  // m
+		const double kReturnHeadingThreshold = return_heading_threshold_deg_ * M_PI / 180.0;
+		const bool return_aligned = (std::abs(c_d) < kReturnToCenterThreshold) &&
+		                            (std::abs(yaw_err) < kReturnHeadingThreshold);
+		const bool return_dead_center = (std::abs(c_d) < 0.10);
+
+		// 신호+회피 안전 로직(trafficLightHold 주석 참조): 빨간불에 정지선 전이면
+		// 회피를 시작하지 않고 차선 중앙을 유지한다. 방향 락도 비워 초록불 뒤
+		// 그 시점 기하로 새로 정하게 한다.
+		{
+			double tl_cap = -1.0;
+			if (trafficLightHold(c_d, c_speed, tl_cap))
+			{
+				committed_avoid_side_ = 0;
+				pending_avoid_side_ = 0;
+				pending_avoid_side_scans_ = 0;
+				resetAvoidanceFailureState();
+				publishAvoidanceFailed(false);
+				if (tl_cap >= 0.0)
+				{
+					std_msgs::Float64 cap_msg;
+					cap_msg.data = tl_cap;
+                    if (tunnel_mode_ && (ros::Time::now()-coverage_stamp_).toSec()<=.5)
+                        cap_msg.data=std::min(cap_msg.data,coverage_cap_);
+					avoidance_speed_pub_.publish(cap_msg);
+				}
+				else
+					publishAvoidanceSpeedLimit(false);
+				publishPassthroughPath(s0);
+				return;
+			}
+		}
+
+        // All existing mission, dynamic, tunnel observation and signal guards above remain authoritative.
+        // Embedded mode never enters the legacy candidate/side/radius/fallback selection below.
+        if(embedded_engine_){publishEmbeddedPath(m3_mode);return;}
+        if(engine_primary_active_ && latest_ob_x_.empty() && std::abs(c_d)<=.2 && std::abs(yaw_err)<=3*M_PI/180.) {
+            if(engine_aligned_since_.isZero())engine_aligned_since_=ros::Time::now();
+            if((ros::Time::now()-engine_aligned_since_).toSec()>=.5 && !occ_returning_){
+                engine_primary_active_=false;engine_good_since_=engine_bad_since_=ros::Time();
+            }
+        } else engine_aligned_since_=ros::Time();
+        if(enginePrimaryOverride("primary_before_frenet")){
+            publishAvoidanceSpeedLimit(!latest_ob_x_.empty()||occ_returning_,c_d);
+            return;
+        }
+		if (latest_ob_x_.empty() && (return_aligned || return_dead_center))
+		{
+			m3_avoid_latched_ = false;    // M3 정적 전환 회피도 복귀까지 끝
+			last_obstacle_length_ = 0.0;  // 복귀 완전히 끝남 - 다음 물체를 위해 리셋
+			committed_avoid_side_ = 0;    // 회피 완전히 끝남 - 방향 락 리셋
+			pending_avoid_side_ = 0;
+			pending_avoid_side_scans_ = 0;
+			resetAvoidanceFailureState();
+			publishAvoidanceFailed(false);
+			publishAvoidanceSpeedLimit(false);  // 평소 주행: 속도 제한 없음
+			publishPassthroughPath(s0);
+			return;
+		}
+
+		// 회피 탐색이든 복귀든, 이 지점에 도달했으면 아직 "회피 중"이므로
+		// target_speed로 감속 요청. mpc_path_tracking이 min(ref_v, 이 값)으로 적용.
+		publishAvoidanceSpeedLimit(true, c_d);
+
+		FrenetPath path;
+		if (latest_ob_x_.empty())
+		{
+			// 장애물은 없는데 아직 옆으로 밀려나 있는 상태(|c_d| >= threshold).
+			// 회피용 짧은 시간범위(mint~maxt) 기반 비용 탐색을 쓰면 "제자리 유지"가
+			// 항상 이겨서 안 돌아오므로, 훨씬 긴 고정 시간으로 직접 부드러운
+			// 복귀 경로를 만든다 (비용 탐색 자체를 우회).
+			// 방금까지 피하던 물체의 길이에 비례해서 복귀시간을 줄이되,
+			// 횡방향 이탈량(|c_d|)이 클 때도 그에 비례하여 복귀시간을 확장한다.
+			// 3m 이상 크게 회피한 뒤 3초 만에 무리하게 파고드는(-13도 급다이브)
+			// 현상과 그 반동으로 인한 복귀 후 오실레이션을 원천 차단한다.
+			double length_ratio = last_obstacle_length_ / return_ti_ref_length_;
+			length_ratio = std::min(1.0, std::max(0.0, length_ratio));
+			double base_return_ti = return_ti_ * length_ratio;
+			double lat_return_ti = std::abs(c_d) * return_lat_time_scale_;
+			double effective_return_ti = std::max(min_return_ti_, std::max(base_return_ti, lat_return_ti));
+			effective_return_ti = std::min(return_ti_ * 1.2, effective_return_ti);
+
+			const double effective_c_d = (tunnel_mode_ && tunnel_wall_offset_valid_)
+				? (c_d - tunnel_lateral_offset_) : c_d;
+
+			// ★ 공간(거리) 복귀. 시간 기반 calc_direct 는 거의 정지한 상태에서
+			//   경로점 간격이 0 에 가까워져 곡률이 수십~100 으로 튄다.
+			//     리플레이 2026-09-25(09-23 17:46:27 백, v 0.02~0.12 m/s):
+			//     복귀 경로 곡률 98 -> 67 로 8.5 s 동안 전부 거부 -> 실패 발행.
+			//     실차였으면 정지 상태에서 출발을 못 하는 교착이다.
+			//   회피와 같은 횡가속/저크 한계의 공간 5차식(속도 하한 0.5, 최소
+			//   전환 길이)으로 복귀하면 속도와 무관하게 곡선 모양이 정해진다.
+			//   복귀 곡률도 회피 곡률 설정(spatial_max_lat_*)을 그대로 따른다.
+			//   return_ti 계열은 연석 검사용 가상 복귀 모델에만 쓰인다.
+			(void)effective_return_ti;
+			if (SPATIAL_AVOIDANCE_ENABLED)
+			{
+				double rt_d_d = c_d_d, rt_d_dd = c_d_dd;
+				stitchedLateralState(s0, c_speed, effective_c_d, c_d_d, rt_d_d, rt_d_dd);
+				Fplist fpl(c_speed, effective_c_d, rt_d_d, rt_d_dd, s0);
+				path = fpl.calc_spatial(0.0);
+			}
+			else
+			{
+				Fplist fpl(c_speed, effective_c_d, c_d_d, c_d_dd, s0);
+				path = fpl.calc_direct(0.0, effective_return_ti, TARGET_SPEED);
+			}
+			path.adding_global_path(*csp_);
+		}
+		else
+		{
+			// 회피 커밋 상태를 플래너에 넘긴다. 커밋 중이면 '이전보다 중앙에
+			// 가까운' 후보가 후보 목록에서 아예 빠져서, d=0 이 간헐적으로
+			// 살아나 회피량이 튀는 일이 없어진다(src_최적 local_planner 방식).
+			// 좌우 비대칭 회피 폭. 좌측은 중앙선을 넘는 방향이라, 대향 차량이
+			// 보이면 자기 차로 안으로만 피한다.
+			MAX_ROAD_WIDTH_LEFT = oncomingBlocked()
+				? max_road_width_left_blocked_ : max_road_width_left_;
+			// 터널 좌측 벽(자차 기준 약 5.5 m) 안쪽으로 제한(2026-09-26).
+			//   예전에는 대향차가 없으면 max_road_width_left(6.0)가 그대로 쓰였고,
+			//   인지 터널 충돌 코리도(5.5)가 벽을 안 올려 벽 너머 경로가 가능했다.
+			// ★ 2026-09-29: 벽이 보이면 벽 따라 만든 제한(tunnelLimitsCallback)을 쓴다.
+			if (tunnel_mode_)
+				MAX_ROAD_WIDTH_LEFT = std::min(MAX_ROAD_WIDTH_LEFT,
+					tunnel_limits_active_ ? tunnel_left_limit_ : tunnel_max_road_width_left_);
+			MAX_ROAD_WIDTH_RIGHT = tunnel_mode_
+				? (tunnel_limits_active_ ? tunnel_right_limit_ : 1.5) : max_road_width_right_;
+			// ★ 연석이 보이면 그쪽 상한을 연석 안쪽까지로 좁힌다.
+			//   고정값(우 3.5 / 좌 4.5)은 '1차선 옆이 연석' 구간과 '삼거리라
+			//   옆이 트인' 구간을 구분하지 못한다. 실측 2026-09-21(18:59:20
+			//   백): 연석이 경로 우측 2.42~2.48m 에 정상 검출됐는데도 폭
+			//   0.35 짜리 작은 원으로 모델링돼 플래너가 그 위로 경로를 그렸고,
+			//   차체 우측이 연석 안쪽 2.6m 까지 들어간 채 2.4초를 달렸다
+			//   (6주행 중 3회). 연석이 안 보이면 인지가 값을 안 보내므로
+			//   기존 고정값이 그대로 남아 삼거리에서는 넓게 쓸 수 있다.
+			// ★ 구간별 회피 폭 상한. csv idx 로 지정한다.
+			//   인지로 연석을 찾아 폭을 자동 산출하는 방식은 실주행에서
+			//   한 번도 발동하지 않았다(3주행 0/194, 0/160, 0/165 - 백
+			//   재생에서는 29~56 프레임 나왔는데 실차에서만 0이라
+			//   원인을 특정하지 못했다). 연석 위치는 코스가 고정이라
+			//   idx 로 주는 편이 확실하고 검증도 쉽다.
+			//   형식: [idx_start, idx_end, right_m, left_m] 의 반복.
+			//   겹치면 먼저 매칭된 구간을 쓴다. 해당 구간이 없으면
+			//   기존 고정값(max_road_width_right/left)을 그대로 쓴다.
+			applyIdxRoadWidth();
+			// 경로점별 연석 검사용. 끝점 di 범위 제한(MAX_ROAD_WIDTH_*)만으로는
+			// 개방 구간에서 시작해 제한 구간을 관통하는 경로를 못 막는다.
+			//   실측 2026-09-22(17:19:35): 자차 idx 3300(개방, 우측 3.5)에서
+			//   d=-3.50 경로를 냈는데 경로 범위가 idx 3308~3596 이었다.
+			//   끝점은 연석 구간(3365~3700) 한가운데다.
+			// 경로의 s 는 자차 위치(s0)를 지나는 전역 누적거리이고,
+			// CSV 는 0.1 m 간격이므로 idx = current_waypoint_idx_ + (s-s0)*10.
+			CURB_ZONES = road_width_zones_;
+			CURB_PROFILE = road_width_profile_;
+			CURB_S_ORIGIN = s0;
+			CURB_S0_IDX = current_waypoint_idx_;
+			CURB_CORRIDOR_CHECK = curb_corridor_check_enabled_ && !tunnel_mode_;
+			CURB_CLEARANCE_M = curb_clearance_m_;
+			TUNNEL_BODY_CHECK = tunnel_body_check_enabled_ && tunnel_mode_ && tunnel_limits_active_;
+			TUNNEL_CURB_RIGHT_D = tunnel_curb_right_d_;
+			TUNNEL_CURB_LEFT_D = tunnel_curb_left_d_;
+			TUNNEL_BODY_HALF_WIDTH = tunnel_body_half_width_;
+			TUNNEL_BODY_FRONT_M = tunnel_body_front_m_;
+			TUNNEL_BODY_REAR_M = tunnel_body_rear_m_;
+			TUNNEL_BODY_MARGIN = tunnel_body_margin_;
+			TUNNEL_BODY_RECOVER_M = tunnel_body_recover_m_;
+			CURB_OPEN_RIGHT = max_road_width_right_;
+			CURB_OPEN_LEFT = max_road_width_left_;
+			setCurbReturnModel(s0);
+			// ★ 다단 후보 전환점(frenet SPATIAL_SWITCH_S 주석 참조).
+			//   primary(방향 고정·선호 방향의 대상)를 이미 지나 그 전환점도
+			//   지났으면, 방향 고정과 선호는 '지나간 장애물' 기준이다. 그대로
+			//   두면 다음 장애물 반대편으로 가는 후보가 뒤집기 벌점을 받아,
+			//   다음 장애물 바깥까지 크게 도는 후보가 선택된다(15:49 백 +4.5).
+			//   primary 인계(primary_release_behind_idx)를 기다리지 않고 여기서 푼다.
+			int plan_preferred_side = preferred_avoid_side_;
+			SPATIAL_SWITCH_S.clear();
+			if (stage_candidates_enabled_ && (!tunnel_mode_ || tunnel_stage_candidates_enabled_))
+			{
+				const double cy = std::cos(bot_yaw_), sy = std::sin(bot_yaw_);
+				bool first_found = false;
+				for (const auto &p : stage_switch_pts_)
+				{
+					const double sw = cy * (p.first - pose_x_) + sy * (p.second - pose_y_) +
+						stage_switch_margin_m_;
+					if (sw > 1.0)
+					{
+						SPATIAL_SWITCH_S.push_back(s0 + sw);
+						if (!first_found)
+						{
+							first_found = true;
+							// 첫 전환점(= 첫 묶음)이 바뀌면 경로의 '첫 오프셋' 이
+							// 가리키는 장애물도 바뀐다. 직전 경로의 첫 오프셋과
+							// 비교하는 요동 제한·방향 뒤집기 검사를 이번 한 번 건너뛴다.
+							if (have_first_switch_ &&
+								std::hypot(p.first - first_switch_x_, p.second - first_switch_y_) > 1.5)
+							{
+								const double prev_fwd = cy * (first_switch_x_ - pose_x_) +
+									sy * (first_switch_y_ - pose_y_) + stage_switch_margin_m_;
+								if (prev_fwd <= 1.0)
+									primary_changed_for_plan_ = true;
+							}
+							have_first_switch_ = true;
+							first_switch_x_ = p.first;
+							first_switch_y_ = p.second;
+						}
+					}
+				}
+				if (!first_found)
+					have_first_switch_ = false;
+				if (primary_obstacle_idx_ >= 0)
+				{
+					const double base_fwd = cy * (primary_base_x_ - pose_x_) +
+						sy * (primary_base_y_ - pose_y_);
+					const double hl = std::min(1.5, std::max(0.2, primary_env_half_len_));
+					if (base_fwd + hl + stage_switch_margin_m_ <= 1.0)
+					{
+						if (committed_avoid_side_ != 0)
+							ROS_INFO("[obstacle_avoidance] passed primary idx %d (rear %.1fm behind); "
+								"releasing %s side lock for the next obstacle",
+								primary_obstacle_idx_, -(base_fwd + hl),
+								committed_avoid_side_ > 0 ? "LEFT" : "RIGHT");
+						committed_avoid_side_ = 0;
+						pending_avoid_side_ = 0;
+						pending_avoid_side_scans_ = 0;
+						plan_preferred_side = 0;
+					}
+				}
+			}
+			AVOID_LOCK_SIDE = committed_avoid_side_;
+			AVOID_PREV_OFFSET = last_path_.avoid_offset();
+			// 계획 유지 비용 기준(frenet SPATIAL_PLAN_CHANGE_COST). 첫 묶음이
+			// 바뀌었거나(primary 인계·통과) 직전 경로가 없으면 적용하지 않는다.
+			AVOID_PREV_SECOND = (primary_changed_for_plan_ || last_path_.get_x().empty() ||
+				last_path_.stage_d.empty())
+				? std::numeric_limits<double>::quiet_NaN() : last_path_.second_offset();
+			AVOID_INWARD_MARGIN = avoid_inward_margin_;
+			// 회피량 최소화: 충돌 안 나는 후보 중 가장 안쪽을 고르게 한다.
+			AVOID_EXCESS_COST = avoid_excess_cost_;
+			AVOID_SIDE_FLIP_COST = avoid_side_flip_cost_;
+			const double effective_c_d = (tunnel_mode_ && tunnel_wall_offset_valid_)
+				? (c_d - tunnel_lateral_offset_) : c_d;
+			vecD planning_ob_x = latest_ob_x_;
+			vecD planning_ob_y = latest_ob_y_;
+			if (tunnel_mode_ && tunnel_wall_offset_valid_ && !planning_ob_x.empty())
+			{
+				const double shift = tunnel_lateral_offset_;
+				for (size_t i = 0; i < planning_ob_x.size(); ++i)
+				{
+					planning_ob_x[i] += shift * std::sin(bot_yaw_);
+					planning_ob_y[i] -= shift * std::cos(bot_yaw_);
+				}
+			}
+			double sp_d_d = c_d_d, sp_d_dd = c_d_dd;
+			if (SPATIAL_AVOIDANCE_ENABLED)
+				stitchedLateralState(s0, c_speed, effective_c_d, c_d_d, sp_d_d, sp_d_dd);
+			path = frenet_optimal_planning(*csp_, s0, c_speed, effective_c_d, sp_d_d, sp_d_dd,
+											last_path_, pose_x_, pose_y_,
+											planning_ob_x, planning_ob_y, bot_yaw_,
+											committed_avoid_side_, plan_preferred_side,
+											avoid_side_preference_cost_);
+			// M8 search and final validation use the same normal safety radius.
+			if (path.get_x().empty() && tunnel_mode_)
+				ROS_WARN_THROTTLE(0.3, "[obstacle_avoidance] all blocked (side %d, c_d %.2f)",
+					committed_avoid_side_, effective_c_d);
+			SPATIAL_SWITCH_S.clear();
+			AVOID_PREV_SECOND = std::numeric_limits<double>::quiet_NaN();
+			AVOID_LOCK_SIDE = 0;   // 다른 경로(복귀 등)에는 영향 주지 않는다
+			MAX_ROAD_WIDTH_LEFT = 0.0;   // 0 = 대칭(MAX_ROAD_WIDTH) 로 복귀
+			MAX_ROAD_WIDTH_RIGHT = 0.0;
+			CURB_S0_IDX = -1;            // 다른 경로(복귀 등)에는 적용 안 함
+		}
+
+		if (path.get_x().empty())
+		{
+			validateTunnelPath(last_path_,s0,"search_no_candidate");
+			// 진단: 모든 후보가 막혔을 때 자차 기준 가장 가까운 충돌 점 5개.
+			{
+				std::vector<std::pair<double, std::pair<double, double>>> near_pts;
+				const double cyw = std::cos(bot_yaw_), syw = std::sin(bot_yaw_);
+				for (size_t i = 0; i < latest_ob_x_.size() && i < latest_ob_y_.size(); ++i)
+				{
+					const double dx = latest_ob_x_[i] - pose_x_, dy = latest_ob_y_[i] - pose_y_;
+					const double ex = cyw * dx + syw * dy, ey = -syw * dx + cyw * dy;
+					near_pts.push_back({std::hypot(ex, ey), {ex, ey}});
+				}
+				std::sort(near_pts.begin(), near_pts.end(),
+					[](const auto &a, const auto &b) { return a.first < b.first; });
+				std::ostringstream os;
+				for (size_t i = 0; i < near_pts.size() && i < 5; ++i)
+					os << " (" << std::fixed << std::setprecision(1) << near_pts[i].second.first
+					   << "," << near_pts[i].second.second << ")";
+				ROS_WARN_THROTTLE(0.5, "[obstacle_avoidance] blocked: %zu obstacle pts, nearest(ego x,y):%s",
+					latest_ob_x_.size(), os.str().c_str());
+			}
+			// 낡은 경로를 재발행하기 전에 반드시 현재 기하로 재검증한다.
+			if (canContinueCommittedPass() && lastPathStillClear())
+			{
+				resetAvoidanceFailureState();
+				publishAvoidanceFailed(false);
+				ROS_WARN_THROTTLE(0.5,
+					"[obstacle_avoidance] no new candidate beside obstacle; "
+					"continuing committed previous path");
+				publishLocalPath(last_path_);
+				return;
+			}
+			if (tryOccupancyFallback()) return;
+			const bool request_stop = registerAvoidanceFailure();
+			ROS_WARN_THROTTLE(0.3,
+				"[obstacle_avoidance] no collision-free path found "
+				"(independent lidar failures %d/%d) -> %s",
+				avoidance_fail_count_, max_avoidance_fail_observations_,
+				request_stop ? "requesting STOP" : "holding previous path");
+
+			if (request_stop)
+			{
+				publishAvoidanceFailed(true);
+				return;
+			}
+			// 1~2사이클 일시적 기각 시 직전 경로가 유효하면 유지하여 순간 급정지 방지.
+			// 단 '유효'는 현재 기하로도 충돌이 없다는 뜻이어야 한다. 검출 흔들림
+			// 때문에 잠깐 후보가 빈 경우만 이 완충이 의미가 있고, 장애물이
+			// 실제로 경로를 막은 경우에는 여기서 버텨봐야 충돌로 이어진다.
+			if (lastPathStillClear())
+			{
+				publishLocalPath(last_path_);
+				return;
+			}
+			ROS_WARN_THROTTLE(0.3,
+				"[obstacle_avoidance] previous path no longer clears current "
+				"obstacle geometry -> requesting STOP instead of reusing it");
+			publishAvoidanceFailed(true);
+			return;
+		}
+
+        if (!last_path_.get_x().empty() && !held_trigger_ob_x_.empty() &&
+            std::abs(last_path_.avoid_offset()) >= .35 &&
+            std::abs(path.avoid_offset()) + .25 < std::abs(last_path_.avoid_offset()) &&
+            path.avoid_offset()*last_path_.avoid_offset() >= 0.0 &&
+            !primary_changed_for_plan_) {
+            double farthest=-1e18;
+            for(size_t i=0;i<held_trigger_ob_x_.size();++i)
+                farthest=std::max(farthest,std::cos(bot_yaw_)*(held_trigger_ob_x_[i]-pose_x_)+
+                    std::sin(bot_yaw_)*(held_trigger_ob_y_[i]-pose_y_));
+            if(farthest > -3.1 && lastPathStillClear()) {
+                resetAvoidanceFailureState();publishAvoidanceFailed(false);
+                publishAvoidanceSpeedLimit(true,c_d,last_path_.avoid_offset(),&last_path_,s0,c_speed);
+                publishLocalPath(last_path_);return;
+            }
+        }
+		double max_c = 0.0;
+		max_c = path_max_curvature(path);
+
+		ROS_INFO_THROTTLE(0.3, "[obstacle_avoidance] DEBUG path found: d_avoid=%.2f d_end=%.2f stages=%zu max_curvature=%.3f",
+			path.avoid_offset(), path.get_d().empty() ? 0.0 : path.get_d().back(),
+			path.stage_d.size(), max_c);
+
+		if (max_c > curvature_limit_)
+		{
+			if (canContinueCommittedPass() && lastPathStillClear())
+			{
+				resetAvoidanceFailureState();
+				publishAvoidanceFailed(false);
+				publishLocalPath(last_path_);
+				return;
+			}
+			if (tryOccupancyFallback()) return;
+			const bool request_stop = registerAvoidanceFailure();
+			ROS_WARN_THROTTLE(0.5,
+				"[obstacle_avoidance] rejected path: curvature %.2f > limit %.2f "
+				"(independent lidar failures %d/%d), keeping previous path",
+				max_c, curvature_limit_, avoidance_fail_count_,
+				max_avoidance_fail_observations_);
+			if (request_stop)
+			{
+				publishAvoidanceFailed(true);
+				return;
+			}
+			if (!last_path_.get_x().empty() && lastPathStillClear())
+			{
+				publishLocalPath(last_path_);
+				return;
+			}
+			publishAvoidanceFailed(true);
+			return;
+		}
+
+		const FrenetPath original_candidate = path;
+		// 매 사이클 새로 비용 탐색을 하다보니(회피 탐색 중일 때) 장애물 위치
+		// 추정이 조금만 흔들려도 목표 d가 프레임 간 크게 튈 수 있음.
+		// 이건 회피 탐색(latest_ob_x_가 비어있지 않을 때)에만 적용한다 - 복귀
+		// 경로(calc_direct)는 이미 실제 차량의 현재 상태(c_d)에서 시작하는
+		// 별도 길이(3.5s)의 부드러운 곡선이라, 회피 탐색(2.0s)의 종점 d와
+		// 직접 비교하면 길이가 다른 경로끼리 비교하는 셈이라 항상 "많이 튄
+		// 것"으로 오판돼서 복귀 경로가 영원히 거부되는 버그가 있었음
+		// (그 결과 마지막 회피 경로에 계속 붙잡혀서 최대조향이 안 풀림).
+		if (!latest_ob_x_.empty() && !primary_changed_for_plan_)
+		{
+			// 다단 후보는 첫 장애물 옆 오프셋으로 비교한다(끝점은 복귀/전환 뒤 값).
+			double last_d = last_path_.avoid_offset();
+			double new_d = path.avoid_offset();
+
+			// 회피 방향이 확정되어 있을 경우, 반대 방향으로 튀는 경로를 엄격히 차단 (좌우 뒤집힘 방지)
+			// ★ 단, 고정한 쪽이 이제 물리적으로 불가능해졌고(필요 이동량 > 구간 한계)
+			//   장애물이 아직 충분히 멀면 반대편으로 바꾼다. 새 경로는 플래너가
+			//   충돌·연석 검사를 통과시킨 것만 온다.
+			//     실측 2026-09-23(17:47:53): 우측 고정 뒤 장애물 폭 추정이 커져
+			//     우측 필요 2.41 > 한계 2.15 가 됐는데, 좌측 +2.85 경로(충돌 0,
+			//     연석 0)를 계속 거부해 장애물 24 m 앞에서 영구 정지했다.
+			//   가까우면(side_switch_min_forward_m 미만) 예전처럼 거부한다 -
+			//   장애물 바로 앞에서 반대편으로 꺾는 건 위험하다.
+			bool side_switched = false;
+			// ★ 2026-09-28: 고정한 쪽 후보가 전부 막혀 플래너가 반대편 비상경로를
+			//   냈고, 차가 아직 기준선 근처(|c_d| 작음)면 그쪽으로 바꾼다.
+			//   17:10:31 백: 우측 고정 -> 출발 직후 연석점에 우측 전부 막힘,
+			//   좌측 +3.50 경로(충돌 0, 연석 0)를 계속 거부해 영구 정지했다
+			//   (자차 d=-0.22, 장애물 17 m 앞). 한 프레임 잡음으로 뒤집히지
+			//   않게 side_switch_blocked_cycles 연속일 때만.
+			const bool blocked_now = LAST_PLAN_OPPOSITE_FALLBACK &&
+				committed_avoid_side_ != 0 && committed_avoid_side_ * new_d < -0.15;
+			side_blocked_streak_ = blocked_now ? side_blocked_streak_ + 1 : 0;
+			if (committed_avoid_side_ != 0 && committed_avoid_side_ * new_d < -0.15)
+			{
+				const bool committed_infeasible = committed_avoid_side_ < 0
+					? !last_right_feasible_ : !last_left_feasible_;
+				const bool committed_blocked = side_switch_on_blocked_enabled_ &&
+					side_blocked_streak_ >= side_switch_blocked_cycles_ &&
+					std::abs(c_d) < side_switch_max_ego_offset_m_;
+				const double fwd = primary_forward_m_ < 1e17
+					? primary_forward_m_ : nearest_trigger_forward_m_;
+				if ((committed_infeasible || committed_blocked) &&
+					fwd < 1e17 && fwd >= side_switch_min_forward_m_)
+				{
+					ROS_WARN("[obstacle_avoidance] committed %s side is %s "
+						"(obstacle %.1f m ahead, c_d=%.2f) -> switching to %s (new_d=%.2f)",
+						committed_avoid_side_ > 0 ? "LEFT" : "RIGHT",
+						committed_infeasible ? "no longer feasible" : "blocked",
+						fwd, c_d, new_d > 0.0 ? "LEFT" : "RIGHT", new_d);
+					side_blocked_streak_ = 0;
+					committed_avoid_side_ = new_d > 0.0 ? 1 : -1;
+					pending_avoid_side_ = 0;
+					pending_avoid_side_scans_ = 0;
+					side_switched = true;
+				}
+			}
+			if (!side_switched && committed_avoid_side_ != 0 && committed_avoid_side_ * new_d < -0.15)
+			{
+				ROS_WARN_THROTTLE(0.5,
+					"[obstacle_avoidance] rejected side flip from committed %s to new_d=%.2f, last_d=%.2f",
+					committed_avoid_side_ > 0 ? "LEFT" : "RIGHT", new_d, last_d);
+				if (lastPathStillClear())
+				{
+					publishAvoidanceFailed(false);
+					publishLocalPath(last_path_);
+					return;
+				}
+				if (tryOccupancyFallback()) return;
+				registerAvoidanceFailure();
+				publishAvoidanceFailed(true);
+				return;
+			}
+
+			bool moving_toward_center = std::abs(new_d) < std::abs(last_d);
+
+			double clamp_step = 0.0;
+			bool need_clamp = false;
+			if (moving_toward_center && std::abs(new_d - last_d) > max_d_step_per_cycle_)
+			{
+				need_clamp = true;
+				clamp_step = max_d_step_per_cycle_;
+				ROS_WARN_THROTTLE(0.5,
+					"[obstacle_avoidance] d jump %.2f -> %.2f exceeds max_d_step_per_cycle=%.2f, clamping instead of freezing",
+					last_d, new_d, max_d_step_per_cycle_);
+			}
+			// 회피(멀어지는) 방향은 원래 위험 반응 늦추지 않으려고 제한이 없었는데,
+			// 이미 어느 정도 피하고 있는 상태(|last_d|가 어느 정도 있음)에서 장애물
+			// 크기 재추정(max-hold)이나 위치 노이즈 때문에 매 사이클 조금씩 더
+			// 필요하다고 판단해서 계속 야금야금 더 꺾여나가는 문제가 있었음.
+			// 최초 반응(작은 |last_d|에서 시작)은 그대로 즉시 허용하되, 이미 어느
+			// 정도 피하고 있는 중이면 한 사이클에 너무 크게 더 밀려나가는 것만 제한.
+			else if (!moving_toward_center && std::abs(last_d) > 0.3 &&
+				std::abs(new_d - last_d) > max_d_step_outward_per_cycle_)
+			{
+				need_clamp = true;
+				clamp_step = max_d_step_outward_per_cycle_;
+				ROS_WARN_THROTTLE(0.5,
+					"[obstacle_avoidance] outward d jump %.2f -> %.2f exceeds max_d_step_outward_per_cycle=%.2f, clamping instead of freezing",
+					last_d, new_d, max_d_step_outward_per_cycle_);
+			}
+
+			if (side_switched)
+				need_clamp = false;   // 방향 전환은 한 번에 받는다(아래 clamp 는 같은 쪽 요동용)
+			if (need_clamp)
+			{
+				// 예전엔 여기서 그냥 거부하고 이전 경로를 유지했는데, last_path_가
+				// 갱신 안 되니까 다음 사이클에도 똑같은 "옛날 기준" 대비 초과로
+				// 계속 거부되면서 d가 영원히 그 자리에 멈춰버리는 버그가 있었음
+				// (필요한 회피 여유가 계속 커지는 상황에서 못 따라가 결국 충돌).
+				// 거부 대신 허용된 만큼만 이동시켜서, 느리더라도 매 사이클 확실히
+				// 목표에 가까워지도록(clamp) 한다.
+				double clamped_d = last_d + (new_d > last_d ? clamp_step : -clamp_step);
+				// 만약 committed_avoid_side_가 걸려있다면 clamped_d가 장애물 중앙(d=0)으로 침범하지 못하게 방어
+				if (committed_avoid_side_ < 0 && clamped_d > -0.2) clamped_d = -0.2;
+				if (committed_avoid_side_ > 0 && clamped_d < 0.2) clamped_d = 0.2;
+				double cl_d_d = c_d_d, cl_d_dd = c_d_dd;
+				if (SPATIAL_AVOIDANCE_ENABLED)
+					stitchedLateralState(s0, c_speed, c_d, c_d_d, cl_d_d, cl_d_dd);
+				Fplist fpl(c_speed, c_d, cl_d_d, cl_d_dd, s0);
+				// 다단 후보는 첫 오프셋만 바꾸고 전환 구성은 유지한다.
+				FrenetPath clamped_path;
+				if (SPATIAL_AVOIDANCE_ENABLED && path.multi_stage())
+				{
+					std::vector<double> targets = path.stage_d;
+					targets[0] = clamped_d;
+					clamped_path = fpl.calc_spatial_stages(targets, path.stage_s);
+				}
+				else
+					clamped_path = SPATIAL_AVOIDANCE_ENABLED
+						? fpl.calc_spatial(clamped_d)
+						: fpl.calc_direct(clamped_d, MINT, TARGET_SPEED);
+				clamped_path.adding_global_path(*csp_);
+				CURB_S_ORIGIN = s0;
+				CURB_S0_IDX = current_waypoint_idx_;
+				setCurbReturnModel(s0);
+				const double clamp_curb = clamped_path.curb_violation_fraction() +
+					clamped_path.tunnel_body_violation_fraction();
+				CURB_S0_IDX = -1;
+				vecD clamp_ob_x = latest_ob_x_, clamp_ob_y = latest_ob_y_;
+				if (tunnel_mode_ && tunnel_wall_offset_valid_)
+					for (size_t i = 0; i < clamp_ob_x.size(); ++i)
+					{
+						clamp_ob_x[i] += tunnel_lateral_offset_ * std::sin(bot_yaw_);
+						clamp_ob_y[i] -= tunnel_lateral_offset_ * std::cos(bot_yaw_);
+					}
+				set_escape_context(clamp_ob_x, clamp_ob_y, pose_x_, pose_y_, bot_yaw_);
+				const double clamp_collision = clamped_path.collision_fraction(
+					clamp_ob_x, clamp_ob_y, ROBOT_RADIUS);
+				clear_escape_context();
+				double clamp_curvature = 0.0;
+				clamp_curvature = path_max_curvature(clamped_path);
+				const bool clamp_clear = tunnel_mode_
+					? validateTunnelPath(clamped_path,s0,"clamp").clear
+					: (!clamped_path.get_x().empty() && clamp_collision <= 1e-9 &&
+					   clamp_curb <= 1e-9 && clamp_curvature <= curvature_limit_);
+				if (clamp_clear)
+					path = clamped_path;
+				else
+					ROS_WARN_THROTTLE(0.5,
+						"[obstacle_avoidance] clamped path unsafe (collision=%.3f curb=%.3f curvature=%.3f); using feasible original",
+						clamp_collision, clamp_curb, clamp_curvature);
+			}
+		}
+
+		// The post-processing path is the one the controller actually follows.
+		if (!validateTunnelPath(path,s0,"postprocess").clear)
+		{
+			if (validateTunnelPath(original_candidate,s0,"original").clear)
+				path=original_candidate;
+			else if (lastPathStillClear()) {
+				resetAvoidanceFailureState();publishAvoidanceFailed(false);
+				publishLocalPath(last_path_);return;
+			} else {
+				if (tryOccupancyFallback()) return;
+				registerAvoidanceFailure();publishAvoidanceFailed(true);return;
+			}
+		}
+		// Recheck it after clamping, since clamping can invalidate collision,
+		// curb or curvature constraints that the original candidate satisfied.
+		vecD validation_x = latest_ob_x_, validation_y = latest_ob_y_;
+		if (tunnel_mode_ && tunnel_wall_offset_valid_)
+			for (size_t i = 0; i < validation_x.size(); ++i)
+			{
+				validation_x[i] += tunnel_lateral_offset_ * std::sin(bot_yaw_);
+				validation_y[i] -= tunnel_lateral_offset_ * std::cos(bot_yaw_);
+			}
+		CURB_S_ORIGIN = s0;
+		CURB_S0_IDX = current_waypoint_idx_;
+		set_escape_context(validation_x, validation_y, pose_x_, pose_y_, bot_yaw_);
+		const double collision_frac = path.collision_fraction(validation_x, validation_y,
+			ROBOT_RADIUS);
+		clear_escape_context();
+		const double curb_frac = path.curb_violation_fraction();
+		CURB_S0_IDX = -1;
+		double final_max_c = 0.0;
+		final_max_c = path_max_curvature(path);
+		if (!tunnel_mode_ && (path.get_x().empty() || collision_frac > 1e-9 ||
+			curb_frac > 1e-9 || final_max_c > curvature_limit_))
+		{
+			ROS_WARN_THROTTLE(0.5,
+				"[obstacle_avoidance] rejected final path: collision=%.3f curb=%.3f curvature=%.3f",
+				collision_frac, curb_frac, final_max_c);
+			if (curb_frac <= 1e-9 && lastPathStillClear())
+			{
+				publishAvoidanceFailed(false);
+				publishLocalPath(last_path_);
+				return;
+			}
+			if (tryOccupancyFallback()) return;
+			registerAvoidanceFailure();
+			publishAvoidanceFailed(true);
+			return;
+		}
+		const double chosen_d = path.avoid_offset();
+		if (!latest_ob_x_.empty() && committed_avoid_side_ == 0 &&
+			std::abs(chosen_d) >= 0.35)
+		{
+			// A candidate may clear for only one lidar frame while its roadside
+			// geometry is still being filled in.  Follow the validated candidate
+			// immediately, but lock its side only after two independent scans
+			// agree.  A transient RIGHT then LEFT no longer traps the planner on
+			// the blocked side for the rest of the obstacle.
+			const int side = chosen_d > 0.0 ? 1 : -1;
+			if (side != pending_avoid_side_)
+			{
+				pending_avoid_side_ = side;
+				pending_avoid_side_scans_ = 0;
+				pending_side_observation_stamp_ = ros::Time();
+			}
+			const ros::Time scan_stamp = geometry_observation_stamp_.isZero()
+				? observation_stamp_ : geometry_observation_stamp_;
+			if (!scan_stamp.isZero() &&
+				scan_stamp != pending_side_observation_stamp_)
+			{
+				++pending_avoid_side_scans_;
+				pending_side_observation_stamp_ = scan_stamp;
+			}
+			if (pending_avoid_side_scans_ >= 2)
+			{
+				committed_avoid_side_ = side;
+				ROS_INFO("[obstacle_avoidance] Committed avoidance direction locked to: %s (d_end=%.2f, scans=%d)",
+					committed_avoid_side_ > 0 ? "LEFT" : "RIGHT", chosen_d,
+					pending_avoid_side_scans_);
+			}
+		}
+
+		resetAvoidanceFailureState();
+		publishAvoidanceFailed(false);
+		last_path_ = path;
+		// The first cap was calculated before the new path existed.  Publish the
+		// cap again with the side that actually passed collision/curb checks.
+		publishAvoidanceSpeedLimit(true, c_d, chosen_d, &path, s0, c_speed);
+		const int want_side = committed_avoid_side_ != 0 ? committed_avoid_side_
+			: (std::abs(chosen_d) >= 0.35 ? (chosen_d > 0.0 ? 1 : -1) : 0);
+		if (enginePrimaryOverride("primary"))
+			;
+		else if (occupancyCandidateUsable(want_side, ROBOT_RADIUS))
+			publishOccupancyCandidate("replace");
+		else
+			publishLocalPath(path);
+		primary_changed_for_plan_ = false;
+	}
+
+	void publishAvoidanceFailed(bool failed)
+	{
+		std_msgs::Bool msg;
+		msg.data = failed;
+		avoidance_failed_pub_.publish(msg);
+	}
+
+	// active=true: available longitudinal distance and the spatial S-curve's
+	// lateral acceleration/jerk limits determine the speed cap. A far proposal
+	// leaves M2 at its section speed; a late detection reduces speed only as much
+	// as needed to finish the same geometric transition before the obstacle.
+	// active=false: 사실상 무제한 값(9999)을 보내 mpc 쪽 min()에서 걸리지 않게 함.
+    void coverageCallback(const std_msgs::Float64::ConstPtr& msg) {
+        if(std::isfinite(msg->data) && msg->data>=0.) {coverage_cap_=msg->data;coverage_stamp_=ros::Time::now();}
+    }
+	void publishAvoidanceSpeedLimit(bool active, double current_d = 0.0,
+									 double selected_d = 0.0,
+									 FrenetPath *selected_path = nullptr,
+									 double s0 = 0.0, double c_speed = 0.0)
+	{
+		std_msgs::Float64 msg;
+		double cap = TARGET_SPEED;
+		// ★ 속도캡 거리는 primary obstacle 만 본다.
+		//   예전에는 latest_ob_x_(충돌 코리도 4m 안 모든 물체의 경계점) 전체의
+		//   min 이었다. 그러면 회피 대상이 아닌 노견 구조물 하나가 캡을 지배한다.
+		//     실측 2026-09-22(17:19 백): 저상 장애물 29.6m 검출 직후, 반대편
+		//     노견의 elev 2.07m 기둥(y=-2.58, 18.3m)이 live_forward 를 가져가
+		//     캡이 6.8 -> 4.5(바닥)로 0.35초 만에 붕괴했다. 기하학적으로는
+		//     9.2~10.0 이 나와야 했다(required_shift 0.50~1.24).
+		//     그 기둥은 passed_release_margin(-2.5m)까지 뒤로 넘어가야
+		//     놓아주므로 회피 내내 캡을 눌렀다.
+		//   캡이 답하는 질문은 "이 물체를 피할 거리가 남았는가"이고 그건
+		//   primary 의 속성이다. 경로상 다른 물체와의 충돌은 Frenet 의
+		//   collision_fraction 이 별도로 본다(이중 방어).
+		double live_forward = primary_forward_m_ < 1e17
+			? primary_forward_m_ : nearest_trigger_forward_m_;
+		if (active && dynamic_speed_cap_enabled_ && live_forward < 1e17)
+		{
+			// A close right-side gap is irrelevant once a collision-free LEFT
+			// path has been selected (and conversely for RIGHT).  Measure only
+			// the remaining lateral distance from the measured vehicle pose.
+			const int side = std::abs(selected_d) > 0.15
+				? (selected_d > 0.0 ? 1 : -1)
+				: (committed_avoid_side_ != 0 ? committed_avoid_side_
+					: (pending_avoid_side_ != 0 ? pending_avoid_side_
+						: preferred_avoid_side_));
+			const double left_remaining = std::max(0.0,
+				primary_obstacle_max_d_ + ROBOT_RADIUS - current_d);
+			const double right_remaining = std::max(0.0,
+				current_d - (primary_obstacle_min_d_ - ROBOT_RADIUS));
+			const double remaining_shift = side > 0 ? left_remaining
+				: (side < 0 ? right_remaining
+					: std::max(left_remaining, right_remaining));
+			const double required_shift = std::max(0.5, remaining_shift);
+			const double ta = std::sqrt(5.774 * required_shift /
+				std::max(0.1, SPATIAL_MAX_LAT_ACCEL));
+			const double tj = std::cbrt(60.0 * required_shift /
+				std::max(0.1, SPATIAL_MAX_LAT_JERK));
+			const double transition_t = std::max(0.8, std::max(ta, tj));
+			const double available = std::max(0.0,
+				live_forward - avoidance_front_clearance_m_);
+			const double feasible_speed = avoidance_speed_safety_factor_ *
+				available / transition_t;
+			// Once the vehicle has cleared the obstacle laterally, the old
+			// distance-to-obstacle must not hold it at the speed floor while
+			// it drives alongside.  The validated path and MPC curvature cap
+			// still guard the pass and return to the reference line.
+			cap = remaining_shift <= 0.1 ? TARGET_SPEED
+				: std::max(avoidance_min_speed_mps_,
+					std::min(TARGET_SPEED, feasible_speed));
+			// ★ 선택된 경로로 직접 판단한다.
+			//   위 식은 '남은 횡이동을 횡속도 0 에서 새로 시작한다'고 가정한다.
+			//   공간경로가 직전 계획의 횡속도를 이어받게 된 뒤로는(stitching)
+			//   회피 중반에 이미 옆으로 움직이고 있는데도 T 를 처음부터 다시
+			//   잡아 속도를 깎는다. 예: 31 m 에서 2.7 m 이동 시작, 11 m 진행 후
+			//   남은 1.43 m 로 다시 계산하면 캡 6.75 m/s (30 km/h 불가).
+			//   선택된 경로는 현재 속도로 횡가속/저크 한계 안에서 만든 것이고
+			//   충돌검사도 통과했다. 그 경로가 필요한 횡거리에 도달하는 지점
+			//   (s_clear)이 장애물 앞 여유거리 안이면 지금 속도로 충분하다.
+			//   아니면 전환거리가 속도에 비례하므로 v*available/s_clear 로 낮춘다.
+			if (selected_path != nullptr && side != 0)
+			{
+				const double need = side > 0
+					? primary_obstacle_max_d_ + ROBOT_RADIUS
+					: primary_obstacle_min_d_ - ROBOT_RADIUS;
+				const vecD ps = selected_path->get_s();
+				const vecD pd = selected_path->get_d();
+				const size_t n = std::min(ps.size(), pd.size());
+				double s_clear = -1.0;
+				for (size_t i = 0; i < n; ++i)
+				{
+					const bool ok = side > 0 ? pd[i] >= need - 0.05 : pd[i] <= need + 0.05;
+					if (ok) { s_clear = std::max(0.0, ps[i] - s0); break; }
+				}
+				if (s_clear >= 0.0)
+				{
+					const double v_now = std::max(0.5, c_speed);
+					const double path_speed = s_clear <= available ? TARGET_SPEED
+						: avoidance_speed_safety_factor_ * v_now * available / std::max(0.1, s_clear);
+					cap = std::max(avoidance_min_speed_mps_, std::min(TARGET_SPEED, path_speed));
+					last_path_speed_cap_ = cap;
+					last_path_speed_cap_time_ = ros::Time::now();
+					ROS_INFO_THROTTLE(0.5,
+						"[obstacle_avoidance] path speed cap %.2fm/s (s_clear %.1fm, available %.1fm, v %.2f)",
+						cap, s_clear, available, v_now);
+				}
+			}
+			else if (selected_path == nullptr && !last_path_speed_cap_time_.isZero() &&
+				(ros::Time::now() - last_path_speed_cap_time_).toSec() < 0.3)
+			{
+				// 경로 선택 전 발행(계획 실패 대비 안전망)이 직전 주기의
+				// 경로기반 캡을 되돌려 덮지 않게 한다 - 같은 주기에 두 번
+				// 발행되므로 값이 번갈아 MPC 에 들어가면 가감속이 흔들린다.
+				cap = last_path_speed_cap_;
+			}
+			ROS_INFO_THROTTLE(0.5,
+				"[obstacle_avoidance] spatial speed cap %.2fm/s "
+				"(obstacle %.1fm, side %d, remaining_shift %.2fm, transition %.2fs)",
+				cap, live_forward, side, remaining_shift, transition_t);
+		}
+		msg.data = active ? cap : 9999.0;
+		if(tunnel_mode_ && !coverage_stamp_.isZero() && (ros::Time::now()-coverage_stamp_).toSec()<=.5)
+            msg.data=std::min(msg.data,coverage_cap_);
+        if(engine_primary_active_ && occFresh(occ_state_stamp_,.35))msg.data=std::min(msg.data,occ_speed_cap_);
+        avoidance_speed_pub_.publish(msg);
+	}
+
+	// 장애물 없을 때: 기준경로(rx_, ry_, ryaw_)에서 현재 s0부터
+	// passthrough_length_m_ 만큼만 잘라서 그대로 /local_path로 publish.
+    void publishStaticPreview(double s0, double speed, double d, double dd, double ddd)
+    {
+        nav_msgs::Path msg;msg.header.stamp=ros::Time::now();msg.header.frame_id="map";
+        if(!latest_ob_x_.empty()) {
+            CURB_ZONES=road_width_zones_;CURB_PROFILE=road_width_profile_;
+            TUNNEL_BODY_CHECK=false;CURB_RETURN_START_S=-1.;
+            CURB_S_ORIGIN=s0;CURB_S0_IDX=current_waypoint_idx_;
+            MAX_ROAD_WIDTH_LEFT=max_road_width_left_;MAX_ROAD_WIDTH_RIGHT=max_road_width_right_;
+            applyIdxRoadWidth();CURB_CORRIDOR_CHECK=curb_corridor_check_enabled_;
+            CURB_CLEARANCE_M=curb_clearance_m_;CURB_OPEN_LEFT=max_road_width_left_;CURB_OPEN_RIGHT=max_road_width_right_;
+            SPATIAL_SWITCH_S.clear();
+            for(const auto& p:stage_switch_pts_) {
+                const double sw=std::cos(bot_yaw_)*(p.first-pose_x_)+std::sin(bot_yaw_)*(p.second-pose_y_)+stage_switch_margin_m_;
+                if(sw>1.0) SPATIAL_SWITCH_S.push_back(s0+sw);
+            }
+            set_escape_context(latest_ob_x_,latest_ob_y_,pose_x_,pose_y_,bot_yaw_);
+            FrenetPath preview=frenet_optimal_planning(*csp_,s0,speed,d,dd,ddd,
+                FrenetPath(),pose_x_,pose_y_,latest_ob_x_,latest_ob_y_,bot_yaw_,0,preferred_avoid_side_,avoid_side_preference_cost_);
+            if(validateTunnelPath(preview,s0,"preview").clear) {
+                const vecD px=preview.get_x(),py=preview.get_y(),yaw=preview.get_yaw();
+                for(size_t i=0;i<px.size();++i) {
+                    geometry_msgs::PoseStamped p;p.header=msg.header;p.pose.position.x=px[i];p.pose.position.y=py[i];
+                    p.pose.orientation=tf::createQuaternionMsgFromYaw(i<yaw.size()?yaw[i]:0.);msg.poses.push_back(p);
+                }
+            }
+            clear_escape_context();SPATIAL_SWITCH_S.clear();CURB_S0_IDX=-1;
+            MAX_ROAD_WIDTH_LEFT=0.;MAX_ROAD_WIDTH_RIGHT=0.;
+        }
+        // Empty explicitly invalidates the preview. It is never sent to MPC.
+        static_preview_pub_.publish(msg);
+    }
+
+	void publishPassthroughPath(double s0)
+	{
+		size_t start_idx = 0;
+		for (size_t i = 0; i < global_s_.size(); ++i)
+		{
+			if (global_s_[i] >= s0)
+			{
+				start_idx = i;
+				break;
+			}
+		}
+
+		nav_msgs::Path msg;
+		msg.header.stamp = ros::Time::now();
+		msg.header.frame_id = "map";
+
+		const double shift = (tunnel_mode_ && tunnel_wall_offset_valid_) ? tunnel_lateral_offset_ : 0.0;
+
+		const double s_end = s0 + passthrough_length_m_;
+		for (size_t i = start_idx; i < rx_.size() && global_s_[i] <= s_end; ++i)
+		{
+			geometry_msgs::PoseStamped ps;
+			ps.header = msg.header;
+			double yaw = (i < ryaw_.size()) ? ryaw_[i] : 0.0;
+			ps.pose.position.x = rx_[i] - shift * std::sin(yaw);
+			ps.pose.position.y = ry_[i] + shift * std::cos(yaw);
+			tf::Quaternion q = tf::createQuaternionFromYaw(yaw);
+			ps.pose.orientation.x = q.x();
+			ps.pose.orientation.y = q.y();
+			ps.pose.orientation.z = q.z();
+			ps.pose.orientation.w = q.w();
+			msg.poses.push_back(ps);
+		}
+
+		// 경로 끝(마지막 waypoint 도달)에서는 되감기 금지.
+		//
+		// 아래 4점 백필은 "아직 앞에 경로가 남아 있는데 슬라이스가 짧게 잘린"
+		// 경우를 위한 방어다. 그런데 전역 경로의 마지막 점까지 소진한 뒤에도
+		// 되감아 4점을 채우면 /local_path 가 0 으로 줄지 않고 4 에서 멈춘다.
+		// MPC 의 path-end 정지는 waypoints_size_ < path_end_min_polyfit_points_(4)
+		// 일 때만 발동하므로(mpc_path_tracking.h), 4 에서 멈추면 정지가 영원히
+		// 발동하지 않는다.
+		//   실측(2026-09-15 18:01 백, 3.csv 종단): t=366.0 에 마지막 waypoint 도달
+		//   -> lp=4 로 고정 -> 5 초간 brake=0, accel 0.06~0.14 로 14.9 m/s 주행
+		//   -> 백 종료까지 미정지.
+		// 남은 점이 4 개 미만이면 그대로(0~3점) 내보내 MPC 가 정지하게 한다.
+		const bool reached_path_end = (start_idx + 4 > rx_.size());
+		if (msg.poses.size() < 4 && rx_.size() >= 4 && !reached_path_end)
+		{
+			msg.poses.clear();
+			size_t safe_start = start_idx;
+			for (size_t i = safe_start; i < rx_.size(); ++i)
+			{
+				geometry_msgs::PoseStamped ps;
+				ps.header = msg.header;
+				double yaw = (i < ryaw_.size()) ? ryaw_[i] : 0.0;
+				ps.pose.position.x = rx_[i] - shift * std::sin(yaw);
+				ps.pose.position.y = ry_[i] + shift * std::cos(yaw);
+				tf::Quaternion q = tf::createQuaternionFromYaw(yaw);
+				ps.pose.orientation.x = q.x();
+				ps.pose.orientation.y = q.y();
+				ps.pose.orientation.z = q.z();
+				ps.pose.orientation.w = q.w();
+				msg.poses.push_back(ps);
+			}
+		}
+
+		local_path_pub_.publish(msg);
+        publishSelection("reference","passthrough_or_hold");
+	}
+
+	void publishLocalPath(FrenetPath &path)
+	{
+		// 엔진 주 경로 모드에서는 Frenet 이 고른 경로(신규/직전 유지 모두) 대신 엔진 경로를 낸다.
+		if (enginePrimaryOverride("primary")) return;
+		nav_msgs::Path msg;
+		msg.header.stamp = ros::Time::now();
+		msg.header.frame_id = "map";
+
+		vecD xs = path.get_x();
+		vecD ys = path.get_y();
+		vecD yaws = path.get_yaw();
+
+		const double shift = (tunnel_mode_ && tunnel_wall_offset_valid_) ? tunnel_lateral_offset_ : 0.0;
+
+		for (size_t i = 0; i < xs.size(); ++i)
+		{
+			geometry_msgs::PoseStamped ps;
+			ps.header = msg.header;
+			double yaw = (i < yaws.size()) ? yaws[i] : 0.0;
+			ps.pose.position.x = xs[i] - shift * std::sin(yaw);
+			ps.pose.position.y = ys[i] + shift * std::cos(yaw);
+			tf::Quaternion q = tf::createQuaternionFromYaw(yaw);
+			ps.pose.orientation.x = q.x();
+			ps.pose.orientation.y = q.y();
+			ps.pose.orientation.z = q.z();
+			ps.pose.orientation.w = q.w();
+			msg.poses.push_back(ps);
+		}
+
+		local_path_pub_.publish(msg);
+        publishSelection("frenet","legacy_candidate");
+	}
+
+	// ---------------- 점유 엔진(서비스 모드) 연동 ----------------
+	struct OccObstacle { double cx = 0.0, cy = 0.0, length = 0.0, width = 0.0; int id = -1; Json::Value poly; };
+
+	static bool pointInPoly(const Json::Value &poly, double x, double y)
+	{
+		bool inside = false;
+		const Json::ArrayIndex n = poly.size();
+		for (Json::ArrayIndex i = 0, j = n - 1; i < n; j = i++)
+		{
+			const double xi = poly[i][0].asDouble(), yi = poly[i][1].asDouble();
+			const double xj = poly[j][0].asDouble(), yj = poly[j][1].asDouble();
+			if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-12) + xi))
+				inside = !inside;
+		}
+		return inside;
+	}
+
+	void occObstaclesCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		Json::CharReaderBuilder builder;
+		Json::Value root;
+		std::string errs;
+		std::istringstream ss(msg->data);
+		if (!Json::parseFromStream(builder, ss, &root, &errs)) return;
+		occ_obstacles_.clear();
+		for (const auto &o : root["obstacles"])
+		{
+			if (!o["footprint_world"].isArray() || o["footprint_world"].size() < 3 || !o["center"].isArray()) continue;
+			OccObstacle ob;
+			ob.id = o.get("id", -1).asInt();
+			ob.cx = o["center"][0].asDouble();
+			ob.cy = o["center"][1].asDouble();
+			ob.length = o.get("length", 0.0).asDouble();
+			ob.width = o.get("width", 0.0).asDouble();
+			ob.poly = o["footprint_world"];
+			occ_obstacles_.push_back(ob);
+		}
+		occ_obstacles_stamp_ = ros::Time::now();
+	}
+
+	void occCandidateCallback(const nav_msgs::Path::ConstPtr &msg)
+	{
+		occ_candidate_ = *msg;
+		occ_candidate_stamp_ = ros::Time::now();
+	}
+
+	void occStateCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		Json::CharReaderBuilder builder;
+		Json::Value root;
+		std::string errs;
+		std::istringstream ss(msg->data);
+		if (!Json::parseFromStream(builder, ss, &root, &errs)) return;
+		occ_active_ = root.get("active", false).asBool();
+		occ_valid_ = root.get("valid", false).asBool();
+        occ_plan_id_=root.get("plan_id",0).asUInt();
+        occ_recovery_=root.get("recovery",false).asBool();
+        occ_returning_=root.get("returning",false).asBool();
+        if(occ_valid_)occ_speed_cap_=std::max(0.,root.get("speed_cap_mps",9999.).asDouble());
+        occ_geometry_stamp_=root.get("geometry_stamp",-1.).asDouble();
+		occ_side_ = root.get("side", 0).asInt();
+		occ_state_stamp_ = ros::Time::now();
+	}
+
+	bool occFresh(const ros::Time &t, double timeout) const
+	{
+		return !t.isZero() && (ros::Time::now() - t).toSec() <= timeout;
+	}
+
+	// 엔진 누적 footprint(원/근거리 크기 일관)로 /obstacle_info 물체의 충돌 다각형을 바꾸고,
+	// 인지 물체에 안 잡힌 엔진 점유는 충돌 목록에만 추가한다(회피 시작 트리거에는 안 넣음).
+	void applyOccupancyFootprints(Json::Value &root)
+	{
+		if (!occupancy_perception_enabled_ || !occ_active_ || !occFresh(occ_obstacles_stamp_, 0.5) ||
+			occ_obstacles_.empty())
+			return;
+		std::vector<bool> used(occ_obstacles_.size(), false);
+		const double m2 = occupancy_match_m_ * occupancy_match_m_;
+		for (const char *key : {"obstacles", "collision_objects"})
+		{
+			if (!root[key].isArray()) continue;
+			for (auto &o : root[key])
+			{
+				if (!o["position_world"].isArray() || o["position_world"].size() < 2) continue;
+				const double x = o["position_world"][0].asDouble(), y = o["position_world"][1].asDouble();
+				for (size_t i = 0; i < occ_obstacles_.size(); ++i)
+				{
+					const auto &ob = occ_obstacles_[i];
+					const double d2 = (ob.cx - x) * (ob.cx - x) + (ob.cy - y) * (ob.cy - y);
+					if (d2 > m2 && !pointInPoly(ob.poly, x, y)) continue;
+					o["footprint_world"] = ob.poly;
+					o["planning_footprint_world"] = ob.poly;
+					o["occupancy_footprint"] = true;
+					used[i] = true;
+					break;
+				}
+			}
+		}
+		if (!occupancy_add_unmatched_ || !root["collision_objects"].isArray()) return;
+		const double c = std::cos(bot_yaw_), s = std::sin(bot_yaw_);
+		for (size_t i = 0; i < occ_obstacles_.size(); ++i)
+		{
+			if (used[i]) continue;
+			const auto &ob = occ_obstacles_[i];
+			Json::Value o;
+			o["id"] = 7000000 + std::max(0, ob.id);
+			Json::Value pw(Json::arrayValue); pw.append(ob.cx); pw.append(ob.cy);
+			o["position_world"] = pw;
+			const double dx = ob.cx - pose_x_, dy = ob.cy - pose_y_;
+			Json::Value pe(Json::arrayValue); pe.append(c * dx + s * dy); pe.append(-s * dx + c * dy); pe.append(0.0);
+			o["position_ego"] = pe;
+			o["footprint_world"] = ob.poly;
+			o["length"] = ob.length;
+			o["width"] = ob.width;
+			o["confirmed"] = true;
+			o["motion_state"] = "static";
+			o["static_occupancy"] = true;
+			o["source"] = "occupancy";
+			root["collision_objects"].append(o);
+		}
+	}
+
+	// 엔진 후보 경로를 쓸 수 있는가: 유효/신선, 방향 일치, 현재 장애물 점과 radius 이상.
+    nav_msgs::Path anchorRemaining(const nav_msgs::Path& path) const {
+        auto out=path;if(path.poses.empty())return out;
+        size_t nearest=0;double best=1e100;
+        for(size_t i=0;i<path.poses.size();++i){const auto& p=path.poses[i].pose.position;
+            double d=std::hypot(p.x-pose_x_,p.y-pose_y_);if(d<best){best=d;nearest=i;}}
+        out.poses.erase(out.poses.begin(),out.poses.begin()+nearest);return out;
+    }
+	bool occupancyCandidateUsable(int required_side, double radius, bool any_side = false) const
+	{
+		if (!occupancy_path_enabled_ || !occ_active_ || !occ_valid_ ||
+            ros::Time::now().toSec()-occ_geometry_stamp_>.35 || ros::Time::now().toSec()<occ_geometry_stamp_) return false;
+		if (!occFresh(occ_state_stamp_, occupancy_candidate_timeout_) ||
+			!occFresh(occ_candidate_stamp_, occupancy_candidate_timeout_))
+			return false;
+        if (occ_candidate_.poses.size() < 10 || occ_candidate_.header.seq!=occ_plan_id_) return false;
+        const auto anchored=anchorRemaining(occ_candidate_);
+        if(anchored.poses.size()<10)return false;
+        const auto& first=anchored.poses.front().pose;
+        if(std::hypot(first.position.x-pose_x_,first.position.y-pose_y_)>.35 ||
+           std::abs(std::atan2(std::sin(tf::getYaw(first.orientation)-bot_yaw_),std::cos(tf::getYaw(first.orientation)-bot_yaw_)))>5*M_PI/180.)return false;
+		// 터널 벽 보정 시프트가 걸린 동안은 기준이 달라 섞지 않는다.
+		if (!any_side && tunnel_mode_ && tunnel_wall_offset_valid_ && std::abs(tunnel_lateral_offset_) > 0.05) return false;
+		// 기존 판단이 정한 방향과 정확히 같을 때만(방향 고정 중 중앙 후보로 바꾸지 않음).
+		if (!any_side && occ_side_ != required_side) return false;
+		return pathClearOf(anchored, radius);
+	}
+
+	// 경로 앞 occupancy_check_length_m 안의 점이 현재 장애물 점과 radius 이상 떨어져 있는가.
+	bool pathClearOf(const nav_msgs::Path &path, double radius) const
+	{
+		if (path.poses.size() < 10) return false;
+		const double r2 = radius * radius;
+		double travelled = 0.0;
+		const auto &P = path.poses;
+		for (size_t k = 0; k < P.size(); k += 2)
+		{
+			if (k >= 2)
+				travelled += std::hypot(P[k].pose.position.x - P[k - 2].pose.position.x,
+					P[k].pose.position.y - P[k - 2].pose.position.y);
+			if (travelled > occupancy_check_length_m_) break;
+			const double px = P[k].pose.position.x, py = P[k].pose.position.y;
+			for (size_t j = 0; j < latest_ob_x_.size(); ++j)
+			{
+				const double dx = latest_ob_x_[j] - px, dy = latest_ob_y_[j] - py;
+				if (dx * dx + dy * dy < r2) return false;
+			}
+		}
+		return true;
+	}
+
+    void publishSelection(const char* source,const char* reason) {
+        Json::Value d;d["source"]=source;d["reason"]=reason;d["stamp"]=ros::Time::now().toSec();
+        d["geometry_stamp"]=occ_geometry_stamp_;d["plan_id"]=occ_plan_id_;
+        d["returning"]=occ_returning_;d["speed_cap_mps"]=occ_speed_cap_;
+        std_msgs::String out;out.data=Json::FastWriter().write(d);selection_pub_.publish(out);
+    }
+	void publishOccupancyCandidate(const char *why)
+	{
+		nav_msgs::Path msg = anchorRemaining(occ_candidate_);
+		msg.header.stamp = ros::Time::now();
+		msg.header.frame_id = "map";
+		for (auto &p : msg.poses) p.header = msg.header;
+        // Reject discontinuous handoffs; never bridge geometry with an unchecked straight segment.
+        if(msg.poses.empty() || std::hypot(msg.poses.front().pose.position.x-pose_x_,
+             msg.poses.front().pose.position.y-pose_y_)>.35) return;
+		local_path_pub_.publish(msg);
+        Json::Value d;d["source"]="apollo";d["reason"]=why;d["side"]=occ_side_;
+        d["returning"]=occ_returning_;d["plan_id"]=occ_plan_id_;d["speed_cap_mps"]=occ_speed_cap_;d["geometry_stamp"]=occ_geometry_stamp_;d["stamp"]=ros::Time::now().toSec();
+        std_msgs::String state;state.data=Json::FastWriter().write(d);selection_pub_.publish(state);
+		last_engine_path_ = msg;
+		last_engine_path_stamp_ = msg.header.stamp;
+		ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] occupancy candidate path used (%s, side %d)", why, occ_side_);
+	}
+
+	// 엔진 주 경로를 쓸 구간/상황인가: M2(정적) 또는 M8(터널), M3 제외, 회피 대상 기하가 있음.
+	bool enginePrimaryZone() const
+	{
+		if (!occupancy_path_primary_ || !occupancy_path_enabled_ ||
+            (latest_ob_x_.empty() && !engine_primary_active_ && !occ_returning_ && !occ_recovery_)) return false;
+		if (tunnel_mode_) return true;
+		if (current_lane_number_ != 0) return false;
+        if(inM3Zone())return occ_recovery_;
+        if(m3_avoid_latched_)return false;
+		return current_waypoint_idx_ >= 0 &&
+			(static_zone_min_idx_ < 0 || current_waypoint_idx_ >= static_zone_min_idx_) &&
+			current_waypoint_idx_ <= static_dynamic_split_idx_;
+	}
+
+	// 출처 히스테리시스: 엔진 후보가 (방향 무관) 유효하면 switch_sec 뒤 엔진으로, 엔진이 switch_sec 이상
+	// 연속 무효면 Frenet 으로. 아직 회피 전(중앙 주행, 방향 미고정)이면 바로 엔진으로 들어간다.
+	void updateEnginePrimary()
+	{
+		const ros::Time now = ros::Time::now();
+		if (!engine_primary_eval_stamp_.isZero() && now == engine_primary_eval_stamp_) return;
+		engine_primary_eval_stamp_ = now;
+		if (!enginePrimaryZone())
+		{
+			if (engine_primary_active_)
+				ROS_INFO("[obstacle_avoidance] engine primary path OFF (left avoidance zone / no obstacle)");
+			engine_primary_active_ = false;
+			engine_good_since_ = engine_bad_since_ = ros::Time();
+			return;
+		}
+		const bool good = occupancyCandidateUsable(0, ROBOT_RADIUS, true);
+		if (good) { engine_bad_since_ = ros::Time(); if (engine_good_since_.isZero()) engine_good_since_ = now; }
+		else { engine_good_since_ = ros::Time(); if (engine_bad_since_.isZero()) engine_bad_since_ = now; }
+		if (!engine_primary_active_ && good)
+		{
+			const bool not_yet_avoiding = committed_avoid_side_ == 0 &&
+				(last_path_.get_x().empty() || std::abs(last_path_.avoid_offset()) < 0.35);
+			if (not_yet_avoiding || (now - engine_good_since_).toSec() >= occupancy_primary_switch_sec_)
+			{
+				engine_primary_active_ = true;
+				ROS_INFO("[obstacle_avoidance] engine primary path ON (side %d)", occ_side_);
+			}
+		}
+		else if (engine_primary_active_ && !good && (now - engine_bad_since_).toSec() >= occupancy_primary_switch_sec_)
+		{
+			engine_primary_active_ = false;
+			ROS_WARN("[obstacle_avoidance] engine primary path OFF (candidate invalid %.1f s) -> Frenet",
+				(now - engine_bad_since_).toSec());
+		}
+	}
+
+	// 엔진 주 경로 발행. 후보가 잠깐(hold_sec) 끊기면 직전 엔진 경로가 근접 통과 반경으로 아직 안전할 때 유지.
+	bool enginePrimaryOverride(const char *why)
+	{
+		updateEnginePrimary();
+		if (!engine_primary_active_) return false;
+		const double near_r = ROBOT_RADIUS;
+		if (occupancyCandidateUsable(0, near_r, true))
+		{
+			if (occ_side_ != 0) committed_avoid_side_ = occ_side_;
+			resetAvoidanceFailureState();
+			publishAvoidanceFailed(false);
+			publishOccupancyCandidate(why);
+			return true;
+		}
+		if (ros::Time::now().toSec()-occ_geometry_stamp_<=.35 && !last_engine_path_stamp_.isZero() &&
+			(ros::Time::now() - last_engine_path_stamp_).toSec() <= occupancy_primary_hold_sec_ &&
+			pathClearOf(anchorRemaining(last_engine_path_), near_r))
+		{
+			resetAvoidanceFailureState();
+			publishAvoidanceFailed(false);
+			nav_msgs::Path msg = anchorRemaining(last_engine_path_);
+			msg.header.stamp = ros::Time::now();
+			for (auto &p : msg.poses) p.header = msg.header;
+			local_path_pub_.publish(msg);
+			publishSelection("apollo_hold","candidate_gap_validated_previous");
+            ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] engine candidate gap -> holding last engine path");
+			return true;
+		}
+		return false;
+	}
+
+	// 기존 판단이 회피 실패로 가기 직전: 엔진 후보가 근접 통과 반경으로도 안전하면 그 경로로 계속 간다.
+	bool tryOccupancyFallback()
+	{
+		if (enginePrimaryOverride("primary")) return true;
+		const double radius = near_pass_robot_radius_ > 0.0 ? std::min(ROBOT_RADIUS, near_pass_robot_radius_) : ROBOT_RADIUS;
+		// 방향을 아직 안 정했으면 엔진 후보의 방향을 받아들인다(기존 판단이 정한 방향과 충돌 없음).
+		const int side = committed_avoid_side_ != 0 ? committed_avoid_side_ : occ_side_;
+		if (!occupancyCandidateUsable(side, radius)) return false;
+		resetAvoidanceFailureState();
+		publishAvoidanceFailed(false);
+		publishOccupancyCandidate("fallback");
+		return true;
+	}
+
+    std::string avoidance_backend_;
+    std::unique_ptr<occupancy_avoidance::RosAdapter> embedded_engine_;
+	bool occupancy_perception_enabled_ = true;
+	bool occupancy_path_enabled_ = true;
+	double occupancy_match_m_ = 1.0;
+	double occupancy_candidate_timeout_ = 0.3;
+	double occupancy_check_length_m_ = 40.0;
+	bool occupancy_add_unmatched_ = false;
+	ros::Subscriber occ_obstacles_sub_, occ_candidate_sub_, occ_state_sub_;
+	std::vector<OccObstacle> occ_obstacles_;
+	ros::Time occ_obstacles_stamp_, occ_candidate_stamp_, occ_state_stamp_;
+	nav_msgs::Path occ_candidate_;
+	bool occ_active_ = false, occ_valid_ = false;
+	int occ_side_ = 0;
+	bool occupancy_path_primary_ = true;
+	double occupancy_primary_switch_sec_ = 0.5, occupancy_primary_hold_sec_ = 0.5;
+	bool engine_primary_active_ = false;
+	ros::Time engine_good_since_, engine_bad_since_, engine_primary_eval_stamp_;
+	nav_msgs::Path last_engine_path_;
+	ros::Time last_engine_path_stamp_;
+
+	// ---------------- 멤버 ----------------
+	bool externalOccupancyOwnsPath() const
+	{
+		bool enabled=false;
+		pnh_.getParamCached("external_occupancy_engine",enabled);
+		int planning_start=static_zone_min_idx_;
+		nh_.getParamCached("/occupancy_avoidance/static_planning_start_idx",planning_start);
+		planning_start=std::max(0,std::min(static_zone_min_idx_,planning_start));
+		return enabled && ((current_lane_number_==0 && current_waypoint_idx_>=planning_start &&
+			current_waypoint_idx_<=static_dynamic_split_idx_) ||
+			(current_lane_number_==3 && current_waypoint_idx_>=7000 && current_waypoint_idx_<=9000));
+	}
+	ros::NodeHandle nh_;
+	ros::NodeHandle pnh_;
+	ros::Publisher local_path_pub_;
+	ros::Publisher global_path_pub_;
+	ros::Publisher avoidance_failed_pub_;
+	ros::Publisher avoidance_speed_pub_;
+	ros::Publisher static_speed_scale_pub_;
+	ros::Publisher validation_debug_pub_;
+	std::map<int,std::pair<vecD,vecD>> validation_points_by_id_;
+    std::set<int> retained_occupancy_ids_;
+    ros::Subscriber divider_boundary_sub_;Json::Value divider_edges_;
+    std::vector<double> divider_base_profile_;ros::Time divider_stamp_;
+    ros::Publisher selection_pub_,planning_obstacles_pub_,boundary_profile_pub_;bool occ_returning_=false,occ_recovery_=false;double occ_geometry_stamp_=-1,occ_speed_cap_=9999.;uint32_t occ_plan_id_=0;
+    ros::Time engine_aligned_since_;
+    ros::Subscriber coverage_sub_;
+    double coverage_cap_{9999.};
+    ros::Time coverage_stamp_;
+    bool static_preview_{false};
+    ros::Publisher static_preview_pub_;
+	ros::Subscriber waypoint_sub_;
+	ros::Subscriber odom_sub_;
+	ros::Subscriber competition_sub_;
+	ros::Subscriber stop_ahead_sub_, stop_required_sub_;
+	bool have_competition_speed_ = false;
+	ros::Subscriber obstacle_sub_;
+	ros::Subscriber camera_detection_sub_;
+	ros::CallbackQueue camera_queue_;
+	std::unique_ptr<ros::AsyncSpinner> camera_spinner_;
+	ros::Timer plan_timer_;
+
+	std::mutex speed_kick_mutex_;
+	bool camera_obstacle_present_ = false;
+	double speed_kick_target_mps_;
+	double speed_kick_duration_sec_;
+	bool speed_kick_active_ = false;
+	ros::Time speed_kick_active_until_;
+	ros::Time last_camera_detection_time_;
+
+	double plan_rate_hz_;
+	double spline_ds_;
+	double path_corridor_radius_;
+	double collision_corridor_radius_;
+	double avoid_excess_cost_ = 3.0e5;
+	double avoid_side_flip_cost_ = 5.0e6;
+	double avoid_side_preference_cost_ = 4.0e6;
+	int primary_release_behind_idx_ = 20;
+	int primary_switch_min_idx_ = 50;
+	int primary_group_span_idx_ = 30;
+	std::vector<double> road_width_zones_;   // [start,end,right,left] * N
+	std::vector<double> road_width_profile_; // [idx,right,left] * N (연속 곡선, 우선 적용)
+	double max_d_step_per_cycle_;
+	double max_d_step_outward_per_cycle_;
+	double obstacle_hold_sec_;
+	double passed_release_margin_;
+	int max_avoidance_fail_observations_ = 3;
+	double failure_no_observation_timeout_sec_ = 0.6;
+	double side_pass_continue_front_m_ = 1.5;
+	double near_pass_robot_radius_ = 0.9;   // 근접 통과 완화 여유 [m] (0 = 끔)
+	double near_pass_window_m_ = 8.0;       // 막는 점이 이 거리 안일 때만 [m]
+	bool dynamic_speed_cap_enabled_ = true;
+	double avoidance_min_speed_mps_ = 4.5;
+	double avoidance_front_clearance_m_ = 3.5;
+	double avoidance_speed_safety_factor_ = 0.90;
+	// 직전 계획과 현재 횡위치 차이가 이보다 크면 이어붙이지 않고 측정값을 쓴다.
+	double stitch_max_offset_m_ = 0.5;
+	bool oncoming_check_outside_tunnel_ = false;
+	bool right_curb_skip_enabled_ = true;
+	double side_slack_margin_ = 0.4;         // 방향 선택 시 한계 안쪽 여유(m)
+	double decision_range_m_ = 30.0;         // 이 거리 안 추정부터 회피 판단에 사용(m)
+	// 다단 후보 전환점. 경로 안쪽 끝이 stage_switch_corridor 안인 물체를 앞뒤
+	// 간격 stage_cluster_gap 이하끼리 묶고, 묶음 뒤끝(월드 좌표)을 가까운 순으로 둔다.
+	// 전환은 그 뒤끝을 base_link 가 stage_switch_margin 만큼 지난 뒤 시작한다.
+	bool stage_candidates_enabled_ = true;
+	double stage_switch_corridor_m_ = 1.7;
+	double stage_switch_margin_m_ = 2.0;
+	double stage_cluster_gap_m_ = 3.0;
+	std::vector<std::pair<double, double>> stage_switch_pts_;
+	bool have_first_switch_ = false;
+	double tall_obstacle_min_top_m_ = 1.9;
+	double tall_obstacle_min_width_m_ = 0.9;
+	double tall_obstacle_assumed_length_m_ = 12.0;
+	double tall_latch_sec_ = 5.0;
+	std::map<int, ros::Time> tall_seen_;   // id -> 마지막으로 높은 물체로 보인 시각
+	double first_switch_x_ = 0.0, first_switch_y_ = 0.0;
+	double side_switch_min_forward_m_ = 8.0; // 이보다 멀 때만 고정 방향 전환 허용(m)
+	bool side_switch_on_blocked_enabled_ = true; // 고정 방향 전부 막힘(반대편 비상경로) 시 전환 허용
+	double side_switch_max_ego_offset_m_ = 0.5;  // 그때 자차 |c_d| 상한(아직 옆으로 안 나감)
+	int side_switch_blocked_cycles_ = 3;         // 연속 몇 사이클 막혀야 전환하나
+	int side_blocked_streak_ = 0;
+	bool side_select_corridor_enabled_ = true;   // 좌/우 선택 한계 = 접근 구간 최솟값
+	double side_select_lookback_m_ = 15.0;       // 장애물 앞 몇 m 부터 보나
+	bool curb_corridor_check_enabled_ = true;    // 연석 제한구역 최근접 거리 검사
+	double curb_clearance_m_ = 1.10;             // 연석선 - 차 중심 최소 거리(반폭 0.95 + 0.15)
+	bool last_left_feasible_ = true, last_right_feasible_ = true;
+	// 신호+회피 안전 로직
+	bool tl_guard_enabled_ = true;
+	double tl_guard_range_m_ = 80.0, tl_hold_gap_m_ = 20.0, tl_hold_decel_mps2_ = 1.5;
+	double tl_offset_tolerance_m_ = 0.4, tl_input_timeout_sec_ = 0.7;
+	double tl_hold_gap_min_m_ = 8.0, tl_gap_shift_min_m_ = 0.35, tl_gap_shift_max_m_ = 1.85;
+	double tl_front_axle_offset_m_ = 3.845, tl_stop_buffer_m_ = 3.0;
+	double tl_stop_dist_ = -1.0;
+	bool tl_stop_required_ = false;
+	ros::Time tl_stop_dist_time_, tl_stop_required_time_;
+	bool tl_hold_logged_ = false;
+	double right_curb_skip_margin_ = 0.0;
+	double vehicle_half_width_ = 0.95;
+	double nearest_trigger_forward_m_ = 1e18;
+	// 속도캡 전용: primary obstacle 자신의 전방거리(m). 노견 구조물 등
+	// 회피 대상이 아닌 물체에 캡이 끌려가지 않게 분리했다.
+	double primary_forward_m_ = 1e18;
+	double return_ti_;
+	double return_ti_ref_length_;
+	double min_return_ti_;
+	double return_lat_time_scale_ = 1.8;
+	double return_heading_threshold_deg_ = 3.5;
+	double last_obstacle_length_ = 0.0;
+	ros::Time last_obstacle_seen_;
+	int obstacle_boundary_samples_;
+	bool require_confirmed_;
+	double curvature_limit_;
+	double passthrough_length_m_;
+
+	bool have_path_ = false;
+	size_t last_wp_count_ = 0;
+	double last_wp_front_x_ = 0.0, last_wp_front_y_ = 0.0;
+	int current_waypoint_idx_ = -1;
+	int current_lane_number_ = 0;
+	bool tunnel_mode_ = false;
+	double tunnel_entry_grace_sec_ = 0.8;
+	double tunnel_mode_hold_sec_ = 1.0;
+	ros::Time tunnel_enter_time_, last_tunnel_mode_signal_;
+	bool m3_static_avoid_enabled_ = true;
+	bool m3_avoid_latched_ = false;   // M3 정적 전환 회피 중(복귀 끝날 때까지 유지)
+	// 터널에서 카메라 선감속 사용 여부(updateSpeedKickLocked 주석 참고).
+	bool tunnel_camera_kick_enabled_ = true;
+	double tunnel_max_road_width_left_ = 4.2;
+	bool front_lock_enabled_ = true;
+	double front_lock_approach_min_ahead_m_ = 5.5;
+	double front_lock_tolerance_m_ = 0.15;
+	double front_lock_match_m_ = 2.0;
+	double front_lock_timeout_sec_ = 3.0;
+	bool tunnel_stage_candidates_enabled_ = true;
+	bool camera_kick_static_zone_enabled_ = false;   // true 면 정적 구간(M2)도 카메라 선감속
+	bool kick_release_on_restart_ = true;
+	double kick_stop_speed_ = 0.3, kick_restart_speed_ = 1.0;
+	double kick_min_stop_sec_ = 0.5, kick_restart_window_sec_ = 3.0;
+	ros::Time kick_stop_since_, kick_restart_time_;
+	bool tunnel_unresolved_ = false;
+	ros::Subscriber tunnel_offset_sub_;
+	// ★ 2026-09-30 동적/정적 중재(obstacle_stop_node 가 단일 출처) + 배경맵 벽 조각 id
+	ros::Subscriber dyn_state_sub_, bg_ids_sub_;
+	bool dyn_hold_ = false;
+	std::set<int> dyn_ids_, restatic_ids_, bg_ids_;
+	ros::Time dyn_state_stamp_, bg_ids_stamp_;
+	ros::Subscriber tunnel_limits_sub_;
+	ros::Subscriber tunnel_lidar_kick_sub_;
+	ros::Publisher tunnel_zone_marker_pub_;
+	bool tunnel_wall_limits_enabled_ = true;
+	double tunnel_wall_clearance_ = 1.10;      // 연석선 - 차 중심 (반폭 0.95 + 0.15)
+	double tunnel_wall_limits_timeout_ = 0.5;
+	bool tunnel_limits_valid_ = false;
+	double tunnel_r_curb_ = 0.0, tunnel_l_curb_ = 0.0;
+	double tunnel_curb_right_d_ = -1e9, tunnel_curb_left_d_ = 1e9;
+	bool tunnel_body_check_enabled_ = true;
+	double tunnel_body_half_width_ = 0.95, tunnel_body_front_m_ = 3.85, tunnel_body_rear_m_ = 0.79;
+	double tunnel_body_margin_ = 0.15, tunnel_body_recover_m_ = 6.0;
+	ros::Time tunnel_limits_stamp_;
+	bool tunnel_limits_active_ = false;
+	double tunnel_right_limit_ = 1.5, tunnel_left_limit_ = 4.2;
+	bool tunnel_zone_markers_shown_ = false;
+	bool tunnel_lidar_kick_enabled_ = true;
+	double tunnel_kick_range_m_ = 20.0;
+	double tunnel_kick_target_mps_ = 6.5;  // 터널 라이다 선감속 목표속도
+	bool tunnel_wall_piece_filter_enabled_ = true;
+	double tunnel_wall_piece_margin_ = 0.3;
+	std::vector<double> tunnel_wall_profile_;   // [idx, right(-), left(+)] * N
+	double tunnel_kick_zone_inset_ = 0.9;   // 표시용: 연석선(벽-0.1)에서 선감속 경계까지(벽-1.0)
+	bool lidar_obstacle_present_ = false;
+	ros::Time last_lidar_detection_time_;
+	ros::Time tunnel_obstacle_kick_time_;   // /obstacle_info 기반 터널 선감속 마지막 시각
+	double last_c_d_ = 0.0;
+	ros::Publisher frenet_d_pub_;
+	double tunnel_lateral_offset_ = 0.0;
+	ros::Time last_tunnel_offset_stamp_;
+	bool tunnel_wall_offset_valid_ = false;
+	ros::Time observation_stamp_;
+	ros::Time geometry_observation_stamp_;
+	ros::Time last_failed_geometry_stamp_;
+	ros::Time avoidance_failure_start_;
+	ros::Time last_oncoming_observation_;
+	std::set<int> tunnel_oncoming_ids_;
+	std::map<int, ros::Time> oncoming_id_last_seen_;
+	int static_dynamic_split_idx_ = 1430;
+	int static_zone_min_idx_ = -1;
+	int dynamic_zone_max_idx_ = -1;
+	double avoid_inward_margin_ = 0.1;
+	double max_road_width_left_ = 3.5;
+	double max_road_width_left_blocked_ = 1.2;
+	double max_road_width_right_ = 3.5;
+	double oncoming_check_range_m_ = 60.0;
+	double oncoming_min_closing_mps_ = 2.0;
+	double oncoming_min_lateral_m_ = 1.5;
+	double oncoming_hold_sec_ = 2.0;
+	ros::Time last_oncoming_seen_;
+	ros::Subscriber tracked_sub_;
+	int committed_avoid_side_ = 0;  // +1: 좌측 회피 고정, -1: 우측 회피 고정, 0: 중립
+	int pending_avoid_side_ = 0;
+	int pending_avoid_side_scans_ = 0;
+	ros::Time pending_side_observation_stamp_;
+	int preferred_avoid_side_ = 0;  // primary 장애물 반대쪽: +1 좌, -1 우
+	int primary_obstacle_idx_ = -1;
+	// primary 의 기준경로 발(foot) 점과 그 경로 방향, envelope 종방향 반길이.
+	double primary_base_x_ = 0.0, primary_base_y_ = 0.0, primary_base_yaw_ = 0.0;
+	double primary_env_half_len_ = 0.0;
+	bool primary_env_from_near_ = false;  // envelope 가 근거리 관측 기반인지
+	double last_path_speed_cap_ = 0.0;     // 직전 주기 경로기반 속도캡
+	ros::Time last_path_speed_cap_time_;
+	double primary_obstacle_min_d_ = 0.0;
+	double primary_obstacle_max_d_ = 0.0;
+	bool primary_changed_for_plan_ = false;
+	double last_wp_back_x_ = 0.0, last_wp_back_y_ = 0.0;
+	bool have_odom_ = false;
+
+	std::unique_ptr<Spline2D> csp_;
+	vecD rx_, ry_, ryaw_, rk_, global_s_;
+
+	double pose_x_ = 0.0, pose_y_ = 0.0, bot_yaw_ = 0.0, bot_speed_ = 0.0;
+
+	vecD latest_ob_x_, latest_ob_y_;
+	vecD held_trigger_ob_x_, held_trigger_ob_y_;
+	vecD path_wp_x_, path_wp_y_;
+	std::vector<int> path_wp_indices_;
+	FrenetPath last_path_;
+	int avoidance_fail_count_ = 0;
+};
+
+int main(int argc, char **argv)
+{
+	ros::init(argc, argv, "obstacle_avoidance_node");
+	ObstacleAvoidanceNode node;
+	ros::spin();
+	return 0;
+}

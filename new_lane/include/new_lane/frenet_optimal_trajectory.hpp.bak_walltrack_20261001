@@ -1,0 +1,358 @@
+#ifndef FRENET_OPTIMAL_TRAJECTORY_HPP_
+#define FRENET_OPTIMAL_TRAJECTORY_HPP_
+
+#include <algorithm>
+#include <cfloat>
+#include "new_lane/polynomials.hpp"
+#include "new_lane/cubic_spline_planner.hpp"
+#include <tf/transform_listener.h>
+#include <geometry_msgs/Pose.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/Point32.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <geometry_msgs/PolygonStamped.h>
+
+// #include <matplotlibcpp.h>
+#include <vector>
+//#include "tbb/concurrent_vector.h"
+
+// Parameters
+extern double MAX_SPEED;	   // maximum speed [m/s]
+extern double MAX_ACCEL;	   // maximum acceleration [m/ss]
+extern double MAX_CURVATURE;  // maximum curvature [1/m]
+extern double MAX_ROAD_WIDTH; // maximum road width [m]
+// 좌우 비대칭 회피 폭(0 이면 MAX_ROAD_WIDTH 로 대칭 동작).
+extern double MAX_ROAD_WIDTH_LEFT;
+extern double MAX_ROAD_WIDTH_RIGHT;
+// 정적 회피 커밋 상태. obstacle_avoidance_node 가 매 사이클 갱신하고,
+// frenet_optimal_planning 이 후보를 고를 때 '이전보다 안쪽' 후보를 배제한다.
+extern double AVOID_PREV_OFFSET;
+extern double AVOID_INWARD_MARGIN;
+// |d| 1m 당 비용. "충돌 안 나는 후보 중 가장 안쪽"을 고르게 해서 회피량을
+// 최소화한다. 장애물 사이 틈이 차폭보다 넓으면 그 틈을 지나는 경로가 선택된다.
+extern double AVOID_EXCESS_COST;
+extern double AVOID_SIDE_FLIP_COST;
+extern int AVOID_LOCK_SIDE;
+// 경로점별 연석 검사(구간별 우측/좌측 상한). frenet_optimal_trajectory.cpp 참조.
+extern double CURB_VIOLATION_COST;
+extern std::vector<double> CURB_ZONES;
+extern std::vector<double> CURB_PROFILE;
+class FrenetPath;
+// 경로 곡률의 절댓값 최대. 기준 스플라인 끝(s_dest) 1.5 m 안은 yaw 외삽 오차로
+// 곡률이 튀므로(실측 6.29, 마지막 점) 제외한다. 비유한 값은 그대로 +inf 로 돌려준다.
+double path_max_curvature(FrenetPath &fp);
+bool road_width_at(const std::vector<double> &profile, const std::vector<double> &zones,
+	int idx, double &right, double &left);
+extern double CURB_S_ORIGIN;
+extern int    CURB_S0_IDX;
+extern double CURB_IDX_PER_M;
+extern double CURB_RETURN_START_S;
+extern double CURB_RETURN_T_MIN;
+extern double CURB_RETURN_T_MAX;
+extern double CURB_RETURN_LAT_SCALE;
+extern bool   CURB_CORRIDOR_CHECK;
+extern double CURB_CLEARANCE_M;
+extern double CURB_OPEN_RIGHT;
+extern double CURB_OPEN_LEFT;
+extern bool   LAST_PLAN_OPPOSITE_FALLBACK;
+extern double D_ROAD_W;	   // road width sampling length [m]
+extern double DT;			   // time tick [s]
+extern double MAXT;		   // max prediction time [m]
+extern double MINT;		   // min prediction time [m]
+extern double PLAN_HORIZON_T;  // common planning horizon [s]
+// Static avoidance can be parameterized by travelled distance instead of
+// elapsed time. This keeps the same geometry when vehicle speed changes.
+extern bool SPATIAL_AVOIDANCE_ENABLED;
+extern double SPATIAL_MAX_LAT_ACCEL;
+extern double SPATIAL_MAX_LAT_JERK;
+extern double SPATIAL_MIN_TRANSITION_M;
+extern double SPATIAL_MAX_TRANSITION_M;
+extern double SPATIAL_SAMPLE_DS;
+extern std::vector<double> SPATIAL_SWITCH_S;
+extern double SPATIAL_STAGE_D_STEP;
+extern double AVOID_FINAL_COST_RATIO;
+extern double SPATIAL_EVAL_BUDGET_MS;
+extern double SPATIAL_LENGTH_MIN_SPEED;
+extern double SPATIAL_SHARP_COST;
+extern bool   SPATIAL_RETURN_GENTLE_ENABLED;
+extern double SPATIAL_RETURN_MAX_LAT_ACCEL;
+extern double SPATIAL_RETURN_MAX_LAT_JERK;
+extern double SPATIAL_RETURN_MIN_SPEED;
+extern double SPATIAL_RETURN_SHARP_COST;
+extern double SPATIAL_MIN_HORIZON_M;
+extern double SPATIAL_PLAN_CHANGE_COST;
+extern double AVOID_PREV_SECOND;
+extern double TARGET_SPEED;   // target speed [m/s]
+extern double D_T_S;		   // target speed sampling length [m/s]
+extern double N_S_SAMPLE;	   // sampling number of target speed
+extern double ROBOT_RADIUS;   // robot radius [m]
+// 이미 충돌 반경 안에 들어와 있는 옆/뒤 장애물 점의 탈출 허용(2026-09-28).
+extern bool ESCAPE_TOLERANCE_ENABLED;
+extern double ESCAPE_MIN_RADIUS;   // 이 아래로는 절대 허용하지 않는 물리 하한 [m]
+extern double ESCAPE_MARGIN;       // 현재 거리에서 이만큼 뺀 값을 그 점의 반경으로 [m]
+void set_escape_context(const std::vector<double> &ob_x, const std::vector<double> &ob_y,
+	double pose_x, double pose_y, double yaw);
+void clear_escape_context();
+// Three-circle vehicle footprint: center plus +/- this longitudinal offset.
+// With ROBOT_RADIUS as the lateral envelope this accounts for front/rear
+// corners without forcing one overly large circular radius.
+extern double ROBOT_CIRCLE_OFFSET;
+// Vehicle body center is ahead of the base_link/rear-axle reference.
+extern double ROBOT_FOOTPRINT_CENTER_OFFSET;
+extern double MIN_LAT_VEL;	   // minimum lateral speed. Sampling for d_dot
+extern double MAX_LAT_VEL;	   // maxmum lateral speed. Sampling for d_dot
+extern double D_D_NS;		   // Step size for sampling of d_dot
+extern double MAX_SHIFT_D;	   // Sampling width for sampling of d.
+
+// cost weights
+extern double KJ;
+extern double KT;
+extern double KD;
+extern double KD_V;
+extern double KLAT;
+extern double KLON;
+extern bool STOP_CAR;
+extern double s_dest;
+// Waypoints
+extern vector<double> W_X;
+extern vector<double> W_Y;
+
+extern vector<double> ob_x; // x coordinates of the obstacles
+extern vector<double> ob_y; // y coordinates of the obstacles
+extern nav_msgs::Odometry odom;
+extern nav_msgs::OccupancyGrid cmap;
+extern geometry_msgs::PolygonStamped footprint;
+
+extern int cnt111;
+extern int cnt222;
+
+class FrenetPath
+{
+private:
+	vecD t, d, d_d, d_dd, d_ddd, s, s_d, s_dd, s_ddd, x, y, yaw, ds, c;
+	/*ye c kya hain radius of curvature hain kya, agr haa to frenet_ros main iska use na krke abhi
+    local variable ka use ho rha hain initial conditions() main */
+	double Js, Jp, cd, cv, cf, Ti, dss;
+	/*
+      t is the vector comprising of the discrete points in time at which other translational variables are calculated
+      d is the vector comprising of the lateral offset(distance) from the expected global path at the discrete points in time
+      d_d is the vector comprising of the first derivative of d with respect to t
+      d_dd is the vector comprising of the second derivative of d with respect to t
+      d_ddd is the vector comprising of the third derivative of d with respect to t
+      s is the vector comprising of the longitudnal arc length covered at the discrete points in time.
+      s_d is the vector comprising of the first derivative of s with respect to t
+      s_dd is the vector comprising of the second derivative of s with respect to t
+      s_ddd is the vector comprising of the third derivative of s with respect to t
+      Js is the summation comprising of the square of all values of d_ddd (latitudnal jerk)
+      Jp is the summation comprising of the square of all values of s_ddd (longitusnal jerk)
+      cd is the cost of the lateral trajectory in the frenet path
+      cv if the cost of the longitudnal trajectory in the frenet path
+      cf is the total cost of the frenet path(comprises of weighted values of cd and cv)
+      
+  */
+public:
+	vecD get_t();
+	vecD get_d();
+	vecD get_d_d();
+	vecD get_d_dd();
+	vecD get_d_ddd();
+	vecD get_s();
+	vecD get_s_d();
+	vecD get_s_dd();
+	vecD get_s_ddd();
+	vecD get_x();
+	vecD get_y();
+	vecD get_yaw();
+	vecD get_ds();
+	vecD get_c();
+	double get_cf();
+	void set_cf(double);
+	void set_Jp(double);
+	void set_Js(double);
+
+	double get_Jp();
+	double get_Js();
+
+	void calc_lat_paths(double, double, double, double, double, double);
+	void calc_lon_paths(double, double, double, double);
+	void calc_lon_paths_quintic_poly(double, double, double, double, double);
+	void adding_global_path(Spline2D &);
+	void adding_global_path_2(Spline2D, int);
+	bool check_collision(double, double, const vecD&, const vecD&, double);
+	// 경로 점 중 차량 footprint가 장애물과 겹치는 비율(0~1).
+	// 0인 후보만 주행 가능하며, 양수 값은 진단과 충돌 홀드에만 사용한다.
+	double collision_fraction(const vecD&, const vecD&, double) const;
+	// 경로점 중 구간별 연석 상한을 넘는 비율. 0 이면 전 구간 통과.
+	double curb_violation_fraction() const;
+	// 첫 충돌점에서 멈추는 판정(비율이 필요 없는 다단 후보 평가용).
+	bool collides(const vecD&, const vecD&, double) const;
+	// 다단(S자) 공간 후보의 정의. stage_d[0] 은 지금 위치에서 바로 가는 오프셋
+	// (= 첫 장애물 옆을 지날 때의 오프셋), stage_d[k] 는 stage_s[k](절대 s)
+	// 이후에 가는 오프셋이다. 단일 후보는 원소가 하나다.
+	std::vector<double> stage_d, stage_s;
+	double stage_end_s = -1.0;   // 마지막 전환이 끝나는 절대 s
+	// 회피 방향·방향 고정·요동 제한은 '첫 장애물 옆 오프셋'으로 판단한다.
+	// 다단 후보의 끝점(d.back())은 복귀/반대편 전환 뒤 값이라 방향을 대표하지 못한다.
+	double avoid_offset() const
+	{
+		return !stage_d.empty() ? stage_d.front() : (d.empty() ? 0.0 : d.back());
+	}
+	double final_offset() const { return d.empty() ? 0.0 : d.back(); }
+	// 첫 묶음을 지난 뒤의 오프셋(단일 후보는 첫 오프셋과 같다). 계획 유지 비용용.
+	double second_offset() const
+	{
+		return stage_d.size() > 1 ? stage_d[1] : avoid_offset();
+	}
+	bool sharp = false;   // 현재 속도 기준 전환 길이로 만든 예비 후보
+	bool sharp_return = false;   // 기존(회피) 한계로 그린 복귀 예비 후보
+	double first_len = 0.0;   // 첫 전환 길이(m). 연석 복귀 허용 거리에 쓴다.
+	bool multi_stage() const { return stage_d.size() > 1; }
+	// void plot_path();
+	// void plot_velocity_profile();
+	friend ostream &operator<<(ostream &os, const FrenetPath &fp);
+	friend class Fplist;
+	bool operator>(FrenetPath &other)
+	{
+		return (cf > other.get_cf());
+	}
+	bool operator<(FrenetPath &other)
+	{
+		return (cf < other.get_cf());
+	}
+};
+double dist(double x1, double y1, double x2, double y2);
+void get_limits_d(FrenetPath, double *, double *);
+vector<FrenetPath> check_path(vector<FrenetPath> &, double, double, double, double, vecD, vecD, double);
+vector<FrenetPath> calc_frenet_paths(double, double, double, double, double, FrenetPath);
+vector<FrenetPath> calc_global_paths(vector<FrenetPath> &, double);
+FrenetPath frenet_optimal_planning(Spline2D, double, double, double, double, double, FrenetPath, double, double, vecD, vecD,
+								   double, int = 0, int = 0, double = 0.0);
+FrenetPath frenet_optimal_planning_2(Spline2D, double, double, double, double, double, FrenetPath, double, double, vecD, vecD,
+								   double, int);
+
+/*******for printing the frenet path***********/
+
+// #define trace(...) __f(#__VA_ARGS__, __VA_ARGS__)
+// template <typename Arg1>
+// void __f(const char* name, Arg1&& arg1){cerr << name << " : " << arg1 << endl;}
+// template <typename Arg1, typename... Args>
+// void __f(const char* names, Arg1&& arg1, Args&&... args){ const char* comma = strchr(names + 1,
+//','); cerr.write(names, comma - names) << " : " << arg1<<" | "; __f(comma+1, args...); }
+
+/***********************end******************/
+inline vecD FrenetPath::get_t()
+{
+	return t;
+}
+inline vecD FrenetPath::get_d()
+{
+	return d;
+}
+inline vecD FrenetPath::get_d_d()
+{
+	return d_d;
+}
+inline vecD FrenetPath::get_d_dd()
+{
+	return d_dd;
+}
+inline vecD FrenetPath::get_d_ddd()
+{
+	return d_ddd;
+}
+inline vecD FrenetPath::get_s()
+{
+	return s;
+}
+inline vecD FrenetPath::get_s_d()
+{
+	return s_d;
+}
+inline vecD FrenetPath::get_s_dd()
+{
+	return s_dd;
+}
+inline vecD FrenetPath::get_s_ddd()
+{
+	return s_ddd;
+}
+inline vecD FrenetPath::get_x()
+{
+	return x;
+}
+inline vecD FrenetPath::get_y()
+{
+	return y;
+}
+inline vecD FrenetPath::get_yaw()
+{
+	return yaw;
+}
+inline vecD FrenetPath::get_ds()
+{
+	return ds;
+}
+inline vecD FrenetPath::get_c()
+{
+	return c;
+}
+inline double FrenetPath::get_cf()
+{
+	return cf;
+}
+inline void FrenetPath::set_cf(double c)
+{
+	cf = c;
+}
+inline void FrenetPath::set_Jp(double jp)
+{
+	Jp = jp;
+}
+inline void FrenetPath::set_Js(double js)
+{
+	Js = js;
+}
+inline double FrenetPath::get_Jp()
+{
+	return Jp;
+}
+inline double FrenetPath::get_Js()
+{
+	return Js;
+}
+
+class Fplist
+{
+public:
+	Fplist(double c_speed, double c_d, double c_d_d, double c_d_dd, double s0);
+	FrenetPath calc_lat(double di, double Ti, double Di_d);
+	FrenetPath calc_lon(double tv, double Ti);
+	// 비용 후보군 탐색(calc()) 없이, 지정한 di/Ti/tv 하나로 바로 경로를 만든다.
+	// 장애물이 없어져서 중앙으로 복귀할 때, 회피용으로 짧게 잡은 시간범위(mint~maxt)
+	// 안에서 탐색하면 큰 offset을 짧은 시간에 되돌리는 candidate의 jerk 비용이
+	// 너무 커서 항상 "제자리 유지"가 이겨버림. 복귀는 급하지 않으니 훨씬 긴
+	// Ti를 직접 지정해서 부드럽게 복귀하는 경로를 강제로 만들기 위함.
+	FrenetPath calc_direct(double di, double Ti, double tv);
+	// Quintic smooth-step in longitudinal arc length. The transition length is
+	// derived from lateral acceleration/jerk limits and current speed.
+	FrenetPath calc_spatial(double di, bool gentle = true);
+	// targets[0] 은 지금 바로, targets[k] 는 starts[k](절대 s) 이후에 가는 오프셋.
+	// 전환 길이는 calc_spatial 과 같은 횡가속/저크 규칙으로 정한다.
+	// gentle=false 는 현재 속도로 전환 길이를 잡는 예비 후보(SPATIAL_LENGTH_MIN_SPEED 주석).
+	FrenetPath calc_spatial_stages(const std::vector<double> &targets,
+		const std::vector<double> &starts, bool gentle = true);
+	void copy(int i);
+	void calc_cost(int i);
+
+	double c_speed;
+	double c_d;
+	double c_d_d;
+	double c_d_dd;
+	double s0;
+	std::vector<FrenetPath> fplist_lat;
+	std::vector<FrenetPath> fplist_lon;
+	int samples_tv = 2 * N_S_SAMPLE;
+};
+
+#endif // FRENET_OPTIMAL_TRAJECTORY_HPP_

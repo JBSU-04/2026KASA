@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>occupancy_avoidance</name><version>0.1.0</version>
+  <description>Persistent LiDAR occupancy, curb-constrained corridors and Apollo path optimization.</description>
+  <maintainer email="kuuve@example.com">KUUVE</maintainer><license>BSD-3-Clause</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend><depend>rospy</depend><depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend><depend>std_msgs</depend><depend>visualization_msgs</depend>
+  <depend>waypoint_maker</depend><depend>grid_map_core</depend><depend>grid_map_ros</depend>
+  <depend>morai_msgs</depend><depend>octomap</depend><depend>tf2</depend><depend>jsoncpp</depend>
+  <exec_depend>rospkg</exec_depend>
+  <exec_depend>waypoint_system</exec_depend>
+<build_depend>message_generation</build_depend>
+<exec_depend>message_runtime</exec_depend>
+<depend>geometry_msgs</depend>
+</package>

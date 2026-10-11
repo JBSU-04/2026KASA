@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>mission_supervisor</name>
+  <version>0.1.0</version>
+  <description>구간 라우터 · 시퀀스 관측기 · 미션제약 속도캡 변환</description>
+  <maintainer email="junshu0503@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>morai_msgs</depend>
+  <depend>waypoint_maker</depend>
+  <depend>mission_planner_msgs</depend>
+  <depend>non_gps_msgs</depend>
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>rospkg</exec_depend>
+</package>

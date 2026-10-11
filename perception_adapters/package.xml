@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>perception_adapters</name>
+  <version>0.1.0</version>
+  <description>lidar_ttc_tracker 정본 트랙을 각 미션의 메시지 타입으로 변환한다.</description>
+  <maintainer email="junshu0503@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>lidar_ttc_tracker</depend>
+  <depend>mission_planner_msgs</depend>
+  <depend>non_gps_msgs</depend>
+</package>

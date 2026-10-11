@@ -1,0 +1,25 @@
+observation_only: true
+cloud_topic: /perception/points_gravity
+pose_topic: /odom
+base_frame: base_link
+map_frame: map
+active_sections: [M8, tunnel_approach, gps_shadow]
+max_input_age_sec: 0.3
+pose_max_gap_sec: 0.08
+reference_radius_m: 40.0
+max_input_points: 800
+min_matched_points: 100
+min_correspondence_ratio: 0.60
+max_residual_rms_m: 0.10
+max_lateral_correction_m: 0.60
+max_yaw_correction_deg: 3.0
+observable_projection_min: 0.95
+wall_z_min: 0.0
+wall_z_max: 1.5
+wall_x_min: 1.0
+wall_x_max: 35.0
+wall_y_abs_min: 1.5
+wall_y_abs_max: 12.0
+wall_map_gate_m: 0.8
+obstacle_mask_margin_m: 0.5
+processing_warn_ms: 80.0

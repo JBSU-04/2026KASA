@@ -1,0 +1,221 @@
+# 구간 정의 — section_router 의 유일한 입력
+#
+# 인덱스는 waypoint_system 이 쓰는 CSV 인덱스다(간격 0.1 m).
+#   csv: /path_number 값. 0 = 출발~고주로 진입, 1~3 = 고주로 차선
+#
+# [확정]  M5 M6 M7 — 규정 링크 ID(A2256W000411 / A2256W000153)를 mgeo 좌표로
+#         풀어 CSV 에 투영한 결과다(오차 0.03 m).
+# [추정]  M1 M4 — CSV mission_state 의 감속 구간(state 1) 위치. 신호등 4개소 중
+#         어느 것인지는 미확정.
+# [확정]  M2 M3 — 팀 확인 구간. M8 — 3.csv idx 7000~9000 지정 구간.
+#
+# executors 는 그 구간에서 활성화할 미션 실행기 이름이다. 비어 있으면
+# 라우터는 구간만 알리고 아무 미션도 무장하지 않는다.
+# 'lane_following' 이 들어가면 control_arbiter 가 제어 소스를 M8 페달 PI +
+# 차선 조향으로 전환한다 — 범위가 확정되기 전에는 넣지 않는다.
+
+section_router:
+  waypoint_spacing_m: 0.1
+  enter_margin_idx: 100 # 진입은 일찍
+  exit_margin_idx: 150 # 이탈은 늦게 (히스테리시스)
+  index_timeout: 0.5
+  rate: 20.0
+  sections:
+    - id: M1
+      name: traffic_light_1 # mgeo 정지선 C1256W000077 @ idx 2021
+      exit_margin_idx: 99 # M2 실제 회피는 idx 2400부터
+      csv: 0
+      idx: [1700, 2200]
+      executors: [traffic_light]
+    - id: M2
+      name: static_obstacle # 신호등 C1256W000091 @ idx 3096 + 정적 장애물
+      # [확정] 팀 확인값. 정적 장애물 구간 = 2400~3700.
+      csv: 0
+      idx: [2300, 3700]
+      # mpc_params.yaml 의 mission_speed.default_mps/state_0_mps 를 정동적
+      # 원본값(10.0)으로 복원(2026-09-03)해서 이제 기본값과 동일하다.
+      # 그래도 위치 기반 상한을 하나 더 남겨둔다 - CSV mission_state 태깅이
+      # 틀리거나 밀려도 이 구간 속도는 인덱스만으로 보장된다.
+      speed_limit_mps: 10.0
+      executors: [traffic_light, static_obstacle]
+    - id: M3
+      name: dynamic_obstacle # 신호등 C1256W000016 @ idx 4305 + 동적 장애물
+      # [확정] 팀 확인값. 동적 장애물 구간 = 3701~4900.
+      csv: 0
+      idx: [3701, 4800]
+      speed_limit_mps: 10.0 # mission_speed 기본값과 동일 - 위치 기반 안전망
+      executors: [traffic_light, dynamic_obstacle]
+    - id: M4
+      name: traffic_light_4 # mgeo 정지선 C1256W000123 @ idx 5443
+      csv: 0
+      # 5700 -> 6200 (2026-09-14 실측). M4 정지선(5443) 뒤로 신호등이 하나 더
+      # 있다(정지선 idx ~6040, stop_xy=(-12.7, 98.9)). 이 신호는
+      # traffic_light_mission.active_idx_ranges 의 [5000, 6200] 에 들어 있어
+      # 정지 판단은 무장되는데, 정작 구간(M4)은 5850(5700+exit margin)에서
+      # 끝나 그 뒤로는 속도 상한이 사라졌다.
+      #   실측 12:55 백: t=91.6 에 M4 이탈(idx 5851) -> 상한 해제 -> 10.6 m/s
+      #   까지 가속 -> t=92.71 황색 전환 시 정지선 9.15 m 앞. 5 m/s^2 로도
+      #   10.6 m 가 필요해 정지 불가, 정지선을 넘어 멈췄다.
+      # 구간을 6200 까지 늘려 다섯번째 신호등까지 같은 상한을 적용한다.
+      idx: [5000, 6200]
+      executors: [traffic_light]
+    - id: M5
+      name: roundabout # [확정] 양보선 UTM (302495.6, 4124461.9)
+      # 공간 기반 무정지 접근: 완만한 감속을 위해 양보선60m 전부터 활성화.
+      # 0.csv 양보선 최근접 idx8797에서 역방향 누적거리60.001m = idx8197.
+      # 기존 시작 idx8650; 끝점9269는 유지.
+      csv: 0
+      idx: [8197, 9269] # 공간 기반 무정지 접근: 양보선 약60m 전부터 완만한 감속
+      executors: [roundabout]
+    # 고주로 진입 준비(2026-10-01). 속도 예외가 아니다(60 km/h 유지).
+    #   목표 차로(1.csv)는 0.csv idx 11124 에서 시작해 나란한 구간이 106 m 뿐이다.
+    #   21:37 백: M6 진입(idx ~10820, 차로 끝 137 m 전)에서야 차량 추적/판단이 시작돼,
+    #   본선(9~11 m/s)과 속도차 6 m/s 를 줄이고 틈을 맞출 시간이 없어 차로 끝에서 정지.
+    #   executors 에 smpc 를 넣어 차량 추적과 틈 맞추기(속도 조절)만 먼저 켠다.
+    #   차선변경 실행은 smpc_decision 이 speed_limit_exempt 구간에서만 허용한다.
+    #   10500 = 차로 끝 169 m 전(본선과 횡거리 ~63 m, LiDAR 에 들어오기 시작).
+    #   ※ 반드시 아래 highway_entry 보다 앞에 둔다(section_router 는 먼저 맞는 항목을 쓴다).
+    - id: M6
+      name: highway_approach
+      csv: 0
+      idx: [10500, 11123]
+      exit_margin_idx: 0 # 11124 에서 정확히 highway_entry 로 넘긴다
+      speed_limit_exempt: false
+      executors: [smpc]
+    - id: M6
+      name: highway_entry # [확정] 속도 예외 시작 = A2256W000411 시작점 (0.csv idx 11124)
+      csv: 0
+      # 11000 -> 10600 (2026-09-11 실측). 구간 진입이 늦어 판단 시간이 없었다.
+      #   실측: t=19.09 M6 무장(idx 10903) -> t=20.40 차선변경 실행(1.3초 뒤)
+      #        -> t=22.96 목표 차로 NPC 를 d=1.9m 에서야 발견(충돌).
+      #   그 직전 3.4초간 12m 이내 트랙이 0 이었다. 목표 차로가 비어 보이는
+      #   상태로 변경을 시작한 것이다.
+      #   40m(400 idx) 앞당겨 SMPC 가 인접 차량을 관측·확정할 시간을 준다.
+      #   ※ 이 구간은 speed_limit_exempt 라 앞당겨도 속도 제한 영향은 없다.
+      # 2026-10-01: 10900 -> 11124. 규정상 속도 예외는 링크 A2256W000411 시작점부터다.
+      #   10900(+진입 여유 100 = 10800)은 그보다 32 m 앞이었다. 판단 시간은 위
+      #   highway_approach 구간이 대신 벌어 준다.
+      idx: [11124, 12185]
+      enter_margin_idx: 0 # 규정 경계 그대로
+      speed_limit_exempt: true
+      executors: [smpc]
+    - id: M6
+      name: highway_lane1 # 0->1 차선변경 후 주행하는 1.csv 전체(고주로 중간 차선)
+      csv: 1
+      idx: [0, 4747]
+      speed_limit_exempt: true
+      executors: [smpc]
+    - id: M6
+      name: highway_lane2 # 1->2 차선변경 후 주행하는 2.csv 전체(고주로 중간 차선)
+      csv: 2
+      idx: [0, 4179]
+      speed_limit_exempt: true
+      executors: [smpc]
+    - id: M7
+      name: highway # [확정] 예외 끝 = A2256W000153 끝점 (3.csv 6197)
+      csv: 3
+      # 2026-10-01: 6400 -> 6196, exit_margin 0. 예전에는 이탈 여유 150 까지 붙어
+      #   idx 6550(규정 끝 35 m 뒤)까지 속도 예외로 나갔다.
+      idx: [0, 6196]
+      exit_margin_idx: 0 # 규정 경계 그대로
+      speed_limit_exempt: true
+      executors: [smpc]
+    - id: M7B
+      name: tunnel_approach # M8 앞 60m 인지 준비, 40m 정동적 제어 (실제 CSV 거리)
+      csv: 3
+      # M7 끝(6197)과 M8 시작(7000) 사이 약 80 m 공백을 메운다. 공백이면
+      # section_id 가 '' 로 나가고, 그때 obstacle_perception 의 폴백
+      #   if self.mission_zone == 'tunnel' and self.current_lane == 3
+      # 이 /mission/active_section 1.5초 유실만으로 발동한다.
+      # current_lane==3 은 3.csv 진입 시점부터 참이라 터널 진입 전에
+      # tunnel 프로파일이 켜지고, obstacle_stop_node 의
+      #   if tunnel: in_dynamic_zone = True
+      # 때문에 터널 입구 구조물에 급정지가 걸릴 수 있다.
+      idx: [6197, 7000]
+      # 경계를 정확히 맞춘다. M7 이 6196 에서 끝나고(exit_margin 0) 바로 이어받아
+      # 그 사이에 구간이 비지 않는다.
+      enter_margin_idx: 0
+      exit_margin_idx: 0
+      # 터널 진입 감속. 실제 값은 mpc_params.yaml speed_limit.sections.M7B.
+      speed_limit_mps: 15.0
+      # 기본은 미무장. section_router가 공유 접근 경계 안에서만
+      # static/dynamic executors를 추가한다. GPS 음영 시작은 M8 그대로.
+      executors: []
+    - id: M8
+      name: gps_shadow # 음영구간 랜덤 정적·동적 장애물
+      csv: 3
+      # 대회 터널/음영구간: 3.csv idx 7000~9000 (양 끝 포함).
+      # 전역 진입/이탈 margin을 적용하지 않아 지정한 index와 정확히 맞춘다.
+      idx: [7001, 8850]
+      enter_margin_idx: 0
+      exit_margin_idx: 0
+      # 실제 값은 mpc_params.yaml speed_limit.sections.M8이 덮어쓴다.
+      speed_limit_mps: 11.0
+      # obstacle_perception은 M8에서 tunnel 프로파일을 선택하고, new_lane이
+      # 정적 장애물 회피와 동적/충돌예측 장애물 정지를 각각 수행한다.
+      executors: [static_obstacle, dynamic_obstacle]
+
+sequence_monitor:
+  rate: 2.0
+  time_limit_sec: 900.0 # 규정: 15분
+  # M7B(터널 접근)는 감속만 하고 미션을 무장하지 않으므로 여기에 넣지
+  # 않는다. 넣으면 제약을 안 냈다고 계속 SKIPPED 로 찍힌다. 관측기는
+  # 기록만 하고 아무것도 차단하지 않으므로 빠져 있어도 문제없다.
+  expected_order: [M1, M2, M3, M4, M5, M6, M7, M8]
+
+# 신호등 인식 결과를 실제 정지 제약으로 바꾸는 구간. csv 1~3은 고주로
+# 차선별 경로라 index가 다시 0부터 시작하므로 반드시 csv 0으로 제한한다.
+# 범위 양 끝 index는 포함된다.
+traffic_light_mission:
+  # 정지선 앞에 남길 여유(m). 정지 목표거리는
+  #   d = stop_dist - front_axle_offset_m(3.845) - stop_buffer_m
+  # 이므로 이 값을 키우면 정지선에서 그만큼 더 뒤에 선다.
+  # 2.0 -> 3.0 (2026-09-17). 현재 정지 위치보다 1 m 더 앞에서 멈춘다.
+  #   실측(12:17 백) 정지 시 stop_dist 4.07 / 4.17 m 였다. 앞범퍼가
+  #   정지선에서 0.23 / 0.33 m 뒤였다는 뜻으로, 제동 오버슈트가 기존
+  #   buffer 1.0 m 를 거의 다 먹었다. 3.0 이면 같은 제동 오버슈트에서도
+  #   정지선까지 약 2.2~2.3 m 여유를 목표로 한다.
+  #   신호등 가시성은 상향 보조 카메라(cam3, pitch -35deg)가 커버하므로
+  #   뒤로 물러나도 신호를 놓치지 않는다(정지선 2 m 뒤에서 올려본각 약
+  #   35 deg, cam3 커버 -1.9~71.9 deg).
+  # 2026-10-02: 앞범퍼 기준 정지선 4.0 m 전을 정지 목표로 설정.
+  stop_buffer_m: 4.0
+  active_csv: 0
+  active_idx_ranges:
+    - [1800, 4600]
+    # idx 5443의 중간 신호는 미션 대상이 아니므로 제외한다. 마지막 미션
+    # 신호(idx 약 6040)는 34m 전부터 판정해 10m/s에서도 제동거리를 확보한다.
+    - [5700, 6200]
+
+constraint_to_speed_cap:
+  # --- 구간 전환 선제 감속 ---
+  # 구간 경계에서 상한이 계단처럼 떨어지면 MPC 가 그 순간부터 급제동한다.
+  #   실측 2026-09-15(12:44 백) M1(15.0) -> M2(9.5):
+  #     t=29.6 14.71 m/s -> t=30.6 9.76 m/s = -5.0 m/s^2.
+  # 전방 경계를 미리 보고 v = sqrt(v_next^2 + 2*a*d) 로 캡을 내려두면
+  # 같은 전환을 아래 감속률로 부드럽게 넘는다(시뮬 결과 -5.0 -> -1.0).
+  section_prep_enabled: true
+  section_prep_decel_mps2: 1.0
+  # lookahead 는 속도 비례로 늘어난다(느릴 때의 하한이 이 값).
+  #   필요거리 = (v_cur^2 - v_next^2) / (2*a)
+  #   M1->M2  15.0->9.5   67 m
+  #   M7->M7B 25.0->12.0 241 m
+  section_prep_min_lookahead_m: 80.0
+  section_prep_lookahead_scale: 1.2
+  # 고주로(M6/M7)는 ACC 가 종방향 주인이라 기본은 건드리지 않는다.
+  # 켜면 ACC 중계값에도 이 캡이 min() 으로 씌워진다.
+  section_prep_apply_in_exempt: false
+  # ACC 중계 금지 구간 [csv, idx_lo, idx_hi(-1=끝)] (2026-09-29).
+  #   3.csv idx 5200 이후 톨게이트 구조물에 ACC 가 걸려 서행하는 것으로 의심.
+  #   이 구간은 ACC 원본을 MPC 로 넘기지 않는다(MPC 자기 목표속도).
+  #   smpc_decision.yaml 의 lane_change_max_index(_csv) 로 차선변경도 같이 끈다.
+  acc_disable_ranges:
+    - [3, 5200, -1]
+
+  comfortable_decel: 2.0
+  lead_standstill_dist: 3.0 # 앞차 완전 정차 시 최소 정지 간격 [m]
+  lead_time_gap: 1.2 # 앞차 추종 시간 간격 (Time Headway) [s]
+  stop_epsilon_m: 0.5
+  constraint_timeout: 0.5
+  fail_closed_after_active: true
+  rate: 20.0

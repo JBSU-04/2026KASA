@@ -1,0 +1,37 @@
+cost:
+  kj: 0.01
+  kt: 5
+  kd: 0.5
+  kd_v: 0.5
+  klat: 1.0
+  klon: 1.0
+
+path:
+  max_speed: 3.1
+  max_accel: 1.0
+  max_curvature: 2.0
+  max_road_width: 4.0
+  d_road_w: 0.4
+  # mint의 4로 나눈 값
+  dt: 1.0
+  # 시간은 파라미터말고 변수로 설정해서 값 넣어주기
+  maxt: 9.0 # 곡선구간에서 걸리는 시간
+  mint: 8.82 # 직선구간에서 걸리는 시간
+  target_speed: 3.0
+  d_t_s: 0.425
+  n_s_sample: 0.5
+  robot_radius: 2.0
+  min_lat_vel: -0.003
+  max_lat_vel: 0.003
+  d_d_ns: 0.01
+  max_shift_d: 0.5
+
+frenet:
+  d_offset: 3.0
+  #3.0
+  # 속도 정확하게 하면 성능 올라갈듯(값이 아니라 gps에서 받아오는 속도로)
+  linear_speed: 5.5
+
+# waypoints:
+#   W_X: [38, 38, 38, 38, 38, 38, 38 , 38.21, 39.25, 42.56, 48.97, 61]
+#   W_Y: [-57, -45, -32.0, -18.5, -12.0, 0.0, 12, 35, 42.89, 80.41, 131.48, 139.47]

@@ -1,0 +1,19 @@
+# Backups
+.git_backup/
+
+# Large model weights (>100MB)
+morai_sensor_fusion/models/tunnel_ufld_res18.pth
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE and editor settings
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db

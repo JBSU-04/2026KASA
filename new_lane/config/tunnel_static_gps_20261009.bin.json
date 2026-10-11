@@ -1,0 +1,13 @@
+{
+  "source": "src/new_lane/config/tunnel_static_gps_20261009.npz",
+  "source_sha256": "9239df4afc24a896fe2f9074423a58040d822ccb29745a8297a8393cb529c842",
+  "points": 2457589,
+  "floor_points": 445593,
+  "origin": [
+    302665.26383715635,
+    4123727.0398684195,
+    0.0
+  ],
+  "format": "TMAP3D1",
+  "geometry_changed": false
+}

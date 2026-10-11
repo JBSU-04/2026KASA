@@ -1,0 +1,24 @@
+<launch>
+  <arg name="config_file"
+       default="$(find roundabout_lidar_tracker)/config/tracker_template.yaml" />
+  <arg name="node_name" default="roundabout_lidar_tracker" />
+  <arg name="cloud_topic" default="/nonground" />
+  <arg name="odom_topic" default="/odom" />
+  <arg name="input_mode" default="sensor_nonground" />
+  <arg name="expected_cloud_frame" default="velodyne" />
+
+  <node pkg="roundabout_lidar_tracker"
+        type="roundabout_lidar_tracker_node"
+        name="$(arg node_name)" output="screen" respawn="true">
+    <rosparam command="load" file="$(arg config_file)" />
+    <!-- 통합 인지 튜닝 파일(tuning_perception.yaml)을 글로벌 루트에 로드하여
+         회전교차로 클러스터링 및 차량 필터 피팅 파라미터가 단일 파일에서 반영되도록 연동 -->
+    <rosparam command="load"
+              file="$(find total_bringup)/config/tuning_perception.yaml" ns="/" />
+    <param name="lidar_tracker/topics/cloud" value="$(arg cloud_topic)" />
+    <param name="lidar_tracker/topics/odom" value="$(arg odom_topic)" />
+    <param name="lidar_tracker/input_mode" value="$(arg input_mode)" />
+    <param name="lidar_tracker/expected_cloud_frame"
+           value="$(arg expected_cloud_frame)" />
+  </node>
+</launch>

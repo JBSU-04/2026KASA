@@ -1,0 +1,12 @@
+<launch>
+  <arg name="map" default="$(find tunnel_xicp)/maps/tunnel_walls_gps_20261009.pcd"/>
+  <arg name="metadata" default="$(find tunnel_xicp)/maps/tunnel_walls_gps_20261009.json"/>
+  <node pkg="tunnel_xicp" type="tunnel_xicp_node" name="tunnel_xicp_observer" output="screen">
+    <env name="OMP_NUM_THREADS" value="1"/>
+    <env name="OPENBLAS_NUM_THREADS" value="1"/>
+    <rosparam command="load" file="$(find tunnel_xicp)/config/observer.yaml"/>
+    <param name="reference_map" value="$(arg map)"/>
+    <param name="map_metadata" value="$(arg metadata)"/>
+    <param name="icp_config" value="$(find tunnel_xicp)/config/xicp.yaml"/>
+  </node>
+</launch>

@@ -1,0 +1,16 @@
+<launch>
+
+  <!-- odom_information node -->
+  <node pkg="odom_information"
+        type="odom_information_node"
+        name="odom_information"
+        output="screen">
+
+    <!-- load yaml parameters -->
+    <rosparam command="load"
+              file="$(find odom_information)/config/odom_information.yaml"/>
+
+  </node>
+
+</launch>
+

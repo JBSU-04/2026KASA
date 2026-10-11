@@ -1,0 +1,17 @@
+<launch>
+    <arg name="image_topic" default="/front/image_jpeg/compressed"/>
+    <arg name="stop_topic" default="/localization/stop_ahead"/>
+    <arg name="output_dir" default="$(env HOME)/Downloads/kcity_traffic_light"/>
+    <arg name="max_dist" default="60.0"/>
+    <arg name="save_fps" default="2.0"/>
+
+    <node pkg="kcity_localizer" type="traffic_light_dataset_collector.py"
+          name="traffic_light_dataset_collector" output="screen">
+        <param name="image_topic" value="$(arg image_topic)"/>
+        <param name="stop_topic" value="$(arg stop_topic)"/>
+        <param name="output_dir" value="$(arg output_dir)"/>
+        <param name="max_dist" value="$(arg max_dist)"/>
+        <param name="save_fps" value="$(arg save_fps)"/>
+        <param name="jpeg_quality" value="95"/>
+    </node>
+</launch>

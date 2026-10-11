@@ -1,0 +1,14 @@
+<launch>
+  <arg name="run_twinlitenet" default="true"/>
+  <arg name="repo_root" default="$(find lane_perception_pkg)/TwinLiteNet-main"/>
+  <node if="$(arg run_twinlitenet)" pkg="lane_perception_pkg" type="twinlitenet_node.py"
+        name="twinlitenet_node" output="screen">
+    <rosparam command="load" file="$(find lane_perception_pkg)/config/twinlitenet.yaml"/>
+    <param name="repo_root" value="$(arg repo_root)"/>
+    <param name="weights" value="$(find lane_perception_pkg)/weights/best.pth"/>
+  </node>
+  <node pkg="lane_perception_pkg" type="sliding_window_node"
+        name="sliding_window_node" output="screen">
+    <rosparam command="load" file="$(find lane_perception_pkg)/config/sliding_window.yaml"/>
+  </node>
+</launch>

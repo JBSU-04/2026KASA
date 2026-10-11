@@ -1,0 +1,68 @@
+<launch>
+  <!-- ==================================================================
+       경로 계층 - 원본(0901 + 정동적) 방식 유지.
+
+       정동적 원본은 obstacle_avoidance_node 가 /local_path 의 유일한
+       발행자였다(장애물 없으면 패스스루, 있으면 회피 경로).
+       local_path_publisher_node(0901 원본, 정동적에서도 그대로 씀)는
+       /final_waypoint 만 냈다 - obstacle_avoidance_node 의 입력이다.
+
+       0901 쪽 local_path_publisher_node.cpp 는 회피 없는 독립 실행을
+       가정해서 /local_path 도 직접 낸다(차선변경 블렌딩·endpoint
+       connector 는 전부 이 파일 안, /final_waypoint 로 나간다 -
+       obstacle_avoidance_node 와 무관하게 계속 동작한다).
+       둘을 그대로 나란히 붙이면 같은 토픽에 두 발행자가 경쟁해서
+       MPC 가 대부분 CSV 경로만 보고 회피가 거의 반영되지 않았다
+       (실측 22Hz vs 4Hz, 회피 반영 비율 18%).
+       use_avoidance:=true 면 publish_local_path:=false 로 꺼서
+       원본처럼 단일 발행자로 되돌린다.
+       use_path_mux:=true 로 하면 후보 토픽 + mux 방식으로도 바꿀 수
+       있으나 기본은 원본이다.
+       ================================================================== -->
+  <arg name="use_avoidance" default="true"/>
+  <arg name="path_number"   default="0"/>
+  <arg name="static_dynamic_split_idx" default="3700"/>
+  <!-- 정적 회피 구간의 시작 idx. missions.yaml 의 M2 시작과 같아야 한다. -->
+  <arg name="static_zone_min_idx" default="2400"/>
+  <arg name="dynamic_zone_max_idx" default="-1"/>
+  <arg name="use_path_mux" default="false"/>
+  <arg name="tunnel_camera_kick_enabled" default="true"/>
+
+  <!-- 원본 방식: obstacle_avoidance_node 가 /local_path 의 유일한 발행자 -->
+  <group unless="$(arg use_path_mux)">
+    <include file="$(find waypoint_system)/launch/missions/default_mission.launch">
+      <arg name="use_rviz" value="false"/>
+      <arg name="publish_local_path" value="$(eval 'false' if arg('use_avoidance') else 'true')"/>
+      <arg name="path_number" value="$(arg path_number)"/>
+    </include>
+    <include if="$(arg use_avoidance)"
+             file="$(find new_lane)/launch/obstacle_avoidance.launch">
+      <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+      <arg name="static_zone_min_idx"      value="$(arg static_zone_min_idx)"/>
+      <arg name="dynamic_zone_max_idx"     value="$(arg dynamic_zone_max_idx)"/>
+      <arg name="tunnel_camera_kick_enabled" value="$(arg tunnel_camera_kick_enabled)"/>
+    </include>
+  </group>
+
+  <!-- mux 방식: 후보 토픽으로 내리고 하나만 승격 -->
+  <group if="$(arg use_path_mux)">
+    <group>
+      <remap from="/local_path" to="/planning/local_path/waypoint"/>
+      <include file="$(find waypoint_system)/launch/missions/default_mission.launch">
+        <arg name="use_rviz" value="false"/>
+        <arg name="path_number" value="$(arg path_number)"/>
+      </include>
+    </group>
+    <group if="$(arg use_avoidance)">
+      <remap from="/local_path" to="/planning/local_path/avoidance"/>
+      <include file="$(find new_lane)/launch/obstacle_avoidance.launch">
+        <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+        <arg name="static_zone_min_idx"      value="$(arg static_zone_min_idx)"/>
+        <arg name="dynamic_zone_max_idx"     value="$(arg dynamic_zone_max_idx)"/>
+        <arg name="tunnel_camera_kick_enabled" value="$(arg tunnel_camera_kick_enabled)"/>
+      </include>
+    </group>
+    <node pkg="planning_mux" type="local_path_mux.py" name="local_path_mux"
+          output="screen"/>
+  </group>
+</launch>

@@ -1,0 +1,103 @@
+#include <gtest/gtest.h>
+
+#include "mission_planner/gap_selector.hpp"
+
+namespace mission_planner {
+namespace {
+
+EgoEntryModel standingEgo() {
+  EgoEntryModel ego;
+  ego.distance_to_merge = 7.3;  // K-City 양보선 -> 합류점
+  ego.speed = 0.0;
+  ego.accel = 2.2;
+  ego.max_speed = 8.5;
+  ego.start_delay = 0.2;
+  ego.length = 4.6;
+  return ego;
+}
+
+GapSelectorParams ringParams() {
+  GapSelectorParams p;
+  p.ring_length = 2.0 * 3.14159265358979323846 * 17.955;
+  return p;
+}
+
+StreamVehicle vehicle(int id, double pos, double speed) {
+  StreamVehicle v;
+  v.id = id;
+  v.pos = pos;
+  v.speed = speed;
+  v.length = 4.5;
+  return v;
+}
+
+const GapCandidate* earliest(const std::vector<GapCandidate>& gaps) {
+  const GapCandidate* best = nullptr;
+  for (const GapCandidate& g : gaps)
+    if (g.feasible && (!best || g.depart_delay < best->depart_delay)) best = &g;
+  return best;
+}
+
+TEST(GapSelector, EmptyRingGoesNow) {
+  const auto gaps = GapSelector::evaluate({}, standingEgo(), ringParams());
+  ASSERT_EQ(gaps.size(), 1u);
+  EXPECT_TRUE(gaps[0].feasible);
+  EXPECT_DOUBLE_EQ(gaps[0].depart_delay, 0.0);
+}
+
+TEST(GapSelector, VehicleJustPassedAllowsImmediateGo) {
+  // 합류점을 막 지난 차량(앞차)만 있으면 바로 출발.
+  const auto gaps = GapSelector::evaluate({vehicle(6, 3.2, 6.2)}, standingEgo(),
+                                          ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+  EXPECT_EQ(best->leader_id, 6);
+}
+
+TEST(GapSelector, CloseFastFollowerMakesUsWaitBehindIt) {
+  // 12 m 상류에서 8 m/s 로 오는 차량: 지금은 앞에 못 끼고, 지나간 뒤 출발.
+  const auto gaps = GapSelector::evaluate({vehicle(7, -12.0, 8.0)},
+                                          standingEgo(), ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->leader_id, 7);
+  EXPECT_GE(best->depart_delay, 0.4);
+  EXPECT_LT(best->depart_delay, 4.0);
+}
+
+TEST(GapSelector, FarFollowerLeavesGapNow) {
+  const auto gaps = GapSelector::evaluate({vehicle(8, -55.0, 6.0)},
+                                          standingEgo(), ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->follower_id, 8);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+}
+
+TEST(GapSelector, PicksGapBetweenPlatoonVehicles) {
+  // 차량 A 가 막 지나가는 중, B 는 멀리 뒤: A/B 사이 틈에 바로 들어간다.
+  const auto gaps = GapSelector::evaluate(
+      {vehicle(1, 1.0, 6.0), vehicle(2, -48.0, 6.0)}, standingEgo(),
+      ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->leader_id, 1);
+  EXPECT_EQ(best->follower_id, 2);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+}
+
+TEST(GapSelector, StoppedLeaderAtConflictBlocks) {
+  // 합류점 바로 앞에 선 차량: 앞차 간격이 영영 안 난다.
+  const auto gaps = GapSelector::evaluate({vehicle(3, 4.0, 0.0)},
+                                          standingEgo(), ringParams());
+  EXPECT_EQ(earliest(gaps), nullptr);
+}
+
+}  // namespace
+}  // namespace mission_planner
+
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

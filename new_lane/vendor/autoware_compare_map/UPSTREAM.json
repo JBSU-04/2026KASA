@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/autowarefoundation/autoware_universe",
+  "commit": "dc1fcea1d7ccae851466e7c4db3843c08304c6a5",
+  "files": {
+    "perception/autoware_compare_map_segmentation/src/distance_based_compare_map_filter/node.cpp": "85e6e7603c0a6255df38020e011c2a06eaedc5919d0d1c875d8782310a4b093e",
+    "perception/autoware_compare_map_segmentation/src/distance_based_compare_map_filter/node.hpp": "158c55a36585a28e5b2cd4a70acdd0560eaf63e7fc30fbff5f8efeef3e82524d",
+    "perception/autoware_compare_map_segmentation/src/voxel_distance_based_compare_map_filter/node.cpp": "96388396ba0015052ae66f5228144ae8f5b9f727bb3fc742fc4d308a57f293b2",
+    "perception/autoware_compare_map_segmentation/src/voxel_distance_based_compare_map_filter/node.hpp": "9429365a1a2569c00e4fc54ceb78f6e2d5746854c6df9f2eaafbe478d71c95cc",
+    "perception/autoware_compare_map_segmentation/lib/voxel_grid_map_loader.cpp": "f6ada5ab1bd91369e2489a594fcc8db60462e00174c526a233951dcf58dec34f"
+  },
+  "license": "Apache-2.0; copyright notices retained in original source",
+  "adapter": "scripts/tunnel_map_geometry.py; 3D nearest-map-distance kernel ported to cached scipy KD tree, ROS1 stamping and floor/unknown/confirmation added",
+  "ros1_cpp_adapter": "include/new_lane/tunnel_map_kernel.hpp: sparse 0.05m voxel occupancy + original-point radius query; dense PCL leaf layout replaced to bound memory; same-voxel shortcut only if voxel diagonal is below threshold; no input downsampling; exact-query cache reused by raw and nonground."
+}

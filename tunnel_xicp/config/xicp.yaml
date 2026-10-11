@@ -1,0 +1,52 @@
+readingDataPointsFilters:
+  - RemoveNaNDataPointsFilter
+referenceDataPointsFilters:
+  - RemoveNaNDataPointsFilter
+matcher:
+  KDTreeMatcher:
+    knn: 1
+    maxDist: 0.5
+    epsilon: 0.0
+outlierFilters:
+  - TrimmedDistOutlierFilter:
+      ratio: 0.95
+regularization:
+  Disabled:
+    regularizationWeight: 440.0
+enableRMSfiltering:
+  Disabled:
+    rmsLambda: 0.0036
+ceresDegeneracyAnalysis:
+  CeresDegeneracyState:
+    isActive: 0
+    usePointToPointCost: 0
+    usePointToPlaneCost: 1
+    useBoundConstraints: 1
+    useSixDofRegularization: 0
+    useThreeDofRegularization: 1
+    regularizationWeight: 675.0
+degeneracyAwareness:
+  OptimizedEqualityConstraints:
+    enoughInformationThreshold: 300
+    insufficientInformationThreshold: 150
+    point2NormalMinimalAlignmentAngleThreshold: 80
+    point2NormalStrongAlignmentAngleThreshold: 45
+forceXICPdetection:
+  Enabled
+degeneracyDebug:
+  Enabled
+printingDegeneracy:
+  Disabled
+transformationCheckers:
+  - DifferentialTransformationChecker:
+      minDiffRotErr: 0.001
+      minDiffTransErr: 0.01
+      smoothLength: 3
+  - CounterTransformationChecker:
+      maxIterationCount: 30
+inspector:
+  NullInspector
+logger:
+  NullLogger
+errorMinimizer:
+  PointToPlaneErrorMinimizer

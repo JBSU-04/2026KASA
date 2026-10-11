@@ -1,0 +1,47 @@
+<launch>
+  <!-- MORAI 경계. 규정 2-8 허용 채널은 UDP 7종뿐이므로 rosbridge 는 쓰지 않는다.
+       ctrl_cmd 도 UDP 로 나가야 하므로 enable_control 을 true 로 둔다. -->
+  <arg name="sim_ip" default="192.168.0.1"/>
+  <!-- 규정 2-6-2: 고정 카메라 3대 중 Front(1280x720, FOV 90)만 사용한다.
+       Left/Right 는 MORAI 쪽 commType=0 이고 쓰는 노드도 없다.
+       브리지는 카메라 채널을 1개만 지원한다. -->
+  <arg name="enable_camera" default="true"/>
+  <!-- 규정 2-6-2 자유 선택 1대. 상향(pitch 325 = -35deg, nose up) 보조
+       카메라로, 정지선 앞에 섰을 때 Front 화각(광축 위 29.4deg)을 벗어나는
+       신호등을 본다.
+         실측 2026-09-14(12:15 백): 정지선 4.7m 앞 정지 시 신호등 올려본각이
+         31.2deg 라 Front 에서 사라졌고, 적색이 래치돼 54초간 못 움직였다.
+       장착 (x-0.20, y0, z1.25), pitch 325 -> 커버 5.6~64.4deg.
+       Front 보다 0.65m 뒤라 같은 정지거리에서 올려본각이 작다(정지선
+       4.7m 앞 = 25.4deg). 두 카메라 커버가 8~20m 에서 겹친다. -->
+  <arg name="enable_camera2" default="true"/>
+  <arg name="camera2_port"   default="1238"/>
+  <!-- true 면 CtrlMode=1(KeyBoard)을 계속 보내 MORAI 를 수동으로 돌린다.
+       차량을 출발 위치로 옮길 때 쓴다. 대회 주행에서는 반드시 false. -->
+  <arg name="manual_drive" default="false"/>
+
+  <!-- GPS · IMU · Competition Status · Collision · (Camera) -->
+  <include file="$(find morai_udp_bridge)/launch/morai_udp_bridge.launch">
+    <arg name="simulator_ip"   value="$(arg sim_ip)"/>
+    <arg name="enable_control" value="true"/>
+    <arg name="enable_camera"  value="$(arg enable_camera)"/>
+    <arg name="enable_camera2" value="$(arg enable_camera2)"/>
+    <arg name="camera2_port"   value="$(arg camera2_port)"/>
+    <arg name="ctrl_mode"             value="$(eval 1 if arg('manual_drive') else 2)"/>
+    <arg name="send_before_first_cmd" value="$(arg manual_drive)"/>
+  </include>
+
+  <!-- 3D LiDAR 는 브리지가 아니라 velodyne 드라이버가 UDP 를 직접 해석한다.
+       규정 2-6-2: 최대 1대 · VLP16 · 10 Hz 권장. MORAI 쪽 hostPort 2369 -> 2368.
+       rpm 600 = 10 Hz. 출력은 /velodyne_points (스택 전체가 쓰는 이름). -->
+  <arg name="enable_lidar" default="true"/>
+  <arg name="lidar_port"   default="2368"/>
+  <arg name="lidar_rpm"    default="600.0"/>
+  <include if="$(arg enable_lidar)"
+           file="$(find velodyne_pointcloud)/launch/VLP16_points.launch">
+    <arg name="device_ip" value="$(arg sim_ip)"/>
+    <arg name="port"      value="$(arg lidar_port)"/>
+    <arg name="frame_id"  value="velodyne"/>
+    <arg name="rpm"       value="$(arg lidar_rpm)"/>
+  </include>
+</launch>

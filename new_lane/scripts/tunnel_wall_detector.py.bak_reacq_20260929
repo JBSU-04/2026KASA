@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Tunnel Wall Detector Node.
+
+Subscribes to LiDAR /nonground point cloud and estimates distance to the right
+and left tunnel walls. Computes the lateral shift required to keep the vehicle
+centered in lane 3 during GPS outages in the tunnel. Decouples intentional
+Frenet avoidance swerving from true dead-reckoning drift.
+"""
+
+import math
+import numpy as np
+import rospy
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+def pointcloud2_to_xyz_array(msg):
+    """Fast unpacking of PointCloud2 into an (N, 3) float32 numpy array."""
+    field_offset = {f.name: f.offset for f in msg.fields}
+    if not all(k in field_offset for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), dtype=np.float32)
+
+    names = ['x', 'y', 'z']
+    dtype = np.dtype({
+        'names': names,
+        'formats': [np.float32] * 3,
+        'offsets': [field_offset[name] for name in names],
+        'itemsize': msg.point_step,
+    })
+    n = len(msg.data) // msg.point_step
+    arr = np.frombuffer(msg.data, dtype=dtype, count=n)
+    pts = np.stack([arr[name] for name in names], axis=-1)
+    return pts[~np.isnan(pts).any(axis=1)]
+
+
+def fit_wall_line_ransac(points_xy, max_iter=25, dist_thresh=0.08, max_slope=0.30,
+                         allow_median_fallback=True):
+    """Fit a line y = m*x + b to wall points using RANSAC.
+
+    Returns (m, b, inlier_ratio) or (None, None, 0.0) if fit fails.
+    """
+    n = len(points_xy)
+    if n < 20:
+        return None, None, 0.0
+
+    best_inliers = 0
+    best_m = 0.0
+    best_b = 0.0
+
+    x = points_xy[:, 0]
+    y = points_xy[:, 1]
+
+    # Pre-filter by slope bounds using randomized pairs
+    for _ in range(max_iter):
+        idx = np.random.choice(n, 2, replace=False)
+        dx = x[idx[1]] - x[idx[0]]
+        if abs(dx) < 1.0:
+            continue
+        dy = y[idx[1]] - y[idx[0]]
+        m = dy / dx
+        if abs(m) > max_slope:
+            continue
+        b = y[idx[0]] - m * x[idx[0]]
+
+        # Distance from line: |m*x - y + b| / sqrt(m^2 + 1)
+        dists = np.abs(m * x - y + b) / math.sqrt(m * m + 1.0)
+        inliers = np.count_nonzero(dists < dist_thresh)
+
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_m = m
+            best_b = b
+
+    if best_inliers < max(15, int(n * 0.25)):
+        # Fallback: simple median of y if points are concentrated
+        if allow_median_fallback and n >= 20:
+            med_y = float(np.median(y))
+            return 0.0, med_y, float(n) / max(n, 1)
+        return None, None, 0.0
+
+    # Refine with least squares on inliers
+    dists = np.abs(best_m * x - y + best_b) / math.sqrt(best_m * best_m + 1.0)
+    inlier_mask = dists < dist_thresh
+    if np.count_nonzero(inlier_mask) >= 10:
+        poly = np.polyfit(x[inlier_mask], y[inlier_mask], 1)
+        return float(poly[0]), float(poly[1]), float(best_inliers) / n
+
+    return best_m, best_b, float(best_inliers) / n
+
+
+class TunnelWallDetector:
+    """터널(음영구간) 벽 기반 보정 + 제한영역 + 라이다 선감속 트리거.
+
+    2026-09-29 (16:23 백) 재구성:
+      - 실측 단면(15~20 s, 39 스캔): 우측 연석 -3.9 m / 벽면 -4.4 m,
+        좌측 연석 +6.9~7.1 m / 벽면 +7.4~7.6 m, 폭 11.8 m. 예전 값(폭 8.4,
+        우측 2.45, 좌측 창 1.5~6.5 m)은 이 터널과 맞지 않아 좌측 벽을 못 봤다.
+      - 헤딩 누적: 카메라 VP 헤딩이 +-1 deg 흔들려 추측항법 위치가 벽 기준
+        +-0.3 m 흘렀다(13~17 s 좌측(중앙선 쪽) 0.2 m, 17~21.6 s 우측 0.3 m).
+        /odom 은 경로 위(+-0.1 m)라고 믿었다. 벽까지 거리로 추측항법 오차를
+        직접 재서 /tunnel/wall_offset 으로 플래너에 준다(플래너가 빼서 계획).
+      - 기준 벽 거리(target)는 GPS 가 얼 때(그 순간 추측항법 오차 ~0) 자동 보정.
+      - /tunnel/wall_limits: 연석선(벽 - curb_inset) 까지 거리 -> 플래너 좌우 제한.
+      - /tunnel/lidar_obstacle_ahead: 연석선 안쪽, 전방 kick_range 안 물체.
+    """
+
+    def __init__(self):
+        # 기하(센서 프레임: x 전방, y 좌측, z 는 센서 기준 - 지면 약 -1.75)
+        self.nominal_tunnel_width = float(rospy.get_param('~nominal_tunnel_width', 11.8))
+        self.width_tolerance = float(rospy.get_param('~width_tolerance', 1.0))
+        self.target_wall_dist = float(rospy.get_param('~target_wall_dist', 4.30))
+        self.auto_target = bool(rospy.get_param('~auto_target', True))
+        self.auto_target_window_sec = float(rospy.get_param('~auto_target_window_sec', 4.0))
+        self.auto_target_samples = int(rospy.get_param('~auto_target_samples', 8))
+        self.curb_inset = float(rospy.get_param('~curb_inset', 0.1))
+        self.right_roi = rospy.get_param('~right_roi_y', [-6.5, -2.5])
+        self.left_roi = rospy.get_param('~left_roi_y', [5.0, 10.0])
+        self.wall_z = rospy.get_param('~wall_z', [0.0, 1.5])
+        self.wall_x = rospy.get_param('~wall_x', [1.0, 15.0])
+        self.sensor_x = float(rospy.get_param('~sensor_x', 1.10))
+        # 보정 필터
+        self.max_shift = float(rospy.get_param('~max_shift', 1.20))
+        self.shift_rate_limit = float(rospy.get_param('~shift_rate_limit', 0.30))
+        self.ema_alpha = float(rospy.get_param('~ema_alpha', 0.20))
+        self.deadband_m = float(rospy.get_param('~deadband_m', 0.03))
+        self.offset_enabled = bool(rospy.get_param('~offset_enabled', True))
+        # 라이다 선감속
+        self.kick_enabled = bool(rospy.get_param('~kick_enabled', True))
+        self.kick_range = float(rospy.get_param('~kick_range_m', 20.0))
+        self.kick_min_x = float(rospy.get_param('~kick_min_x_m', 3.0))
+        self.kick_z = rospy.get_param('~kick_z', [-1.45, 0.5])
+        # 선감속 영역은 제한선과 따로 '벽에서' 잰다. 벽 아래 턱(우측 -3.9 m, 높이
+        # ~0.75 m, 벽면 -4.4 m)이 영역 안에 들어오면 계속 오검출된다.
+        self.kick_wall_inset = float(rospy.get_param('~kick_wall_inset_m', 0.8))
+        self.kick_min_points = int(rospy.get_param('~kick_min_points', 8))
+        self.kick_confirm_frames = int(rospy.get_param('~kick_confirm_frames', 2))
+        self.limits_hold_sec = float(rospy.get_param('~limits_hold_sec', 1.0))
+        # ★ 2026-09-29 (19:23 백): 선감속은 원본 점군 + 국소 지면으로 판정한다.
+        #   낮은 장애물(윗면 0.33 m)을 /nonground(GroundGrid)가 10 m 밖에서 지면으로
+        #   지워 선감속이 한 번도 안 걸렸다(원본 점은 25~30 m 부터 있었다).
+        #   영역 안 점을 x 2 m 칸으로 나눠 칸마다 노면 높이(낮은 점의 20 백분위)를 잡고
+        #   그보다 kick_min_height 이상 높은 점을 물체로 센다.
+        self.kick_use_raw = bool(rospy.get_param('~kick_use_raw', True))
+        self.kick_cloud_topic = rospy.get_param('~kick_cloud_topic', '/velodyne_points')
+        self.kick_min_height = float(rospy.get_param('~kick_min_height_m', 0.20))
+        # 노면 요철/경사로 퍼진 점(16:23 13.3 s: 차로 전폭에 0.12~0.16 m)을 거르기 위해
+        # 1 m 격자 한 칸에 kick_cell_min_points 이상 모인 점만 물체로 본다.
+        self.kick_cell_m = float(rospy.get_param('~kick_cell_m', 1.0))
+        self.kick_cell_min_points = int(rospy.get_param('~kick_cell_min_points', 6))
+        self.kick_max_height = float(rospy.get_param('~kick_max_height_m', 2.2))
+        self.kick_ground_z = float(rospy.get_param('~kick_default_ground_z', -1.75))
+        self.kick_lines_state = None   # (stamp, m_r, bk_r, m_l, bk_l) 최근 곧은 벽 기준 선감속 경계
+        # ★ 2026-09-29 (19:49 백): 원거리 후보 기억.
+        #   낮은 장애물(0.33~0.49 m)은 라이다(1.75 m, 링 2 deg)에 25~30 m(-3 deg 링),
+        #   15~18 m(-5 deg), 11~13 m(-7 deg)에서만 맞고 18~25 m 에서는 링 사이로
+        #   빠진다. 20 m 에서 '지금 보이는가'로는 12 m 에서야 선감속이 걸렸다.
+        #   kick_detect_range 까지 후보를 찾아 세계좌표로 기억하고, 기억한 물체가
+        #   kick_range 안(영역 안)에 들어오면 선감속한다.
+        self.kick_detect_range = float(rospy.get_param('~kick_detect_range_m', 35.0))
+        self.kick_memory_sec = float(rospy.get_param('~kick_memory_sec', 4.0))
+        self.kick_memory_merge_m = float(rospy.get_param('~kick_memory_merge_m', 1.0))
+        self.kick_memory_min_hits = int(rospy.get_param('~kick_memory_min_hits', 2))
+        self.kick_memory = []          # [wx, wy, last_seen_sec, hits]
+        # ★ 2026-09-29 (20:27 백): idx 별 실측 벽/턱 경계(config/tunnel_wall_profile.yaml)로
+        #   선감속 후보 중 벽 조각을 뺀다(출구에서 좁아지는 구조물이 직선 벽 영역 안으로 들어왔다).
+        prof = rospy.get_param('~tunnel_wall_profile', [])
+        self.wprof = None
+        if len(prof) >= 6 and len(prof) % 3 == 0:
+            a = np.asarray(prof, dtype=np.float64).reshape(-1, 3)
+            self.wprof = (a[:, 0], a[:, 1], a[:, 2])
+        self.profile_margin = float(rospy.get_param('~kick_profile_margin_m', 0.5))
+        self.route = None              # (xy[N,2], idx[N], tan[N,2])
+        self.pose = None               # (x, y, yaw) /odom
+        self.last_kick_confirmed = False
+        self.wall_max_curvature = float(rospy.get_param('~wall_max_curvature', 0.0015))
+        self.wall_min_inlier_ratio = float(rospy.get_param('~wall_min_inlier_ratio', 0.5))
+        self.wall_min_points = int(rospy.get_param('~wall_min_points', 100))
+        self.parallel_max_slope_diff = float(rospy.get_param('~parallel_max_slope_diff', 0.04))
+
+        # State
+        self.gps_mode = 'normal'
+        self.active_section = ''
+        self.current_frenet_d = 0.0
+        self.last_frenet_d_stamp = rospy.Time(0)
+        self.filtered_shift = 0.0
+        self.last_update_time = rospy.Time.now()
+        self.freeze_start = None
+        self.calib_samples = []
+        self.target_calibrated = False
+        self.target = self.target_wall_dist
+        self.last_limits = None       # (stamp, m_r, r_curb, m_l, l_curb)
+        self.kick_hits = 0
+
+        # Publishers
+        self.offset_pub = rospy.Publisher('/tunnel/wall_offset', Float64, queue_size=1)
+        self.limits_pub = rospy.Publisher('/tunnel/wall_limits', Float64MultiArray, queue_size=1)
+        self.kick_pub = rospy.Publisher('/tunnel/lidar_obstacle_ahead', Bool, queue_size=1)
+        self.kick_dist_pub = rospy.Publisher('/tunnel/lidar_obstacle_distance', Float64, queue_size=1)
+        self.marker_pub = rospy.Publisher('/tunnel/wall_markers', MarkerArray, queue_size=1)
+        # ★ 2026-09-29 (20:27 백): 벽 기준 헤딩(터널 방향 대비 자차 헤딩 [rad], + = 좌).
+        #   곧은 벽 두 면이 서로 평행하게 잡힐 때만 낸다. 위치추정(어댑터)이 카메라 VP 보다
+        #   먼저 쓴다 - 카메라는 회피 중 +5.5 deg 에 멈춰 추측항법이 ~2 m 흘렀다.
+        self.wall_yaw_pub = rospy.Publisher('/tunnel/wall_yaw_error', Float64, queue_size=5)
+
+        # Subscribers
+        rospy.Subscriber('/localization/gps_mode', String, self.gps_mode_cb, queue_size=1)
+        try:
+            from mission_supervisor.msg import SectionState
+            rospy.Subscriber('/mission/active_section', SectionState, self.section_cb, queue_size=1)
+        except Exception:
+            pass
+        rospy.Subscriber('/obstacle_avoidance/frenet_d', Float64, self.frenet_d_cb, queue_size=1)
+        rospy.Subscriber('/nonground', PointCloud2, self.lidar_cb, queue_size=1)
+        from nav_msgs.msg import Odometry
+        rospy.Subscriber('/odom', Odometry, self.odom_cb, queue_size=5)
+        try:
+            from waypoint_maker.msg import Lane
+            rospy.Subscriber('/final_waypoint', Lane, self.route_cb, queue_size=1)
+        except Exception:
+            pass
+        if self.kick_use_raw:
+            rospy.Subscriber(self.kick_cloud_topic, PointCloud2, self.raw_kick_cb, queue_size=1,
+                             buff_size=2 ** 24)
+        rospy.loginfo('[tunnel_wall_detector] width=%.2f target=%.2f (auto=%s) curb_inset=%.2f kick=%s %.0fm',
+                      self.nominal_tunnel_width, self.target_wall_dist, self.auto_target,
+                      self.curb_inset, self.kick_enabled, self.kick_range)
+
+    def gps_mode_cb(self, msg):
+        prev = self.gps_mode
+        self.gps_mode = msg.data
+        if self.gps_mode == 'frozen' and prev != 'frozen':
+            self.freeze_start = rospy.Time.now()
+            self.calib_samples = []
+            self.target_calibrated = False
+            self.target = self.target_wall_dist
+
+    def odom_cb(self, msg):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+
+    def route_cb(self, msg):
+        if len(msg.waypoints) < 2:
+            return
+        xy = np.array([[w.pose.pose.position.x, w.pose.pose.position.y] for w in msg.waypoints])
+        idx = np.array([w.waypoint_index for w in msg.waypoints], dtype=np.float64)
+        tan = np.gradient(xy, axis=0)
+        n = np.linalg.norm(tan, axis=1)
+        n[n < 1e-9] = 1.0
+        self.route = (xy, idx, tan / n[:, None])
+
+    def is_wall_piece_world(self, wx, wy):
+        """세계좌표 점이 idx 별 벽/턱 경계 안쪽 profile_margin 이내 또는 바깥인가."""
+        if self.wprof is None or self.route is None:
+            return False
+        xy, idx, tan = self.route
+        d2 = (xy[:, 0] - wx) ** 2 + (xy[:, 1] - wy) ** 2
+        j = int(np.argmin(d2))
+        lat = -tan[j, 1] * (wx - xy[j, 0]) + tan[j, 0] * (wy - xy[j, 1])
+        lat -= self.filtered_shift        # 추측항법 보정(실제 횡위치)
+        ik, rk, lk = self.wprof
+        k = idx[j]
+        if k < ik[0] or k > ik[-1]:
+            return False
+        r_ok = np.interp(k, ik, (rk < 0).astype(float)) >= 0.999
+        l_ok = np.interp(k, ik, (lk > 0).astype(float)) >= 0.999
+        r = np.interp(k, ik, rk)
+        l = np.interp(k, ik, lk)
+        return bool((r_ok and lat <= r + self.profile_margin) or
+                    (l_ok and lat >= l - self.profile_margin))
+
+    def section_cb(self, msg):
+        self.active_section = getattr(msg, 'section_id', '')
+
+    def frenet_d_cb(self, msg):
+        self.current_frenet_d = msg.data
+        self.last_frenet_d_stamp = rospy.Time.now()
+
+    def is_tunnel_zone(self):
+        return (self.gps_mode == 'frozen' or
+                self.active_section == 'M8' or
+                self.active_section == 'tunnel_approach' or
+                self.active_section == 'gps_shadow')
+
+    def fit_straight_wall(self, pts_xy):
+        """곧은 벽이면 (m, b, True). 곡선/가림/부족이면 (m, b, False)."""
+        if len(pts_xy) < self.wall_min_points:
+            return 0.0, 0.0, False
+        m, b, ratio = fit_wall_line_ransac(pts_xy, allow_median_fallback=False)
+        if m is None or ratio < self.wall_min_inlier_ratio:
+            return 0.0, 0.0, False
+        d = np.abs(m * pts_xy[:, 0] - pts_xy[:, 1] + b) / math.sqrt(m * m + 1.0)
+        k = d < 0.25
+        if np.count_nonzero(k) < 20:
+            return m, b, False
+        curv = np.polyfit(pts_xy[k, 0], pts_xy[k, 1], 2)[0]
+        return m, b, abs(curv) <= self.wall_max_curvature
+
+    def publish_idle(self, dt):
+        # 터널 밖: 보정은 0 으로 서서히, 제한/선감속은 무효.
+        if abs(self.filtered_shift) > 0.01:
+            decay = max(0.0, abs(self.filtered_shift) - self.shift_rate_limit * dt)
+            self.filtered_shift = math.copysign(decay, self.filtered_shift)
+        else:
+            self.filtered_shift = 0.0
+        self.offset_pub.publish(Float64(data=self.filtered_shift))
+        self.limits_pub.publish(Float64MultiArray(data=[0.0, 0.0, 0.0, 0.0, 0.0]))
+        self.kick_hits = 0
+        self.kick_pub.publish(Bool(data=False))
+        self.kick_dist_pub.publish(Float64(data=-1.0))
+
+    def lidar_cb(self, msg):
+        now = rospy.Time.now()
+        dt = max(0.001, (now - self.last_update_time).to_sec())
+        self.last_update_time = now
+        if not self.is_tunnel_zone():
+            self.publish_idle(dt)
+            return
+        pts = pointcloud2_to_xyz_array(msg)
+        if len(pts) == 0:
+            self.offset_pub.publish(Float64(data=self.filtered_shift))
+            return
+
+        # ---- 벽 직선 (차량보다 높은 띠: 센서 z 0~1.5 = 지면 위 약 1.75~3.25 m) ----
+        # 유효 조건은 '자차가 벽과 평행한가'가 아니라 '벽이 곧은가'다.
+        #   13:02 백 71.5~72 s: 회피 복귀 중 자차 헤딩 -9 deg(기울기 +0.155)라도
+        #   벽은 곧아(2차항 a~0) 제한/선감속에 써야 한다. 반대로 곡선 진입부(16:23
+        #   11~11.5 s)나 장애물에 가린 벽(13:02 66~69 s)은 2차항이 0.0017~0.02 로 컸다.
+        #   거리는 수직거리 |b|/sqrt(1+m^2) 로 쓴다(헤딩과 무관).
+        wm = ((pts[:, 0] >= self.wall_x[0]) & (pts[:, 0] <= self.wall_x[1]) &
+              (pts[:, 2] >= self.wall_z[0]) & (pts[:, 2] <= self.wall_z[1]))
+        wall_pts = pts[wm]
+        right_pts = wall_pts[(wall_pts[:, 1] >= self.right_roi[0]) &
+                             (wall_pts[:, 1] <= self.right_roi[1])][:, :2]
+        left_pts = wall_pts[(wall_pts[:, 1] >= self.left_roi[0]) &
+                            (wall_pts[:, 1] <= self.left_roi[1])][:, :2]
+        m_r, b_r, r_ok = self.fit_straight_wall(right_pts)
+        m_l, b_l, l_ok = self.fit_straight_wall(left_pts)
+        W = self.nominal_tunnel_width
+        both = False
+        if r_ok and l_ok:
+            width = (-b_r) / math.sqrt(1.0 + m_r * m_r) + b_l / math.sqrt(1.0 + m_l * m_l)
+            both = (abs(m_r - m_l) <= self.parallel_max_slope_diff and
+                    abs(width - W) <= self.width_tolerance)
+            if not both:
+                r_ok = l_ok = False   # 둘 다 곧은데 서로 안 맞음 = 한쪽이 가짜
+        if r_ok and not l_ok:
+            m_l, b_l = m_r, b_r + W * math.sqrt(1.0 + m_r * m_r)
+        elif l_ok and not r_ok:
+            m_r, b_r = m_l, b_l - W * math.sqrt(1.0 + m_l * m_l)
+        walls_ok = r_ok or l_ok
+        if both:
+            self.wall_yaw_pub.publish(Float64(data=-math.atan(0.5 * (m_r + m_l))))
+
+        limits = None
+        kick_lines = None
+        if walls_ok:
+            d_right = (-b_r) / math.sqrt(1.0 + m_r * m_r)
+            d_left = b_l / math.sqrt(1.0 + m_l * m_l)
+            d_fused = 0.5 * d_right + 0.5 * (W - d_left)
+            frenet_d = 0.0
+            if (now - self.last_frenet_d_stamp).to_sec() < 0.5:
+                frenet_d = self.current_frenet_d
+            # 기준 벽 거리 자동 보정(GPS 가 언 직후 = 추측항법 오차 ~0)
+            if (self.auto_target and not self.target_calibrated and
+                    self.gps_mode == 'frozen' and self.freeze_start is not None and both):
+                if (now - self.freeze_start).to_sec() <= self.auto_target_window_sec:
+                    self.calib_samples.append(d_fused - frenet_d)
+                    if len(self.calib_samples) >= self.auto_target_samples:
+                        self.target = float(np.median(self.calib_samples))
+                        self.target_calibrated = True
+                        rospy.loginfo('[tunnel_wall] target wall dist calibrated: %.2f m '
+                                      '(%d samples, fallback %.2f)', self.target,
+                                      len(self.calib_samples), self.target_wall_dist)
+            # 추측항법 오차 = (기준 + 의도한 횡이동) - 실제 벽 거리
+            #   + 면 추측항법이 실제보다 왼쪽(실제 차는 오른쪽으로 흐름)
+            if self.offset_enabled and self.gps_mode == 'frozen':
+                raw = (self.target + frenet_d) - d_fused
+                if abs(raw) < self.deadband_m:
+                    raw = 0.0
+                raw = max(-self.max_shift, min(self.max_shift, raw))
+                step = self.ema_alpha * (raw - self.filtered_shift)
+                max_change = self.shift_rate_limit * dt
+                step = max(-max_change, min(max_change, step))
+                self.filtered_shift += step
+            # 연석선: 벽을 curb_inset 만큼 안쪽(수직)으로 옮긴 선
+            b_r_curb = b_r + self.curb_inset * math.sqrt(1.0 + m_r * m_r)
+            b_l_curb = b_l - self.curb_inset * math.sqrt(1.0 + m_l * m_l)
+            limits = (now, m_r, b_r_curb, m_l, b_l_curb)
+            self.last_limits = limits
+            kick_lines = (m_r, b_r + self.kick_wall_inset * math.sqrt(1.0 + m_r * m_r),
+                          m_l, b_l - self.kick_wall_inset * math.sqrt(1.0 + m_l * m_l))
+            rospy.loginfo_throttle(1.0,
+                '[tunnel_wall] R=%.2f L=%.2f (%s) fused=%.2f target=%.2f%s frenet_d=%.2f '
+                'slope %.3f/%.3f -> shift=%.2f',
+                d_right, d_left, 'both' if both else ('R' if r_ok else 'L'), d_fused,
+                self.target, '' if self.target_calibrated else '(fallback)', frenet_d,
+                m_r, m_l, self.filtered_shift)
+        # GPS 가 돌아오면(벽 검출 여부와 무관하게) 보정을 0 으로 서서히 뺀다.
+        if self.gps_mode != 'frozen':
+            decay = max(0.0, abs(self.filtered_shift) - self.shift_rate_limit * dt)
+            self.filtered_shift = math.copysign(decay, self.filtered_shift)
+        fresh_limits = limits is not None
+        if (limits is None and self.last_limits is not None and
+                (now - self.last_limits[0]).to_sec() <= self.limits_hold_sec):
+            limits = self.last_limits
+        self.offset_pub.publish(Float64(data=self.filtered_shift))
+
+        if limits is not None:
+            _, lm_r, bc_r, lm_l, bc_l = limits
+            r_curb = (-bc_r) / math.sqrt(1.0 + lm_r * lm_r)
+            l_curb = bc_l / math.sqrt(1.0 + lm_l * lm_l)
+            self.limits_pub.publish(Float64MultiArray(
+                data=[1.0, r_curb, l_curb, lm_r, lm_l]))
+        else:
+            self.limits_pub.publish(Float64MultiArray(data=[0.0, 0.0, 0.0, 0.0, 0.0]))
+
+        # ---- 라이다 선감속: 연석선 안쪽 + 전방 kick_range 안 물체 ----
+        present, nearest = False, -1.0
+        if fresh_limits and kick_lines is not None:
+            self.kick_lines_state = (now,) + tuple(kick_lines)
+        # 선감속은 이번 스캔에서 직접 잰(유지값 아님) 직선 구간 제한으로만.
+        #   곡선 출구에서 유지값 + 휘어 들어오는 벽이 영역 안으로 잡혔다(22.6 s).
+        if self.kick_enabled and not self.kick_use_raw and fresh_limits and kick_lines is not None:
+            lm_r, bk_r, lm_l, bk_l = kick_lines
+            km = ((pts[:, 2] >= self.kick_z[0]) & (pts[:, 2] <= self.kick_z[1]))
+            kp = pts[km]
+            xb = kp[:, 0] + self.sensor_x          # base_link 기준 전방 거리
+            sel = (xb >= self.kick_min_x) & (xb <= self.kick_range)
+            kp, xb = kp[sel], xb[sel]
+            if len(kp):
+                y_r = lm_r * kp[:, 0] + bk_r
+                y_l = lm_l * kp[:, 0] + bk_l
+                inside = (kp[:, 1] > y_r) & (kp[:, 1] < y_l)
+                if np.count_nonzero(inside) >= self.kick_min_points:
+                    present = True
+                    nearest = float(np.min(xb[inside]))
+        if not self.kick_use_raw:
+            self.publish_kick(present, nearest)
+        self.publish_markers(msg.header.frame_id, m_r, b_r, m_l, b_l,
+                             kick_lines if fresh_limits else None, self.last_kick_confirmed)
+
+    def publish_kick(self, present, nearest):
+        self.kick_hits = self.kick_hits + 1 if present else 0
+        confirmed = present and self.kick_hits >= self.kick_confirm_frames
+        self.last_kick_confirmed = confirmed
+        self.kick_pub.publish(Bool(data=confirmed))
+        self.kick_dist_pub.publish(Float64(data=nearest if confirmed else -1.0))
+        if confirmed:
+            rospy.loginfo_throttle(1.0, '[tunnel_wall] lidar object inside zone at %.1f m '
+                                   '-> pre-decel', nearest)
+
+    def raw_kick_cb(self, msg):
+        """원본 점군 선감속(kick_use_raw). 경계는 /nonground 에서 잰 곧은 벽 선.
+
+        kick_detect_range 까지 후보(1 m 칸에 모인 노면 위 점)를 찾아 세계좌표로
+        기억하고, 기억한 물체 중 kick_min_x~kick_range(영역 안)가 있으면 선감속.
+        """
+        if not self.kick_enabled or not self.is_tunnel_zone():
+            return
+        now = rospy.Time.now()
+        now_s = now.to_sec()
+        st = self.kick_lines_state
+        if st is None or (now - st[0]).to_sec() > 0.3 or self.pose is None:
+            self.publish_kick(False, -1.0)
+            return
+        _, lm_r, bk_r, lm_l, bk_l = st
+        ex, ey, eyaw = self.pose
+        c, s = math.cos(eyaw), math.sin(eyaw)
+        pts = pointcloud2_to_xyz_array(msg)
+        x0 = self.kick_min_x - self.sensor_x
+        x1 = max(self.kick_range, self.kick_detect_range) - self.sensor_x
+        centers = []
+        if len(pts):
+            m = ((pts[:, 0] >= x0) & (pts[:, 0] <= x1) &
+                 (pts[:, 2] <= self.kick_ground_z + self.kick_max_height + 0.5))
+            p = pts[m]
+            if len(p):
+                inside = (p[:, 1] > lm_r * p[:, 0] + bk_r) & (p[:, 1] < lm_l * p[:, 0] + bk_l)
+                p = p[inside]
+            if len(p):
+                bins = np.floor((p[:, 0] - x0) / 2.0).astype(int)
+                ground = np.full(bins.max() + 1, self.kick_ground_z)
+                low = np.abs(p[:, 2] - self.kick_ground_z) <= 0.4
+                for bb in np.unique(bins):
+                    sel = (bins == bb) & low
+                    if np.count_nonzero(sel) >= 15:
+                        ground[bb] = np.percentile(p[sel, 2], 20)
+                h = p[:, 2] - ground[bins]
+                q = p[(h >= self.kick_min_height) & (h <= self.kick_max_height)]
+                if len(q):
+                    cells = np.floor(q[:, :2] / self.kick_cell_m).astype(np.int64)
+                    keys = cells[:, 0] * 100003 + cells[:, 1]
+                    uniq, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
+                    for k in np.nonzero(counts >= self.kick_cell_min_points)[0]:
+                        cp = q[inv == k]
+                        centers.append((float(np.mean(cp[:, 0])), float(np.mean(cp[:, 1]))))
+        # 세계좌표 기억 갱신(같은 스캔 안 중복은 한 번만 센다)
+        touched = set()
+        merge2 = self.kick_memory_merge_m ** 2
+        for sx, sy in centers:
+            bx = sx + self.sensor_x
+            wx = ex + c * bx - s * sy
+            wy = ey + s * bx + c * sy
+            best, bd = None, merge2
+            for i, it in enumerate(self.kick_memory):
+                d2 = (it[0] - wx) ** 2 + (it[1] - wy) ** 2
+                if d2 <= bd:
+                    best, bd = i, d2
+            if best is None:
+                self.kick_memory.append([wx, wy, now_s, 1])
+                touched.add(len(self.kick_memory) - 1)
+            else:
+                it = self.kick_memory[best]
+                it[0] = 0.7 * it[0] + 0.3 * wx
+                it[1] = 0.7 * it[1] + 0.3 * wy
+                it[2] = now_s
+                if best not in touched:
+                    it[3] += 1
+                    touched.add(best)
+        # 만료/지나감 정리 + 선감속 판정
+        present, nearest = False, -1.0
+        keep = []
+        for it in self.kick_memory:
+            if now_s - it[2] > self.kick_memory_sec:
+                continue
+            dx, dy = it[0] - ex, it[1] - ey
+            bx = c * dx + s * dy            # base_link 전방
+            by = -s * dx + c * dy
+            if bx < -2.0:
+                continue
+            keep.append(it)
+            if it[3] < self.kick_memory_min_hits:
+                continue
+            if self.is_wall_piece_world(it[0], it[1]):
+                continue
+            sx = bx - self.sensor_x
+            if not (self.kick_min_x <= bx <= self.kick_range):
+                continue
+            if not (lm_r * sx + bk_r < by < lm_l * sx + bk_l):
+                continue
+            if not present or bx < nearest:
+                present, nearest = True, bx
+        self.kick_memory = keep[-100:]
+        self.publish_kick(present, nearest)
+
+    def publish_markers(self, frame_id, m_r, b_r, m_l, b_l, limits=None, kick=False):
+        if self.marker_pub.get_num_connections() == 0:
+            return
+
+        ma = MarkerArray()
+
+        del_m = Marker()
+        del_m.action = Marker.DELETEALL
+        ma.markers.append(del_m)
+
+        header_stamp = rospy.Time.now()
+
+        # Right wall marker (Green line)
+        if b_r is not None:
+            mr = Marker()
+            mr.header.frame_id = frame_id
+            mr.header.stamp = header_stamp
+            mr.ns = "tunnel_walls"
+            mr.id = 1
+            mr.type = Marker.LINE_STRIP
+            mr.action = Marker.ADD
+            mr.scale.x = 0.12
+            mr.color.r = 0.1
+            mr.color.g = 1.0
+            mr.color.b = 0.1
+            mr.color.a = 0.9
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                mr.points.append(Point(x_val, m_r * x_val + b_r, 0.5))
+            ma.markers.append(mr)
+
+        # Left wall marker (Blue line)
+        if b_l is not None:
+            ml = Marker()
+            ml.header.frame_id = frame_id
+            ml.header.stamp = header_stamp
+            ml.ns = "tunnel_walls"
+            ml.id = 2
+            ml.type = Marker.LINE_STRIP
+            ml.action = Marker.ADD
+            ml.scale.x = 0.12
+            ml.color.r = 0.1
+            ml.color.g = 0.3
+            ml.color.b = 1.0
+            ml.color.a = 0.9
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                ml.points.append(Point(x_val, m_l * x_val + b_l, 0.5))
+            ma.markers.append(ml)
+
+        # Target lane center line (Yellow line)
+        if b_r is not None:
+            mc = Marker()
+            mc.header.frame_id = frame_id
+            mc.header.stamp = header_stamp
+            mc.ns = "tunnel_walls"
+            mc.id = 3
+            mc.type = Marker.LINE_STRIP
+            mc.action = Marker.ADD
+            mc.scale.x = 0.08
+            mc.color.r = 1.0
+            mc.color.g = 0.9
+            mc.color.b = 0.1
+            mc.color.a = 0.8
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                mc.points.append(Point(x_val, m_r * x_val + b_r + self.target, 0.2))
+            ma.markers.append(mc)
+        # 라이다 선감속 영역(연석선 안쪽, kick_min_x~kick_range): 감지 시 빨강
+        if limits is not None:
+            from geometry_msgs.msg import Point
+            lm_r, bk_r, lm_l, bk_l = limits
+            zone = Marker()
+            zone.header.frame_id = frame_id
+            zone.header.stamp = header_stamp
+            zone.ns = "tunnel_kick_zone"
+            zone.id = 4
+            zone.type = Marker.LINE_STRIP
+            zone.action = Marker.ADD
+            zone.scale.x = 0.10
+            zone.color.r = 1.0 if kick else 0.2
+            zone.color.g = 0.2 if kick else 1.0
+            zone.color.b = 0.2
+            zone.color.a = 0.9
+            x0 = self.kick_min_x - self.sensor_x
+            x1 = self.kick_range - self.sensor_x
+            for (px, py) in ((x0, lm_r * x0 + bk_r), (x1, lm_r * x1 + bk_r),
+                             (x1, lm_l * x1 + bk_l), (x0, lm_l * x0 + bk_l),
+                             (x0, lm_r * x0 + bk_r)):
+                zone.points.append(Point(px, py, 0.3))
+            ma.markers.append(zone)
+
+        self.marker_pub.publish(ma)
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('tunnel_wall_detector', anonymous=False)
+        node = TunnelWallDetector()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

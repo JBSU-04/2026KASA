@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /home/kuuve/catkin_ws/src/erp_driver/build/devel/setup.sh

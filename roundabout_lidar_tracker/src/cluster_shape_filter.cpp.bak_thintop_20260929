@@ -1,0 +1,114 @@
+#include "roundabout_lidar_tracker/cluster_shape_filter.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace roundabout_lidar_tracker {
+
+ClusterShape measureClusterShape(const std::vector<ClusterPoint3D>& points) {
+  ClusterShape shape;
+  if (points.empty()) {
+    return shape;
+  }
+
+  double mean_x = 0.0;
+  double mean_y = 0.0;
+  double min_x = std::numeric_limits<double>::infinity();
+  double min_y = std::numeric_limits<double>::infinity();
+  double min_z = std::numeric_limits<double>::infinity();
+  double max_x = -std::numeric_limits<double>::infinity();
+  double max_y = -std::numeric_limits<double>::infinity();
+  double max_z = -std::numeric_limits<double>::infinity();
+  for (const ClusterPoint3D& point : points) {
+    mean_x += point.x;
+    mean_y += point.y;
+    min_x = std::min(min_x, point.x);
+    min_y = std::min(min_y, point.y);
+    min_z = std::min(min_z, point.z);
+    max_x = std::max(max_x, point.x);
+    max_y = std::max(max_y, point.y);
+    max_z = std::max(max_z, point.z);
+  }
+  const double inverse_count = 1.0 / static_cast<double>(points.size());
+  mean_x *= inverse_count;
+  mean_y *= inverse_count;
+
+  double covariance_xx = 0.0;
+  double covariance_xy = 0.0;
+  double covariance_yy = 0.0;
+  for (const ClusterPoint3D& point : points) {
+    const double dx = point.x - mean_x;
+    const double dy = point.y - mean_y;
+    covariance_xx += dx * dx;
+    covariance_xy += dx * dy;
+    covariance_yy += dy * dy;
+  }
+  covariance_xx *= inverse_count;
+  covariance_xy *= inverse_count;
+  covariance_yy *= inverse_count;
+
+  double yaw = 0.5 * std::atan2(2.0 * covariance_xy,
+                                covariance_xx - covariance_yy);
+  double axis_x = std::cos(yaw);
+  double axis_y = std::sin(yaw);
+  double normal_x = -axis_y;
+  double normal_y = axis_x;
+  double min_axis = std::numeric_limits<double>::infinity();
+  double max_axis = -std::numeric_limits<double>::infinity();
+  double min_normal = std::numeric_limits<double>::infinity();
+  double max_normal = -std::numeric_limits<double>::infinity();
+  for (const ClusterPoint3D& point : points) {
+    const double dx = point.x - mean_x;
+    const double dy = point.y - mean_y;
+    const double along_axis = dx * axis_x + dy * axis_y;
+    const double along_normal = dx * normal_x + dy * normal_y;
+    min_axis = std::min(min_axis, along_axis);
+    max_axis = std::max(max_axis, along_axis);
+    min_normal = std::min(min_normal, along_normal);
+    max_normal = std::max(max_normal, along_normal);
+  }
+
+  double length = max_axis - min_axis;
+  double width = max_normal - min_normal;
+  if (width > length) {
+    std::swap(length, width);
+    yaw += 0.5 * 3.14159265358979323846;
+  }
+
+  shape.valid = std::isfinite(length) && std::isfinite(width) &&
+                std::isfinite(min_z) && std::isfinite(max_z);
+  shape.center_x = 0.5 * (min_x + max_x);
+  shape.center_y = 0.5 * (min_y + max_y);
+  shape.center_z = 0.5 * (min_z + max_z);
+  shape.size_x = max_x - min_x;
+  shape.size_y = max_y - min_y;
+  shape.height = max_z - min_z;
+  shape.oriented_length = std::max(0.0, length);
+  shape.oriented_width = std::max(0.0, width);
+  shape.yaw = yaw;
+  shape.aspect_ratio = shape.oriented_length /
+                       std::max(0.05, shape.oriented_width);
+  return shape;
+}
+
+bool isVehicleShape(const ClusterShape& shape,
+                    const VehicleShapeFilterConfig& config) {
+  if (!shape.valid || shape.oriented_length < config.min_length ||
+      shape.oriented_length > config.max_length ||
+      shape.oriented_width < config.min_width ||
+      shape.oriented_width > config.max_width ||
+      shape.height < config.min_height || shape.height > config.max_height) {
+    return false;
+  }
+
+  const bool low_linear =
+      config.reject_low_linear &&
+      shape.oriented_length >= config.linear_min_length &&
+      shape.height <= config.linear_max_height &&
+      (shape.oriented_width <= config.linear_max_width ||
+       shape.aspect_ratio >= config.linear_min_aspect_ratio);
+  return !low_linear;
+}
+
+}  // namespace roundabout_lidar_tracker

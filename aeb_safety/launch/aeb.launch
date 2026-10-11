@@ -1,0 +1,55 @@
+<launch>
+  <!-- 안전/행동 결정층 + arbiter 독립 브링업.
+       전제: /merged_lidar, /odom, /imu, 그리고 MPC 가 /ctrl_cmd_raw 로 발행(메인 런치 remap)하고 있어야 함.
+       merged_lidar 가 없으면 launch_merger:=true 로 lidar_merger 도 띄운다. -->
+  <arg name="map"             default="kcity2025"/>
+  <arg name="ref_v"           default="12.0"/>
+  <arg name="cloud_topic"     default="/merged_lidar"/>
+  <arg name="cloud_latency"   default="0.15"/>
+  <arg name="lane_half_width" default="1.75"/>
+  <arg name="launch_merger"   default="false"/>
+
+  <group if="$(arg launch_merger)">
+    <node pkg="morai_lidar_merger" type="lidar_merger.py" name="lidar_merger" output="screen">
+      <param name="lidar1_topic" value="/lidar3d_0"/>
+      <param name="lidar2_topic" value="/lidar3d_1"/>
+      <param name="merged_topic" value="$(arg cloud_topic)"/>
+      <param name="target_frame" value="lidar1"/>
+      <param name="sync_slop"    value="0.1"/>
+      <param name="max_rate"     value="5.0"/>
+      <param name="voxel_size"   value="0.15"/>
+      <rosparam>
+        lidar2_to_lidar1: {x: -2.42, y: 0.0, z: 0.64, roll: 0.0, pitch: 0.0, yaw: 0.0}
+      </rosparam>
+    </node>
+  </group>
+
+  <!-- 1) 검출-추적-TTC (시간보간·TTC보정 반영본) -->
+  <include file="$(find lidar_ttc_tracker)/launch/lidar_ttc_tracker.launch">
+    <arg name="cloud_topic"   value="$(arg cloud_topic)"/>
+    <arg name="cloud_latency" value="$(arg cloud_latency)"/>
+  </include>
+
+  <!-- 2) AEB 결정 (정적/CCRm/CCRb + 고속 끼어들기 통합) -->
+  <node pkg="aeb_safety" type="aeb_decision_node.py" name="aeb_decision" output="screen">
+    <param name="ref_v" value="$(arg ref_v)"/>
+    <param name="lane_half_width" value="$(arg lane_half_width)"/>
+    <param name="horizon" value="3.0"/>
+    <param name="ttc_fcw" value="2.6"/>
+    <param name="ttc_pb1" value="2.0"/>
+    <param name="ttc_pb2" value="1.6"/>
+    <param name="ttc_full" value="1.0"/>
+  </node>
+
+  <!-- 3) 교차로 진입판단 (MGeo 정지선 + 교차교통 gap-acceptance) -->
+  <node pkg="aeb_safety" type="intersection_manager_node.py" name="intersection_manager" output="screen">
+    <param name="map" value="$(arg map)"/>
+    <param name="ref_v" value="$(arg ref_v)"/>
+    <param name="lane_half_width" value="$(arg lane_half_width)"/>
+    <param name="conflict_radius" value="18.0"/>
+    <param name="pet_margin" value="2.0"/>
+  </node>
+
+  <!-- 4) arbiter (/ctrl_cmd_raw -> /ctrl_cmd) -->
+  <node pkg="aeb_safety" type="aeb_arbiter_node.py" name="aeb_arbiter" output="screen"/>
+</launch>

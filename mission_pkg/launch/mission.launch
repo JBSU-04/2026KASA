@@ -1,0 +1,6 @@
+<launch>
+  <node pkg="mission_pkg" type="lane_obstacle_mission_node"
+        name="lane_obstacle_mission_node" output="screen">
+    <rosparam command="load" file="$(find mission_pkg)/config/lane_obstacle.yaml"/>
+  </node>
+</launch>

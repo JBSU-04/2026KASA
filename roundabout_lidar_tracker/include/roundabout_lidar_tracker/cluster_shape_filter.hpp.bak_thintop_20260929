@@ -1,0 +1,48 @@
+#pragma once
+
+#include <vector>
+
+namespace roundabout_lidar_tracker {
+
+struct ClusterPoint3D {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+};
+
+struct ClusterShape {
+  bool valid = false;
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double center_z = 0.0;
+  double size_x = 0.0;
+  double size_y = 0.0;
+  double height = 0.0;
+  double oriented_length = 0.0;
+  double oriented_width = 0.0;
+  double yaw = 0.0;
+  double aspect_ratio = 0.0;
+};
+
+struct VehicleShapeFilterConfig {
+  double min_length = 0.4;
+  double max_length = 8.0;
+  double min_width = 0.15;
+  double max_width = 6.0;
+  double min_height = 0.2;
+  double max_height = 4.0;
+
+  // 가드레일/중앙분리대처럼 길고 낮은 선형 클러스터를 제거한다.
+  bool reject_low_linear = true;
+  double linear_min_length = 2.0;
+  double linear_max_width = 0.45;
+  double linear_max_height = 1.3;
+  double linear_min_aspect_ratio = 6.0;
+};
+
+ClusterShape measureClusterShape(const std::vector<ClusterPoint3D>& points);
+
+bool isVehicleShape(const ClusterShape& shape,
+                    const VehicleShapeFilterConfig& config);
+
+}  // namespace roundabout_lidar_tracker

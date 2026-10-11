@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>aeb_safety</name>
+  <version>0.1.0</version>
+  <description>
+    안전/행동 결정층 + 명령 arbiter.
+    - aeb_decision: /tracked_objects 로 예측 코리도 교차 판정 -> 정적/CCRm/CCRb + 고속 끼어들기(cut-in)
+      통합 위협 산정 -> 단계별(FCW/부분/완전) AebCommand 발행.
+    - intersection_manager: MGeo 정지선/교차로 + 교차교통 gap-acceptance -> 진입 HOLD 판단.
+    - aeb_arbiter: MPC 출력(/ctrl_cmd_raw) 하류에서 위 명령을 최우선으로 융합해 /ctrl_cmd 발행
+      (Apollo Guardian 패턴). MPC 소스는 건드리지 않음.
+  </description>
+  <maintainer email="secondbabydinosaur@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>message_generation</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>lidar_ttc_tracker</exec_depend>
+  <depend>mission_supervisor</depend>
+</package>

@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""Existing reverse escape supervisor plus validated reverse/forward joint planning.
+
+Original mission/stop/gear/command gates are retained. Joint planning is opt-out:
+no reverse is authorized without a collision-free reverse sweep and an Apollo
+forward escape from its endpoint. Unknown rear space is rejected by the engine.
+"""
+import json
+import math
+import os
+import sys
+import threading
+import time
+from collections import deque
+
+import numpy as np
+from scipy.spatial import cKDTree
+import rospy
+from morai_msgs.msg import CtrlCmd, EgoVehicleStatus
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseStamped
+# Catkin's devel executable is a relay, not an importable helper module.
+# Resolve the actual source/share directory before importing the helpers.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from escape_planning import reverse_candidates, polygon_points, body_clearance, wrap
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Bool, String, UInt8, Float64MultiArray
+from visualization_msgs.msg import Marker, MarkerArray
+from waypoint_maker.msg import Lane
+
+GEAR_R, GEAR_D = 2, 4
+IDLE, PRE_STOP, SHIFT_R, REVERSE, POST_STOP, SHIFT_D = (
+    'idle', 'pre_stop', 'shift_r', 'reverse', 'post_stop', 'shift_d')
+
+
+def cloud_xyz(msg):
+    fields = {f.name: f for f in msg.fields}
+    if not all(k in fields for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), dtype=np.float32)
+    endian = '>' if msg.is_bigendian else '<'
+    formats = [endian + ('f8' if fields[k].datatype == 8 else 'f4') for k in ('x', 'y', 'z')]
+    dt = np.dtype({'names': ['x', 'y', 'z'], 'formats': formats,
+                   'offsets': [fields[k].offset for k in ('x', 'y', 'z')], 'itemsize': msg.point_step})
+    arr = np.ndarray((msg.height, msg.width), dtype=dt, buffer=msg.data,
+                     strides=(msg.row_step, msg.point_step))
+    pts = np.stack([arr[k].ravel() for k in ('x', 'y', 'z')], axis=-1)
+    return pts[np.isfinite(pts).all(axis=1)]
+
+
+class ReverseEscape(object):
+    def __init__(self):
+        rospy.init_node('reverse_escape_node')
+        g = rospy.get_param
+        self.enabled = bool(g('~enabled', True))
+        self.split_idx = int(g('~static_dynamic_split_idx', 3700))
+        self.dyn_max_idx = int(g('~dynamic_zone_max_idx', 4900))
+        self.trigger_stop_sec = float(g('~trigger_stop_sec', 8.0))
+        self.stop_speed = float(g('~stop_speed', 0.2))
+        self.trigger_gap = float(g('~trigger_gap_m', 5.0))
+        self.stale_dynamic_sec = float(g('~stale_dynamic_sec', 1.5))
+        self.min_gap = float(g('~trigger_min_gap_m', -3.0))      # 음수 = 앞범퍼보다 뒤(옆)
+        self.avoid_fail_recent = float(g('~avoid_fail_recent_sec', 1.0))
+        self.front_overhang = float(g('~front_overhang_m', 3.85))  # base_link(후축) -> 앞범퍼
+        self.rear_overhang = float(g('~rear_overhang_m', 0.79))    # base_link -> 뒤범퍼
+        self.sensor_x = float(g('/lidar_extrinsic/x', 1.1))                 # 라이다 장착(base_link 기준)
+        self.ground_z = -float(g('/lidar_extrinsic/z_from_ground', 1.765))               # 센서 좌표 지면 높이
+        self.robot_radius = float(g('~robot_radius', 1.35))
+        self.corridor_radius = float(g('~corridor_radius', 1.5))
+        self.shift_min = float(g('~shift_min_m', 0.35))
+        self.shift_max = float(g('~shift_max_m', 1.85))
+        self.rev_min = float(g('~reverse_min_m', 5.0))
+        self.rev_max = float(g('~reverse_max_m', 10.0))
+        self.min_reverse = float(g('~min_reverse_m', 2.0))
+        self.rear_margin = float(g('~rear_margin_m', 1.0))
+        self.rear_half_width = float(g('~rear_half_width_m', 1.25))
+        self.rear_min_h = float(g('~rear_min_height_m', 0.06))
+        self.rear_max_h = float(g('~rear_max_height_m', 2.5))
+        self.rev_speed = float(g('~reverse_speed', 1.0))
+        self.rev_max_speed = float(g('~reverse_max_speed', 1.5))
+        self.accel_gain = float(g('~accel_gain', 0.4))
+        self.max_accel = float(g('~max_accel', 0.35))
+        self.end_decel = float(g('~end_decel', 0.8))
+        self.max_attempts = int(g('~max_attempts', 2))
+        self.cooldown = float(g('~cooldown_sec', 5.0))
+        self.shift_timeout = float(g('~shift_timeout_sec', 1.5))
+        self.cloud_timeout = float(g('~cloud_timeout_sec', 0.5))
+        self.wheelbase = float(g('~wheelbase_m', 3.0))
+        self.lookahead_min = float(g('~lookahead_min_m', 3.0))
+        self.lookahead_gain = float(g('~lookahead_gain', 1.0))     # Ld = min + gain*|v|
+        self.max_steer = float(g('~max_steer_rad', 0.6))
+        self.straight_check = float(g('~straight_check_m', 3.0))
+        self.path_hist_len = int(g('~path_history_points', 3000))
+        self.debug_period = 1.0 / max(1.0, float(g('~debug_rate_hz', 5.0)))
+        self.path_mode = str(g('~path_mode', 'heading'))
+        self.heading_fix_max = math.radians(float(g('~heading_fix_max_deg', 10.0)))
+        self.heading_fix_len = float(g('~heading_fix_length_m', 5.0))
+        self.heading_change_limit = math.radians(float(g('~heading_change_limit_deg', 15.0)))
+        self.joint_heading_gain = float(g("~joint_heading_gain", 2.0))
+        self.joint_lateral_gain = float(g("~joint_lateral_gain", .6))
+        self.steer_limit = float(g('~steer_limit_rad', 0.3))
+        self.half_width = float(g('~vehicle_half_width_m', 0.95))
+        self.body_margin = float(g('~body_margin_m', 0.5))
+        self.memory_sec = float(g('~memory_sec', 10.0))
+        self.avoid_radius = float(g('~avoid_turn_radius_m', 8.0))   # 회피 S자 유효 회전반경
+        self.joint_enabled = bool(g('~joint_planning_enabled', True))
+        self.joint_lock = threading.Lock()
+        self.joint_event = threading.Event()
+        self.joint_response = None
+        self.joint_pending = False
+        self.joint_result = None
+        self.joint_id = 0
+        self.joint_reason = 'idle'
+        self.handoff_ready = False
+        self.handoff_sent = -1e9
+        self.joint_forward = []
+        self.joint_poses = None
+        self.joint_controls = None
+        self.joint_last_try = -1e9
+        self.cloud_world = np.empty((0, 2))
+        self.plan_pub = rospy.Publisher('/reverse_escape/joint_plan', String, queue_size=1)
+        self.handoff_pub = rospy.Publisher('/reverse_escape/handoff', String, queue_size=1)
+        self.request_pub = rospy.Publisher('/occupancy_avoidance/escape_request', String, queue_size=1)
+        self.reverse_path_pub = rospy.Publisher('/reverse_escape/reverse_path', Path, queue_size=1)
+        self.forward_path_pub = rospy.Publisher('/reverse_escape/forward_path', Path, queue_size=1)
+        rospy.Subscriber('/occupancy_avoidance/escape_handoff_state', String, self.handoff_ack_cb, queue_size=1)
+        rospy.Subscriber('/occupancy_avoidance/escape_response', String, self.escape_response_cb, queue_size=1)
+        self.contact_drop = float(g('~contact_drop_mps', 0.3))
+
+        self.pose_history = deque(maxlen=120)
+        self.wall_profile = np.array(g('~tunnel_wall_profile', []), dtype=float).reshape((-1, 3))
+        self.wall_heading = None
+        self.wall_heading_t = -1e9
+        self.wall_tree = None
+        self.wall_refs = None
+        self.wall_indices = None
+        self.pose_t = -1e9
+        self.pose = None
+        self.speed = 0.0
+        self.speed_t = -1e9
+        self.gear = None
+        self.gear_t = -1e9
+        self.path = None                 # (xy[N,2], idx0, lane)
+        self.path_hist = {}              # waypoint_index -> (x, y)  지나온 기준경로
+        self.path_hist_lane = None
+        self.obs = []
+        self.corrected_obs_t = -1e9
+        self.mission_mode = ''
+        self.dyn_hold = False
+        self.dyn_ids, self.static_ids, self.ever_dyn_ids = set(), set(), set()
+        self.handoff_guard = False
+        self.handoff_guard_ids = set()
+        self.dyn_t = -1e9
+        self.bg_ids = set()
+        self.bg_ids_t = -1e9
+        self.avoid_fail_t = -1e9
+        self.rear_free = None            # 뒤범퍼에서 가장 가까운 후방 물체까지 [m]
+        self.cloud_pts = None            # 후방 점(센서 좌표 x, y)
+        self.rev_path = None             # 후진 판단 시 만든 후진 경로 (points, s, kind)
+        self.cloud_t = -1e9
+        self.memory = {}                 # id -> (t, 점[N,2] 세계좌표)
+        self.back_hist = []              # 후진 중 (t, 후진속도)
+        self.last_acc = 0.0
+
+        self.state = IDLE
+        self.state_t = 0.0
+        self.stopped_since = None
+        self.still_since = None
+        self.cooldown_until = 0.0
+        self.attempts = {}               # (round x, round y) -> 횟수
+        self.target = None               # dict(dist, start, key, gap, shift)
+        self.last_debug_t = -1e9
+
+        self.cmd_pub = rospy.Publisher('/control/reverse_cmd', CtrlCmd, queue_size=1)
+        self.gear_pub = rospy.Publisher('/control/reverse_gear', UInt8, queue_size=1)
+        self.state_pub = rospy.Publisher('/reverse_escape/state', String, queue_size=1)
+        self.debug_pub = rospy.Publisher('/reverse_escape/debug_markers', MarkerArray,
+                                         queue_size=1)
+        rospy.Subscriber('/odom', Odometry, self.odom_cb, queue_size=1)
+        rospy.Subscriber('/Competition_topic', EgoVehicleStatus, self.ego_cb, queue_size=1)
+        rospy.Subscriber('/morai/gear', UInt8, self.gear_cb, queue_size=1)
+        rospy.Subscriber('/final_waypoint', Lane, self.path_cb, queue_size=1)
+        rospy.Subscriber('/obstacle_avoidance/planning_obstacles', String, self.planning_obs_cb, queue_size=1)
+        rospy.Subscriber('/obstacle_info', String, self.obs_cb, queue_size=1)
+        rospy.Subscriber('/obstacle_stop/dynamic_state', String, self.dyn_cb, queue_size=1)
+        rospy.Subscriber('/tunnel/wall_limits', Float64MultiArray, self.wall_heading_cb, queue_size=1)
+        rospy.Subscriber('/tunnel/background_ids', String, self.bg_cb, queue_size=1)
+        rospy.Subscriber('/avoidance_failed', Bool, self.fail_cb, queue_size=1)
+        rospy.Subscriber(g('~cloud_topic', '/perception/points_gravity'), PointCloud2, self.cloud_cb,
+                         queue_size=1, buff_size=2 ** 24)
+        rospy.Timer(rospy.Duration(0.05), self.tick)
+        rospy.loginfo('[reverse_escape] ready: stop %.0fs gap %.1fm reverse %.0f~%.0fm (M3 %d~%d, tunnel)',
+                      self.trigger_stop_sec, self.trigger_gap, self.rev_min, self.rev_max,
+                      self.split_idx, self.dyn_max_idx)
+
+    # ---------------- 입력 ----------------
+    def odom_cb(self, m):
+        q = m.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.pose_t = m.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        self.pose = (m.pose.pose.position.x, m.pose.pose.position.y, yaw)
+        self.pose_history.append((self.pose_t, self.pose))
+
+    def ego_cb(self, m):
+        self.speed, self.speed_t = float(m.velocity.x), rospy.Time.now().to_sec()
+
+    def gear_cb(self, m):
+        self.gear, self.gear_t = int(m.data), rospy.Time.now().to_sec()
+
+    def path_cb(self, m):
+        if len(m.waypoints) < 2:
+            return
+        xy = np.array([[w.pose.pose.position.x, w.pose.pose.position.y] for w in m.waypoints])
+        lane = int(getattr(m.waypoints[0], 'lane_number', 0))
+        self.path = (xy, int(m.waypoints[0].waypoint_index), lane)
+        if lane != self.path_hist_lane:
+            self.path_hist, self.path_hist_lane = {}, lane
+        for w in m.waypoints:
+            self.path_hist[int(w.waypoint_index)] = (w.pose.pose.position.x, w.pose.pose.position.y)
+        if len(self.path_hist) > self.path_hist_len:
+            for k in sorted(self.path_hist)[:len(self.path_hist) - self.path_hist_len]:
+                del self.path_hist[k]
+
+        if lane == 3 and self.path_hist:
+            keys = sorted(self.path_hist)
+            self.wall_refs = np.array([self.path_hist[k] for k in keys])
+            self.wall_indices = np.array(keys)
+            self.wall_tree = cKDTree(self.wall_refs)
+
+    def planning_obs_cb(self, msg):
+        self.corrected_obs_t = rospy.Time.now().to_sec()
+        self.obs_cb(msg, corrected=True)
+
+    def obs_cb(self, m, corrected=False):
+        try:
+            d = json.loads(m.data)
+        except ValueError:
+            return
+        self.mission_mode = d.get('mission_mode', '')
+        if not corrected and rospy.Time.now().to_sec()-self.corrected_obs_t < .3:
+            return
+        seen, out = set(), []
+        for key in ('collision_objects', 'obstacles'):
+            for o in d.get(key, []) or []:
+                oid = int(o.get('id', -1))
+                if o.get('background_excluded', False):
+                    self.memory.pop(oid, None)
+                    continue
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                out.append(o)
+                self.remember(o)
+        self.obs = out
+
+    def remember(self, o):
+        """정지 물체의 세계좌표 외곽점을 memory_sec 동안 기억한다(차 주변 근거리 사각 보완)."""
+        oid = int(o.get('id', -1))
+        now = rospy.Time.now().to_sec()
+        if oid in self.bg_ids and now - self.bg_ids_t < .5:
+            return
+        state = o.get('motion_state', '')
+        if state == 'dynamic' or oid in self.dyn_ids:
+            self.memory.pop(oid, None)
+            return
+        # 2026-10-07(20:29:27 백): 누적(retained) 외곽선은 실제보다 부풀어(차 옆 물체 0.34 m vs 실제 0.62 m)
+        #   시작 자세부터 여유 0.5 m 미달 -> no_collision_free_reverse. 실제 관측 외곽선을 먼저 쓴다(정지 노드와 동일).
+        fp = o.get('observed_footprint_world') or o.get('footprint_world') or o.get('planning_footprint_world')
+        if fp and len(fp) >= 3:
+            pts = polygon_points(fp)
+        else:
+            pw = o.get('position_world')
+            if not pw or len(pw) < 2:
+                return
+            length = float(o.get('length', .35) or .35)
+            width = float(o.get('width', .35) or .35)
+            yaw = float(o.get('geometry_reference_yaw', self.pose[2] if self.pose else 0.))
+            c, sn = math.cos(yaw), math.sin(yaw)
+            fp = [[pw[0] + c*x - sn*y, pw[1] + sn*x + c*y]
+                  for x, y in [(-length/2, -width/2), (length/2, -width/2),
+                               (length/2, width/2), (-length/2, width/2)]]
+            pts = polygon_points(fp)
+        if len(pts):
+            # Unclassified objects have only a short lifetime, never a static 10s memory.
+            age = self.memory_sec if state == 'static' or oid in self.static_ids else .5
+            self.memory[oid] = (now + age - self.memory_sec, pts)
+
+    def memory_points(self, now):
+        for k in [k for k, (t, _) in self.memory.items() if now - t > self.memory_sec]:
+            del self.memory[k]
+        if not self.memory:
+            return np.empty((0, 2))
+        return np.vstack([p for _, p in self.memory.values()])
+
+    def dyn_cb(self, m):
+        try:
+            d = json.loads(m.data)
+        except ValueError:
+            return
+        self.dyn_hold = bool(d.get('hold', False))
+        self.dyn_ids = set(int(i) for i in d.get('dynamic_ids', []))
+        self.static_ids = set(int(i) for i in d.get('static_ids', []))
+        self.ever_dyn_ids = set(int(i) for i in d.get('ever_dynamic_ids', []))
+        self.handoff_guard = bool(d.get('handoff_guard', False))
+        self.handoff_guard_ids = set(int(i) for i in d.get('handoff_guard_ids', []))
+        self.dyn_t = rospy.Time.now().to_sec()
+        for oid in self.dyn_ids - self.static_ids:
+            self.memory.pop(oid, None)
+
+    def wall_heading_cb(self, msg):
+        if self.pose is not None and len(msg.data) >= 5 and msg.data[0] > 0:
+            self.wall_heading = self.pose[2] + math.atan(.5*(msg.data[3]+msg.data[4]))
+            self.wall_heading_t = rospy.Time.now().to_sec()
+
+    def bg_cb(self, m):
+        try:
+            self.bg_ids = set(int(i) for i in json.loads(m.data).get('ids', []))
+            self.bg_ids_t = rospy.Time.now().to_sec()
+            for oid in self.bg_ids:
+                self.memory.pop(oid, None)
+        except (ValueError, TypeError):
+            pass
+
+    def fail_cb(self, m):
+        if m.data:
+            self.avoid_fail_t = rospy.Time.now().to_sec()
+
+    def cloud_cb(self, m):
+        """후방 확인용 점만 저장(센서 좌표, 뒤범퍼 뒤, 높이 범위). 계산은 후진 판단/후진 중에만."""
+        pts = cloud_xyz(m)
+        if self.pose is None or m.header.frame_id != "velodyne_ground":
+            return
+        x0 = -(self.rear_overhang + self.sensor_x)          # 센서 좌표 뒤범퍼
+        h = pts[:, 2] - self.ground_z
+        # 2026-10-07(20:01:54 백): MORAI 점군에는 자차 지붕 반사점이 매 프레임 ~770개 있다. 차체 안 점을 두면
+        #   후진 탐색 시작 자세부터 body_clearance=0 -> 'no_collision_free_reverse' 로 후진이 한 번도 안 됐다.
+        #   차체(후축 기준 -rear..front, |y|<=half) 안쪽 점은 자차라 버린다(그 공간엔 다른 물체가 있을 수 없다).
+        ax = pts[:, 0] + self.sensor_x
+        inside_body = ((ax > -self.rear_overhang + .05) & (ax < self.front_overhang - .05) &
+                       (np.abs(pts[:, 1]) < self.half_width - .05))
+        keep = ((pts[:, 0] < 35.0) & ~inside_body &
+                (pts[:, 0] > x0 - (self.rev_max + self.rear_margin + 6.0)) &
+                (np.abs(pts[:, 1]) <= 15.0) & (h >= self.rear_min_h) & (h <= self.rear_max_h))
+        xy = pts[keep, :2]
+        if len(xy):     # 0.15 m 격자로 줄인다(차체 궤적 검사 비용)
+            _, u = np.unique(np.floor(xy / 0.15).astype(np.int32), axis=0, return_index=True)
+            xy = xy[u]
+        self.cloud_pts = xy.copy()
+        stamp = m.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        history = list(self.pose_history)
+        if not history:
+            return
+        times = [v[0] for v in history]
+        i = int(np.searchsorted(times, stamp))
+        if i == 0 or i == len(history):
+            t, capture = history[min(i, len(history)-1)]
+            if abs(t-stamp) > .08:
+                return
+        else:
+            t0, p0 = history[i-1]; t1, p1 = history[i]
+            if t1-t0 > .3 or t1 <= t0:
+                return
+            u = (stamp-t0)/(t1-t0)
+            capture = (p0[0]+u*(p1[0]-p0[0]), p0[1]+u*(p1[1]-p0[1]), p0[2]+u*wrap(p1[2]-p0[2]))
+        ex, ey, yaw = capture
+        c, sn = math.cos(yaw), math.sin(yaw)
+        bx = xy[:, 0] + self.sensor_x
+        self.cloud_world = np.stack((ex+c*bx-sn*xy[:, 1], ey+sn*bx+c*xy[:, 1]), axis=1)
+        # Wall/curb points constrain the engine boundary, not generic obstacle margins.
+        if self.zone() == 'tunnel' and self.wall_tree is not None and len(self.wall_profile) and len(self.cloud_world):
+            distance, j = self.wall_tree.query(self.cloud_world)
+            idx = self.wall_indices[j]
+            refs = self.wall_refs
+            j1 = np.maximum(j-1, 0); j2 = np.minimum(j+1, len(refs)-1)
+            tangent = refs[j2]-refs[j1]
+            norm = np.maximum(np.linalg.norm(tangent, axis=1), 1e-6)
+            delta = self.cloud_world-refs[j]
+            lat = (-tangent[:, 1]*delta[:, 0]+tangent[:, 0]*delta[:, 1])/norm
+            right = np.interp(idx, self.wall_profile[:, 0], self.wall_profile[:, 1])
+            left = np.interp(idx, self.wall_profile[:, 0], self.wall_profile[:, 2])
+            valid = (idx >= self.wall_profile[0, 0]) & (idx <= self.wall_profile[-1, 0])
+            exterior = valid & (distance < 10.) & (((right < 0) & (lat <= right+.12)) | ((left > 0) & (lat >= left-.12)))
+            self.cloud_world = self.cloud_world[~exterior]
+        self.cloud_t = stamp
+
+    # ---------------- 후진 경로(후진 판단 시 한 번) ----------------
+    def build_reverse_path(self, length):
+        """자차(후축)에서 뒤쪽 기준경로를 따라 length m 의 후진 경로(0.5 m 간격, 세계좌표).
+
+        지나온 기준경로(/final_waypoint 이력)가 자차 근처에 없으면 지금 헤딩 직선.
+        반환 (points[N,2], s[N] 누적거리, 'ref'|'straight').
+        """
+        ex, ey, yaw = self.pose
+        pts = None
+        if self.path_mode == 'heading':
+            # 지금 헤딩으로 곧게 물러나되, 기준경로 헤딩과의 오차를 최대 heading_fix_max 만
+            # heading_fix_len 에 걸쳐 줄인다. 횡위치를 기준경로로 끌어오지 않는다.
+            err = self.heading_error()
+            fix = max(-self.heading_fix_max, min(self.heading_fix_max, err))
+            out, x, y, h = [(ex, ey)], ex, ey, yaw
+            step, acc = 0.25, 0.0
+            while acc < length:
+                if acc < self.heading_fix_len:
+                    h -= fix * step / self.heading_fix_len
+                x -= step * math.cos(h)
+                y -= step * math.sin(h)
+                acc += step
+                out.append((x, y))
+            pts = np.array(out)
+            seg = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+            s = np.concatenate([[0.0], np.cumsum(seg)])
+            si = np.arange(0.0, s[-1] + 1e-6, 0.5)
+            rp = np.stack([np.interp(si, s, pts[:, 0]), np.interp(si, s, pts[:, 1])], axis=1)
+            return rp, si, 'heading(fix %.1f deg)' % math.degrees(fix)
+        if len(self.path_hist) >= 10:
+            keys = sorted(self.path_hist)
+            arr = np.array([self.path_hist[k] for k in keys])
+            j = int(np.argmin((arr[:, 0] - ex) ** 2 + (arr[:, 1] - ey) ** 2))
+            if math.hypot(arr[j, 0] - ex, arr[j, 1] - ey) <= 4.0:
+                out, acc, i = [(ex, ey)], 0.0, j
+                while i > 0 and acc < length:
+                    if keys[i] - keys[i - 1] > 20:      # 인덱스가 끊긴 곳(경로 전환)에서 멈춤
+                        break
+                    acc += math.hypot(arr[i, 0] - arr[i - 1, 0], arr[i, 1] - arr[i - 1, 1])
+                    out.append((float(arr[i - 1, 0]), float(arr[i - 1, 1])))
+                    i -= 1
+                if acc >= min(length, self.rev_min + self.rear_margin):
+                    pts = np.array(out)
+        kind = 'ref'
+        if pts is None:
+            kind = 'straight'
+            k = np.arange(0.0, length + 0.01, 0.5)
+            pts = np.stack([ex - k * math.cos(yaw), ey - k * math.sin(yaw)], axis=1)
+        # 0.5 m 간격으로 다시 뽑는다
+        seg = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        si = np.arange(0.0, s[-1] + 1e-6, 0.5)
+        rp = np.stack([np.interp(si, s, pts[:, 0]), np.interp(si, s, pts[:, 1])], axis=1)
+        return rp, si, kind
+
+    def path_progress(self, path):
+        """현재 후축 위치를 후진 경로에 투영한 누적거리 [m]."""
+        rp, rs, _ = path
+        ex, ey, _ = self.pose
+        best_d, best_s = 1e18, 0.0
+        for a in range(len(rp) - 1):
+            ax, ay = rp[a]
+            dx, dy = rp[a + 1][0] - ax, rp[a + 1][1] - ay
+            ln2 = dx * dx + dy * dy
+            if ln2 < 1e-9:
+                continue
+            t = min(1.0, max(0.0, ((ex - ax) * dx + (ey - ay) * dy) / ln2))
+            d = (ex - ax - t * dx) ** 2 + (ey - ay - t * dy) ** 2
+            if d < best_d:
+                best_d, best_s = d, rs[a] + t * (rs[a + 1] - rs[a])
+        return best_s
+
+    def rear_free_along(self, path, s_cur):
+        """후진 경로를 따라 차체 전체가 물체(점군 + 기억된 물체)와 body_margin 이상 떨어져 있는
+        최대 이동거리 [m]. 지금 위치보다 가까워지는 점만 센다(이미 붙어 있는 앞 물체에서 멀어지는 건 허용).
+        """
+        reach = self.rev_max + self.rear_margin + 2.0
+        now = rospy.Time.now().to_sec()
+        ex, ey, yaw = self.pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        parts = [self.memory_points(now), self.cloud_world]
+        p = None
+        if p is not None and len(p):
+            bx = p[:, 0] + self.sensor_x
+            parts.append(np.stack([ex + c * bx - s * p[:, 1], ey + s * bx + c * p[:, 1]], axis=1))
+        W = np.vstack([q for q in parts if len(q)]) if any(len(q) for q in parts) else np.empty((0, 2))
+        if not len(W):
+            return reach
+        W = W[np.hypot(W[:, 0] - ex, W[:, 1] - ey) <= reach + self.front_overhang + 4.0]
+        if not len(W):
+            return reach
+        hl_f, hl_r, hw = self.front_overhang, self.rear_overhang, self.half_width
+
+        def clearance(px, py, h):
+            dx, dy = W[:, 0] - px, W[:, 1] - py
+            u = math.cos(h) * dx + math.sin(h) * dy
+            v = -math.sin(h) * dx + math.cos(h) * dy
+            du = np.maximum(np.maximum(u - hl_f, -hl_r - u), 0.0)
+            dv = np.maximum(np.abs(v) - hw, 0.0)
+            return np.hypot(du, dv)
+
+        if np.any(clearance(ex, ey, yaw) < self.body_margin):
+            return 0.0
+        rp, rs, _ = path
+        travel = 0.0
+        while travel < reach:
+            travel += 0.2
+            st = s_cur + travel
+            if st > rs[-1]:
+                break
+            px, py = float(np.interp(st, rs, rp[:, 0])), float(np.interp(st, rs, rp[:, 1]))
+            qx, qy = float(np.interp(st + 0.3, rs, rp[:, 0])), float(np.interp(st + 0.3, rs, rp[:, 1]))
+            if math.hypot(px - qx, py - qy) < 1e-3:
+                break
+            h = float(np.interp(st, rs, np.unwrap(self.joint_poses[:, 2]))) if (
+                self.joint_enabled and self.joint_poses is not None and len(rs) == len(self.joint_poses)) else math.atan2(py - qy, px - qx)        # 앞방향 = 경로 진행의 반대
+            cl = clearance(px, py, h)
+            bad = cl < self.body_margin
+            if np.any(bad):
+                return max(0.0, travel - 0.2)
+        return reach
+
+    def heading_error(self):
+        """자차 헤딩 - 최근접 기준경로 헤딩 [rad]."""
+        if self.path is None or self.pose is None:
+            return 0.0
+        xy = self.path[0]
+        ex, ey, yaw = self.pose
+        j = int(np.argmin((xy[:, 0] - ex) ** 2 + (xy[:, 1] - ey) ** 2))
+        j1, j2 = max(j - 1, 0), min(j + 1, len(xy) - 1)
+        ref = math.atan2(xy[j2, 1] - xy[j1, 1], xy[j2, 0] - xy[j1, 0])
+        return (yaw - ref + math.pi) % (2.0 * math.pi) - math.pi
+
+    def reverse_steer(self, path, s_cur, v_back):
+        """고정된 후진 경로 위 전방주시점으로 후진 pure pursuit(tan d = 2 L y / Ld^2)."""
+        rp, rs, _ = path
+        ld = self.lookahead_min + self.lookahead_gain * abs(v_back)
+        st = min(rs[-1], s_cur + ld)
+        tx, ty = float(np.interp(st, rs, rp[:, 0])), float(np.interp(st, rs, rp[:, 1]))
+        ex, ey, yaw = self.pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        px = c * (tx - ex) + s * (ty - ey)
+        py = -s * (tx - ex) + c * (ty - ey)
+        d2 = px * px + py * py
+        if d2 < 0.25:
+            return 0.0
+        delta = math.atan(2.0 * self.wheelbase * py / d2)
+        if self.joint_enabled and self.joint_controls is not None:
+            feed = float(np.interp(s_cur, rs, self.joint_controls))
+            # Signed reverse bicycle feedback: e_dot=-|v|*heading_error.
+            # A positive lateral error therefore needs negative steering correction.
+            hx = float(np.interp(s_cur, rs, rp[:, 0]))
+            hy = float(np.interp(s_cur, rs, rp[:, 1]))
+            href = float(np.interp(s_cur, rs, np.unwrap(self.joint_poses[:, 2])))
+            lateral = -math.sin(href)*(ex-hx)+math.cos(href)*(ey-hy)
+            delta = feed + getattr(self, 'joint_heading_gain', 2.)*wrap(yaw-href) - getattr(self, 'joint_lateral_gain', .6)*lateral
+        lim = min(self.max_steer, self.steer_limit)
+        if self.target is not None and 'yaw0' in self.target:
+            turned = (yaw - self.target['yaw0'] + math.pi) % (2.0 * math.pi) - math.pi
+            # 헤딩이 이미 한계만큼 돌았으면 더 돌리는 쪽 조향은 0(후진에서 delta>0 이면 헤딩 감소).
+            if abs(turned) >= self.heading_change_limit and delta * turned < 0.0:
+                return 0.0
+        return max(-lim, min(lim, delta))
+
+    def handoff_ack_cb(self, msg):
+        try:
+            d = json.loads(msg.data)
+            if d.get('id') == self.joint_id:
+                self.handoff_ready = bool(d.get('valid', False))
+                self.joint_reason = d.get('reason', 'handoff_rejected')
+        except ValueError:
+            pass
+
+    def escape_response_cb(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        with self.joint_lock:
+            if d.get('id') != self.joint_id:
+                return
+            self.joint_response = d
+            self.joint_event.set()
+
+    def launch_joint_search(self, obstacle, recheck=False):
+        if self.joint_pending or self.pose is None:
+            return
+        self.joint_pending = True
+        self.joint_result = None
+        self.joint_id += 1
+        self.joint_last_try = rospy.Time.now().to_sec()
+        pose = tuple(self.pose)
+        parts = [self.memory_points(self.joint_last_try), self.cloud_world.copy()]
+        points = np.vstack([p for p in parts if len(p)]) if any(len(p) for p in parts) else np.empty((0, 2))
+        goal_heading = self.wall_heading if (self.zone() == 'tunnel' and self.wall_heading is not None and
+            self.joint_last_try-self.wall_heading_t < .5) else pose[2]-self.heading_error()
+        request_id = self.joint_id
+
+        def worker():
+            result = None
+            try:
+                # A joint escape must have a consumer for its evaluated forward path.
+                if not rospy.get_param('/obstacle_avoidance_node/occupancy_path_enabled', True):
+                    self.joint_reason = 'forward_path_owner_disabled'
+                    return
+                if recheck:
+                    candidates = [dict(index=0, poses=[pose], controls=[0.], distance=0., clearance=9999.)]
+                else:
+                    candidates = reverse_candidates(pose, points, self.wheelbase, self.steer_limit,
+                        self.front_overhang, self.rear_overhang, self.half_width, self.body_margin,
+                        self.min_reverse, self.rev_max, goal_heading=goal_heading)
+                if not candidates:
+                    self.joint_reason = 'no_collision_free_reverse'
+                    return
+                req = dict(id=request_id, stamp=rospy.Time.now().to_sec(), candidates=candidates,
+                           blocker=[obstacle['wx'], obstacle['wy']], blocker_length=obstacle.get('length', 2.),
+                           recheck=recheck)
+                with self.joint_lock:
+                    self.joint_response = None
+                    self.joint_event.clear()
+                self.request_pub.publish(String(data=json.dumps(req, allow_nan=False)))
+                if not self.joint_event.wait(.65):
+                    self.joint_reason = 'forward_evaluation_timeout'
+                    return
+                with self.joint_lock:
+                    response = dict(self.joint_response)
+                self.joint_reason = response.get('reason', 'invalid')
+                if not response.get('valid'):
+                    return
+                k = int(response['candidate'])
+                candidate = candidates[k]
+                forward = response.get('forward', [])
+                if any(body_clearance(points, p, self.front_overhang, self.rear_overhang,
+                                      self.half_width) < .2 for p in forward):
+                    self.joint_reason = 'forward_memory_collision'
+                    return
+                result = dict(candidate=candidate, response=response, start=pose, obstacle=obstacle)
+            except Exception as exc:
+                self.joint_reason = 'planning_error:' + str(exc)
+                rospy.logwarn_throttle(2., '[reverse_escape] joint planning: %s', exc)
+            finally:
+                self.joint_result = result
+                self.joint_pending = False
+        threading.Thread(target=worker, daemon=True).start()
+
+    def publish_joint_paths(self, response):
+        for pub, poses in ((self.reverse_path_pub, self.joint_poses),
+                           (self.forward_path_pub, response.get('forward', []))):
+            if poses is None:
+                continue
+            path = Path()
+            path.header.frame_id = 'map'
+            path.header.stamp = rospy.Time.now()
+            for x, y, h in poses:
+                p = PoseStamped(); p.header = path.header
+                p.pose.position.x, p.pose.position.y = float(x), float(y)
+                p.pose.orientation.z, p.pose.orientation.w = math.sin(h/2), math.cos(h/2)
+                path.poses.append(p)
+            pub.publish(path)
+        self.plan_pub.publish(String(data=json.dumps(dict(
+            id=response['id'], geometry_stamp=response['geometry_stamp'], reason=response['reason'],
+            endpoint=self.joint_poses[-1].tolist() if self.joint_poses is not None else list(self.pose),
+            minimum_clearance=self.target.get('clearance') if self.target else None))))
+
+    def joint_tracking_bad(self, s_cur):
+        if self.joint_poses is None:
+            return False
+        xy, rs, _ = self.rev_path
+        x, y, yaw = self.pose
+        px, py = float(np.interp(s_cur, rs, xy[:, 0])), float(np.interp(s_cur, rs, xy[:, 1]))
+        h = float(np.interp(s_cur, rs, np.unwrap(self.joint_poses[:, 2])))
+        return math.hypot(x-px, y-py) > .3 or abs(wrap(yaw-h)) > math.radians(10)
+
+    # ---------------- 판단 ----------------
+    def zone(self):
+        if self.path is None:
+            return None
+        _, idx, lane = self.path
+        if self.mission_mode == 'tunnel' and lane == 3:
+            return 'tunnel'
+        if lane == 0 and self.split_idx < idx <= self.dyn_max_idx:
+            return 'm3'
+        return None
+
+    def path_lateral(self, wx, wy):
+        xy = self.path[0]
+        j = int(np.argmin((xy[:, 0] - wx) ** 2 + (xy[:, 1] - wy) ** 2))
+        j1, j2 = max(j - 1, 0), min(j + 1, len(xy) - 1)
+        tx, ty = xy[j2] - xy[j1]
+        n = math.hypot(tx, ty) or 1.0
+        return (-(ty / n) * (wx - xy[j, 0]) + (tx / n) * (wy - xy[j, 1]))
+
+    def blocking_obstacle(self, now):
+        """코리도 안, 앞범퍼 trigger 거리 안 정적 장애물 중 가장 가까운 것."""
+        dyn_fresh = now - self.dyn_t < 0.5
+        bg_fresh = now - self.bg_ids_t < 0.5
+        best = None
+        for o in self.obs:
+            oid = int(o.get('id', -1))
+            if o.get('passed', False):
+                continue
+            # 2026-10-07(15:12:12 백): 앞 4.5 m 경로 중앙에 멈춘 저상 동적 물체가 라이다 근거리 사각에 들어가
+            #   다시 관측되지 않았는데(관측 경과 3~5 s), '동적'이라 막는 장애물에서 빠져 후진하지 않았다.
+            #   지금 실제로 움직이는(신선하고 0.3 m/s 이상) 동적 물체만 뺀다.
+            moving_now = (float(o.get('observation_age', 0.0) or 0.0) < self.stale_dynamic_sec and
+                          float(o.get('speed', 0.0) or 0.0) >= 0.3)
+            if dyn_fresh and oid in self.dyn_ids and oid not in self.static_ids and moving_now:
+                continue
+            if bg_fresh and oid in self.bg_ids:
+                continue
+            pe, pw = o.get('position_ego'), o.get('position_world')
+            if not pe or not pw or len(pw) < 2:
+                continue
+            length = float(o.get('length', 0.0) or 0.0)
+            width = float(o.get('width', 0.0) or 0.0)
+            gap = float(pe[0]) - 0.5 * length - self.front_overhang
+            if not (self.min_gap <= gap <= self.trigger_gap):
+                continue
+            lat = self.path_lateral(float(pw[0]), float(pw[1]))
+            lo, hi = lat - 0.5 * width, lat + 0.5 * width
+            edge = max(0.0, lo) if lo > 0 else (max(0.0, -hi) if hi < 0 else 0.0)
+            # 2026-10-07(15:11:08 백): 회피 중 기준경로에서 2.8 m 벗어나 20 도 틀어진 채 앞 4 m 물체에 막혔는데,
+            #   기준경로 횡거리로만 봐서 막는 장애물이 아니었다. 지금 차 진행 방향(자차 좌표) 기준으로도 본다.
+            elo, ehi = float(pe[1]) - 0.5 * width, float(pe[1]) + 0.5 * width
+            ego_edge = max(0.0, elo) if elo > 0 else (max(0.0, -ehi) if ehi < 0 else 0.0)
+            if edge > self.corridor_radius and ego_edge > self.corridor_radius:
+                continue
+            if best is None or gap < best['gap']:
+                best = {'id': oid, 'gap': gap, 'lo': lo, 'hi': hi,
+                        'wx': float(pw[0]), 'wy': float(pw[1]), 'length': length}
+        return best
+
+    def reverse_distance(self, ob):
+        """장애물까지 '전진 회피에 필요한 거리'가 되도록 후진 거리를 정한다.
+
+        필요 횡이동 = 지금 횡위치에서 장애물 옆(좌/우 중 가까운 쪽)을 robot_radius 로 지나는 데 필요한 이동,
+        필요 거리 = S자 2*sqrt(R*shift) + 헤딩 오차를 펴는 R*|err| (R = avoid_turn_radius_m).
+        후진 거리 = 필요 거리 - 지금 간격, reverse_min_m ~ reverse_max_m.
+        """
+        ego_lat = self.path_lateral(self.pose[0], self.pose[1]) if self.path is not None else 0.0
+        left_req = max(0.0, ob['hi'] + self.robot_radius - ego_lat)
+        right_req = max(0.0, ego_lat - (ob['lo'] - self.robot_radius))
+        shift = min(left_req, right_req)
+        err = abs(self.heading_error())
+        need = 2.0 * math.sqrt(self.avoid_radius * shift) + self.avoid_radius * err
+        dist = max(self.rev_min, min(self.rev_max, need - max(0.0, ob['gap'])))
+        return dist, shift
+
+    # ---------------- 출력 ----------------
+    def send(self, gear, accel=0.0, brake=1.0, steering=0.0):
+        c = CtrlCmd()
+        c.longlCmdType = 1
+        c.accel, c.brake, c.steering = accel, brake, steering
+        self.cmd_pub.publish(c)
+        self.gear_pub.publish(UInt8(data=gear))
+
+    def go(self, state, now, why=''):
+        rospy.logwarn('[reverse_escape] %s -> %s %s', self.state, state, why)
+        self.state, self.state_t = state, now
+
+    def gear_is(self, want, now):
+        if now - self.gear_t > 1.0:      # 기어 피드백이 없으면 시간으로 판단
+            return now - self.state_t >= 0.5
+        return self.gear == want
+
+    def tick(self, _evt):
+        now = rospy.Time.now().to_sec()
+        v = self.speed if now - self.speed_t < 0.5 else 0.0
+        stopped = abs(v) < self.stop_speed
+        self.stopped_since = (self.stopped_since or now) if stopped else None
+        self.still_since = (self.still_since or now) if abs(v) < 0.05 else None
+        hold = self.dyn_hold and now - self.dyn_t < 0.5
+        cloud_ok = now - self.cloud_t < self.cloud_timeout
+        st = self.state
+        if now-self.pose_t > .25 or now-self.speed_t > .5:
+            if st != IDLE:
+                self.send(GEAR_D if st == PRE_STOP or st == SHIFT_D else GEAR_R)
+                self.joint_reason = 'stale_odometry_or_speed'
+            return
+
+        # RViz 디버그는 모든 조기 return 전에 발행한다. 8초 타이머가 찼는데도
+        # 다른 조건 때문에 발동하지 않는 경우를 화면에서 바로 구분할 수 있다.
+        self.publish_debug(now, hold, cloud_ok)
+
+        if st == IDLE:
+            self.publish_state(now, None)
+            if not self.enabled or now < self.cooldown_until or self.pose is None:
+                return
+            zone = self.zone()
+            if zone is None or self.stopped_since is None:
+                return
+            if now - self.stopped_since < self.trigger_stop_sec:
+                return
+            if hold:
+                return
+            ob = self.blocking_obstacle(now)
+            if ob is None:
+                return
+            # 동적이었다가 가까이서 멈춘 장애물은 플래너가 무리한 경로를 하나
+            # 만들었다는 이유로 전진시키지 않는다. static handoff 자체를 후진
+            # 근거로 인정하며, 일반 정적 장애물은 기존 avoidance_failed를 요구한다.
+            # 그 물체가 지금 주행 경로를 막고 있을 때만(정지 노드의 인계 제동 대상) 인정한다.
+            handoff = (now - self.dyn_t < 0.5 and
+                       ob['id'] in self.static_ids and
+                       ob['id'] in self.ever_dyn_ids and
+                       ob['id'] in self.handoff_guard_ids)
+            if not handoff and now - self.avoid_fail_t > self.avoid_fail_recent:
+                return
+            key = (round(ob['wx'] / 2.0), round(ob['wy'] / 2.0))
+            if self.attempts.get(key, 0) >= self.max_attempts:
+                rospy.logwarn_throttle(5.0, '[reverse_escape] 같은 장애물 %d 회 시도함 - 더 후진하지 않음',
+                                       self.max_attempts)
+                return
+            if not cloud_ok or self.cloud_pts is None:
+                return
+            if self.joint_enabled:
+                if self.joint_result is None:
+                    if now - self.joint_last_try >= 1.:
+                        self.launch_joint_search(ob)
+                    return
+                r = self.joint_result
+                self.joint_result = None
+                response, candidate = r['response'], r['candidate']
+                if now-response['geometry_stamp'] > .5 or math.hypot(
+                        self.pose[0]-r['start'][0], self.pose[1]-r['start'][1]) > .2 or hold:
+                    self.joint_reason = 'stale_joint_plan'
+                    return
+                self.joint_poses = np.array(candidate['poses'])
+                self.joint_controls = np.array(candidate['controls'])
+                xy = self.joint_poses[:, :2]
+                rs = np.r_[0., np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))]
+                path = (xy, rs, 'joint_hybrid_apollo')
+                dist, shift = float(rs[-1]), 0.
+                self.rear_free = self.rear_free_along(path, 0.)
+                if self.rear_free < dist-.1:
+                    self.joint_reason = 'latest_reverse_collision'
+                    return
+                self.joint_forward = response['forward']
+            else:
+                dist, shift = self.reverse_distance(ob)
+                path = self.build_reverse_path(self.rev_max + self.rear_margin + 6.)
+                self.rear_free = self.rear_free_along(path, 0.)
+                if self.rear_free < dist:
+                    return
+            self.attempts[key] = self.attempts.get(key, 0) + 1
+            self.rev_path = path
+            self.target = {'dist': dist, 'key': key, 'gap': ob['gap'], 'shift': shift,
+                           'id': ob['id'], 'path': path[2], 'yaw0': self.pose[2],
+                           'obstacle': ob, 'clearance': candidate['clearance'] if self.joint_enabled else None}
+            self.back_hist = []
+            if self.joint_enabled:
+                self.publish_joint_paths(response)
+            reason = '동적->정적 인계' if handoff else '회피경로 실패'
+            self.go(PRE_STOP, now, '(%s, %s, id %d gap %.1f m, 침범 %.2f m -> 후진 %.1f m, 후방 %.1f m, '
+                    '경로 %s %.1f m, %d 회째)' % (
+                        zone, reason, ob['id'], ob['gap'], shift, dist, self.rear_free, path[2],
+                        path[1][-1], self.attempts[key]))
+            return
+
+        if st == PRE_STOP:
+            self.send(GEAR_D)
+            if self.still_since is not None and now - self.still_since >= 0.5:
+                self.go(SHIFT_R, now)
+        elif st == SHIFT_R:
+            self.send(GEAR_R)
+            if self.gear_is(GEAR_R, now):
+                self.target['s0'] = self.path_progress(self.rev_path)
+                self.go(REVERSE, now)
+            elif now - self.state_t > self.shift_timeout:
+                self.go(SHIFT_D, now, '(R 기어 전환 실패)')
+        elif st == REVERSE:
+            s_cur = self.path_progress(self.rev_path)
+            moved = s_cur - self.target['s0']
+            remain = self.target['dist'] - moved
+            self.rear_free = self.rear_free_along(self.rev_path, s_cur) if cloud_ok else None
+            timeout = self.target['dist'] / max(0.3, 0.6 * self.rev_speed) + 5.0
+            why = None
+            if remain <= 0.1:
+                why = '(후진 %.1f m 완료)' % moved
+            elif not cloud_ok:
+                why = '(후방 점군 끊김)'
+            elif self.rear_free is None or self.rear_free < 0.2:
+                why = '(차체 궤적 여유 부족, %.1f m)' % (self.rear_free or 0.0)
+            elif self.contact_suspected(now, v):
+                why = '(접촉 의심: 속도 급감)'
+            elif self.joint_enabled and self.joint_tracking_bad(s_cur):
+                why = '(후진 경로 추종 오차)'
+            elif abs(wrap(self.pose[2]-self.target['yaw0'])) > self.heading_change_limit:
+                why = '(후진 헤딩 변화 제한)'
+            elif hold:
+                why = '(동적 장애물 정지)'
+            elif now - self.state_t > timeout:
+                why = '(시간 초과 %.1f m)' % moved
+            if why:
+                self.go(POST_STOP, now, why)
+                self.send(GEAR_R)
+                return
+            back = -v                                  # 후진 속도(+)
+            steer = self.reverse_steer(self.rev_path, s_cur, back)
+            target_v = min(self.rev_speed, 1.0, math.sqrt(2.0 * self.end_decel * max(0.0, remain)) + 0.15)
+            if back > self.rev_max_speed:
+                self.send(GEAR_R, 0.0, 0.3, steer)
+            else:
+                acc = min(self.max_accel, max(0.0, self.accel_gain * (target_v - back) + 0.1))
+                brake = 0.2 if back > target_v + 0.3 else 0.0
+                self.last_acc = 0.0 if brake > 0 else acc
+                self.last_target_v = target_v
+                self.send(GEAR_R, self.last_acc, brake, steer)
+        elif st == POST_STOP:
+            self.send(GEAR_R)
+            if self.still_since is not None and now - self.still_since >= 0.3:
+                if not self.joint_enabled:
+                    self.go(SHIFT_D, now)
+                elif not cloud_ok or hold:
+                    self.joint_reason = 'handoff_sensor_or_dynamic_hold'
+                elif self.joint_result is not None:
+                    r = self.joint_result; self.joint_result = None
+                    if now-r['response']['geometry_stamp'] <= .5 and math.hypot(
+                            self.pose[0]-r['start'][0], self.pose[1]-r['start'][1]) <= .2:
+                        self.joint_forward = r['response']['forward']
+                        self.publish_joint_paths(r['response'])
+                        self.handoff_ready = False
+                        self.handoff_sent = -1e9
+                        self.go(SHIFT_D, now)
+                elif now-self.joint_last_try >= 1.:
+                    self.launch_joint_search(self.target['obstacle'], recheck=True)
+        elif st == SHIFT_D:
+            self.send(GEAR_D)
+            if self.gear_is(GEAR_D, now) and now - self.state_t >= 0.3:
+                if self.joint_enabled:
+                    if not self.handoff_ready:
+                        if now-self.handoff_sent >= .5:
+                            self.handoff_sent = now
+                            self.handoff_pub.publish(String(data=json.dumps(dict(
+                                stamp=now, forward=self.joint_forward, id=self.joint_id))))
+                        self.publish_state(now, self.target)
+                        return
+                self.go(IDLE, now, '-> 플래너 회피로')
+                self.cooldown_until = now + self.cooldown
+                self.stopped_since = None
+                self.target = None
+                self.rev_path = None
+                self.joint_poses = self.joint_controls = None
+        self.publish_state(now, self.target)
+
+    def contact_suspected(self, now, v):
+        """후진 가속 중인데 속도가 최근 1 s 최고보다 contact_drop 이상 떨어짐(목표 감속 구간 제외)."""
+        back = -v
+        self.back_hist = [(t, b) for t, b in self.back_hist if now - t <= 1.0] + [(now, back)]
+        if (self.last_acc <= 0.05 or len(self.back_hist) < 5 or
+                getattr(self, 'last_target_v', 0.0) - back < 0.1):   # 계획된 감속은 제외
+            return False
+        peak = max(b for _, b in self.back_hist)
+        return peak >= 0.4 and peak - back >= self.contact_drop
+
+    def publish_state(self, now, target):
+        if self.state == IDLE and int(now * 20) % 10:
+            return          # 대기 중에는 2 Hz
+        self.state_pub.publish(String(data=json.dumps({
+            'state': self.state, 'target': target, 'rear_free': self.rear_free,
+            'joint_pending': self.joint_pending, 'joint_reason': self.joint_reason,
+            'stopped_sec': (now - self.stopped_since) if self.stopped_since else 0.0})))
+
+    def publish_debug(self, now, hold, cloud_ok):
+        """차량 위에 후진 발동 타이머와 각 게이트의 상태를 표시한다."""
+        if now >= self.last_debug_t and now - self.last_debug_t < self.debug_period:
+            return
+        self.last_debug_t = now
+
+        zone = self.zone()
+        stopped_sec = max(0.0, now - self.stopped_since) if self.stopped_since else 0.0
+        progress = min(1.0, stopped_sec / max(0.1, self.trigger_stop_sec))
+        fail_ok = now - self.avoid_fail_t <= self.avoid_fail_recent
+        obstacle = self.blocking_obstacle(now) if zone is not None else None
+        handoff_obstacle = (obstacle is not None and now - self.dyn_t < 0.5 and
+                            obstacle['id'] in self.static_ids and
+                            obstacle['id'] in self.ever_dyn_ids and
+                            obstacle['id'] in self.handoff_guard_ids)
+        # 후진 경로는 후진 판단 때만 만들므로, 대기 중에는 표시용으로 같은 방식의
+        # 후방 여유를 따로 계산한다(정지해서 타이머가 도는 동안만).
+        rear_free = self.rear_free
+        if (self.state == IDLE and zone is not None and self.stopped_since is not None and
+                cloud_ok and self.cloud_pts is not None and self.pose is not None):
+            rear_free = self.rear_free_along(self.build_reverse_path(
+                self.rev_max + self.rear_margin + self.lookahead_min +
+                self.lookahead_gain * self.rev_max_speed + 3.0), 0.0)
+        rear_available = ((rear_free - self.rear_margin)
+                          if cloud_ok and rear_free is not None else None)
+        rear_ok = rear_available is not None and rear_available >= self.min_reverse
+
+        if self.state != IDLE:
+            title = 'REVERSE TRIGGERED: {}'.format(self.state.upper())
+            color = (0.95, 0.10, 0.95, 1.0)
+        elif not self.enabled:
+            title = 'REVERSE ESCAPE: DISABLED'
+            color = (0.45, 0.45, 0.45, 1.0)
+        elif now < self.cooldown_until:
+            title = 'REVERSE COMPLETE / COOLDOWN {:.1f}s'.format(
+                self.cooldown_until - now)
+            color = (0.10, 1.00, 0.65, 1.0)
+        elif zone is None:
+            title = 'REVERSE ESCAPE: OUTSIDE TUNNEL/M3'
+            color = (0.45, 0.45, 0.45, 1.0)
+        elif self.stopped_since is None:
+            title = 'REVERSE TIMER: MOVING (0.0/{:.1f}s)'.format(self.trigger_stop_sec)
+            color = (0.20, 0.75, 1.00, 1.0)
+        elif stopped_sec < self.trigger_stop_sec:
+            title = 'REVERSE TIMER: {:.1f}/{:.1f}s  LEFT {:.1f}s'.format(
+                stopped_sec, self.trigger_stop_sec,
+                max(0.0, self.trigger_stop_sec - stopped_sec))
+            color = (1.00, 0.75, 0.05, 1.0)
+        elif (fail_ok or handoff_obstacle) and not hold and obstacle is not None and rear_ok:
+            title = 'REVERSE TIMER: {:.1f}s COMPLETE / READY'.format(
+                self.trigger_stop_sec)
+            color = (0.10, 1.00, 0.20, 1.0)
+        else:
+            title = 'REVERSE TIMER: {:.1f}s COMPLETE / BLOCKED'.format(
+                self.trigger_stop_sec)
+            color = (1.00, 0.25, 0.05, 1.0)
+
+        obs_text = ('NONE' if obstacle is None else
+                    'ID {} GAP {:.1f}m'.format(obstacle['id'], obstacle['gap']))
+        rear_text = ('NO CLOUD' if not cloud_ok else
+                     ('UNKNOWN' if rear_free is None else '{:.1f}m'.format(rear_free)))
+        if self.dyn_ids:
+            motion_text = 'DYNAMIC NOW IDs={}'.format(sorted(self.dyn_ids))
+        elif self.static_ids:
+            motion_text = 'DYNAMIC->STATIC IDs={}'.format(sorted(self.static_ids))
+        elif self.ever_dyn_ids:
+            motion_text = 'DYNAMIC HISTORY IDs={}'.format(sorted(self.ever_dyn_ids))
+        else:
+            motion_text = 'NO DYNAMIC HISTORY'
+        guard_text = ('ON IDs={}'.format(sorted(self.handoff_guard_ids))
+                      if self.handoff_guard else 'OFF')
+        text = ('{}\nMOTION={}\nZONE={}  FAIL={}  DYN_HOLD={}\nHANDOFF_GUARD={}\nOBST={}  REAR={}').format(
+            title, motion_text,
+            zone.upper() if zone else 'NO',
+            'OK' if fail_ok else 'WAIT', 'BLOCK' if hold else 'CLEAR',
+            guard_text, obs_text, rear_text)
+        text += '\nJOINT={} {} '.format('PLANNING' if self.joint_pending else 'READY', self.joint_reason)
+        if self.target is not None:
+            text += '\nTARGET REVERSE={:.1f}m'.format(self.target.get('dist', 0.0))
+
+        markers = MarkerArray()
+
+        label = Marker()
+        # 디버그 HUD는 위치추정이 준비되기 전에도 보여야 한다. /odom의 세계
+        # 좌표를 복사하지 않고 자차 고정 프레임에 붙이면 항상 차량 위를 따른다.
+        label.header.frame_id = 'base_link'
+        label.header.stamp = rospy.Time(0)  # 최신 TF 사용: 센서/위치 타임스탬프 지연에 강함
+        label.frame_locked = True
+        label.ns = 'reverse_escape_debug'
+        label.id = 0
+        label.type = Marker.TEXT_VIEW_FACING
+        label.action = Marker.ADD
+        label.pose.position.x = 0.0
+        label.pose.position.y = 0.0
+        label.pose.position.z = 4.2
+        label.pose.orientation.w = 1.0
+        label.scale.z = 0.55
+        label.color.r, label.color.g, label.color.b, label.color.a = color
+        label.text = text
+        marker_lifetime = rospy.Duration(max(0.3, 2.0 * self.debug_period))
+        label.lifetime = marker_lifetime
+        markers.markers.append(label)
+
+        # 4m 회색 바 위에 정지 시간 비율을 표시한다. 실제 후진 상태에서는
+        # 가득 찬 자홍색 바로 유지해 트리거 여부가 멀리서도 보인다.
+        base = Marker()
+        base.header = label.header
+        base.ns = label.ns
+        base.id = 1
+        base.type = Marker.CUBE
+        base.action = Marker.ADD
+        base.pose.position.x = 0.0
+        base.pose.position.y = 0.0
+        base.pose.position.z = 3.45
+        base.pose.orientation.w = 1.0
+        base.frame_locked = True
+        base.scale.x, base.scale.y, base.scale.z = 4.0, 0.28, 0.12
+        base.color.r, base.color.g, base.color.b, base.color.a = 0.20, 0.20, 0.20, 0.85
+        base.lifetime = marker_lifetime
+        markers.markers.append(base)
+
+        fill = Marker()
+        fill.header = label.header
+        fill.ns = label.ns
+        fill.id = 2
+        fill.type = Marker.CUBE
+        fill.action = Marker.ADD
+        fill.pose.position.x = 0.0
+        fill.pose.position.y = 0.0
+        fill.pose.position.z = 3.53
+        fill.pose.orientation = base.pose.orientation
+        fill.frame_locked = True
+        fill.scale.x = max(0.02, 4.0 * (1.0 if self.state != IDLE else progress))
+        fill.scale.y, fill.scale.z = 0.24, 0.13
+        fill.color.r, fill.color.g, fill.color.b, fill.color.a = color
+        fill.lifetime = marker_lifetime
+        markers.markers.append(fill)
+        if self.joint_poses is not None and self.state != IDLE:
+            x, y, h = self.joint_poses[-1]
+            endpoint = Marker(); endpoint.header.frame_id = 'map'; endpoint.header.stamp = rospy.Time.now()
+            endpoint.ns = 'reverse_escape_endpoint'; endpoint.id = 0; endpoint.type = Marker.CUBE
+            endpoint.action = Marker.ADD; endpoint.pose.position.z = .7
+            center = .5*(self.front_overhang-self.rear_overhang)
+            endpoint.pose.position.x = float(x+center*math.cos(h))
+            endpoint.pose.position.y = float(y+center*math.sin(h))
+            endpoint.pose.orientation.z = math.sin(h/2); endpoint.pose.orientation.w = math.cos(h/2)
+            endpoint.scale.x = self.front_overhang+self.rear_overhang
+            endpoint.scale.y = 2*self.half_width; endpoint.scale.z = .15
+            endpoint.color.r = .9; endpoint.color.b = .9; endpoint.color.a = .3
+            endpoint.lifetime = marker_lifetime; markers.markers.append(endpoint)
+        self.debug_pub.publish(markers)
+
+
+if __name__ == '__main__':
+    ReverseEscape()
+    rospy.spin()

@@ -1,0 +1,190 @@
+<launch>
+  <!-- merged_lidar + /odom(또는 Ego_topic)/IMU 기반 장애물 추적 + TTC -->
+  <arg name="cloud_topic" default="/merged_lidar"/>
+  <arg name="ground_input_mode" default="raw"/>
+  <!-- IONIQ 5: 후축 기준 전방 1.1 m, 차량 중심선에 라이다 장착.
+       MORAI SensorInfo 의 Lidar3D pos.x 와 반드시 같아야 한다
+       MORAI SensorInfo 변경값과 일치해야 한다. -->
+  <arg name="lidar_x"     default="1.1"/>
+  <arg name="cloud_latency" default="0.15"/>
+
+  <node pkg="lidar_ttc_tracker" type="lidar_ttc_tracker_node.py" name="lidar_ttc_tracker" output="screen">
+    <!-- 토픽 -->
+    <param name="cloud_topic" value="$(arg cloud_topic)"/>
+    <param name="ground_input_mode" value="$(arg ground_input_mode)"/>
+    <param name="ego_topic" value="/Ego_topic"/>
+    <param name="imu_topic" value="/imu"/>
+    <!-- imu: IMU yaw 우선(미수신 시 pose 소스 heading 폴백) / ego: Ego heading 만 -->
+    <param name="heading_source" value="imu"/>
+    <!-- false(기본): /odom 구독. GT 를 쓰려면 true 로 Ego_topic 사용 -->
+    <param name="use_ego_topic" value="false"/>
+
+    <!-- 라이다 장착 오프셋 (전방 x[m], 좌측 y[m]) -->
+    <param name="lidar_x" value="$(arg lidar_x)"/>
+    <param name="lidar_y" value="0.0"/>
+
+    <!-- ★스캔 지연 보정: 스캔 stamp - latency 시점 ego 포즈로 변환 (dogm_node 규약) -->
+    <param name="cloud_latency" value="$(arg cloud_latency)"/>
+    <param name="pose_buffer_sec" value="1.0"/>
+
+    <!-- 포인트 필터 -->
+    <param name="min_range" value="1.5"/>
+    <!-- lidar_x=+1.1 m 기준 차량 후방 120 m ROI를 온전히 포함. -->
+    <param name="max_range" value="130.0"/>
+    <!-- IONIQ 5 자차 footprint 제거 (라이다 프레임, 사방 0.2 m 여유).
+         후축 기준 차체: x=-0.790..3.845 m, |y|=0.946 m; lidar_x=1.1 m
+         -> 라이다 기준 x=-1.890..2.745 에 여유 0.2 를 더한 값.
+         이 값은 라이다 프레임이라 장착 위치를 옮기면 반드시 같이 움직여야 한다.
+         너무 크면 센서 앞쪽 실제 장애물이 '자차'로 지워지고, 너무 작으면
+         자기 차체가 장애물로 잡힌다. -->
+    <param name="ego_x_min" value="-2.09"/>
+    <param name="ego_x_max" value="2.95"/>
+    <param name="ego_y_half" value="1.15"/>
+    <!-- 차량 기준 3차선 ROI: 후방·전방 120 m, 좌우 5.5 m. -->
+    <param name="roi_enabled" value="true"/>
+    <param name="roi_x_min" value="-120.0"/>
+    <param name="roi_x_max" value="120.0"/>
+    <param name="roi_y_half" value="5.5"/>
+    <!-- 차량 로컬 원점(후륜축) 기준. MORAI SensorInfo pos.z 와 같은 기준. -->
+    <param name="lidar_z" value="1.33"/>
+    <!-- 지면 기준 장착고. 위와 기준이 다르다(차량 원점 != 지면).
+         점이 없는 bin 의 지면을 무엇으로 가정할지에 쓰이므로 지면 기준이어야
+         한다. 값의 단일 출처는 total_bringup/config/lidar_extrinsic.yaml 의
+         z_from_ground 이고, 바꿀 일이 있으면 그 파일을 고친다.
+         2026-09-11 /groundgrid/ground 40프레임 평면 피팅 실측값이다. -->
+    <!-- 2026-09-17: 라이다 z=1.33. 실측 장착고 1.754m.
+         단일 출처는 total_bringup/config/lidar_extrinsic.yaml -->
+    <param name="ground_z_below_sensor" value="1.765"/>
+    <param name="ground_clearance" value="0.15"/>
+    <param name="ground_bin_size" value="2.0"/>
+    <!-- 지면 기준이 될 bin 의 자격. VLP-16 은 노면을 동심원 링으로 때려서 링과
+         링 사이 x 구간에는 노면 점이 없고(실측 2026-09-07: 링 5/10/14/19/25/31m,
+         32m 밖은 전무), 거기 물체가 있으면 그 bin 의 지면이 물체 높이로 잡힌다.
+         노면 링은 ROI 폭 11m 를 11셀 다 덮고 물체는 몇 셀에 그친다. -->
+    <param name="ground_y_cell" value="1.0"/>
+    <param name="ground_min_y_cells" value="8"/>
+    <param name="ground_min_points" value="8"/>
+    <param name="ground_cand_z_max" value="-0.30"/>
+    <param name="z_max" value="2.1"/>
+    <param name="z_sensor_ceiling" value="0.90"/>
+    <param name="max_vehicle_elevation" value="2.10"/>
+    <!-- 지면제거 문턱 위로 '드러난' 높이라 물체 실제 높이보다 작다. 낮은 장애물 보존을 위해 완화. -->
+    <param name="min_box_height" value="0.08"/>
+    <param name="min_box_width" value="0.30"/>
+
+    <!-- 클러스터링 -->
+    <param name="cluster_res" value="0.5"/>
+    <param name="min_cluster_pts" value="2"/>
+    <param name="max_box_size" value="8.0"/>
+    <param name="yaw_confidence_full_points" value="20"/>
+    <param name="yaw_confidence_anisotropy_min" value="1.5"/>
+    <param name="yaw_confidence_anisotropy_full" value="4.0"/>
+    <param name="yaw_confidence_axis_swap_penalty" value="0.25"/>
+    <param name="yaw_confidence_alpha" value="0.35"/>
+    <param name="yaw_update_min_confidence" value="0.35"/>
+    <!-- Do not expose a heading as reliable until two position differences
+         and sufficient PCA quality exist. Position/obstacle output stays live. -->
+    <param name="yaw_maturity_hits" value="3"/>
+    <param name="yaw_maturity_confidence" value="0.55"/>
+    <param name="association_size_weight" value="0.35"/>
+    <param name="association_yaw_weight" value="0.75"/>
+    <param name="association_yaw_min_confidence" value="0.55"/>
+    <param name="association_feature_min_hits" value="3"/>
+
+    <!-- 추적기 (칼만 + 헝가리안: 고속 접근차 추적 유실 방지) -->
+    <param name="gate_dist" value="5.0"/>
+    <param name="max_age" value="8"/>
+    <param name="min_hits" value="2"/>
+    <param name="max_coast_age" value="2"/>
+    <!-- 프레임 기준과 OR 로 적용되는 시간 기준 수명.
+         8.2 Hz 실측에서 max_coast_age=2 는 0.24 s 뿐이라 같은 ID 재관측
+         공백(p50 0.48 s / p90 0.99 s)의 0% 만 커버했고, 한 번만 놓쳐도
+         새 ID 가 발급돼 속도 칼만이 처음부터 다시 수렴했다(1.4 s 소요).
+         0.8 s 면 공백의 76% 를 커버한다. coast 중 등속 예측 오차는
+         ±2 m/s^2 가감속 가정에서도 0.64 m 로 gate_dist(5.0) 안이다. -->
+    <param name="max_coast_sec" value="0.8"/>
+    <param name="max_track_age_sec" value="1.0"/>
+    <param name="tracker_yaw_alpha" value="0.25"/>
+    <!-- OBB geometry score + temporal confirmation for vehicle candidates. -->
+    <param name="vehicle_score_enabled" value="true"/>
+    <param name="vehicle_confidence_alpha" value="0.35"/>
+    <!-- 후방 차량 인식 완화 (2026-09-11 실측).
+         raw 점군과 /tracked_objects 를 프레임별 대조한 결과, 트래커 ROI 안
+         후방 차량크기 클러스터 277개 중 트랙이 103개뿐이었다(37%).
+         검출/미검출을 가른 건 거리가 아니라 점 개수와 관측 높이다:
+           검출됨  점수 중앙 81, 높이 1.10m, 거리 16.6m
+           미검출  점수 중앙 50, 높이 0.81m, 거리 18.7m
+         후방 차량은 뒷면만 보여 점이 적은데, 4프레임 연속 차량 판정을
+         요구하면 점수가 오르내리며 문턱을 못 채운다.
+         고주로 차선변경이 이 입력에 의존한다 - 실측 t=19~48 구간에서
+         SMPC 가 본 인접 차량이 vehicles=2 / nearby=2 뿐이었고, 놓친
+         차량이 있으면 위험도 계산이 왜곡된다.
+         ※ 완화이므로 오검출이 늘 수 있다. 재주행에서 오탐을 같이 볼 것. -->
+    <param name="vehicle_confirm_score" value="0.50"/>
+    <param name="vehicle_confirm_hits" value="2"/>
+    <!-- Once confirmed, do not drop a car because a few long-range scans see
+         only a partial face.  Release requires 7 observed scans below 0.25. -->
+    <param name="vehicle_release_score" value="0.25"/>
+    <param name="vehicle_release_frames" value="7"/>
+
+    <!-- 단일 링 원거리 차량 가설. VLP-16 은
+         약 32m 까지 승용차에 2링(-3,-1deg), 그 뒤 -1deg 하나만 스쳐 높이가
+         관측 불가가 된다(100m 0링). 그 구간은 3D 박스 대신 '뒷면 현' 으로 판정. -->
+    <param name="single_ring_max_size_z" value="0.18"/>
+    <!-- 이론 전환점은 1.730/tan(3deg)=33.0m이며 중심 산포를 고려해
+         1m 앞부터 원거리 가설을 허용한다. -->
+    <param name="single_ring_min_range" value="32.0"/>
+    <param name="far_chord_soft_min" value="0.8"/>
+    <param name="far_chord_ideal_min" value="1.2"/>
+    <param name="far_chord_ideal_max" value="2.7"/>
+    <!-- 현이 시선에 수직이어야 차량 뒷면. 가드레일·차선은 시선과 나란하다. -->
+    <param name="far_tangential_min" value="0.50"/>
+    <param name="far_tangential_full" value="0.80"/>
+    <!-- -1deg 링의 지면 위 고도: 25m 1.26m, 40m 1.00m, 60m 0.65m. 노면은 0. -->
+    <param name="far_elev_ideal_min" value="0.15"/>
+    <param name="far_elev_ideal_max" value="1.6"/>
+    <param name="far_elev_soft_max" value="2.0"/>
+    <param name="far_vehicle_length" value="4.5"/>
+    <param name="far_vehicle_height" value="1.5"/>
+    <!-- 차량 가설 실패 + 지면 위 물체 = 낙하물·저상 장애물. 차량성 0 으로 두되
+         장애물로는 살려 보낸다. 오탐을 만든 가늘고 긴 노면·가드레일은 길이로 막는다. -->
+    <param name="far_obstacle_max_chord" value="2.0"/>
+    <param name="far_obstacle_min_footprint" value="0.8"/>
+    <param name="far_obstacle_min_height" value="0.3"/>
+
+    <!-- Debug only: show confirmed vehicles, persistent far candidates and
+         other unknown objects in separate marker namespaces/colors. -->
+    <param name="marker_vehicles_only" value="false"/>
+    <param name="marker_far_candidate_min_range" value="25.0"/>
+    <param name="marker_far_candidate_min_hits" value="3"/>
+    <param name="marker_far_candidate_min_obstacle_confidence" value="0.55"/>
+
+    <!-- 장애물성(차량성과 분리). 낮은 장애물은 '차 모양이 아닌' 것이지
+         '없는' 것이 아니므로, 버릴지 여부는 이 점수로 판단한다. -->
+    <param name="obstacle_elev_ideal_min" value="0.10"/>
+    <param name="obstacle_elev_ideal_max" value="1.8"/>
+    <param name="obstacle_elev_soft_max" value="2.1"/>
+    <param name="obstacle_full_points" value="12"/>
+    <param name="obstacle_extent_ideal_min" value="0.25"/>
+
+    <!-- 정적/동적 분류 (강건화): 정적물·건물이 동적으로 튀는 것 방지 -->
+    <param name="dynamic_on_speed" value="1.0"/>     <!-- 기본 문턱 [m/s] -->
+    <param name="dynamic_off_speed" value="0.5"/>
+    <param name="dynamic_on_per_m" value="0.05"/>    <!-- 거리비례 가산: 먼 물체일수록 문턱↑ (yaw오차 억제) -->
+    <param name="dynamic_persist_up" value="2"/>     <!-- 동적 확정 연속프레임 -->
+    <param name="dynamic_persist_down" value="3"/>
+    <param name="dynamic_vhist_len" value="6"/>
+    <param name="dynamic_vconsistency_min" value="0.6"/>  <!-- 속도방향 일관성(지터 억제). 낮추면 관대 -->
+    <param name="dynamic_with_ego_eps" value="0.8"/> <!-- 자차 동행(벽 슬라이딩) 판정 [m/s] -->
+    <!-- 튜닝: 정적물이 여전히 동적이면 vconsistency_min↑(0.7) 또는 on_per_m↑(0.06).
+         실제 이동차가 정적으로 잡히면 vconsistency_min↓(0.5) 또는 persist_up↓(1). -->
+
+
+    <!-- TTC 보정 -->
+    <param name="ttc_range_margin" value="0.0"/>
+    <param name="min_closing_speed" value="0.1"/>
+    <param name="ego_front_overhang" value="2.0"/>   <!-- 후축->앞범퍼 -->
+    <param name="lane_half_width" value="1.75"/>      <!-- CPA 코리도 게이트 -->
+    <param name="cpa_gate_margin" value="0.5"/>
+  </node>
+</launch>

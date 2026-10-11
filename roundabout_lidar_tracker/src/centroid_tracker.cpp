@@ -1,0 +1,555 @@
+#include "roundabout_lidar_tracker/centroid_tracker.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+
+namespace roundabout_lidar_tracker {
+namespace {
+
+double clamp(double value, double lower, double upper) {
+  return std::max(lower, std::min(upper, value));
+}
+
+double normalizedAngleDifference(double lhs, double rhs) {
+  return std::atan2(std::sin(lhs - rhs), std::cos(lhs - rhs));
+}
+
+struct AssociationCandidate {
+  std::size_t track_index = 0U;
+  std::size_t detection_index = 0U;
+  double distance = 0.0;
+};
+
+}  // namespace
+
+CentroidTracker::CentroidTracker(const TrackerConfig& config)
+    : config_(config) {}
+
+void CentroidTracker::setConfig(const TrackerConfig& config) {
+  config_ = config;
+}
+
+bool CentroidTracker::retainable(const TrackState& track) const {
+  return config_.confirmed_hold_seconds > 0.0 && track.has_moved &&
+         track.has_velocity_evidence &&
+         track.hits >= static_cast<std::uint32_t>(std::max(config_.min_confirm_hits, config_.min_velocity_hits));
+}
+
+double CentroidTracker::lifetime(const TrackState& track) const {
+  return retainable(track) ? std::max(config_.stale_seconds, config_.confirmed_hold_seconds)
+                          : config_.stale_seconds;
+}
+
+void CentroidTracker::updateVehicleProof(TrackState& track, const Detection2D& raw,
+                                         double now) const {
+  const double rx = raw.x - config_.circular_center_x;
+  const double ry = raw.y - config_.circular_center_y;
+  const double radius = std::hypot(rx, ry);
+  const double sign = config_.counter_clockwise ? 1.0 : -1.0;
+  double angle = std::atan2(ry, rx);
+  double arc = sign * angle * radius;
+  if (!track.progress_history.empty()) {
+    // 연속 원호로 펼친다(±pi 경계).
+    const auto& prev = track.progress_history.back();
+    const double prev_angle = sign * prev.arc / std::max(0.1, prev.radius);
+    angle = prev_angle + normalizedAngleDifference(angle, prev_angle);
+    arc = sign * angle * radius;
+  }
+  const bool edges = std::isfinite(raw.arc_lo) && std::isfinite(raw.arc_hi);
+  track.progress_history.push_back({now, arc, radius, edges ? arc + raw.arc_lo : arc,
+                                    edges ? arc + raw.arc_hi : arc});
+  static const bool debug = std::getenv("RA_PROOF_DEBUG") != nullptr;
+  if (debug) std::fprintf(stderr, "PROOF %d %.3f %.3f %.3f %d %.3f %.3f\n", track.id, now, arc, radius,
+                          track.proven ? 1 : 0, track.progress_history.back().lo, track.progress_history.back().hi);
+  while (track.progress_history.size() > 2U &&
+         track.progress_history.front().time < now - config_.proof_window_seconds)
+    track.progress_history.pop_front();
+  // 원시 중심은 차체 일부만 보일 때 1~2 m 튄다. 3점 중앙값으로 단발 튐을 지운 뒤 판단한다.
+  auto filtered = [&](int which) {
+    std::vector<double> out;
+    const auto& h = track.progress_history;
+    auto val = [&](std::size_t i) {
+      return which == 0 ? h[i].arc : which == 1 ? h[i].lo : h[i].hi;
+    };
+    for (std::size_t i = 0; i < h.size(); ++i) {
+      if (i == 0 || i + 1 == h.size()) { out.push_back(val(i)); continue; }
+      const double a = val(i - 1), b = val(i), c2 = val(i + 1);
+      out.push_back(std::max(std::min(a, b), std::min(std::max(a, b), c2)));
+    }
+    return out;
+  };
+  const std::vector<double> med = filtered(0);
+  const std::vector<double> med_lo = filtered(1);
+  const std::vector<double> med_hi = filtered(2);
+  // 마지막 값은 다음 프레임에 중앙값이 된다. 판단은 확정된(가운데) 값까지만 쓴다.
+  const std::size_t usable = med.size() >= 3U ? med.size() - 1U : med.size();
+  if (track.proven) {
+    if (usable >= 1U) track.proof_arc_max = std::max(track.proof_arc_max, med[usable - 1U]);
+    if (usable >= 1U && track.proof_arc_max - med[usable - 1U] > config_.revoke_reversal) {
+      track.proven = false;
+      track.has_moved = false;
+      track.progress_history.clear();
+      track.proof_arc_max = -std::numeric_limits<double>::infinity();
+    }
+    return;
+  }
+  // 첫 값은 중앙값이 안 된 원시값이다(18 번: 첫 검출만 2 m 옆 물체에 붙음). 안쪽 값만 쓴다.
+  const std::size_t first = med.size() >= 3U ? 1U : 0U;
+  if (static_cast<int>(usable - first) < config_.proof_min_samples) return;
+  double running_max = -std::numeric_limits<double>::infinity();
+  double reversal = 0.0, r_min = 1e9, r_max = -1e9, max_step = 0.0;
+  for (std::size_t i = first; i < usable; ++i) {
+    if (i > first) max_step = std::max(max_step, med[i] - med[i - 1]);
+    running_max = std::max(running_max, med[i]);
+    reversal = std::max(reversal, running_max - med[i]);
+    r_min = std::min(r_min, track.progress_history[i].radius);
+    r_max = std::max(r_max, track.progress_history[i].radius);
+  }
+  // 앞끝·뒤끝이 모두 진행해야 한다. 가려졌다 드러나는 정지 물체는 한쪽 끝이 제자리라 중심만 끌려간다(19:04:57 id19).
+  const double progress = std::min(med[usable - 1U] - med[first],
+      std::min(med_lo[usable - 1U] - med_lo[first], med_hi[usable - 1U] - med_hi[first]));
+  // 진짜 차량은 여러 스텝에 걸쳐 움직인다. 한 스텝이 대부분이면 연결 점프다.
+  const double center_progress = med[usable - 1U] - med[first];
+  const bool spread_motion = center_progress > 0.0 && max_step <= 0.6 * center_progress;
+  if (progress >= config_.proof_progress && reversal <= config_.proof_reversal && spread_motion &&
+      (r_max - r_min) <= config_.proof_radial_ratio * progress + 0.5) {
+    track.proven = true;
+    track.has_moved = true;
+    track.proof_arc_max = running_max;
+  }
+}
+
+bool CentroidTracker::occlusionUnresolved(double now) const {
+  return last_confirmed_expiry_ >= 0.0 && now >= last_confirmed_expiry_ &&
+         now - last_confirmed_expiry_ < config_.expiry_guard_seconds;
+}
+
+void CentroidTracker::update(const std::vector<Detection2D>& detections,
+                             double now) {
+  // Repeated or out-of-order sensor stamps are not independent observations.
+  if (!std::isfinite(now) || now <= last_frame_time_) return;
+  last_frame_time_ = now;
+  // Expire before association: an old ghost must not acquire a new vehicle ID.
+  tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
+      [this, now](const TrackState& track) {
+        if (now - track.last_measurement <= lifetime(track)) return false;
+        bool critical_expiry = retainable(track);
+        if (critical_expiry && config_.circular_velocity_enabled &&
+            std::isfinite(config_.expiry_guard_conflict_angle)) {
+          const double radius = std::hypot(track.x - config_.circular_center_x,
+                                           track.y - config_.circular_center_y);
+          const double angle = std::atan2(track.y - config_.circular_center_y,
+                                          track.x - config_.circular_center_x) +
+              track.angular_velocity * clamp(now - track.last_update, 0.0,
+                                              config_.max_prediction_seconds);
+          const double pos = normalizedAngleDifference(angle,
+              config_.expiry_guard_conflict_angle) * radius *
+              (config_.counter_clockwise ? 1.0 : -1.0);
+          // Do not pause entry when a car already departed the conflict zone.
+          critical_expiry = pos >= -30.0 && pos <=
+              3.0 + 0.5 * track.observed_body_length;
+        }
+        if (critical_expiry) last_confirmed_expiry_ = now;
+        return true;
+      }), tracks_.end());
+  std::vector<double> predicted_x(tracks_.size(), 0.0);
+  std::vector<double> predicted_y(tracks_.size(), 0.0);
+  std::vector<AssociationCandidate> candidates;
+  candidates.reserve(tracks_.size() * detections.size());
+
+  for (std::size_t track_index = 0U; track_index < tracks_.size();
+       ++track_index) {
+    const TrackState& track = tracks_[track_index];
+    const double dt = clamp(now - track.last_update, 0.0,
+                            config_.max_prediction_seconds);
+    if (config_.circular_velocity_enabled) {
+      const double relative_x = track.x - config_.circular_center_x;
+      const double relative_y = track.y - config_.circular_center_y;
+      const double radius = std::hypot(relative_x, relative_y);
+      const double angle = std::atan2(relative_y, relative_x) +
+                           track.angular_velocity * dt;
+      predicted_x[track_index] =
+          config_.circular_center_x + radius * std::cos(angle);
+      predicted_y[track_index] =
+          config_.circular_center_y + radius * std::sin(angle);
+    } else {
+      predicted_x[track_index] = track.x + track.velocity_x * dt;
+      predicted_y[track_index] = track.y + track.velocity_y * dt;
+    }
+    const double predicted_motion =
+        std::hypot(track.velocity_x, track.velocity_y) * dt;
+    const double gate = config_.association_distance +
+                        std::min(config_.association_distance,
+                                 0.5 * predicted_motion);
+
+    for (std::size_t detection_index = 0U;
+         detection_index < detections.size(); ++detection_index) {
+      const double error = std::hypot(
+          detections[detection_index].x - predicted_x[track_index],
+          detections[detection_index].y - predicted_y[track_index]);
+      if (error <= gate) {
+        candidates.push_back({track_index, detection_index, error});
+      }
+    }
+  }
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const AssociationCandidate& lhs,
+               const AssociationCandidate& rhs) {
+              return lhs.distance < rhs.distance;
+            });
+  std::vector<bool> track_matched(tracks_.size(), false);
+  std::vector<bool> detection_matched(detections.size(), false);
+
+  for (const AssociationCandidate& candidate : candidates) {
+    if (track_matched[candidate.track_index] ||
+        detection_matched[candidate.detection_index]) {
+      continue;
+    }
+    track_matched[candidate.track_index] = true;
+    detection_matched[candidate.detection_index] = true;
+
+    TrackState& track = tracks_[candidate.track_index];
+    const Detection2D& raw_detection = detections[candidate.detection_index];
+    Detection2D detection = raw_detection;
+    if (retainable(track) && std::max(detection.size_x, detection.size_y) <
+                                0.65 * track.observed_body_length) {
+      // A fragment centroid is not the whole body's center. Reduce its weight
+      // before both the position and angular-speed fit to avoid a false jump.
+      detection.x = 0.25 * detection.x + 0.75 * predicted_x[candidate.track_index];
+      detection.y = 0.25 * detection.y + 0.75 * predicted_y[candidate.track_index];
+    }
+    const double measurement_dt = now - track.last_measurement;
+    if (config_.circular_velocity_enabled && measurement_dt > 1.0e-3 &&
+        measurement_dt <= 2.0 * lifetime(track)) {
+      // Speed uses independent raw detections. Partial-body position smoothing
+      // blends a prediction into detection, so it must not feed velocity back.
+      const Detection2D& speed_detection = config_.robust_circular_velocity
+          ? raw_detection : detection;
+      const double wrapped_angle = std::atan2(
+          speed_detection.y - config_.circular_center_y,
+          speed_detection.x - config_.circular_center_x);
+      const double previous_unwrapped = track.angle_history.empty()
+                                            ? wrapped_angle
+                                            : track.angle_history.back().angle;
+      const double previous_wrapped =
+          std::atan2(std::sin(previous_unwrapped), std::cos(previous_unwrapped));
+      const double unwrapped_angle =
+          previous_unwrapped +
+          normalizedAngleDifference(wrapped_angle, previous_wrapped);
+      track.angle_history.push_back({now, unwrapped_angle,
+          std::max(raw_detection.size_x, raw_detection.size_y)});
+      const std::size_t window_size = static_cast<std::size_t>(
+          std::max(2, config_.velocity_window_size));
+      while (track.angle_history.size() > window_size) {
+        track.angle_history.pop_front();
+      }
+      if (config_.robust_circular_velocity) {
+        const double cutoff = now - std::max(config_.velocity_min_span,
+                                             config_.velocity_window_seconds);
+        while (track.angle_history.size() > 2U &&
+               track.angle_history.front().time < cutoff)
+          track.angle_history.pop_front();
+      }
+
+      const double sample_span = track.angle_history.back().time -
+                                 track.angle_history.front().time;
+      if (track.angle_history.size() >= 2U &&
+          sample_span >= std::max(1.0e-3, config_.velocity_min_span)) {
+        double mean_time = 0.0;
+        double mean_angle = 0.0;
+        for (const AngleSample& sample : track.angle_history) {
+          mean_time += sample.time;
+          mean_angle += sample.angle;
+        }
+        mean_time /= static_cast<double>(track.angle_history.size());
+        mean_angle /= static_cast<double>(track.angle_history.size());
+
+        double covariance = 0.0;
+        double time_variance = 0.0;
+        for (const AngleSample& sample : track.angle_history) {
+          const double centered_time = sample.time - mean_time;
+          covariance += centered_time * (sample.angle - mean_angle);
+          time_variance += centered_time * centered_time;
+        }
+        if (time_variance > 1.0e-9) {
+          const double radius = std::max(
+              0.1, std::hypot(detection.x - config_.circular_center_x,
+                              detection.y - config_.circular_center_y));
+          const double max_angular_speed = config_.max_object_speed / radius;
+          double slope = covariance / time_variance;
+          bool comparable_fit = !config_.robust_circular_velocity;
+          if (config_.robust_circular_velocity) {
+            // Median of sufficiently separated pairs: isolated centroid jumps
+            // cannot dominate a short least-squares window. Bootstrap with the
+            // available span, without assuming any scenario vehicle speed.
+            std::vector<double> slopes;
+            const double pair_span = std::min(std::max(0.01, config_.velocity_pair_min_span),
+                                               0.75 * sample_span);
+            for (std::size_t i = 0; i < track.angle_history.size(); ++i) {
+              for (std::size_t j = i + 1; j < track.angle_history.size(); ++j) {
+                const auto& first = track.angle_history[i];
+                const auto& last = track.angle_history[j];
+                if (last.time - first.time < pair_span) continue;
+                // Face/extent changes can introduce a persistent center offset.
+                // Compare real observations with similar visible extent only;
+                // never substitute predicted centers as velocity measurements.
+                if (std::abs(last.visible_extent - first.visible_extent) >
+                    std::max(0.0, config_.velocity_extent_tolerance)) continue;
+                if (last.time < now - 0.4) continue;
+                slopes.push_back((last.angle - first.angle) / (last.time - first.time));
+              }
+            }
+            if (!slopes.empty()) {
+              comparable_fit = true;
+              std::sort(slopes.begin(), slopes.end());
+              const std::size_t mid = slopes.size() / 2;
+              slope = slopes.size() % 2 ? slopes[mid]
+                  : 0.5 * (slopes[mid - 1] + slopes[mid]);
+            }
+          }
+          bool observed_stop = false;
+          if (config_.robust_circular_velocity) {
+            double first_time = now, angle_min = unwrapped_angle, angle_max = unwrapped_angle;
+            for (const auto& sample : track.angle_history) {
+              if (sample.time < now - 0.4) continue;
+              first_time = std::min(first_time, sample.time);
+              angle_min = std::min(angle_min, sample.angle);
+              angle_max = std::max(angle_max, sample.angle);
+            }
+            // Fast stop recognition from real observations; a long steady-speed
+            // window must not carry a stopped front vehicle through the merge.
+            observed_stop = now - first_time >= 0.25 &&
+                            (angle_max - angle_min) * radius <= 0.1;
+          }
+          if (comparable_fit || observed_stop) {
+            const double measured_angular_velocity = observed_stop ? 0.0 : clamp(
+                slope, -max_angular_speed, max_angular_speed);
+            track.angular_velocity = observed_stop ? 0.0 : track.velocity_estimate_valid
+                                         ? config_.velocity_alpha *
+                                                   measured_angular_velocity +
+                                               (1.0 - config_.velocity_alpha) *
+                                                   track.angular_velocity
+                                         : measured_angular_velocity;
+            track.velocity_estimate_valid = true;
+            track.has_velocity_evidence = true;
+            track.last_velocity_evidence = now;
+          } else {
+            // Changing fragments alone cannot establish a fresh speed. Keep
+            // association prediction but make TTC consumers wait for evidence.
+            track.velocity_estimate_valid = false;
+          }
+        }
+      }
+    } else if (config_.circular_velocity_enabled) {
+      track.angle_history.clear();
+      const double angle = std::atan2(
+          detection.y - config_.circular_center_y,
+          detection.x - config_.circular_center_x);
+      track.angle_history.push_back({now, angle,
+          std::max(detection.size_x, detection.size_y)});
+      track.angular_velocity = 0.0;
+      track.velocity_x = 0.0;
+      track.velocity_y = 0.0;
+      track.velocity_estimate_valid = false;
+    } else if (!config_.circular_velocity_enabled &&
+               measurement_dt > 1.0e-3 &&
+               measurement_dt <= 2.0 * lifetime(track)) {
+      double measured_vx =
+          (detection.x - track.last_detection_x) / measurement_dt;
+      double measured_vy =
+          (detection.y - track.last_detection_y) / measurement_dt;
+      const double measured_speed = std::hypot(measured_vx, measured_vy);
+      if (measured_speed > config_.max_object_speed) {
+        const double ratio = config_.max_object_speed / measured_speed;
+        measured_vx *= ratio;
+        measured_vy *= ratio;
+      }
+      if (track.velocity_estimate_valid) {
+        track.velocity_x =
+            config_.velocity_alpha * measured_vx +
+            (1.0 - config_.velocity_alpha) * track.velocity_x;
+        track.velocity_y =
+            config_.velocity_alpha * measured_vy +
+            (1.0 - config_.velocity_alpha) * track.velocity_y;
+      } else {
+        track.velocity_x = measured_vx;
+        track.velocity_y = measured_vy;
+      }
+      track.velocity_estimate_valid = true;
+      track.has_velocity_evidence = true;
+      track.last_velocity_evidence = now;
+    }
+
+    track.x = config_.position_alpha * detection.x +
+              (1.0 - config_.position_alpha) *
+                  predicted_x[candidate.track_index];
+    track.y = config_.position_alpha * detection.y +
+              (1.0 - config_.position_alpha) *
+                  predicted_y[candidate.track_index];
+    if (config_.circular_velocity_enabled &&
+        track.velocity_estimate_valid) {
+      track.velocity_x = -track.angular_velocity *
+                         (track.y - config_.circular_center_y);
+      track.velocity_y = track.angular_velocity *
+                         (track.x - config_.circular_center_x);
+    }
+    track.z = config_.position_alpha * detection.z +
+              (1.0 - config_.position_alpha) * track.z;
+    const double size_alpha_x = retainable(track) && detection.size_x < track.size_x
+        ? clamp(config_.confirmed_size_shrink_alpha, 0.0, 1.0) : config_.size_alpha;
+    track.size_x = size_alpha_x * detection.size_x +
+                   (1.0 - size_alpha_x) * track.size_x;
+    const double size_alpha_y = retainable(track) && detection.size_y < track.size_y
+        ? clamp(config_.confirmed_size_shrink_alpha, 0.0, 1.0) : config_.size_alpha;
+    track.size_y = size_alpha_y * detection.size_y +
+                   (1.0 - size_alpha_y) * track.size_y;
+    const double size_alpha_z = retainable(track) && detection.size_z < track.size_z
+        ? clamp(config_.confirmed_size_shrink_alpha, 0.0, 1.0) : config_.size_alpha;
+    track.size_z = size_alpha_z * detection.size_z +
+                   (1.0 - size_alpha_z) * track.size_z;
+    track.observed_body_length = std::max(track.observed_body_length,
+        std::max(detection.size_x, detection.size_y));
+    track.confidence = detection.confidence;
+    track.last_detection_x = detection.x;
+    track.last_detection_y = detection.y;
+    track.last_update = now;
+    track.last_measurement = now;
+    ++track.hits;
+
+    if (config_.vehicle_proof_enabled && config_.circular_velocity_enabled) {
+      updateVehicleProof(track, raw_detection, now);
+      continue;
+    }
+    const double displacement =
+        std::hypot(track.x - track.origin_x, track.y - track.origin_y);
+    const double speed = std::hypot(track.velocity_x, track.velocity_y);
+    if (speed >= config_.moving_speed_threshold ||
+        displacement >= config_.moving_distance_threshold) {
+      ++track.moving_hits;
+    } else {
+      track.moving_hits = std::max(0, track.moving_hits - 1);
+    }
+    if (track.moving_hits >= config_.moving_confirm_hits) {
+      track.has_moved = true;
+    }
+  }
+
+  for (std::size_t index = 0U; index < tracks_.size(); ++index) {
+    if (track_matched[index]) {
+      continue;
+    }
+    tracks_[index].x = predicted_x[index];
+    tracks_[index].y = predicted_y[index];
+    if (config_.circular_velocity_enabled &&
+        tracks_[index].velocity_estimate_valid) {
+      tracks_[index].velocity_x =
+          -tracks_[index].angular_velocity *
+          (tracks_[index].y - config_.circular_center_y);
+      tracks_[index].velocity_y =
+          tracks_[index].angular_velocity *
+          (tracks_[index].x - config_.circular_center_x);
+    }
+    tracks_[index].last_update = now;
+  }
+
+  for (std::size_t index = 0U; index < detections.size(); ++index) {
+    if (detection_matched[index]) {
+      continue;
+    }
+    const Detection2D& detection = detections[index];
+    TrackState track;
+    track.id = next_id_++;
+    track.x = detection.x;
+    track.y = detection.y;
+    track.z = detection.z;
+    track.size_x = detection.size_x;
+    track.size_y = detection.size_y;
+    track.size_z = detection.size_z;
+    track.observed_body_length = std::max(track.observed_body_length,
+        std::max(detection.size_x, detection.size_y));
+    track.confidence = detection.confidence;
+    track.origin_x = detection.x;
+    track.origin_y = detection.y;
+    track.last_detection_x = detection.x;
+    track.last_detection_y = detection.y;
+    track.last_update = now;
+    track.last_measurement = now;
+    track.hits = 1U;
+    if (config_.circular_velocity_enabled) {
+      const double angle = std::atan2(
+          detection.y - config_.circular_center_y,
+          detection.x - config_.circular_center_x);
+      track.angle_history.push_back({now, angle,
+          std::max(detection.size_x, detection.size_y)});
+      if (config_.vehicle_proof_enabled) updateVehicleProof(track, detection, now);
+    }
+    tracks_.push_back(track);
+  }
+}
+
+std::vector<Track2D> CentroidTracker::tracks(double now) const {
+  std::vector<Track2D> result;
+  for (const TrackState& track : tracks_) {
+    if (track.hits < static_cast<std::uint32_t>(config_.min_confirm_hits) ||
+        now - track.last_measurement > lifetime(track)) {
+      continue;
+    }
+    Track2D output;
+    output.id = track.id;
+    output.x = track.x;
+    output.y = track.y;
+    output.z = track.z;
+    output.velocity_x = track.velocity_x;
+    output.velocity_y = track.velocity_y;
+    output.size_x = track.size_x;
+    output.size_y = track.size_y;
+    output.size_z = track.size_z;
+    // Preserve the largest observed body length for this confirmed vehicle ID;
+    // a partial return must never turn a truck into a short passenger car.
+    if (retainable(track)) {
+      if (output.size_x >= output.size_y)
+        output.size_x = std::max(output.size_x, track.observed_body_length);
+      else output.size_y = std::max(output.size_y, track.observed_body_length);
+    }
+    const double freshness =
+        1.0 - clamp((now - track.last_measurement) /
+                        std::max(0.01, config_.stale_seconds),
+                    0.0, 1.0);
+    output.measurement_age = std::max(0.0, now - track.last_measurement);
+    output.confidence = retainable(track)
+        ? std::max(std::min(track.confidence, config_.retained_confidence_floor),
+                   track.confidence * freshness)
+        : track.confidence * freshness;
+    // Widen the longitudinal occupancy during blind prediction (bounded 1.5m).
+    const double uncertainty = retainable(track)
+        ? std::min(1.5, 0.5 * output.measurement_age) : 0.0;
+    if (output.size_x >= output.size_y) output.size_x += uncertainty;
+    else output.size_y += uncertainty;
+    output.hit_count = track.hits;
+    output.velocity_valid =
+        track.hits >= static_cast<std::uint32_t>(config_.min_velocity_hits) &&
+        (track.velocity_estimate_valid ||
+         (track.has_moved && track.has_velocity_evidence &&
+          now - track.last_velocity_evidence <= config_.velocity_hold_seconds));
+    output.has_moved = track.has_moved;
+    result.push_back(output);
+  }
+  std::sort(result.begin(), result.end(),
+            [](const Track2D& lhs, const Track2D& rhs) {
+              return lhs.id < rhs.id;
+            });
+  return result;
+}
+
+void CentroidTracker::reset() {
+  tracks_.clear();
+  next_id_ = 1;
+  last_confirmed_expiry_ = -1.0;
+  last_frame_time_ = -std::numeric_limits<double>::infinity();
+}
+
+}  // namespace roundabout_lidar_tracker

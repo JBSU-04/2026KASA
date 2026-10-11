@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>morai_udp_bridge</name>
+  <version>0.1.0</version>
+  <description>MORAI SIM 25.S4 hybrid bridge: ctrl_cmd via ROSBridge, sensors/status via UDP.</description>
+
+  <maintainer email="kuuve@todo.todo">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>morai_msgs</depend>
+  <depend>rospy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <exec_depend>velodyne_driver</exec_depend>
+  <exec_depend>velodyne_pointcloud</exec_depend>
+  <exec_depend>rosbridge_server</exec_depend>
+
+  <test_depend>python3-nose</test_depend>
+</package>

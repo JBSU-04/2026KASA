@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!-- Modified by KUUVe, 2026.
+     Changes: standalone package metadata and dependency set for the vendored
+     MORAI EKF integration. -->
+<package format="2">
+  <name>ekf_localizer</name>
+  <version>1.12.0</version>
+  <description>Pinned Autoware.AI delay-compensating EKF localizer.</description>
+  <maintainer email="maintainer@example.com">Workspace Maintainer</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>amathutils_lib</depend>
+  <depend>geometry_msgs</depend>
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <build_depend>eigen</build_depend>
+  <export/>
+</package>

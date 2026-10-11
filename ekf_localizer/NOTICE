@@ -1,0 +1,7 @@
+Vendored from Autoware.AI perception/ekf_localizer.
+Repository: https://github.com/autowarefoundation/autoware_ai_perception
+Pinned commit: 98b49bb8841cc9f33ad3632a8d159ad0c6666a2f
+Modified by KUUVe, 2026.
+Local changes: standalone catkin metadata, configurable TF publishing, and
+delay-aware innovation-covariance Mahalanobis gates (S = HPH' + R).
+License: Apache-2.0. Copyright remains with the Autoware Foundation.

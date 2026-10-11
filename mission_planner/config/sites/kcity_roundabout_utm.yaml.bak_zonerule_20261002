@@ -1,0 +1,333 @@
+# kcity_roundabout_utm.yaml
+#
+# kcity_roundabout.yaml 의 좌표를 UTM 절대좌표로 옮긴 것이다.
+# 원본은 mgeo 로컬 프레임(원점 302595.0, 4124145.0 을 뺀 값)인데,
+# 이 워크스페이스의 /odom 은 odom_information 이 내는 UTM 절대좌표다.
+# 그대로 쓰면 양보선까지 거리가 400만 m 로 나오며 미션이 영원히 IDLE 이다.
+#
+# 변환: x += 302595.0,  y += 4124145.0
+# 좌표 외의 값(반경·속도·gap·타이밍)은 팀이 검증한 원본 그대로다.
+# 원본 파일은 kcity_roundabout.yaml 에 남겨 두었다.
+#
+# K-City 회전교차로 현장 설정
+# ros_ws K-City map 로컬 좌표 (UTM52N - [302595.0, 4124145.0])
+frame_id: map # 모든 미션 좌표가 표현되는 기준 프레임 [프레임명]
+update_rate_hz: 20.0 # 미션 상태·제약 계산 주기 [Hz]
+odom_timeout: 0.4 # 이 시간 이상 odom 무수신 시 위치 무효 처리 [s]
+
+topics:
+  curve_speed_limit: /control_feedback/curvature_capacity_speed_mps # 출발 램프를 제외한 곡률 허용 속도
+  odom: /odom # 자차 위치·속도 입력
+  route: /local_path # 현재 주행 경로 입력
+  tracked_objects: /perception/roundabout/tracked_objects # 추적 차량 입력
+  localization_valid: /localization/valid # 측위 유효 여부 입력
+  constraint: /mission/constraints/roundabout # 속도·정지 제약 출력
+  state: /mission/roundabout/state # 미션 상태 출력
+  debug: /mission/roundabout/debug # 계산값 디버그 출력
+  markers: /mission/roundabout/markers # RViz 미션 표시 출력
+
+tracked_objects:
+  min_confidence: 0.4 # 미션에 전달할 최소 트랙 신뢰도 [0~1]
+  # GroundGrid 시설물의 신규/정지 트랙은 미션 입력에서 제외한다.
+  # 한 번 이동이 확인된 차량은 이후 정지해도 has_moved=true가 유지된다.
+  require_velocity_valid: true # 속도 계산이 완료된 트랙만 사용 [bool]
+  require_movement_confirmation: true # 실제 이동이 확인된 트랙만 사용 [bool]
+
+roundabout:
+  enabled: true # 회전교차로 미션 활성화 [bool]
+  counter_clockwise: true # true=반시계, false=시계 방향 [bool]
+  require_tracker_stream: true # 트래커가 끊기면 진입 전 정지 [bool]
+  require_localization: true # 유효한 측위 상태를 필수로 요구 [bool]
+
+  # catkin_ws의 UTM 측정값을 ros_ws mgeo 로컬 프레임으로 변환한 값[m]
+  center: { x: 302492.838, y: 4124488.413 } # 원형 차로 중심 [map m]
+  # 2026-09-10 정차 상태 100 odom 프레임 평균. 기존 양보선보다
+  # 합류점 쪽으로 약 2.6m 전진한 시야 확보 위치다.
+  yield_point: { x: 302496.16555312654, y: 4124463.6043231008 } # 정지·진입판단 기준점 [map m]
+  conflict_point: { x: 302501.042, y: 4124471.967 } # 09-30 두 주행 NPC 궤적과 기준경로 교점 [m]
+  exit_point: { x: 302512.545, y: 4124484.278 } # 선택한 출구 시작점 [map m]
+  entry_heading_deg: 69.713 # 새 판단점 정차 실측 헤딩 [deg]
+  entry_heading_tolerance_deg: 70.0 # 접근 차량 방위 허용 오차 [deg]
+  tangent_heading_tolerance_deg: 75.0 # 순환 차량 접선 방향 허용 오차 [deg] (60.0 -> 75.0: 원거리 초기 헤딩 지터 허용)
+
+  radius:
+    inner: 14.5 # 순환 차량 중심 궤적의 안쪽 경계 [m] (16.0 -> 14.5: 원거리 중심 편향 수용)
+    outer: 21.5 # 순환 차량 중심 궤적의 바깥쪽 경계 [m] (20.0 -> 21.5)
+    nominal: 18.338 # 두 백의 합류부 NPC 궤적 반경 중앙값 [m]
+
+  # 10-01 최근 3주행: 차량 중심 r=16.2~19.7m, 출구 표지판 r=14.5~15.3m.
+  vehicle_roi:
+    inner_radius: 15.8 # 차량 중심을 받는 주행 차로 안쪽 경계 [m]
+    outer_radius: 20.5 # 차량 중심을 받는 주행 차로 바깥쪽 경계 [m]
+    point_padding: 1.2 # 차체 점군은 중심 경계보다 넓게 보존 [m]
+    exit_lead_lateral_tolerance: 2.0 # 출구 경로 주변에서 앞차로 볼 횡거리 [m]
+
+  distance:
+    activation: 25.0 # 양보선까지 이 거리부터 미션 시작 [m]
+    decision: 25.0 # 양보 판단(YIELD)을 시작하는 거리 [m]
+    exit_detection: 3.0 # 출구 도달로 판정하는 출구점 반경 [m]
+    exit_clear: 6.0 # 출구점에서 이만큼 벗어나면 미션 종료 [m]
+    route_projection_tolerance: 4.0 # 경로 투영을 유효하게 보는 횡오차 [m]
+    stop_buffer: 0.0 # yield_point 자체가 의무정지 목표 [m]
+    creep_buffer: 0.0 # 추가 전진 없이 같은 위치에서 gap 판단 [m]
+    lead_search: 60.0 # 원형 차로 앞차 탐색 최대 원호 거리 [m]
+
+  speed:
+    approach: 8.0 # 접근 구간 속도 [m/s] (28.8 km/h)
+    circulation: 8.5 # 원형 차로 순환 및 진입 속도 [m/s] (30.6 km/h, 진입 탄력 상향)
+    exit: 15.0 # 출구 구간 최대속도 [m/s] (54 km/h)
+    degraded: 2.0 # 진입 후 LiDAR가 끊겼을 때 제한속도 [m/s]
+    stationary_threshold: 0.3 # 이 속도 이하면 정지 객체로 판정 [m/s]
+
+  gap:
+    ego_merge_time: 1.0 # 양보선에서 합류 완료까지 자차 시간 [s]
+    # 3.5 -> 2.5 (2026-09-10 실차 실측). 3.5s 는 이 교차로에서 달성 불가능한
+    # 값이었다 - 필요 슬롯이 실제 차간보다 컸다.
+    #   실측(35초, 299프레임): NPC 속도 5.17m/s, 동시 2.2대,
+    #                          차간 호거리 평균 17.5m / 중앙 17.8m / 최대 21.0m
+    #   필요 슬롯 = rear_time*5.17 + front_time*2.00
+    #     3.5/3.5 -> 25.1m  > 최대 21.0m   진입 확률 0
+    #     2.5/2.0 -> 16.9m  < 중앙 17.8m   ← 채택(여유 +0.9m)
+    #     2.0/2.0 -> 14.3m               더 쉽지만 안전여유 과소
+    #   실측 차단사유: rear TTC 52.9% / front gap 44.6% / 안전 2.6%
+    #   -> 103초 대기 후에도 진입 실패했다(대회 제한 15분).
+    # ※ 이 값을 다시 올리려면 먼저 NPC 밀도를 실측할 것. 차간보다 큰
+    #   슬롯을 요구하면 파라미터가 아니라 산술 문제가 된다.
+    rear_time: 1.5 # 진입 허용에 필요한 후방 차량 최소 TTC [s]
+    rear_time_is_total_ttc: true # rear_time을 합류시간과 더하지 않고 최종 TTC로 사용 [bool]
+    # YIELD 5초 후 초당 0.1초씩 rear/front/confirm 기준을 함께 완화한다.
+    # 근접 미확정 객체, 정지 차량, 트래커 단절은 대기 시간과 관계없이 차단한다.
+    relax_start_seconds: 4.0 # YIELD 진입 후 완화 시작 시간 [s]
+    relax_rate: 0.1 # 대기 1초당 시간 기준 감소량 [s/s]
+    rear_ttc_relax_floor: 1.0 # 교착 완화가 내려갈 수 있는 rear TTC 하한 [s]
+    rear_ttc_relax_max: 0.7 # rear_time 2.2에서 최대 1.5까지 완화 [s]
+    front_time: 1.0 # 합류 후 앞차와 남길 시간 간격 [s] (3.5 -> 2.0: 위 rear_time 주석의 슬롯 계산 참고)
+    front_time_relax_floor: 0.8 # 앞차 시간 간격의 절대 하한 [s]
+    front_standstill_distance: 0.0 # 앞차 조건의 고정 거리 가산값 [m] (K-City는 미사용)
+    # 주의: 0.25 는 approach/4 다. 주석이 'approach/2'(=0.5)라고 돼 있었고
+    # 코드 주석에도 'K-City는 0.5'라고 적혀 있었지만 실제 값은 0.25 였다.
+    # 값은 그대로 두고(현재 front_gap 계산이 이 값 기준으로 검증됨) 설명만
+    # 실제와 맞춘다. departure_average_speed = approach 8.0 * 0.25 = 2.0 m/s.
+    front_departure_speed_ratio: 0.25 # 정지 출발 평균속도 비율 [0~1]
+    front_check_distance: 35.0 # 충돌점 통과 앞차를 검사할 원호 범위 [m]
+    stationary_block_distance: 20.0 # 정지 차량이 진입을 막는 충돌점 거리 [m]
+    uncertain_object_block_distance: 15.0 # 속도 미확정 객체가 진입을 막는 거리 [m]
+    prediction_uncertainty_time: 0.2 # 실제 TTC 기준에 더하는 예측 안전 여유 [s]
+    safe_confirm_seconds: 0.3 # 안전 gap이 연속 유지돼야 하는 시간 [s] (0.8 -> 0.3s: 슬롯 발생 시 신속 Commit)
+    safe_confirm_relax_floor: 0.15 # 장기 대기 후 안전 gap 연속 확인 하한 [s]
+
+  # ★ 흐름 틈 선택 진입 (2026-09-29, 고주로 gap select 와 같은 방식, 독립 구현)
+  #   순환 차량을 합류점 기준 호 좌표로 펴서 (앞차, 뒤차) 틈마다 '몇 초 뒤
+  #   출발하면 들어가는지'를 예측하고 가장 이른 틈을 고른다(앞/뒤 id 래치).
+  #   출발 판단은 그 틈의 출발 지연이 0 이 되는 순간. 위 gap 블록의
+  #   rear_time/front_time/relax_*/safe_confirm_* 는 enabled=true 면 쓰지 않는다
+  #   (추적 끊김, 속도 미확정 객체, 합류점 상류 정지 차량 차단은 그대로 적용).
+  #   자차 모델: 정지 출발 ego_start_delay 후 ego_accel 로 ego_max_speed 까지.
+  #     09-18 16:27 백 실측: 양보선(합류점 7.3 m 전) 출발 -> 합류점 2.45 s, 평균 ~2.2 m/s^2.
+  #   합류 구역 진입 뒤 check_horizon 동안
+  #     앞차 간격 >= standstill_gap + front_headway * v_자차
+  #     뒤차 간격 >= standstill_gap + rear_headway * (v_뒤차 + speed_margin)
+  #   enabled=false 면 기존 판단(evaluateGap)으로 돌아간다.
+  #   간격 기준 근거(09-18 KASA 4주행, 실제 합류 시 실현된 간격): 뒤차 0.55~1.6 s,
+  #   앞차 ~0.8 s 로 통과했다(MORAI NPC 는 자차에 반응해 감속한다). 그보다 약간
+  #   보수적으로 앞 0.8 s / 뒤 1.0 s + 1.5 m 로 뒀더니
+  #   09-29 12:31 백(밀집 흐름: ~4 m/s, 차간 ~3.5 s, 범퍼 간격 ~12 m)에서 25 s 넘게
+  #   틈을 못 찾고 정지했다(필요 ~15 m). 같은 백 리플레이로 앞 0.5 / 뒤 0.6 s +
+  #   1.0 m, 속도 여유 0.2 로 낮추면 28.0 s 에 id3/id4 사이로 진입(기존 로직과 같은
+  #   시점, 예측 합류 간격 앞 ~2.9 m / 뒤 ~3.4 m). 0.6/0.8 s 는 여전히 진입 못 함.
+  #   ★ 트래커 지붕 검출(thin_top) 후 상류 차량이 -45 m 부터 보이자 12:31 밀집 흐름
+  #   (범퍼 간격 8~12 m, 3~4 m/s)이 전부 보여 위 값으로는 다시 못 들어갔다
+  #   (그전엔 다음 차가 안 보여서 틈이 있는 것처럼 보였을 뿐). 추적 결과로 오프라인
+  #   탐색 + C++ 전체 리플레이: 앞 0.3 / 뒤 0.5 s + 0.8 m, 검사 2.0 s ->
+  #   12:31 24.3 s 진입(기존 로직 28.0 s), 12:50 은 늦게 잡혔던 뒤차 앞 0.54 s 틈을 거부.
+  #   더 낮추면(앞 0.2 / 뒤 0.4 / 0.7 m) 12:50 에서 지나가는 차 바로 뒤로 1.7 m 붙어 들어간다.
+  gap_select:
+    enabled: true
+    use_mpc_prediction: true # MPC 곡률 허용 속도와 기존 가속 램프를 예측에만 반영
+    mpc_feedback_timeout: 0.5 # 피드백 끊김 시 진입 대기 [s]
+    require_merge_progress: true # 반경 진입만으로 순환 상태가 되지 않음
+    use_tracker_velocity: true # 실제 검출 기반 트래커 추정 하나만 사용, 미션 재회귀 제외
+    speed_min_span: 0.8 # use_tracker_velocity=false인 기존 미션 회귀에서만 사용 [s]
+    speed_disagreement_limit: 1.0 # 기존 미션 회귀에서만 사용하는 차이 상한 [m/s]
+    stop_reaction_time: 0.3 # 승인 취소 제동 반응 여유 [s]
+    stop_margin: 0.5 # 승인 취소 제동 여유 [m]
+    ego_accel: 3.0 # 정지 출발 가속 [m/s^2]
+    ego_start_delay: 0.2 # 출발 반응 지연 [s]
+    ego_max_speed: 0.0 # 기본 합류 상한. MPC 예측 시 min(이 상한, MPC 곡률 허용 속도) [m/s]
+    ego_length: 4.6 # 자차 길이 [m]
+    min_vehicle_length: 4.0 # 순환 차량 길이 하한 [m] (부분 관측 보정)
+    front_headway: 0.3 # 앞차 시간 간격 [s] (합류 뒤 자차 ACC 가 앞차를 따른다)
+    rear_headway: 0.5 # 뒤차 시간 간격 [s] (MORAI NPC 는 자차에 반응해 감속)
+    standstill_gap: 0.8 # 범퍼 간 최소 거리 [m]
+    check_horizon: 1.5 # 합류 뒤 검사 시간 [s]
+    speed_margin: 0.2 # 순환 차량 속도 불확실성 [m/s]
+    entry_zone: 1.0 # 자차 앞끝이 합류점 이만큼 앞이면 합류 구역 [m]
+    max_wait: 12.0 # 출발 지연 탐색 범위 [s]
+    go_tolerance: 0.05 # 이 지연 이하면 지금 출발 [s]
+    # 2026-09-30 (12:34 백): 앞차만 막는 틈(뒤차 조건은 지금 만족)의 출발 허용.
+    #   앞차가 합류점 앞에서 감속하면 '지나간 뒤 출발' 예측이 매 주기 밀려 0.05 s 에
+    #   못 닿고 틈을 놓쳤다(17 s 동안 5 번). 사후검증: 최소 앞 2.5 m / 뒤 2.1 m 이상.
+    go_tolerance_front: 0.4 # [s]
+    commit_front_tolerance: 1.0 # COMMIT 중 앞차 쪽만 부족할 때 계속 진입 [s]
+    # ★ 2026-09-30 순차 틈 판단: 틈을 도착 순서대로 본다. 목표 틈의 앞차를 따라
+    #   들어가는 시점(앞차 뒤끝이 합류점을 standstill_gap 지날 때 합류 구역 도착)에
+    #   뒤차 간격(standstill_gap + rear_headway*v)과 TTC(ttc_rear)를 못 지키면 그 틈은
+    #   패스하고 뒤차의 뒤 공간으로 넘어간다(되돌아가지 않음 - 틈이 흔들리지 않게).
+    #   오프라인 사후검증(09-29/30 4 주행, 실제 궤적): 최소 앞 2.5 m / 뒤 2.1 m 이상.
+    sequential: true
+    # 2026-09-30: NPC 는 차량마다 랜덤한 등속 -> 차량별 속도는 최근 1.5 s 원호 위치 회귀로
+    #   추정(speed_window). 앞차가 합류점 leader_start_distance 안에 와야 출발한다 - 앞차가
+    #   -12~-15 m 일 때 출발하면 NPC 가 가까워진 자차에 양보해(0.8~2 m/s) 계획이 깨졌다.
+    #   오프라인(09-29/30 8 주행): 앞차 -7~-10 m 에서 출발, 사후 최소 앞 2.5 m / 뒤 2.0 m 이상.
+    #   촘촘한 흐름(차 중심 간격 ~15 m)은 등속 가정상 틈이 없어 기다린다.
+    ttc_rear: 1.0 # 뒤차 최소 TTC [s]
+    late_margin: 0.2 # 뒤차 검사용 진입 늦음 여유 [s]
+    seq_rear_headway: 0.2 # 순차 판단 뒤차 시간 간격 [s] (간격 >= standstill_gap + 이값*v)
+    adaptive_leader_start: true # 합류 도달시간에 맞춰 출발 거리 계산
+    leader_start_max_distance: 10.0 # 먼 상류 출발/NPC 급감속 방지 상한 [m]
+    leader_start_distance: 6.5 # 앞차가 합류점 이 거리 안에 와야 출발 [m]
+    leader_decel_horizon: 0.5 # 최근 속도 감소 추세를 앞차 예측에 반영할 시간 [s]
+    leader_decel_limit: 1.5 # 예측에 반영할 감속도 상한 [m/s^2]
+    prediction_follow_standstill_gap: 4.0 # 속도캡 변환기 ACC 고정 간격 기본값 [m]
+    prediction_follow_time_gap: 1.5 # 속도캡 변환기 ACC 시간 간격 기본값 [s]
+    speed_window: 1.5 # use_tracker_velocity=false인 기존 미션 회귀 창 [s]
+    skip_confirm: 0.3 # 목표 틈이 이 시간 연속으로 안 될 때만 패스 [s] (새 트랙 첫 프레임 속도 노이즈)
+    seq_go_tolerance: 0.3 # 이전 설정 호환용. 순차 GO는 실제 출발 지연 0일 때만 승인
+    circle_stop_margin: 0.5 # 앞차 대기/중단 정지점을 원 판정 반경(outer+이 값) 밖에 [m]
+    confirm_seconds: 0.1 # 출발 판단 연속 유지 [s]
+    switch_margin: 0.5 # 고른 틈을 바꾸는 최소 이득 [s]
+    # 가림 대비: 상류 관측 끝(중앙분리대 가림)에 안 보이는 차량을 가정. 기본 끔.
+    #   09-18 16:27 백: COMMIT 직후 상류 -21.9 m 에서 id7 이 처음 잡혔다.
+    phantom_enabled: false
+    phantom_arc: 22.0 # 상류 관측 한계 호 거리 [m]
+    phantom_speed: 5.0 # 가정 차량 속도 [m/s]
+    # ★ 미확정 상류 트랙을 뒤차로 (2026-09-29, 12:50 백: -22.8 m 에서 막 생긴 트랙이
+    #   속도 미확정이라 빠졌고, 그 차와 0.54 s 간격으로 합류). 갓 생긴 트랙
+    #   (hit_count <= max_hits)만 속도 max(측정, unconfirmed_speed)의 뒤차로 넣는다.
+    unconfirmed_enabled: true
+    unconfirmed_range: 40.0 # 상류 호 거리 [m]
+    unconfirmed_speed: 5.0 # 가정 속도 하한 [m/s]
+    unconfirmed_max_hits: 45 # 이동 이력이 없는 오래된 미확정 트랙만 시설물로 무시
+    # ★ COMMIT 중 틈이 무너지면(늦게 잡힌 뒤차) 합류 구역 앞에서 편하게 설 수 있을
+    #   때 다시 양보. 서는 곳 = 합류점 - 자차 반길이 - entry_zone - abort_margin.
+    commit_abort_enabled: true
+    commit_abort_confirm: 0.2 # 무너짐 연속 유지 [s]
+    abort_margin: 0.5 # [m]
+    viz_range: 35.0 # 틈 시각화 범위(합류점 기준 +-) [m]
+
+  # 합류점/출구 자동 판정(좌표 하드코딩 대체). 못 구하면 위 좌표를 쓴다.
+  #   2026-09-30: 두 백에서 측정한 NPC 회전 궤적과 기준경로 교점을 고정 사용.
+  auto:
+    conflict_point: false # true 면 경로가 nominal+margin 반경 안으로 처음 들어가는 점을 쓴다
+    conflict_radius_margin: 1.0 # [m]
+    exit: true # 순환 중 반경이 outer+margin 을 넘으면 EXIT (exit_point 판정과 OR)
+    exit_radius_margin: 0.5 # [m]
+
+  timing:
+    tracker_timeout: 0.5 # 트래커 무수신 허용 시간 [s]
+    mandatory_stop_seconds: 1.0 # 양보선에서 완전정지 후 반드시 유지할 시간 [s] (0.5 -> 1.0s: 안정적인 정지 후 관측)
+    mandatory_stop_position_tolerance: 0.8 # 실측 판단점 주변에서만 정지 인정 [m]
+    mandatory_stop_speed_threshold: 0.25 # 완전정지로 판정할 최대 자차속도 [m/s]
+    minimum_circulate_seconds: 1.0 # 출구 판정 전 최소 순환 시간 [s]
+    commit_timeout_seconds: 6.0 # COMMIT 후 원형 차로 진입 제한시간 [s]
+    exit_hold_seconds: 1.0 # EXIT 상태 최소 유지시간 [s]
+
+  safety:
+    reset_jump_distance: 5.0 # 한 번에 이 이상 위치 점프 시 상태 초기화 [m]
+    comfortable_decel: 2.5 # 일반 정지에 사용할 감속도 [m/s^2]
+    emergency_decel: 5.0 # 긴급 정지에 사용할 감속도 [m/s^2]
+
+# 회전교차로 트래커는 공통 GroundGrid 비지면 점군을 사용하고 차량용
+# 클러스터 크기·형상·추적 파라미터는 이 미션에서 독립적으로 적용한다.
+lidar_tracker:
+  enabled: true # LiDAR 차량 추적 노드 활성화 [bool]
+  topics:
+    cloud: /nonground # GroundGrid 비지면 PointCloud2 입력
+    odom: /odom # 자차 위치·자세 입력
+    output: /perception/roundabout/tracked_objects # 추적 객체 출력
+    markers: /perception/roundabout/tracker_markers # RViz 추적 박스 출력
+    roi_cloud: /perception/roundabout/roi_cloud # 필터 전 원형 ROI 출력
+    vehicle_cloud: /perception/roundabout/vehicle_cloud # 차량 후보 점 출력
+    aligned_cloud: /perception/roundabout/aligned_cloud # 트래커와 같은 변환을 쓴 map 등고선 점군
+  expected_cloud_frame: velodyne_ground # 입력 점군에 기대하는 frame_id [프레임명]
+  input_mode: sensor_nonground # 비지면 점군 직수 모드 [모드명]
+  max_processing_hz: 15.0 # 트래커 최대 처리 주기 [Hz] (희소 차량을 더 빨리 갱신)
+  processing_radius: 80.0 # 자차가 중심에서 이 거리 안일 때만 처리 [m]
+  odom_timeout: 0.35 # odom 무수신 허용 시간 [s]
+  cloud_timeout: 0.5 # 점군 타임스탬프 지연 허용 시간 [s]
+  reset_jump_distance: 5.0 # 자차 위치 점프 시 트랙 초기화 기준 [m]
+
+  # MORAI Sensor Setting 및 lidar_extrinsic.yaml과 일치 (x=1.10, z=1.33)
+  sensor_extrinsic: { x: 1.10, y: 0.0, z: 1.33, yaw_deg: 0.0 } # 자차 기준 LiDAR x/y/z[m], yaw[deg]
+
+  roi:
+    min_range: 1.5 # 센서에서 사용할 최소 수평거리 [m]
+    max_range: 60.0 # 센서에서 사용할 최대 수평거리 [m] (50.0 -> 60.0: 교차로 북측 전역 커버)
+    # 센서 기준 지면(-장착높이)까지 포함시켜 raw_ground가 지면 높이를 잡게 한다.
+    min_z: -1.66 # 센서 기준 최소 높이 [m] (z=1.33, 실측 지면고 1.754 반영)
+    max_z: 2.5 # 센서 기준 최대 높이 [m]
+    ring_margin: 2.0 # inner/outer 원형 ROI에 더하는 여유폭 [m]
+  voxel_size: 0.10 # 점군 다운샘플링 복셀 한 변 길이 [m] (원거리 차량 점 보존)
+
+  groundgrid:
+    nonground_min_intensity: 90.0 # map_groundgrid 모드의 비지면 라벨 하한 [무단위]
+  raw_ground:
+    percentile: 20.0 # 원본 점군에서 지면 높이로 잡을 z 백분위 [percent]
+    clearance: 0.20 # 추정 지면보다 이 높이까지 제거 [m] (차량 하단 점 보존)
+
+  cluster:
+    tolerance: 1.25 # 같은 클러스터로 묶을 점 사이 최대거리 [m] (1.1 -> 1.25: 원거리 희소 점 연결)
+    # 원거리/가림 차량의 희소한 점도 유지한다. 정적 시설물은 아래 형상+이동 필터가 제거한다.
+    min_points: 3 # 유효 클러스터 최소 점 개수 [점] (4 -> 3: 35~45m 원거리 희소 점 수용)
+    max_points: 3000 # 유효 클러스터 최대 점 개수 [점]
+  vehicle_filter:
+    # 아래 길이/폭은 지도축 AABB가 아니라 PCA 회전 바운딩 기준이다.
+    min_length: 0.20 # 차량 후보 최소 길이 [m] 기존 0.33
+    max_length: 14.0 # 버스·대형 트럭 포함 최대 길이 [m]
+    min_width: 0.10 # 차량 후보 최소 폭 [m] 기존 0.15
+    max_width: 3.5 # 차량 후보 최대 폭 [m]
+    min_height: 0.08 # 차량 후보 최소 높이 [m] 기존 0.12
+    max_height: 4.5 # 대형 트럭 포함 최대 높이 [m]
+    reject_low_linear: true # 길고 낮은 구조물 제거 사용 [bool]
+    linear_min_length: 2.0 # 선형 구조물 판정 최소 길이 [m]
+    linear_max_width: 0.30 # 선형 구조물 판정 최대 폭 [m] (0.45 -> 0.30)
+    linear_max_height: 0.6 # 선형 구조물 판정 최대 높이 [m] (1.3 -> 0.6: 원거리 차량 측면 오제거 방지)
+    linear_min_aspect_ratio: 8.0 # 선형 구조물 판정 최소 길이/폭 비 [무단위] (6.0 -> 8.0)
+    # ★ 지붕만 보이는 차량 (2026-09-29, 12:50 백). 중앙섬에 가려 상류 차량이
+    #   라이다 한 줄(지붕, 지면 위 1.22~1.34 m)로만 찍혀 높이 폭 0.03 m < min_height
+    #   로 탈락했다(-42 m 부터 점이 있었는데 -25 m 에서야 추적). 원형 차로 띠
+    #   (inner~outer) 안에서 윗면이 지면 위 min_top~max_top 이면 차량 지붕으로 본다.
+    #   정지 시설물은 미션의 이동 확인(has_moved)이 거른다.
+    thin_top:
+      enabled: true
+      min_top: 0.9 # 지면 위 윗면 최소 높이 [m]
+      max_top: 2.2 # 지면 위 윗면 최대 높이 [m]
+      min_length: 0.8 # 최소 길이 [m]
+      min_points: 5 # 최소 점 수(복셀 후) [점]
+      ground_z_sensor: -1.754 # 센서 기준 지면 높이 [m] (roi.min_z 주석의 실측 지면고)
+
+  tracking:
+    association_distance: 3.0 # 이전 트랙과 새 검출을 연결할 최대거리 [m]
+    position_alpha: 0.7 # 위치 필터의 새 측정 반영 비율 [0~1]
+    velocity_alpha: 0.25 # 속도 필터의 새 측정 반영 비율 [0~1]
+    circular_velocity_enabled: true # 중심각 회귀로 회전 차량 원호속도 추정 [bool]
+    robust_circular_velocity: true # 장시간 간격 쌍의 중앙값 기울기로 중심점 잡음 억제
+    velocity_window_seconds: 1.8 # 실제 센서 시간 기준 추정 창 [s]
+    velocity_pair_min_span: 0.6 # 속도 기울기 쌍의 최소 시간 간격 [s]
+    velocity_extent_tolerance: 0.5 # 속도 비교에 허용할 관측 크기 차이 [m]
+    velocity_hold_seconds: 0.6 # 이동 확인 차량의 잠깐의 면 변화 동안 최근 속도 유지 [s]
+    velocity_window_size: 20 # 중심각 회귀에 사용할 최근 검출 개수 [프레임]
+    velocity_min_span: 0.3 # 속도를 유효화할 최소 관측 시간 [s]
+    size_alpha: 0.5 # 크기 필터의 새 측정 반영 비율 [0~1]
+    confirmed_hold_seconds: 3.0 # 이동·속도 확인 차량의 검출 누락 보존 [s]
+    retained_confidence_floor: 0.45 # 보존 중 미션 입력 신뢰도 유지
+    confirmed_size_shrink_alpha: 0.02 # 부분 검출에 의한 크기 축소 완화
+    expiry_guard_seconds: 1.0 # 보존 만료 직후 빈 교차로 오판 방지 [s]
+    stale_seconds: 1.5 # 짧은 가림만 유지 [s]
+    max_prediction_seconds: 1.0 # 단일 프레임 예측 dt 상한; 총 보존은 confirmed_hold_seconds [s]
+    max_object_speed: 30.0 # 허용할 추적 객체 최대속도 [m/s]
+    min_confirm_hits: 2 # 트랙 발행 전 필요한 연속 검출 횟수 [회] (3 -> 2)
+    min_velocity_hits: 2 # 속도 유효 판정에 필요한 검출 횟수 [회] (3 -> 2)
+    moving_speed_threshold: 0.8 # 이동 객체 판정 최소속도 [m/s]
+    moving_distance_threshold: 1.0 # 최초 위치 대비 이동 판정 최소거리 [m]
+    moving_confirm_hits: 2 # 이동 확정에 필요한 판정 누적 횟수 [회]

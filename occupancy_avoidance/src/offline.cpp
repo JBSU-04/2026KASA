@@ -1,0 +1,125 @@
+// Read-only bag evaluation. No ROS master, topic publication, or control socket.
+#include "occupancy_avoidance/core.hpp"
+#include "occupancy_avoidance/joint_escape.hpp"
+#include <jsoncpp/json/json.h>
+#include <fstream>
+#include <iostream>
+#include <chrono>
+#include <algorithm>
+using namespace occupancy_avoidance;
+template<class T> bool read(std::istream&s,T&v){return bool(s.read(reinterpret_cast<char*>(&v),sizeof(v)));}
+int main(int argc,char**argv){
+  if(argc<3||argc>30){std::cerr<<"usage: occupancy_offline frames.bin metrics.json [--disable-trigger|--verify-geometry] [--divider-candidates=file.json] [--trigger-half-width=m] [--recovery-rear] [--embedded-connection] [--min-height=m]\n";return 2;}
+  std::ifstream f(argv[1],std::ios::binary);uint32_t magic,n;
+  if(!read(f,magic)||(magic!=0x4f434331&&magic!=0x4f434332&&magic!=0x4f434333&&magic!=0x4f434334&&magic!=0x4f434335)||!read(f,n)){std::cerr<<"invalid input\n";return 2;}
+  std::vector<Reference> road(n);for(auto&p:road){read(f,p.x);read(f,p.y);read(f,p.yaw);read(f,p.idx);}
+  read(f,n);std::vector<Edge> edges(n);for(auto&e:edges){read(f,e.first);read(f,e.last);read(f,e.right);read(f,e.left);}
+  int stride=1;Config config;bool verify=false,embedded=false,disable_admission=false,joint=false,reverse_check=false,reverse_done=false;std::vector<Edge> dividers;for(int arg=3;arg<argc;++arg){std::string flag=argv[arg];
+    if(flag=="--disable-certified-admission")disable_admission=true;else if(flag=="--embedded-connection")embedded=true;else if(flag=="--disable-trigger")config.trigger_enabled=false;else if(flag=="--verify-geometry")verify=true;
+    else if(flag.find("--divider-candidates=")==0){std::ifstream input(flag.substr(21));Json::Value rows;input>>rows;
+      for(const auto& r:rows)dividers.push_back({r[0].asInt(),r[1].asInt(),-1,r[2].asDouble()});}
+    else if(flag.find("--plan-stride=")==0)stride=std::max(1,std::stoi(flag.substr(14)));
+    else if(flag=="--joint-tunnel")joint=true;else if(flag=="--evaluate-joint-reverse")reverse_check=true;
+    else if(flag=="--legacy-tunnel-corridor")config.tunnel_recovery_enabled=false;
+    else if(flag=="--recovery-rear")config.rear_observation_distance=15.;
+    else if(flag.find("--trigger-half-width=")==0)config.trigger_half_width=std::stod(flag.substr(21));
+    else if(flag.find("--min-height=")==0)config.min_height=std::stod(flag.substr(13));
+    else if(flag.find("--certified-min-height=")==0)config.certified_min_height=std::stod(flag.substr(23));
+    else if(flag=="--certified-far-proxy")config.certified_far_proxy=true;
+    else if(flag.find("--return-ramp-time=")==0)config.return_ramp_time=std::stod(flag.substr(19));
+    else if(flag=="--return-quintic")config.return_quintic=true;
+    else if(flag=="--connector-shortest")config.connector_smooth=false;
+    else if(flag.find("--ceiling-skip=")==0)config.ceiling_skip_height=std::stod(flag.substr(15));
+    else if(flag.find("--wall-band=")==0)config.wall_surface_band=std::stod(flag.substr(12));
+    else if(flag.find("--target-extra=")==0)config.corridor_target_extra=std::stod(flag.substr(15));
+    else if(flag.find("--path-smooth-scale=")==0)config.path_smooth_scale=std::stod(flag.substr(20));
+    else if(flag.find("--path-lateral-accel=")==0)config.path_lateral_accel=std::stod(flag.substr(21));
+    else if(flag.find("--return-overshoot=")==0)config.return_overshoot=std::stod(flag.substr(19));
+    else if(flag.find("--spatial-return-jerk=")==0)config.spatial_return_jerk=std::stod(flag.substr(22));
+    else if(flag.find("--spatial-return-accel=")==0)config.spatial_return_accel=std::stod(flag.substr(23));
+    else if(flag.find("--return-quintic-accel=")==0)config.return_quintic_accel=std::stod(flag.substr(23));
+    else if(flag.find("--avoid-speed-ceiling=")==0)config.avoid_speed_ceiling=std::stod(flag.substr(22));
+    else if(flag.find("--max-lateral-accel=")==0)config.max_lateral_accel=std::stod(flag.substr(20));
+    else if(flag.find("--return-min-time=")==0)config.return_min_time=std::stod(flag.substr(18));
+    else if(flag.find("--return-center-weight=")==0)config.return_center_weight=std::stod(flag.substr(23));
+    else return 2;}
+  Engine engine(config);engine.setRoad(road,edges);engine.setConditionalDividers(dividers);
+  Config shadow_config=config;shadow_config.trigger_enabled=false;Engine shadow(shadow_config);shadow.setRoad(road,edges);shadow.setConditionalDividers(dividers);
+  unsigned input_frame=0;unsigned geometry_mismatches=0;Json::Value output,frames;std::vector<double> times;unsigned frames_n=0,clear_n=0,failed_n=0;double max_ms=0;
+  while(f.peek()!=EOF){Pose pose;uint32_t index,active,count;
+    if(!read(f,pose.stamp)||!read(f,pose.x)||!read(f,pose.y)||!read(f,pose.z)||!read(f,pose.yaw)||!read(f,pose.speed)||!read(f,index)||!read(f,active)||!read(f,count))break;
+    if(count>1000000){std::cerr<<"invalid point count\n";return 2;}
+    std::vector<Point> points(count);for(auto&p:points){float x,y,z;if(!read(f,x)||!read(f,y)||!read(f,z))return 2;p={double(x),double(y),double(z)};if(magic>=0x4f434335){float g,l;if(!read(f,g)||!read(f,l))return 2;p.map_ground=g;p.map_label=l;}}
+    read(f,count);std::vector<Reference> route(count);for(auto&p:route){read(f,p.x);read(f,p.y);read(f,p.yaw);read(f,p.idx);}
+    std::vector<Point> ground;std::vector<DynamicRegion> dynamic;LiveEdges live;
+    if(magic>=0x4f434332){
+      if(!read(f,count)||count>1000000)return 2;
+      ground.resize(count);for(auto&p:ground){float x,y,z;if(!read(f,x)||!read(f,y)||!read(f,z))return 2;p={x,y,z};}
+      uint32_t valid;if(!read(f,valid)||!read(f,live.pose.stamp)||!read(f,live.pose.x)||!read(f,live.pose.y)||!read(f,live.pose.z)||!read(f,live.pose.yaw)||!read(f,live.pose.speed)||!read(f,live.right)||!read(f,live.left)||!read(f,live.right_slope)||!read(f,live.left_slope))return 2;
+      live.valid=valid!=0;engine.setLiveEdges(live);if(verify)shadow.setLiveEdges(live);
+      if(!read(f,count)||count>100000)return 2;
+      dynamic.resize(count);
+      for(auto&r:dynamic)if(!read(f,r.x)||!read(f,r.y)||!read(f,r.yaw)||!read(f,r.length)||!read(f,r.width))return 2;
+    }
+    TrafficState traffic;double evaluation_stamp=pose.stamp;
+    if(magic>=0x4f434333){uint32_t enabled,seen,required;
+      if(!read(f,enabled)||!read(f,seen)||!read(f,required)||!read(f,traffic.distance)||!read(f,traffic.stop_target)||!read(f,traffic.distance_stamp)||!read(f,traffic.required_stamp))return 2;
+      if(!read(f,evaluation_stamp))return 2;
+      traffic.enabled=enabled;traffic.seen=seen;traffic.required=required;
+    }
+    std::vector<CertifiedTrigger> admissions;
+    if(magic>=0x4f434334){if(!read(f,count)||count>100000)return 2;admissions.resize(count);
+      for(auto& o:admissions){uint32_t vertices;if(!read(f,o.stamp)||!read(f,vertices)||vertices>100000)return 2;
+        o.footprint.resize(vertices);for(auto& p:o.footprint)if(!read(f,p.x)||!read(f,p.y)||!read(f,p.z))return 2;}}
+    if(disable_admission)admissions.clear();engine.setCertifiedTriggers(admissions);if(verify)shadow.setCertifiedTriggers(admissions);
+    if(verify)shadow.integrate(pose,points,ground,dynamic);
+    auto begin=std::chrono::steady_clock::now();engine.integrate(pose,points,ground,dynamic);
+    const double integrate_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+    size_t n_points=points.size(),n_high=0;for(const auto&q:points)if(q.z+config.sensor_height>config.max_height)++n_high;
+    engine.setTraffic(traffic);if(verify)shadow.setTraffic(traffic);
+    if(!active||(++input_frame%stride)!=0)continue;
+    Pose current=pose;current.stamp=std::max(pose.stamp,evaluation_stamp);
+    Result result=engine.plan(current,route);
+    EscapePlan escape;
+    if(joint&&index>=7000&&index<=9000&&!result.clear&&result.reason!="stale_lidar"){
+      double ahead=result.failure_distance>0?result.failure_distance:5.;
+      escape=engine.jointEscapePlan(current,current.x+std::cos(current.yaw)*ahead,current.y+std::sin(current.yaw)*ahead,2.,{},3.,.45,0.,.10,true);
+      if(escape.valid){result.clear=true;result.path=escape.forward;result.avoiding=true;result.speed_cap=2.;result.reason="forward_hybrid_recovery";engine.adoptEscape(result.path);}
+    }
+    EscapePlan reverse;
+    if(reverse_check&&!reverse_done&&index>=7500&&index<=9000&&pose.speed<.2&&!result.clear){
+      double ahead=result.failure_distance>0?result.failure_distance:5.;
+      reverse=engine.jointEscapePlan(current,current.x+std::cos(current.yaw)*ahead,current.y+std::sin(current.yaw)*ahead,2.,{},3.,.45,10.,.5,false);
+      reverse_done=true;
+    }
+    bool candidate_clear=result.clear;std::string connection_reason;
+    if(embedded&&result.clear){std::vector<Reference> connected;
+      result.clear=engine.connect(current,result.path,current.stamp,connected,&connection_reason);
+      if(result.clear)result.path=std::move(connected);else result.reason="connection_"+connection_reason;
+    }
+    double elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();times.push_back(elapsed);max_ms=std::max(max_ms,elapsed);
+    if(verify){shadow.plan(current,route);if(shadow.geometryDigest()!=engine.geometryDigest())++geometry_mismatches;}
+    ++frames_n;if(result.clear)++clear_n;else ++failed_n;
+    Json::Value row;row["joint_reverse_reason"]=reverse.reason;row["joint_reverse_valid"]=reverse.valid;row["joint_reverse_ms"]=reverse.compute_ms;row["joint_reverse_distance"]=reverse.reverse_distance;row["escape_reason"]=escape.reason;row["escape_ms"]=escape.compute_ms;row["escape_expanded"]=Json::UInt64(escape.expanded);row["candidate_clear"]=candidate_clear;row["connection_reason"]=connection_reason;row["divider_active"]=!engine.conditionalDividers(pose.stamp).empty();row["geometry_digest"]=std::to_string(engine.geometryDigest());row["stamp"]=pose.stamp;row["idx"]=index;row["clear"]=result.clear;row["reason"]=result.reason;
+    row["held"]=result.held;row["trigger_count"]=result.trigger_count;row["trigger_reason"]=result.trigger_reason;
+    row["trigger_held"]=result.trigger_held;row["trigger_nearest_m"]=result.trigger_nearest;row["traffic_held"]=result.traffic_held;
+    row["return_complete_distance_m"]=result.return_complete_distance;row["traffic_stop_target_m"]=result.traffic_stop_target;
+row["integrate_ms"]=integrate_ms;row["n_points"]=Json::UInt64(n_points);row["n_above_max_height"]=Json::UInt64(n_high);
+row["max_curvature"]=result.max_curvature;row["speed_cap"]=result.speed_cap;row["total_ms"]=elapsed;
+    row["ground_samples"]=Json::UInt64(ground.size());row["live_wall"]=live.valid;
+    row["motion_state"]=result.motion_state;row["speed_limit_reason"]=result.speed_limit_reason;
+    row["return_rejection_reason"]=result.return_rejection_reason;
+    row["planning_horizon_m"]=result.planning_horizon;
+    row["approach_blockage_distance_m"]=result.approach_blockage_distance;
+    row["boundary_source"]=result.boundary_source;row["failure_distance_m"]=result.failure_distance;
+    row["static_voxels"]=Json::UInt64(result.static_voxels);row["transient_voxels"]=Json::UInt64(result.transient_voxels);
+    row["corridor"]=Json::Value(Json::arrayValue);for(const auto& c:result.corridor){Json::Value r;for(double v:c)r.append(v);row["corridor"].append(r);}
+    row["path"]=Json::Value(Json::arrayValue);for(size_t i=0;i<result.path.size();i+=5){Json::Value p;p.append(result.path[i].x);p.append(result.path[i].y);row["path"].append(p);}
+    frames.append(row);
+  }
+  output["geometry_verified"]=verify;output["geometry_mismatches"]=geometry_mismatches;output["traffic_inputs_available"]=magic>=0x4f434333;output["frames"]=frames;output["evaluated_frames"]=frames_n;output["clear_frames"]=clear_n;output["failed_frames"]=failed_n;
+  if(!times.empty()){std::sort(times.begin(),times.end());output["p50_ms"]=times[times.size()/2];output["p95_ms"]=times[size_t(.95*(times.size()-1))];output["max_ms"]=max_ms;}
+  std::ofstream out(argv[2]);out<<Json::StyledWriter().write(output);
+  std::cout<<"frames="<<frames_n<<" clear="<<clear_n<<" failed="<<failed_n<<" max_ms="<<max_ms<<"\n";
+  return out&&geometry_mismatches==0?0:2;
+}

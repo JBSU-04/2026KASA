@@ -1,0 +1,25 @@
+input_topic: /cluster_boxes
+output_topic: /lidar_perception/tracked_objects
+visualization_topic: /lidar_perception/tracked_boxes
+ego_status_topic: /Competition_topic
+use_ego_motion_compensation: true
+allow_static_without_ego: true
+wheel_base: 2.8
+ego_status_timeout: 0.5
+steer_angle_scale: -1.0
+ego_buffer_duration: 2.0
+association_max_distance: 2.5
+min_size_similarity: 0.1
+iou_weight: 1.0
+size_weight: 0.5
+velocity_window_size: 5
+velocity_alpha: 0.35
+static_speed_threshold: 1.5
+dynamic_speed_threshold: 3.0
+motion_confirm_frames: 2
+dynamic_confirm_frames: 3
+static_confirm_frames: 1
+track_timeout: 0.5
+odom_frame: base_link
+ego_speed_scale: 1.0         # Velocity in Morai is already m/s!
+yaw_rate_is_deg: false       # Set true if angular_velocity.z is in degrees/s

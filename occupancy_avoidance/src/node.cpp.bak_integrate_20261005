@@ -1,0 +1,321 @@
+#include "occupancy_avoidance/core.hpp"
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
+#include <std_msgs/Float32MultiArray.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <grid_map_ros/GridMapRosConverter.hpp>
+#include <waypoint_maker/Lane.h>
+#include <jsoncpp/json/json.h>
+#include <XmlRpcValue.h>
+#include <deque>
+#include <set>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+
+using namespace occupancy_avoidance;
+namespace {
+double number(const XmlRpc::XmlRpcValue& v){return v.getType()==XmlRpc::XmlRpcValue::TypeInt?double(int(v)):double(v);}
+double yawOf(const geometry_msgs::Quaternion&q){return std::atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z));}
+std::vector<Point> points(const sensor_msgs::PointCloud2&msg){
+  std::vector<Point> out;out.reserve(msg.width*msg.height);
+  sensor_msgs::PointCloud2ConstIterator<float>x(msg,"x"),y(msg,"y"),z(msg,"z");
+  for(;x!=x.end();++x,++y,++z)if(std::isfinite(*x+*y+*z))out.push_back({double(*x),double(*y),double(*z)});
+  return out;
+}
+std::vector<Reference> csv(const std::string&name){
+  std::ifstream file(name);std::string line;std::vector<Reference> out;int i=0;
+  while(std::getline(file,line)){std::replace(line.begin(),line.end(),',',' ');std::istringstream s(line);double ignored,x,y;
+    if(s>>ignored>>x>>y)out.push_back({x,y,0,i++});}
+  for(size_t j=0;j+1<out.size();++j)out[j].yaw=std::atan2(out[j+1].y-out[j].y,out[j+1].x-out[j].x);
+  if(out.size()>1)out.back().yaw=out[out.size()-2].yaw;
+  return out;
+}
+}
+class Node {
+  ros::NodeHandle nh_,pnh_{"~"};Config cfg_;std::unique_ptr<Engine> engine_;
+  ros::Subscriber lidar_,ground_sub_,odom_,waypoint_,near_,stop_dist_sub_,stop_required_sub_,coverage_sub_,wall_sub_,dynamic_state_sub_;
+  ros::Publisher path_pub_,failed_pub_,speed_pub_,scale_pub_,debug_pub_,grid_pub_,marker_pub_,d_pub_,active_pub_;
+  ros::Timer plan_timer_,publish_timer_;std::deque<Pose> history_;Pose pose_;
+  std::vector<Reference> route_,road0_,road3_;std::vector<Edge> edges0_,edges3_;
+  std::vector<Point> ground_;double ground_stamp_=0,waypoint_stamp_=0,result_stamp_=0;
+  int lane_=-1,index_=-1,road_lane_=-1,min_idx_=2400,max_idx_=3700,tunnel_min_=7000,tunnel_max_=9000;
+  bool previous_active_=false,stop_required_=false;double stop_dist_=-1,stop_stamp_=0,required_stamp_=0,coverage_=9999,coverage_stamp_=0;
+  double objects_stamp_=0,dynamic_state_stamp_=-1,front_axle_offset_=3.845,stop_buffer_=3.;
+  Json::Value latest_objects_;std::set<int> dynamic_ids_,static_ids_;std::vector<DynamicRegion> dynamic_;
+  std::map<int,DynamicRegion> old_regions_;Result result_;bool tl_guard_=true;
+ public:
+  Node(){
+    pnh_.param("static_zone_min_idx",min_idx_,2400);pnh_.param("static_dynamic_split_idx",max_idx_,3700);
+    pnh_.param("static_planning_start_idx",cfg_.static_planning_start_idx,min_idx_-300);
+    cfg_.static_planning_start_idx=std::max(0,std::min(min_idx_,cfg_.static_planning_start_idx));
+    cfg_.static_zone_min_idx=min_idx_;
+    pnh_.param("tunnel_min_idx",tunnel_min_,7000);pnh_.param("tunnel_max_idx",tunnel_max_,9000);
+    pnh_.param("tl_guard_enabled",tl_guard_,true);
+    nh_.param("/lidar_extrinsic/x",cfg_.sensor_x,1.1);nh_.param("/lidar_extrinsic/y",cfg_.sensor_y,0.);
+    nh_.param("/lidar_extrinsic/z",cfg_.sensor_z,1.33);nh_.param("/lidar_extrinsic/z_from_ground",cfg_.sensor_height,1.765);
+    pnh_.param("resolution",cfg_.resolution,.1);pnh_.param("map_length_m",cfg_.length,80.);
+    pnh_.param("vehicle_half_width",cfg_.half_width,.95);
+    pnh_.param("curb_margin",cfg_.curb_margin,.1);pnh_.param("obstacle_margin",cfg_.obstacle_margin,.2);
+    pnh_.param("min_height",cfg_.min_height,.06);pnh_.param("max_height",cfg_.max_height,2.8);
+    pnh_.param("target_speed_mps",cfg_.target_speed,8.333);pnh_.param("max_curvature",cfg_.max_curvature,.18);
+    pnh_.param("max_lateral_accel",cfg_.max_lateral_accel,2.5);pnh_.param("horizon_m",cfg_.horizon,40.);
+    pnh_.param("approach_horizon_m",cfg_.approach_horizon,50.);
+    pnh_.param("approach_obstacle_margin_m",cfg_.approach_obstacle_margin,.2);
+    pnh_.param("trigger_enabled",cfg_.trigger_enabled,true);
+    pnh_.param("trigger_corridor_half_width_m",cfg_.trigger_half_width,1.5);
+    pnh_.param("trigger_distance_m",cfg_.trigger_distance,30.);
+    pnh_.param("trigger_hold_sec",cfg_.trigger_hold,3.);
+    pnh_.param("tl_guard_range_m",cfg_.traffic_range,80.);
+    pnh_.param("tl_input_timeout_sec",cfg_.traffic_timeout,.7);
+    pnh_.param("tl_hold_gap_min_m",cfg_.traffic_gap_min,10.);
+    pnh_.param("tl_hold_gap_m",cfg_.traffic_gap_max,20.);
+    pnh_.param("tl_hold_decel_mps2",cfg_.traffic_decel,1.5);
+    nh_.param("/traffic_light_mission/front_axle_offset_m",front_axle_offset_,3.845);
+    nh_.param("/traffic_light_mission/stop_buffer_m",stop_buffer_,3.);
+
+    pnh_.param("scan_timeout",cfg_.scan_timeout,.35);
+    pnh_.param("return_min_distance_m",cfg_.return_min_distance,12.);
+    pnh_.param("return_min_time_sec",cfg_.return_min_time,2.);
+    pnh_.param("return_offset_tolerance_m",cfg_.return_tolerance,.2);
+    pnh_.param("return_center_weight",cfg_.return_center_weight,2.);
+    pnh_.param("return_overshoot_m",cfg_.return_overshoot,.1);
+    pnh_.param("spatial_return_max_lat_accel",cfg_.spatial_return_accel,1.5);
+    pnh_.param("spatial_return_max_lat_jerk",cfg_.spatial_return_jerk,8.);
+    pnh_.param("spatial_return_min_speed",cfg_.spatial_return_min_speed,4.5);
+    pnh_.param("spatial_return_min_transition_m",cfg_.spatial_return_min_length,6.);
+    pnh_.param("spatial_return_max_transition_m",cfg_.spatial_return_max_length,32.);
+    pnh_.param("cruise_offset_m",cfg_.cruise_offset,.15);
+    double cruise_degrees=3,wall_degrees=5;
+    pnh_.param("cruise_heading_deg",cruise_degrees,3.);cfg_.cruise_heading=cruise_degrees*std::acos(-1)/180;
+    pnh_.param("cruise_path_offset_m",cfg_.cruise_path_offset,.2);
+    pnh_.param("cruise_preview_m",cfg_.cruise_preview,8.);pnh_.param("cruise_hold_sec",cfg_.cruise_hold,.5);
+    pnh_.param("live_boundary_distance_m",cfg_.live_boundary_distance,6.);
+    pnh_.param("live_boundary_heading_deg",wall_degrees,5.);cfg_.live_boundary_heading=wall_degrees*std::acos(-1)/180;
+    std::string path0,path3;pnh_.getParam("csv0",path0);pnh_.getParam("csv3",path3);road0_=csv(path0);road3_=csv(path3);
+    if(road0_.size()<10||road3_.size()<10)throw std::runtime_error("reference CSV is missing/invalid");
+    XmlRpc::XmlRpcValue edges;if(pnh_.getParam("curb_edges",edges))for(int i=0;i<edges.size();++i){
+      auto&r=edges[i];if(r.size()>=3)edges0_.push_back({int(r[0]),int(r[1]),number(r[2]),r.size()>=5?number(r[4]):-1});}
+    XmlRpc::XmlRpcValue tunnel;if(pnh_.getParam("tunnel_wall_profile",tunnel))for(int i=0;i+2<tunnel.size();i+=3){
+      int last=i+3<tunnel.size()?int(tunnel[i+3])-1:9000;
+      edges3_.push_back({int(tunnel[i]),last,-number(tunnel[i+1]),number(tunnel[i+2])});}
+    engine_.reset(new Engine(cfg_));
+    path_pub_=nh_.advertise<nav_msgs::Path>("/local_path",1);
+    failed_pub_=nh_.advertise<std_msgs::Bool>("/avoidance_failed",1);
+    speed_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/target_speed_mps",1);
+    scale_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/static_speed_scale",1);
+    debug_pub_=nh_.advertise<std_msgs::String>("/obstacle_avoidance/validation_debug",1);
+    grid_pub_=nh_.advertise<grid_map_msgs::GridMap>("/occupancy_avoidance/grid",1);
+    marker_pub_=nh_.advertise<visualization_msgs::MarkerArray>("/occupancy_avoidance/markers",1);
+    d_pub_=nh_.advertise<std_msgs::Float64>("/obstacle_avoidance/frenet_d",1);
+    active_pub_=nh_.advertise<std_msgs::Bool>("/occupancy_avoidance/active",1,true);
+    odom_=nh_.subscribe("/odom",100,&Node::odom,this);
+    waypoint_=nh_.subscribe("/final_waypoint",1,&Node::route,this);
+    ground_sub_=nh_.subscribe("/groundgrid/ground",1,&Node::ground,this);
+    lidar_=nh_.subscribe("/perception/points_gravity",1,&Node::cloud,this);
+    near_=nh_.subscribe("/obstacle_info_near",1,&Node::objects,this);
+    wall_sub_=nh_.subscribe<std_msgs::Float64MultiArray>("/tunnel/wall_limits",1,[this](const std_msgs::Float64MultiArray::ConstPtr&m){
+      LiveEdges e;if(lane_==3&&m->data.size()>=5&&m->data[0]>0&&m->data[1]>0&&m->data[2]>0){
+        e.pose=pose_;e.pose.stamp=ros::Time::now().toSec();e.right=m->data[1];e.left=m->data[2];e.right_slope=m->data[3];e.left_slope=m->data[4];e.valid=true;
+      }engine_->setLiveEdges(e);
+    });
+    stop_dist_sub_=nh_.subscribe<std_msgs::Float32MultiArray>("/localization/stop_ahead",1,[this](const std_msgs::Float32MultiArray::ConstPtr&m){stop_dist_=m->data.empty()?-1:m->data[0];stop_stamp_=ros::Time::now().toSec();});
+    stop_required_sub_=nh_.subscribe<std_msgs::Bool>("/localization/stop_required",1,[this](const std_msgs::Bool::ConstPtr&m){stop_required_=m->data;required_stamp_=ros::Time::now().toSec();});
+    dynamic_state_sub_=nh_.subscribe<std_msgs::String>("/obstacle_stop/dynamic_state",1,[this](const std_msgs::String::ConstPtr&m){
+      Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
+      dynamic_ids_.clear();static_ids_.clear();
+      for(const auto&id:root["dynamic_ids"])dynamic_ids_.insert(id.asInt());
+      for(const auto&id:root["static_ids"])static_ids_.insert(id.asInt());
+      dynamic_state_stamp_=ros::Time::now().toSec();
+    });
+    coverage_sub_=nh_.subscribe<std_msgs::Float64>("/obstacle_stop/path_speed_limit_mps",1,[this](const std_msgs::Float64::ConstPtr&m){coverage_=m->data;coverage_stamp_=ros::Time::now().toSec();});
+    plan_timer_=nh_.createTimer(ros::Duration(.1),&Node::plan,this);
+    publish_timer_=nh_.createTimer(ros::Duration(.05),&Node::publish,this);
+    ROS_INFO("[occupancy] static %d..%d tunnel %d..%d curb inset %.2fm; original Apollo + OSQP",min_idx_,max_idx_,tunnel_min_,tunnel_max_,cfg_.half_width+cfg_.curb_margin);
+  }
+  bool active()const{return(lane_==0&&index_>=cfg_.static_planning_start_idx&&index_<=max_idx_)||(lane_==3&&index_>=tunnel_min_&&index_<=tunnel_max_);}
+  bool warm()const{return(lane_==0&&index_>=cfg_.static_planning_start_idx-200&&index_<=max_idx_+100)||(lane_==3&&index_>=tunnel_min_-100&&index_<=tunnel_max_+100);}
+  void odom(const nav_msgs::Odometry::ConstPtr&m){Pose p;p.stamp=m->header.stamp.toSec();if(!p.stamp)p.stamp=ros::Time::now().toSec();
+    p.x=m->pose.pose.position.x;p.y=m->pose.pose.position.y;p.z=m->pose.pose.position.z;p.yaw=yawOf(m->pose.pose.orientation);
+    p.speed=std::hypot(m->twist.twist.linear.x,m->twist.twist.linear.y);
+    if(!history_.empty()&&p.stamp<history_.back().stamp){history_.clear();engine_->reset();result_=Result();}
+    if(history_.empty()||p.stamp>history_.back().stamp)history_.push_back(p);
+    while(history_.size()>200)history_.pop_front();
+    pose_=p;
+  }
+  bool interpolate(double stamp,Pose&out){if(history_.empty())return false;
+    auto it=std::lower_bound(history_.begin(),history_.end(),stamp,[](const Pose&p,double t){return p.stamp<t;});
+    if(it==history_.end()){if(stamp-history_.back().stamp>.08)return false;out=history_.back();out.stamp=stamp;return true;}
+    if(it==history_.begin()){if(it->stamp-stamp>.08)return false;out=*it;out.stamp=stamp;return true;}
+    auto a=it-1,b=it;if(b->stamp-a->stamp>.3)return false;double u=(stamp-a->stamp)/(b->stamp-a->stamp);
+    out=*a;out.stamp=stamp;out.x+=u*(b->x-a->x);out.y+=u*(b->y-a->y);out.z+=u*(b->z-a->z);
+    out.speed+=u*(b->speed-a->speed);out.yaw+=u*std::atan2(std::sin(b->yaw-a->yaw),std::cos(b->yaw-a->yaw));return true;
+  }
+  void route(const waypoint_maker::Lane::ConstPtr&m){if(m->waypoints.empty()){route_.clear();index_=-1;return;}
+    int lane=m->waypoints.front().lane_number;index_=m->waypoints.front().waypoint_index;
+    if(lane!=road_lane_){engine_->reset();engine_->setRoad(lane==3?road3_:road0_,lane==3?edges3_:edges0_);road_lane_=lane;result_=Result();}
+    lane_=lane;route_.clear();for(const auto&w:m->waypoints)route_.push_back({w.pose.pose.position.x,w.pose.pose.position.y,w.ryaw,w.waypoint_index});
+    for(size_t i=0;i+1<route_.size();++i)route_[i].yaw=std::atan2(route_[i+1].y-route_[i].y,route_[i+1].x-route_[i].x);
+    if(route_.size()>1)route_.back().yaw=route_[route_.size()-2].yaw;
+    waypoint_stamp_=ros::Time::now().toSec();
+  }
+  void ground(const sensor_msgs::PointCloud2::ConstPtr&m){if(m->header.frame_id!="velodyne_ground"&&m->header.frame_id!="velodyne")return;
+    try{ground_=points(*m);ground_stamp_=m->header.stamp.toSec();}catch(const std::exception&e){ROS_WARN_THROTTLE(1,"ground: %s",e.what());}}
+  void cloud(const sensor_msgs::PointCloud2::ConstPtr&m){if(!warm())return;
+    if(m->header.frame_id!="velodyne_ground"){ROS_ERROR_THROTTLE(1,"occupancy expects gravity-aligned sensor frame, got %s",m->header.frame_id.c_str());return;}
+    Pose p;if(!interpolate(m->header.stamp.toSec(),p))return;
+    try{static const std::vector<DynamicRegion> no_dynamic;
+      std::vector<Point> aligned_ground;Pose gp;
+      if(std::abs(ground_stamp_-p.stamp)<=.2&&interpolate(ground_stamp_,gp)){
+        aligned_ground.reserve(ground_.size());double cg=std::cos(gp.yaw),sg=std::sin(gp.yaw),cp=std::cos(p.yaw),sp=std::sin(p.yaw);
+        for(const auto&g:ground_){
+          double dx=gp.x+cg*(g.x+cfg_.sensor_x)-sg*(g.y+cfg_.sensor_y)-p.x;
+          double dy=gp.y+sg*(g.x+cfg_.sensor_x)+cg*(g.y+cfg_.sensor_y)-p.y;
+          aligned_ground.push_back({cp*dx+sp*dy-cfg_.sensor_x,-sp*dx+cp*dy-cfg_.sensor_y,g.z+gp.z-p.z});
+        }
+      }
+      refreshDynamic(ros::Time::now().toSec());
+      engine_->integrate(p,points(*m),aligned_ground,
+                         std::abs(objects_stamp_-p.stamp)<=.35?dynamic_:no_dynamic);
+    }catch(const std::exception&e){ROS_ERROR_THROTTLE(1,"occupancy cloud: %s",e.what());}}
+  void objects(const std_msgs::String::ConstPtr&m){Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
+    latest_objects_=root;objects_stamp_=root.get("stamp",ros::Time::now().toSec()).asDouble();
+  }
+  void refreshDynamic(double now){
+    dynamic_.clear();if(lane_!=3||std::abs(objects_stamp_-now)>.35)return;
+    bool authoritative=dynamic_state_stamp_>=0&&now-dynamic_state_stamp_>=0&&now-dynamic_state_stamp_<=.5;
+    const auto& list=latest_objects_.isMember("collision_objects")?latest_objects_["collision_objects"]:latest_objects_["obstacles"];
+    for(const auto&o:list){if(!o["position_world"].isArray()||o["position_world"].size()<2)continue;
+      DynamicRegion region;region.x=o["position_world"][0].asDouble();region.y=o["position_world"][1].asDouble();
+      region.yaw=o.get("geometry_reference_yaw",pose_.yaw).asDouble();region.length=o.get("length",.35).asDouble();region.width=o.get("width",.35).asDouble();
+      int id=o.get("id",-1).asInt();bool moving=authoritative?
+        (dynamic_ids_.count(id)&&!static_ids_.count(id)):
+        (o.get("motion_state","").asString()=="dynamic"&&o.get("dynamic_streak",0).asInt()>=2&&
+         (o.get("velocity_valid",false).asBool()||o.get("observed_motion_valid",false).asBool()));
+      if(moving){dynamic_.push_back(region);auto old=old_regions_.find(id);if(old!=old_regions_.end())dynamic_.push_back(old->second);}
+      old_regions_[id]=region;
+    }
+    if(old_regions_.size()>1000)old_regions_.clear();
+  }
+  void plan(const ros::TimerEvent&){double now=ros::Time::now().toSec();if(!active())return;
+    if(now-pose_.stamp>.25||now-waypoint_stamp_>.5){result_=Result();result_.reason="stale_pose_or_reference";result_stamp_=now;return;}
+    TrafficState traffic;traffic.enabled=tl_guard_&&lane_==0;traffic.seen=stop_stamp_>0||required_stamp_>0;
+    traffic.required=stop_required_;traffic.distance=stop_dist_;traffic.distance_stamp=stop_stamp_;traffic.required_stamp=required_stamp_;
+    traffic.stop_target=stop_dist_-front_axle_offset_-stop_buffer_;engine_->setTraffic(traffic);
+    Pose current=pose_;current.stamp=now;result_=engine_->plan(current,route_);result_stamp_=now;
+    if(result_.compute_ms>95)ROS_WARN_THROTTLE(1,"occupancy planning %.1fms",result_.compute_ms);
+    grid_map_msgs::GridMap map;grid_map::GridMapRosConverter::toMessage(engine_->grid(),map);map.info.header.stamp=ros::Time::now();grid_pub_.publish(map);
+    markers();
+  }
+  void publish(const ros::TimerEvent&){bool on=active();std_msgs::Bool enabled;enabled.data=on;active_pub_.publish(enabled);
+    if(!on){if(previous_active_){std_msgs::Bool fail;fail.data=false;failed_pub_.publish(fail);std_msgs::Float64 release;release.data=9999;speed_pub_.publish(release);scale_pub_.publish(release);}
+      previous_active_=false;return;}previous_active_=true;
+    double now=ros::Time::now().toSec();bool valid=result_.clear&&now-result_stamp_<.3&&now-engine_->lastScan()<=cfg_.scan_timeout&&now-pose_.stamp<.25;
+    std_msgs::Bool fail;fail.data=!valid;failed_pub_.publish(fail);
+    std_msgs::Float64 speed;speed.data=valid?result_.speed_cap:0;
+    std::string limit_reason=valid?result_.speed_limit_reason:result_.clear?"output_guard_expired":"no_valid_path";
+    if(valid&&lane_==3&&now-coverage_stamp_<.3&&coverage_<speed.data){speed.data=coverage_;limit_reason="tunnel_path_coverage";}
+    if(tl_guard_&&lane_==0&&stop_required_&&stop_dist_>=0&&now-stop_stamp_<cfg_.traffic_timeout&&now-required_stamp_<cfg_.traffic_timeout){
+      double cap=std::sqrt(2*cfg_.braking*std::max(0.,stop_dist_-front_axle_offset_-stop_buffer_));
+      if(cap<speed.data){speed.data=cap;limit_reason="traffic_stop";}
+    }
+    speed_pub_.publish(speed);std_msgs::Float64 scale;scale.data=9999;scale_pub_.publish(scale);
+    nav_msgs::Path path;path.header.frame_id="map";path.header.stamp=ros::Time::now();
+    if(valid)for(const auto&p:result_.path){geometry_msgs::PoseStamped q;q.header=path.header;q.pose.position.x=p.x;q.pose.position.y=p.y;
+      q.pose.orientation.z=std::sin(p.yaw/2);q.pose.orientation.w=std::cos(p.yaw/2);path.poses.push_back(q);}
+    path_pub_.publish(path);
+    std_msgs::Float64 lateral;if(!route_.empty())lateral.data=-(pose_.x-route_[0].x)*std::sin(route_[0].yaw)+(pose_.y-route_[0].y)*std::cos(route_[0].yaw);d_pub_.publish(lateral);
+    Json::Value d;d["engine"]="occupancy_corridor_apollo";d["clear"]=valid;d["stage"]=result_.held?"held":"corridor";
+    d["returning"]=result_.returning;
+    d["trigger_count"]=result_.trigger_count;d["trigger_reason"]=result_.trigger_reason;
+    d["trigger_held"]=result_.trigger_held;d["trigger_nearest_m"]=result_.trigger_nearest;
+    d["traffic_avoidance_held"]=result_.traffic_held;
+    d["return_complete_distance_m"]=result_.return_complete_distance;d["traffic_stop_target_m"]=result_.traffic_stop_target;
+
+    d["reason"]=result_.reason;
+    d["motion_state"]=valid?result_.motion_state:"STOP";
+    d["return_rejection_reason"]=result_.return_rejection_reason;
+    d["speed_limit_reason"]=limit_reason;d["planner_speed_cap_mps"]=result_.speed_cap;
+    d["boundary_source"]=result_.boundary_source;d["failure_distance_m"]=result_.failure_distance;
+    d["planning_horizon_m"]=result_.planning_horizon;
+    d["approach_blockage_distance_m"]=result_.approach_blockage_distance;
+    d["static_approach"]=lane_==0&&index_<min_idx_;
+    d["static_planning_start_idx"]=cfg_.static_planning_start_idx;
+    d["return_min_distance_m"]=cfg_.return_min_distance;d["return_min_time_sec"]=cfg_.return_min_time;
+    d["candidate_rejection_reason"]=valid?"none":result_.reason;d["held"]=result_.held;d["static_voxels"]=Json::UInt64(result_.static_voxels);
+    d["transient_voxels"]=Json::UInt64(result_.transient_voxels);d["compute_ms"]=result_.compute_ms;d["max_curvature"]=result_.max_curvature;
+    d["curb_center_inset_m"]=cfg_.half_width+cfg_.curb_margin;d["speed_cap_mps"]=speed.data;d["geometry_stamp"]=engine_->lastScan();d["index"]=index_;d["mission_mode"]=lane_==3?"tunnel":"static";
+    std_msgs::String debug;debug.data=Json::FastWriter().write(d);debug_pub_.publish(debug);
+  }
+  void markers(){visualization_msgs::MarkerArray out;visualization_msgs::Marker clear;clear.action=visualization_msgs::Marker::DELETEALL;out.markers.push_back(clear);
+    // Show measured occupied cells, rather than an inflated fitted object box.
+    for(const std::string layer:{"static","transient"}){
+      visualization_msgs::Marker cells;cells.header.frame_id="map";cells.header.stamp=ros::Time::now();
+      cells.ns="occupied_"+layer;cells.id=0;cells.type=visualization_msgs::Marker::CUBE_LIST;
+      cells.action=visualization_msgs::Marker::ADD;cells.pose.orientation.w=1;
+      cells.scale.x=cells.scale.y=cfg_.resolution;cells.scale.z=.08;
+      cells.color.r=1;cells.color.g=layer=="static"?.2:.7;cells.color.a=.8;
+      const auto& grid=engine_->grid();
+      for(grid_map::GridMapIterator it(grid);!it.isPastEnd();++it){
+        if(!(grid.at(layer,*it)>.5))continue;
+        grid_map::Position position;grid.getPosition(*it,position);
+        geometry_msgs::Point p;p.x=position.x();p.y=position.y();p.z=.12;cells.points.push_back(p);
+      }
+      out.markers.push_back(cells);
+    }
+    int id=0;for(bool inset:{false,true}){visualization_msgs::Marker m;m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns=inset?"curb_center_limit":"physical_curb";m.id=id++;
+      m.type=visualization_msgs::Marker::LINE_LIST;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1;m.scale.x=.07;
+      m.color.r=inset?1:0;m.color.g=1;m.color.b=inset?0:1;m.color.a=1;
+      for(size_t i=5;i<route_.size();i+=5)for(bool left:{false,true}){auto a=engine_->bounds(route_[i-5].idx),b=engine_->bounds(route_[i].idx);
+        if(!engine_->boundaryKnown(route_[i-5].idx,left)||!engine_->boundaryKnown(route_[i].idx,left))continue;
+        double da=left?a.second:a.first,db=left?b.second:b.first;if(std::abs(da-db)>1)continue;
+        if(inset){da+=left?-(cfg_.half_width+cfg_.curb_margin):cfg_.half_width+cfg_.curb_margin;db+=left?-(cfg_.half_width+cfg_.curb_margin):cfg_.half_width+cfg_.curb_margin;}
+        for(auto q:{std::make_pair(route_[i-5],da),std::make_pair(route_[i],db)}){geometry_msgs::Point p;p.x=q.first.x-std::sin(q.first.yaw)*q.second;p.y=q.first.y+std::cos(q.first.yaw)*q.second;p.z=.1;m.points.push_back(p);}}
+      out.markers.push_back(m);}
+    visualization_msgs::Marker corridor;corridor.header=clear.header;corridor.header.frame_id="map";corridor.header.stamp=ros::Time::now();corridor.ns="selected_corridor";corridor.id=id++;
+    corridor.type=visualization_msgs::Marker::LINE_LIST;corridor.action=visualization_msgs::Marker::ADD;corridor.pose.orientation.w=1;corridor.scale.x=.04;corridor.color.g=1;corridor.color.a=.6;
+    for(const auto& row:result_.corridor){size_t j=0;double best=1e20;for(size_t i=0;i<route_.size();++i){double d=std::hypot(route_[i].x-row[0],route_[i].y-row[1]);if(d<best){best=d;j=i;}}
+      for(double v:{row[2],row[3]}){geometry_msgs::Point p;p.x=row[0]-std::sin(route_[j].yaw)*v;p.y=row[1]+std::cos(route_[j].yaw)*v;p.z=.15;corridor.points.push_back(p);}}
+    out.markers.push_back(corridor);
+    for(size_t i=0;i<result_.path.size();i+=25){const auto&p=result_.path[i];visualization_msgs::Marker m;m.header=corridor.header;m.ns="swept_body";m.id=id++;
+      m.type=visualization_msgs::Marker::LINE_STRIP;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1;m.scale.x=.035;m.color.b=1;m.color.a=.55;
+      for(auto xy:{std::make_pair(-cfg_.rear,-cfg_.half_width),std::make_pair(cfg_.front,-cfg_.half_width),std::make_pair(cfg_.front,cfg_.half_width),std::make_pair(-cfg_.rear,cfg_.half_width),std::make_pair(-cfg_.rear,-cfg_.half_width)}){
+        geometry_msgs::Point q;q.x=p.x+std::cos(p.yaw)*xy.first-std::sin(p.yaw)*xy.second;q.y=p.y+std::sin(p.yaw)*xy.first+std::cos(p.yaw)*xy.second;q.z=.2;m.points.push_back(q);}out.markers.push_back(m);}
+    visualization_msgs::Marker trigger;trigger.header=corridor.header;trigger.ns="static_start_corridor";trigger.id=0;
+    trigger.lifetime=ros::Duration(.35);trigger.type=visualization_msgs::Marker::LINE_LIST;trigger.action=visualization_msgs::Marker::ADD;trigger.pose.orientation.w=1;
+    trigger.scale.x=.06;trigger.color.r=1;trigger.color.b=1;trigger.color.a=.9;
+    double travelled=0;
+    for(size_t i=1;i<route_.size();++i){double ds=std::hypot(route_[i].x-route_[i-1].x,route_[i].y-route_[i-1].y);
+      double u=std::min(1.,(cfg_.trigger_distance-travelled)/std::max(ds,1e-9));if(u<=0)break;
+      Reference end=route_[i];end.x=route_[i-1].x+u*(end.x-route_[i-1].x);end.y=route_[i-1].y+u*(end.y-route_[i-1].y);
+      for(double side:{-cfg_.trigger_half_width,cfg_.trigger_half_width})for(const auto&r:{route_[i-1],end}){
+        geometry_msgs::Point p;p.x=r.x-std::sin(r.yaw)*side;p.y=r.y+std::cos(r.yaw)*side;p.z=.3;trigger.points.push_back(p);}
+      travelled+=ds;if(u<1||travelled>=cfg_.trigger_distance){
+        for(double side:{-cfg_.trigger_half_width,cfg_.trigger_half_width}){geometry_msgs::Point p;p.x=end.x-std::sin(end.yaw)*side;p.y=end.y+std::cos(end.yaw)*side;p.z=.3;trigger.points.push_back(p);}break;}
+    }out.markers.push_back(trigger);
+    for(const auto& mark: {std::make_pair("traffic_stop_target",result_.traffic_stop_target),std::make_pair("avoidance_return_complete",result_.return_complete_distance)}){
+      if(mark.second<0)continue;double arc=0;
+      for(size_t i=1;i<route_.size();++i){double ds=std::hypot(route_[i].x-route_[i-1].x,route_[i].y-route_[i-1].y);
+        if(arc+ds>=mark.second){double u=(mark.second-arc)/std::max(ds,1e-9);visualization_msgs::Marker m;
+          m.lifetime=ros::Duration(.35);m.header=corridor.header;m.ns=mark.first;m.id=0;m.type=visualization_msgs::Marker::SPHERE;m.action=visualization_msgs::Marker::ADD;
+          m.pose.orientation.w=1;m.pose.position.x=route_[i-1].x+u*(route_[i].x-route_[i-1].x);m.pose.position.y=route_[i-1].y+u*(route_[i].y-route_[i-1].y);m.pose.position.z=.5;
+          m.scale.x=m.scale.y=m.scale.z=.5;m.color.r=1;m.color.g=mark.first=="traffic_stop_target"?0:1;m.color.a=1;out.markers.push_back(m);break;}
+        arc+=ds;}
+    }
+    visualization_msgs::Marker text;text.header=corridor.header;text.ns="static_admission_status";text.id=0;text.type=visualization_msgs::Marker::TEXT_VIEW_FACING;
+    text.lifetime=ros::Duration(.35);text.action=visualization_msgs::Marker::ADD;text.pose.orientation.w=1;text.pose.position.x=pose_.x;text.pose.position.y=pose_.y;text.pose.position.z=3;
+    text.scale.z=.5;text.color.r=text.color.g=text.color.b=text.color.a=1;text.text=result_.trigger_reason+" / "+result_.reason;
+    if(result_.traffic_held)text.text+=" stop="+std::to_string(result_.traffic_stop_target)+" return="+std::to_string(result_.return_complete_distance);
+    out.markers.push_back(text);
+    marker_pub_.publish(out);
+  }
+};
+int main(int argc,char**argv){ros::init(argc,argv,"occupancy_avoidance_node");try{Node node;ros::spin();}catch(const std::exception&e){ROS_FATAL("occupancy: %s",e.what());return 1;}return 0;}

@@ -1,0 +1,49 @@
+mode: "gps_imu"
+
+# odom_information owns the vehicle-pose transform in this workspace.
+publish_tf: true
+
+frames:
+  parent: "map"
+  child: "base_link"
+
+topics:
+  odom_out: "/odom"
+  odom_back: "/odom_back"
+  odom_front: "/odom_front"
+  imu: "/imu"
+  cur_speed: "/cur_speed"
+  competition: "/Competition_topic"
+
+# MORAI 실제 ego velocity를 /odom.twist에 넣는다. /odom pose는 기존 GPS/IMU
+# 융합값을 유지하고, twist는 child_frame(base_link)의 전진 속도로 발행한다.
+# /cur_speed는 기존 호환용 fallback이다.
+competition_speed_enabled: true
+competition_speed_scale: 1.0
+competition_speed_stale_sec: 0.5
+competition_speed_max_mps: 60.0
+
+cur_speed_is_kmh: true
+speed_scale: 1.0
+speed_stale_sec: 0.5
+
+dual_gps:
+  print_yaw: true
+  print_period: 0.1
+  yaw_offset: 0.0        # rad (장착 오차 보정 필요하면 여기 조정)
+  min_baseline: 0.00      # m (front-back 거리보다 살짝 작게)
+  max_baseline: 5.00      # m (front-back 거리보다 살짝 길게)
+  yaw_lpf_alpha: 0.2     # 0~1 (작을수록 부드러움)
+
+gps_imu:
+  print_yaw: true
+  print_period: 0.1
+  yaw_offset: 0.0        # rad (장착 오차 보정 필요하면 여기 조정)
+  yaw_lpf_alpha: 0.2     # 0~1 (작을수록 부드러움)
+  
+# 정지 상태에서 yaw가 흔들리면:
+# yaw_lpf_alpha ↓ (0.2 → 0.1) 1.0은 보정 없음 -> 정지,저속에서 오실 발생
+# min_baseline ↑ (0.8 → 1.0) -> 실제 gps 거리
+# yaw가 실제보다 약간 틀어져 있으면:
+# yaw_offset 조정 (라디안)
+# 예: 5도 = 0.087266

@@ -1,0 +1,31 @@
+image_topic: /lane_perception/lane_mask
+steering_topic: /lane_perception/steering_angle
+valid_topic: /lane_perception/valid
+target_width: 640
+target_height: 360
+roi_bottom_ratio: 0.6
+bev_src_bl_x: 80.0
+bev_src_bl_y: 262.5
+bev_src_br_x: 560.0
+bev_src_br_y: 262.5
+bev_src_tl_x: 196.25
+bev_src_tl_y: 202.5
+bev_src_tr_x: 443.75
+bev_src_tr_y: 202.5
+bev_dst_bl_x: 80.0
+bev_dst_bl_y: 360.0
+bev_dst_br_x: 520.0
+bev_dst_br_y: 360.0
+bev_dst_tl_x: 0.0
+bev_dst_tl_y: 0.0
+bev_dst_tr_x: 640.0
+bev_dst_tr_y: 0.0
+steer_k_straight: 0.10
+steer_k_curve: 0.20
+curve_a_low: 0.00015
+curve_a_high: 0.00030
+steer_limit_deg: 50.0
+# Distance to travel forward while completing a lane change (in meters)
+lane_change_target_distance: 5.0
+# Do not accept lane-swap completion before this distance (in meters)
+lane_change_min_distance: 4.0

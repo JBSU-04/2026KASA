@@ -1,0 +1,29 @@
+# MORAI K-City/Sangam baseline for 60 km/h urban and 100 km/h gentle highway.
+# Variances must be retuned from rosbag residuals when simulator noise changes.
+predict_frequency: 50.0
+extend_state_step: 100
+# 2026-09-17: 한때 false 로 껐다가 true 로 되돌렸다.
+#   당시 /odom yaw 가 GT 대비 -0.79 deg 상시 치우쳐 있어 yaw_bias 를
+#   의심했는데, 꺼도 -0.72 deg 로 거의 그대로였다. 진짜 원인은
+#   ekf_localizer 의 측정행렬이 YAWB 를 빼먹은 것이었다(출력/예측은
+#   YAW+YAWB 를 쓰는데 관측만 YAW 단독 -> 출력이 YAWB 만큼 틀어짐).
+#   그 버그를 고쳤으므로 bias 추정을 정상적으로 켜 둔다.
+#   또한 이 플래그는 프로세스 노이즈만 0 으로 만들 뿐 이미 추정된 YAWB
+#   를 되돌리지 않으므로, 끄는 것만으로는 애초에 해결될 수 없었다.
+enable_yaw_bias_estimation: true
+publish_tf: false
+use_pose_with_covariance: true
+use_twist_with_covariance: true
+pose_rate: 20.0
+twist_rate: 50.0
+# 재수신 GPS는 adapter가 DR 위치로 천천히 수렴시키므로, 정상 상태의
+# 명백한 이상치만 걸러내는 범위로 pose gate를 둔다.
+pose_gate_dist: 9.21
+twist_gate_dist: 25.0
+pose_additional_delay: 0.0
+twist_additional_delay: 0.0
+pose_measure_uncertainty_time: 0.02
+proc_stddev_yaw_c: 0.003
+proc_stddev_yaw_bias_c: 0.0001
+proc_stddev_vx_c: 0.8
+proc_stddev_wz_c: 0.10

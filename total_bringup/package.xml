@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>total_bringup</name>
+  <version>1.0.0</version>
+  <description>K-City Autonomous Mission Total Bringup</description>
+  <maintainer email="kuuve@kuuve.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>morai_msgs</build_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>groundgrid</exec_depend>
+</package>

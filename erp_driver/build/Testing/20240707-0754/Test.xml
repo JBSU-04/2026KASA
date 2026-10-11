@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Site BuildName="(empty)"
+	BuildStamp="20240707-0754-Experimental"
+	Name="kuuve"
+	Generator="ctest-3.16.3"
+	CompilerName="/usr/bin/c++"
+	CompilerVersion="9.4.0"
+	OSName="Linux"
+	Hostname="kuuve"
+	OSRelease="5.15.0-113-generic"
+	OSVersion="#123~20.04.1-Ubuntu SMP Wed Jun 12 17:33:13 UTC 2024"
+	OSPlatform="x86_64"
+	Is64Bits="1"
+	VendorString="GenuineIntel"
+	VendorID="Intel Corporation"
+	FamilyID="6"
+	ModelID="141"
+	ProcessorCacheSize="24576"
+	NumberOfLogicalCPU="16"
+	NumberOfPhysicalCPU="8"
+	TotalVirtualMemory="2047"
+	TotalPhysicalMemory="31828"
+	LogicalProcessorsPerPhysical="2"
+	ProcessorClockFrequency="2300"
+	>
+	<Testing>
+		<StartDateTime>Jul 07 16:54 KST</StartDateTime>
+		<StartTestTime>1720338880</StartTestTime>
+		<TestList/>
+		<EndDateTime>Jul 07 16:54 KST</EndDateTime>
+		<EndTestTime>1720338880</EndTestTime>
+		<ElapsedMinutes>0</ElapsedMinutes>
+	</Testing>
+</Site>

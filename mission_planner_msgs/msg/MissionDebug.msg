@@ -1,0 +1,11 @@
+std_msgs/Header header
+geometry_msgs/Point center
+geometry_msgs/Point yield_point
+geometry_msgs/Point conflict_point
+geometry_msgs/Point exit_point
+float64 inner_radius
+float64 outer_radius
+float64 ego_radius
+float64 ego_angle
+float64 safe_speed
+int32 blocking_object_id

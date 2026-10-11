@@ -1,0 +1,34 @@
+<launch>
+  <arg name="config_file" default="$(find morai_udp_bridge)/config/morai_25s4.yaml"/>
+  <arg name="enable_camera" default="false"/>
+  <arg name="enable_camera2" default="false"/>
+  <arg name="enable_control" default="false"/>
+  <arg name="camera_topic" default="/image_jpeg/compressed"/>
+  <arg name="camera2_topic" default="/image_jpeg2/compressed"/>
+  <arg name="camera2_port" default="1238"/>
+  <!-- 대회 시뮬 PC(Client)는 192.168.0.1. 다른 환경은 인자로 재정의한다. -->
+  <arg name="simulator_ip" default="192.168.0.1"/>
+  <!-- 1=KeyBoard, 2=AutoMode. UDP 는 매 패킷에 CtrlMode 를 싣기 때문에
+       수동 조작을 하려면 1을 "보내야" 한다. 대회 주행은 규정 2-8에 따라 2. -->
+  <arg name="ctrl_mode" default="2"/>
+  <!-- /ctrl_cmd 가 없어도 패킷을 보낼지. 수동 모드 전환에 필요하다. -->
+  <arg name="send_before_first_cmd" default="false"/>
+
+  <node pkg="morai_udp_bridge"
+        type="morai_udp_bridge_node.py"
+        name="morai_udp_bridge"
+        output="screen"
+        required="true">
+    <rosparam command="load" file="$(arg config_file)"/>
+    <!-- 단독 수신 실행은 control off. 대회 transport.launch는 UDP control을 켠다. -->
+    <param name="enable/control" value="$(arg enable_control)"/>
+    <param name="enable/camera" value="$(arg enable_camera)"/>
+    <param name="enable/camera2" value="$(arg enable_camera2)"/>
+    <param name="control/ctrl_mode" value="$(arg ctrl_mode)"/>
+    <param name="control/send_before_first_cmd" value="$(arg send_before_first_cmd)"/>
+    <param name="topics/camera" value="$(arg camera_topic)"/>
+    <param name="topics/camera2" value="$(arg camera2_topic)"/>
+    <param name="ports/camera2/listen" value="$(arg camera2_port)"/>
+    <param name="network/simulator_ip" value="$(arg simulator_ip)"/>
+  </node>
+</launch>

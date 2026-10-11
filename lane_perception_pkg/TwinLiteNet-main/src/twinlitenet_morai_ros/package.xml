@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>twinlitenet_morai_ros</name>
+  <version>0.1.0</version>
+  <description>TwinLiteNet inference node for MORAI camera image topics.</description>
+
+  <maintainer email="user@example.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>rospy</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>cv_bridge</build_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+
+  <export>
+  </export>
+</package>

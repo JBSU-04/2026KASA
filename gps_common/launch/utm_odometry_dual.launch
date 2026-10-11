@@ -1,0 +1,23 @@
+<launch>
+  <node pkg="gps_common"
+        type="utm_odometry_node"
+        name="utm_odometry_dual"
+        output="screen">
+
+    <param name="frame_id" value="map"/>
+    <param name="append_zone" value="false"/>
+
+    <!-- input gps topics (임시: 둘 다 /gps) -->
+    <param name="topics/gps_back"   value="/gps_back"/>
+    <param name="topics/gps_front"  value="/gps_front"/>
+
+    <!-- output odom topics -->
+    <param name="topics/odom_back"  value="/odom_back"/>
+    <param name="topics/odom_front" value="/odom_front"/>
+
+    <!-- child frame ids -->
+    <param name="child_frame_id_back"  value="gps_back"/>
+    <param name="child_frame_id_front" value="gps_front"/>
+  </node>
+</launch>
+

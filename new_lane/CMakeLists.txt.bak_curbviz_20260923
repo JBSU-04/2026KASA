@@ -1,0 +1,90 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(new_lane)
+
+set(CMAKE_BUILD_TYPE Release)
+add_compile_options(-O3 -march=native)
+
+
+find_package(catkin REQUIRED COMPONENTS
+  roscpp
+  rospy
+  std_msgs
+  pcl_conversions
+  pcl_ros
+  sensor_msgs
+  ackermann_msgs
+  geometry_msgs
+  message_generation
+  message_runtime
+  laser_geometry
+  waypoint_maker
+  lidar_ttc_tracker
+  tf2_ros
+)
+
+add_message_files(
+   FILES
+   lidar_topic_msg.msg
+)
+
+generate_messages(
+   DEPENDENCIES
+   std_msgs
+   geometry_msgs
+   ackermann_msgs
+   sensor_msgs
+   waypoint_maker
+)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+
+include_directories(
+ include
+ ${catkin_INCLUDE_DIRS}./include
+)
+catkin_package(
+    INCLUDE_DIRS include
+    CATKIN_DEPENDS roscpp rospy std_msgs waypoint_maker message_runtime
+)
+
+add_executable(lane_changer_node 
+   src/lane_changer.cpp 
+   src/cubic_spline_planner.cpp
+   src/frenet_optimal_trajectory.cpp
+   src/polynomials.cpp
+)
+add_dependencies(lane_changer_node 
+  ${${PROJECT_NAME}_EXPORTED_TARGETS} 
+  ${catkin_EXPORTED_TARGETS}
+  waypoint_maker_generate_messages_cpp
+)
+
+target_link_libraries(lane_changer_node
+   ${catkin_LIBRARIES}
+)
+
+add_executable(obstacle_avoidance_node
+   src/obstacle_avoidance_node.cpp
+   src/cubic_spline_planner.cpp
+   src/frenet_optimal_trajectory.cpp
+   src/polynomials.cpp
+)
+add_dependencies(obstacle_avoidance_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+  waypoint_maker_generate_messages_cpp
+)
+target_include_directories(obstacle_avoidance_node PRIVATE ${JSONCPP_INCLUDE_DIRS})
+target_link_libraries(obstacle_avoidance_node
+   ${catkin_LIBRARIES}
+   ${JSONCPP_LIBRARIES}
+)
+
+catkin_install_python(PROGRAMS
+  scripts/obstacle_stop_node.py
+  scripts/tunnel_wall_detector.py
+  scripts/far_static_obstacle_detector.py
+  scripts/obstacle_info_merger.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

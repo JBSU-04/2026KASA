@@ -1,0 +1,26 @@
+<launch>
+  <arg name="gateway_config"
+       default="$(find control_constraint_gateway)/config/gateway.yaml" />
+  <arg name="start_lidar_tracker" default="true" />
+  <!-- 회전교차로 단독 실행도 GroundGrid 지연 없이 사용자 LiDAR를 직수한다. -->
+  <arg name="cloud_topic" default="/lidar3D" />
+  <arg name="cloud_input_mode" default="sensor_raw" />
+  <arg name="expected_cloud_frame" default="velodyne" />
+  <arg name="gateway_output_topic" default="/ctrl_cmd" />
+  <arg name="raw_command_topic" default="/control/raw_cmd" />
+
+  <include file="$(find mission_planner)/launch/roundabout_stack.launch">
+    <arg name="mission_config"
+         value="$(find mission_planner)/config/sites/kcity_roundabout.yaml" />
+    <arg name="gateway_config" value="$(arg gateway_config)" />
+    <arg name="start_lidar_tracker" value="$(arg start_lidar_tracker)" />
+    <arg name="cloud_topic" value="$(arg cloud_topic)" />
+    <arg name="cloud_input_mode" value="$(arg cloud_input_mode)" />
+    <arg name="expected_cloud_frame" value="$(arg expected_cloud_frame)" />
+    <arg name="odom_topic" value="/odom" />
+    <arg name="route_topic" value="/local_path" />
+    <arg name="localization_valid_topic" value="/localization/valid" />
+    <arg name="gateway_output_topic" value="$(arg gateway_output_topic)" />
+    <arg name="raw_command_topic" value="$(arg raw_command_topic)" />
+  </include>
+</launch>

@@ -1,0 +1,19 @@
+cost_weight:
+  cte_cost_weight: 5000
+  epsi_cost_weight: 1000
+  v_start_weight: 1
+  delta_cost_weight: 500
+  v_target_cost_weight: 1
+  delta_change_cost_weight: 10000
+  v_target_change_cost_weight: 1
+k_v: 0.4
+N: 50
+dt: 0.1
+ref_v: 10.0
+speed:
+  upperBound: 20.0
+  lowerBound: 0.0
+steer:
+  upperBound: 0.6981
+  lowerBound: -0.6981
+Lf: 1.5

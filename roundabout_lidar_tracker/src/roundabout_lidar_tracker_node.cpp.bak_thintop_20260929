@@ -1,0 +1,855 @@
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <mission_planner_msgs/TrackedObject.h>
+#include <mission_planner_msgs/TrackedObjectArray.h>
+#include <mission_supervisor/SectionState.h>
+#include <nav_msgs/Odometry.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <std_msgs/ColorRGBA.h>
+#include <tf2/utils.h>
+#include <xmlrpcpp/XmlRpcValue.h>
+#include <visualization_msgs/MarkerArray.h>
+
+#include "roundabout_lidar_tracker/centroid_tracker.hpp"
+#include "roundabout_lidar_tracker/cluster_shape_filter.hpp"
+
+namespace roundabout_lidar_tracker {
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+double squaredDistance(double x1, double y1, double x2, double y2) {
+  const double dx = x1 - x2;
+  const double dy = y1 - y2;
+  return dx * dx + dy * dy;
+}
+
+std_msgs::ColorRGBA color(float red, float green, float blue, float alpha) {
+  std_msgs::ColorRGBA value;
+  value.r = red;
+  value.g = green;
+  value.b = blue;
+  value.a = alpha;
+  return value;
+}
+
+}  // namespace
+
+class RoundaboutLidarTrackerNode {
+ public:
+  RoundaboutLidarTrackerNode()
+      : nh_(), pnh_("~"), tracker_(TrackerConfig()) {
+    loadParameters();
+    tracker_.setConfig(tracker_config_);
+
+    odom_sub_ = nh_.subscribe(odom_topic_, 5,
+                              &RoundaboutLidarTrackerNode::odomCallback, this);
+    cloud_sub_ = nh_.subscribe(cloud_topic_, 1,
+                               &RoundaboutLidarTrackerNode::cloudCallback, this);
+    tracks_pub_ = nh_.advertise<mission_planner_msgs::TrackedObjectArray>(
+        output_topic_, 2);
+    markers_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
+        markers_topic_, 1);
+    roi_cloud_pub_ =
+        nh_.advertise<sensor_msgs::PointCloud2>(roi_cloud_topic_, 1);
+    vehicle_cloud_pub_ =
+        nh_.advertise<sensor_msgs::PointCloud2>(vehicle_cloud_topic_, 1);
+    aligned_cloud_pub_ =
+        nh_.advertise<sensor_msgs::PointCloud2>(aligned_cloud_topic_, 1);
+    section_sub_ = nh_.subscribe(section_topic_, 2,
+                                 &RoundaboutLidarTrackerNode::sectionCallback, this);
+
+    ROS_INFO_STREAM("[roundabout_lidar_tracker] ready enabled=" << enabled_
+                    << " cloud=" << cloud_topic_ << " odom=" << odom_topic_
+                    << " output=" << output_topic_);
+    if (!enabled_) {
+      ROS_WARN("[roundabout_lidar_tracker] disabled: configure site coordinates "
+               "and set lidar_tracker/enabled=true");
+    }
+  }
+
+ private:
+  struct OdomSnapshot {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double yaw = 0.0;
+    ros::Time received;
+    bool valid = false;
+  };
+
+  void loadParameters() {
+    pnh_.param<bool>("lidar_tracker/enabled", enabled_, false);
+    pnh_.param<std::string>("lidar_tracker/topics/cloud", cloud_topic_,
+                            "/demo/nonground");
+    pnh_.param<std::string>("lidar_tracker/topics/odom", odom_topic_,
+                            "/odom");
+    pnh_.param<std::string>("lidar_tracker/topics/output", output_topic_,
+                            "/perception/roundabout/tracked_objects");
+    pnh_.param<std::string>("lidar_tracker/topics/markers", markers_topic_,
+                            "/perception/roundabout/tracker_markers");
+    pnh_.param<std::string>("lidar_tracker/topics/roi_cloud", roi_cloud_topic_,
+                            "/perception/roundabout/roi_cloud");
+    pnh_.param<std::string>("lidar_tracker/topics/vehicle_cloud",
+                            vehicle_cloud_topic_,
+                            "/perception/roundabout/vehicle_cloud");
+    pnh_.param<std::string>("lidar_tracker/topics/aligned_cloud",
+                            aligned_cloud_topic_,
+                            "/perception/roundabout/aligned_cloud");
+    pnh_.param<std::string>("lidar_tracker/topics/active_section",
+                            section_topic_, "/mission/active_section");
+    pnh_.param<bool>("lidar_tracker/section_gating_enabled",
+                     section_gating_enabled_, true);
+    pnh_.param<std::string>("frame_id", frame_id_, "map");
+    pnh_.param<std::string>("lidar_tracker/expected_cloud_frame",
+                            expected_cloud_frame_, "os_sensor");
+    pnh_.param<std::string>("lidar_tracker/input_mode", input_mode_,
+                            "sensor_nonground");
+    pnh_.param<double>("lidar_tracker/max_processing_hz", max_processing_hz_,
+                       12.0);
+    pnh_.param<double>("lidar_tracker/processing_radius", processing_radius_,
+                       80.0);
+    pnh_.param<double>("lidar_tracker/odom_timeout", odom_timeout_, 0.35);
+    pnh_.param<double>("lidar_tracker/cloud_timeout", cloud_timeout_, 0.5);
+    pnh_.param<double>("lidar_tracker/reset_jump_distance",
+                       reset_jump_distance_, 5.0);
+
+    pnh_.param<double>("roundabout/center/x", center_x_, 0.0);
+    pnh_.param<double>("roundabout/center/y", center_y_, 0.0);
+    pnh_.param<double>("roundabout/radius/inner", inner_radius_, 8.0);
+    pnh_.param<double>("roundabout/radius/outer", outer_radius_, 18.0);
+
+    pnh_.param<double>("lidar_tracker/sensor_extrinsic/x", sensor_x_, 1.1);
+    pnh_.param<double>("lidar_tracker/sensor_extrinsic/y", sensor_y_, 0.0);
+    // 기본값은 total_bringup/config/lidar_extrinsic.yaml 의 차량원점 기준 z.
+    pnh_.param<double>("lidar_tracker/sensor_extrinsic/z", sensor_z_, 1.33);
+    double sensor_yaw_deg = 0.0;
+    pnh_.param<double>("lidar_tracker/sensor_extrinsic/yaw_deg",
+                       sensor_yaw_deg, 0.0);
+    sensor_yaw_ = sensor_yaw_deg * kPi / 180.0;
+
+    pnh_.param<double>("lidar_tracker/roi/min_range", min_range_, 1.5);
+    pnh_.param<double>("lidar_tracker/roi/max_range", max_range_, 60.0);
+    pnh_.param<double>("lidar_tracker/roi/min_z", min_z_, -0.8);
+    pnh_.param<double>("lidar_tracker/roi/max_z", max_z_, 2.5);
+    pnh_.param<double>("lidar_tracker/roi/ring_margin", ring_margin_, 3.0);
+    pnh_.param<double>("lidar_tracker/groundgrid/nonground_min_intensity",
+                       nonground_min_intensity_, 90.0);
+    pnh_.param<double>("lidar_tracker/raw_ground/percentile",
+                       raw_ground_percentile_, 20.0);
+    pnh_.param<double>("lidar_tracker/raw_ground/clearance",
+                       raw_ground_clearance_, 0.25);
+    pnh_.param<double>("lidar_tracker/voxel_size", voxel_size_, 0.10);
+
+    pnh_.param<double>("lidar_tracker/cluster/tolerance",
+                       cluster_tolerance_, 1.25);
+    pnh_.param<int>("lidar_tracker/cluster/min_points", cluster_min_points_,
+                    3);
+    pnh_.param<int>("lidar_tracker/cluster/max_points", cluster_max_points_,
+                    3000);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/min_length",
+                       min_length_, 0.33);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/max_length",
+                       max_length_, 6.5);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/min_width", min_width_,
+                       0.15);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/max_width", max_width_,
+                       3.5);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/min_height", min_height_,
+                       0.12);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/max_height", max_height_,
+                       3.0);
+    pnh_.param<bool>("lidar_tracker/vehicle_filter/reject_low_linear",
+                     shape_filter_config_.reject_low_linear, true);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/linear_min_length",
+                       shape_filter_config_.linear_min_length, 2.0);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/linear_max_width",
+                       shape_filter_config_.linear_max_width, 0.30);
+    pnh_.param<double>("lidar_tracker/vehicle_filter/linear_max_height",
+                       shape_filter_config_.linear_max_height, 0.6);
+    pnh_.param<double>(
+        "lidar_tracker/vehicle_filter/linear_min_aspect_ratio",
+        shape_filter_config_.linear_min_aspect_ratio, 8.0);
+
+    pnh_.param<double>("lidar_tracker/tracking/association_distance",
+                       tracker_config_.association_distance, 3.0);
+    pnh_.param<double>("lidar_tracker/tracking/position_alpha",
+                       tracker_config_.position_alpha, 0.7);
+    pnh_.param<double>("lidar_tracker/tracking/velocity_alpha",
+                       tracker_config_.velocity_alpha, 0.4);
+    pnh_.param<bool>("lidar_tracker/tracking/circular_velocity_enabled",
+                     tracker_config_.circular_velocity_enabled, true);
+    tracker_config_.circular_center_x = center_x_;
+    tracker_config_.circular_center_y = center_y_;
+    pnh_.param<int>("lidar_tracker/tracking/velocity_window_size",
+                    tracker_config_.velocity_window_size, 7);
+    pnh_.param<double>("lidar_tracker/tracking/velocity_min_span",
+                       tracker_config_.velocity_min_span, 0.12);
+    pnh_.param<double>("lidar_tracker/tracking/size_alpha",
+                       tracker_config_.size_alpha, 0.5);
+    pnh_.param<double>("lidar_tracker/tracking/stale_seconds",
+                       tracker_config_.stale_seconds, 1.0);
+    pnh_.param<double>("lidar_tracker/tracking/max_prediction_seconds",
+                       tracker_config_.max_prediction_seconds, 0.3);
+    pnh_.param<double>("lidar_tracker/tracking/max_object_speed",
+                       tracker_config_.max_object_speed, 30.0);
+    pnh_.param<int>("lidar_tracker/tracking/min_confirm_hits",
+                    tracker_config_.min_confirm_hits, 2);
+    pnh_.param<int>("lidar_tracker/tracking/min_velocity_hits",
+                    tracker_config_.min_velocity_hits, 2);
+    pnh_.param<double>("lidar_tracker/tracking/moving_speed_threshold",
+                       tracker_config_.moving_speed_threshold, 0.8);
+    pnh_.param<double>("lidar_tracker/tracking/moving_distance_threshold",
+                       tracker_config_.moving_distance_threshold, 1.0);
+    pnh_.param<int>("lidar_tracker/tracking/moving_confirm_hits",
+                    tracker_config_.moving_confirm_hits, 2);
+
+    shape_filter_config_.min_length = min_length_;
+    shape_filter_config_.max_length = max_length_;
+    shape_filter_config_.min_width = min_width_;
+    shape_filter_config_.max_width = max_width_;
+    shape_filter_config_.min_height = min_height_;
+    shape_filter_config_.max_height = max_height_;
+
+    loadExclusionZones();
+
+    // 속도 미확정 신규 클러스터가 먼저 발행되면 중앙분리대 조각이
+    // fail-closed 정지를 반복시킬 수 있으므로 발행 시점을 맞춘다.
+    if (tracker_config_.min_confirm_hits <
+        tracker_config_.min_velocity_hits) {
+      ROS_WARN_STREAM("[roundabout_lidar_tracker] min_confirm_hits="
+                      << tracker_config_.min_confirm_hits
+                      << " raised to min_velocity_hits="
+                      << tracker_config_.min_velocity_hits);
+      tracker_config_.min_confirm_hits = tracker_config_.min_velocity_hits;
+    }
+
+    max_processing_hz_ = std::max(1.0, max_processing_hz_);
+    processing_radius_ = std::max(outer_radius_ + ring_margin_,
+                                  processing_radius_);
+    voxel_size_ = std::max(0.05, voxel_size_);
+    raw_ground_percentile_ =
+        std::max(0.0, std::min(100.0, raw_ground_percentile_));
+    raw_ground_clearance_ = std::max(0.0, raw_ground_clearance_);
+    if (input_mode_ != "sensor_nonground" &&
+        input_mode_ != "sensor_raw" &&
+        input_mode_ != "map_groundgrid") {
+      ROS_WARN_STREAM("[roundabout_lidar_tracker] unknown input_mode='"
+                      << input_mode_ << "'; using sensor_nonground");
+      input_mode_ = "sensor_nonground";
+    }
+  }
+
+  // 회전교차로 진입 전 중앙분리대처럼 매 주행 같은 자리에 잡히는 고정
+  // 구조물을 점군 단계에서 제거한다. 형상 필터는 이런 구조물을 못 거른다 -
+  // VLP-16 링이 하나만 스치면 조각 길이가 linear_min_length(2.0m)에 못 미쳐
+  // 선형 판정이 성립하지 않고, 링이 바뀔 때마다 폭이 0.27~1.50m 로 출렁여
+  // 중심이 끌려다니며 has_moved 까지 참이 된다(실측 2026-09-18 15:47 백).
+  // 위치가 확정적이므로 좌표 기반 제외가 가장 확실하다.
+  void loadExclusionZones() {
+    exclusion_zones_.clear();
+    XmlRpc::XmlRpcValue zones;
+    if (!pnh_.getParam("lidar_tracker/exclusion_zones", zones)) {
+      return;
+    }
+    if (zones.getType() != XmlRpc::XmlRpcValue::TypeArray) {
+      ROS_WARN("[roundabout_lidar_tracker] exclusion_zones must be a list");
+      return;
+    }
+    for (int i = 0; i < zones.size(); ++i) {
+      XmlRpc::XmlRpcValue& entry = zones[i];
+      if (entry.getType() != XmlRpc::XmlRpcValue::TypeStruct ||
+          !entry.hasMember("x") || !entry.hasMember("y") ||
+          !entry.hasMember("radius")) {
+        ROS_WARN_STREAM("[roundabout_lidar_tracker] exclusion_zones[" << i
+                        << "] needs x, y, radius; skipped");
+        continue;
+      }
+      ExclusionZone zone;
+      zone.x = static_cast<double>(entry["x"]);
+      zone.y = static_cast<double>(entry["y"]);
+      zone.radius = static_cast<double>(entry["radius"]);
+      if (!(zone.radius > 0.0)) {
+        ROS_WARN_STREAM("[roundabout_lidar_tracker] exclusion_zones[" << i
+                        << "] radius must be > 0; skipped");
+        continue;
+      }
+      exclusion_zones_.push_back(zone);
+      ROS_INFO_STREAM("[roundabout_lidar_tracker] exclusion zone ("
+                      << zone.x << ", " << zone.y << ") r=" << zone.radius
+                      << " m");
+    }
+  }
+
+  bool inExclusionZone(double map_x, double map_y) const {
+    for (const ExclusionZone& zone : exclusion_zones_) {
+      if (squaredDistance(map_x, map_y, zone.x, zone.y) <
+          zone.radius * zone.radius) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void odomCallback(const nav_msgs::Odometry::ConstPtr& message) {
+    OdomSnapshot snapshot;
+    snapshot.x = message->pose.pose.position.x;
+    snapshot.y = message->pose.pose.position.y;
+    snapshot.z = message->pose.pose.position.z;
+    snapshot.yaw = tf2::getYaw(message->pose.pose.orientation);
+    snapshot.received = ros::Time::now();
+    snapshot.valid = std::isfinite(snapshot.x) && std::isfinite(snapshot.y) &&
+                     std::isfinite(snapshot.yaw);
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    odom_ = snapshot;
+  }
+
+  void sectionCallback(
+      const mission_supervisor::SectionState::ConstPtr& message) {
+    std::lock_guard<std::mutex> lock(section_mutex_);
+    current_section_id_ = message->section_id;
+    current_executors_ = message->executors;
+    last_section_time_ = ros::Time::now();
+    have_section_status_ = true;
+  }
+
+  void cloudCallback(const sensor_msgs::PointCloud2::ConstPtr& message) {
+    std::unique_lock<std::mutex> process_lock(process_mutex_,
+                                               std::try_to_lock);
+    if (!process_lock.owns_lock()) {
+      return;
+    }
+
+    const ros::Time received = ros::Time::now();
+    if (!last_process_time_.isZero() &&
+        (received - last_process_time_).toSec() < 1.0 / max_processing_hz_) {
+      return;
+    }
+    last_process_time_ = received;
+
+    // 런타임 핫 리로드: 1초 주기로 파라미터 동기화하여 rosparam 갱신 시 실시간 반영
+    if ((received - last_param_sync_).toSec() >= 1.0) {
+      loadParameters();
+      tracker_.setConfig(tracker_config_);
+      last_param_sync_ = received;
+    }
+
+    OdomSnapshot odom;
+    {
+      std::lock_guard<std::mutex> lock(odom_mutex_);
+      odom = odom_;
+    }
+    const ros::Time stamp = message->header.stamp.isZero()
+                                ? received
+                                : message->header.stamp;
+
+    if (!message->header.stamp.isZero() &&
+        std::abs((received - message->header.stamp).toSec()) > cloud_timeout_) {
+      tracker_.reset();
+      publish({}, received, false);
+      ROS_WARN_THROTTLE(2.0,
+                        "[roundabout_lidar_tracker] rejected stale cloud");
+      return;
+    }
+    if (!last_tracker_stamp_.isZero() && stamp <= last_tracker_stamp_) {
+      tracker_.reset();
+    }
+    last_tracker_stamp_ = stamp;
+
+    if (!enabled_ || !odom.valid || odom.received.isZero() ||
+        (received - odom.received).toSec() > odom_timeout_) {
+      tracker_.reset();
+      publish({}, stamp, false);
+      return;
+    }
+    if (!expected_cloud_frame_.empty() &&
+        message->header.frame_id != expected_cloud_frame_) {
+      ROS_WARN_THROTTLE(2.0,
+                        "[roundabout_lidar_tracker] cloud frame '%s' differs "
+                        "from configured '%s' (input_mode=%s)",
+                        message->header.frame_id.c_str(),
+                        expected_cloud_frame_.c_str(), input_mode_.c_str());
+    }
+
+    if (have_previous_ego_ &&
+        std::sqrt(squaredDistance(odom.x, odom.y, previous_ego_x_,
+                                  previous_ego_y_)) > reset_jump_distance_) {
+      tracker_.reset();
+    }
+    previous_ego_x_ = odom.x;
+    previous_ego_y_ = odom.y;
+    bool in_roundabout_section = false;
+    {
+      std::lock_guard<std::mutex> lock(section_mutex_);
+      if (have_section_status_ &&
+          (received - last_section_time_).toSec() < 1.5) {
+        in_roundabout_section = (current_section_id_ == "M5");
+        for (const auto& ex : current_executors_) {
+          if (ex == "roundabout") {
+            in_roundabout_section = true;
+            break;
+          }
+        }
+      } else {
+        // 폴백: 중심 거리 기준 (양보선 접근 반경 ~36m)
+        const double activation_radius = outer_radius_ + ring_margin_ + 15.0;
+        in_roundabout_section =
+            squaredDistance(odom.x, odom.y, center_x_, center_y_) <=
+            activation_radius * activation_radius;
+      }
+    }
+
+    if ((section_gating_enabled_ && !in_roundabout_section) ||
+        squaredDistance(odom.x, odom.y, center_x_, center_y_) >
+            processing_radius_ * processing_radius_) {
+      tracker_.reset();
+      publish({}, stamp, false);
+      return;
+    }
+
+    const std::vector<Detection2D> detections = extractDetections(*message, odom);
+    tracker_.update(detections, stamp.toSec());
+    publish(tracker_.tracks(stamp.toSec()), stamp, true);
+  }
+
+  std::vector<Detection2D> extractDetections(
+      const sensor_msgs::PointCloud2& message,
+      const OdomSnapshot& odom) {
+    pcl::PointCloud<pcl::PointXYZI> input;
+    pcl::fromROSMsg(message, input);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr ring_cloud(
+        new pcl::PointCloud<pcl::PointXYZ>());
+    ring_cloud->reserve(input.size());
+    pcl::PointCloud<pcl::PointXYZI>::Ptr aligned_cloud(
+        new pcl::PointCloud<pcl::PointXYZI>());
+    const bool publish_aligned_cloud =
+        aligned_cloud_pub_.getNumSubscribers() > 0U;
+    if (publish_aligned_cloud) {
+      aligned_cloud->reserve(input.size());
+    }
+    const double min_range_squared = min_range_ * min_range_;
+    const double max_range_squared = max_range_ * max_range_;
+    const double ring_min = std::max(0.0, inner_radius_ - ring_margin_);
+    const double ring_max = outer_radius_ + ring_margin_;
+    const double cos_sensor = std::cos(sensor_yaw_);
+    const double sin_sensor = std::sin(sensor_yaw_);
+    const double cos_ego = std::cos(odom.yaw);
+    const double sin_ego = std::sin(odom.yaw);
+
+    // ros_ws의 기본 GroundGrid 출력은 map 프레임이며 intensity=99를
+    // 비지면으로 사용한다. 원본 센서를 직접 받을 때는 평탄한 K-City용
+    // percentile 지면 제거를 적용하고, 이미 비지면인 점군에는 적용하지 않는다.
+    double raw_ground_z = -std::numeric_limits<double>::infinity();
+    if (input_mode_ == "sensor_raw") {
+      std::vector<float> candidate_z;
+      candidate_z.reserve(input.size());
+      for (const pcl::PointXYZI& point : input.points) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+            !std::isfinite(point.z)) {
+          continue;
+        }
+        const double range_squared = point.x * point.x + point.y * point.y;
+        if (range_squared >= min_range_squared &&
+            range_squared <= max_range_squared && point.z >= min_z_ &&
+            point.z <= max_z_) {
+          candidate_z.push_back(point.z);
+        }
+      }
+      if (!candidate_z.empty()) {
+        const std::size_t index = std::min(
+            candidate_z.size() - 1U,
+            static_cast<std::size_t>(
+                raw_ground_percentile_ * 0.01 * candidate_z.size()));
+        std::nth_element(candidate_z.begin(), candidate_z.begin() + index,
+                         candidate_z.end());
+        raw_ground_z = candidate_z[index];
+      }
+    }
+
+    for (const pcl::PointXYZI& point : input.points) {
+      if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+          !std::isfinite(point.z)) {
+        continue;
+      }
+      const bool map_cloud = input_mode_ == "map_groundgrid";
+      const double local_x = map_cloud ? point.x - odom.x : point.x;
+      const double local_y = map_cloud ? point.y - odom.y : point.y;
+      const double local_z = map_cloud ? point.z - odom.z : point.z;
+      if (local_z < min_z_ || local_z > max_z_) {
+        continue;
+      }
+      const double range_squared = local_x * local_x + local_y * local_y;
+      if (range_squared < min_range_squared || range_squared > max_range_squared) {
+        continue;
+      }
+
+      const double base_x = sensor_x_ + cos_sensor * point.x -
+                            sin_sensor * point.y;
+      const double base_y = sensor_y_ + sin_sensor * point.x +
+                            cos_sensor * point.y;
+      const double map_x = map_cloud
+                               ? point.x
+                               : odom.x + cos_ego * base_x - sin_ego * base_y;
+      const double map_y = map_cloud
+                               ? point.y
+                               : odom.y + sin_ego * base_x + cos_ego * base_y;
+      const double map_z = map_cloud ? point.z
+                                     : odom.z + sensor_z_ + point.z;
+
+      // RViz가 원본 frame_id/TF를 다시 해석하지 않도록, 트래커가 실제 차량
+      // 검출에 쓰는 것과 동일한 외부 파라미터와 odom으로 map 점군을 만든다.
+      // 지면 제거 전 점을 담아 LiDAR 스캔 링(등고선)도 그대로 확인할 수 있다.
+      if (publish_aligned_cloud) {
+        pcl::PointXYZI aligned_point;
+        aligned_point.x = static_cast<float>(map_x);
+        aligned_point.y = static_cast<float>(map_y);
+        aligned_point.z = static_cast<float>(map_z);
+        aligned_point.intensity = point.intensity;
+        aligned_cloud->push_back(aligned_point);
+      }
+
+      if (map_cloud && point.intensity < nonground_min_intensity_) {
+        continue;
+      }
+      if (input_mode_ == "sensor_raw" &&
+          point.z <= raw_ground_z + raw_ground_clearance_) {
+        continue;
+      }
+      const double ring_radius =
+          std::hypot(map_x - center_x_, map_y - center_y_);
+      if (ring_radius < ring_min || ring_radius > ring_max) {
+        continue;
+      }
+      // 클러스터가 아니라 점 단계에서 버린다. 조각이 남으면 인접한 실제
+      // 차량 클러스터에 붙어 중심과 크기를 왜곡한다.
+      if (inExclusionZone(map_x, map_y)) {
+        continue;
+      }
+      ring_cloud->push_back(pcl::PointXYZ(
+          static_cast<float>(map_x), static_cast<float>(map_y),
+          static_cast<float>(map_z)));
+    }
+
+    publishAlignedCloud(aligned_cloud, message.header.stamp);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr filtered(
+        new pcl::PointCloud<pcl::PointXYZ>());
+    if (!ring_cloud->empty()) {
+      pcl::VoxelGrid<pcl::PointXYZ> voxel;
+      voxel.setInputCloud(ring_cloud);
+      voxel.setLeafSize(static_cast<float>(voxel_size_),
+                        static_cast<float>(voxel_size_),
+                        static_cast<float>(voxel_size_));
+      voxel.filter(*filtered);
+    }
+    publishRoiCloud(filtered);
+
+    std::vector<Detection2D> detections;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr vehicle_cloud(
+        new pcl::PointCloud<pcl::PointXYZ>());
+    if (filtered->size() < static_cast<std::size_t>(cluster_min_points_)) {
+      publishVehicleCloud(vehicle_cloud);
+      return detections;
+    }
+
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(
+        new pcl::search::KdTree<pcl::PointXYZ>());
+    tree->setInputCloud(filtered);
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> clustering;
+    clustering.setClusterTolerance(cluster_tolerance_);
+    clustering.setMinClusterSize(cluster_min_points_);
+    clustering.setMaxClusterSize(cluster_max_points_);
+    clustering.setSearchMethod(tree);
+    clustering.setInputCloud(filtered);
+    std::vector<pcl::PointIndices> cluster_indices;
+    clustering.extract(cluster_indices);
+
+    for (const pcl::PointIndices& indices : cluster_indices) {
+      std::vector<ClusterPoint3D> cluster_points;
+      cluster_points.reserve(indices.indices.size());
+      for (int index : indices.indices) {
+        const pcl::PointXYZ& point = filtered->points[index];
+        cluster_points.push_back({point.x, point.y, point.z});
+      }
+
+      // 지도축 AABB 대신 PCA 회전 바운딩 크기로 차량을 판정한다.
+      // 회전차로의 차량은 유지하면서 길고 낮은 가드레일 조각을 제거한다.
+      const ClusterShape shape = measureClusterShape(cluster_points);
+      if (!isVehicleShape(shape, shape_filter_config_)) {
+        continue;
+      }
+      for (int index : indices.indices) {
+        vehicle_cloud->push_back(filtered->points[index]);
+      }
+
+      Detection2D detection;
+      detection.x = shape.center_x;
+      detection.y = shape.center_y;
+      detection.z = shape.center_z;
+      detection.size_x = shape.size_x;
+      detection.size_y = shape.size_y;
+      detection.size_z = shape.height;
+      detection.confidence = std::min(
+          1.0, 0.5 + 0.5 * static_cast<double>(indices.indices.size()) /
+                         std::max(1, 4 * cluster_min_points_));
+      detections.push_back(detection);
+    }
+    publishVehicleCloud(vehicle_cloud);
+    return detections;
+  }
+
+  void publishRoiCloud(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud) {
+    if (roi_cloud_pub_.getNumSubscribers() == 0U) {
+      return;
+    }
+    sensor_msgs::PointCloud2 message;
+    pcl::toROSMsg(*cloud, message);
+    message.header.frame_id = frame_id_;
+    message.header.stamp = ros::Time::now();
+    roi_cloud_pub_.publish(message);
+  }
+
+  void publishVehicleCloud(
+      const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud) {
+    if (vehicle_cloud_pub_.getNumSubscribers() == 0U) {
+      return;
+    }
+    sensor_msgs::PointCloud2 message;
+    pcl::toROSMsg(*cloud, message);
+    message.header.frame_id = frame_id_;
+    message.header.stamp = ros::Time::now();
+    vehicle_cloud_pub_.publish(message);
+  }
+
+  void publishAlignedCloud(
+      const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud,
+      const ros::Time& source_stamp) {
+    if (aligned_cloud_pub_.getNumSubscribers() == 0U) {
+      return;
+    }
+    sensor_msgs::PointCloud2 message;
+    pcl::toROSMsg(*cloud, message);
+    message.header.frame_id = frame_id_;
+    message.header.stamp = source_stamp.isZero() ? ros::Time::now()
+                                                 : source_stamp;
+    aligned_cloud_pub_.publish(message);
+  }
+
+  void publish(const std::vector<Track2D>& tracks, const ros::Time& stamp,
+               bool valid) {
+    mission_planner_msgs::TrackedObjectArray message;
+    message.header.stamp = stamp;
+    message.header.frame_id = frame_id_;
+    message.valid = valid;
+    message.objects.reserve(tracks.size());
+    for (const Track2D& track : tracks) {
+      mission_planner_msgs::TrackedObject object;
+      object.id = track.id;
+      object.position.x = track.x;
+      object.position.y = track.y;
+      object.position.z = track.z;
+      object.velocity.x = track.velocity_x;
+      object.velocity.y = track.velocity_y;
+      object.size.x = track.size_x;
+      object.size.y = track.size_y;
+      object.size.z = track.size_z;
+      object.confidence = track.confidence;
+      object.hit_count = track.hit_count;
+      object.velocity_valid = track.velocity_valid;
+      object.has_moved = track.has_moved;
+      message.objects.push_back(object);
+    }
+    tracks_pub_.publish(message);
+    markers_pub_.publish(makeMarkers(tracks, stamp, valid));
+  }
+
+  visualization_msgs::MarkerArray makeMarkers(
+      const std::vector<Track2D>& tracks, const ros::Time& stamp,
+      bool valid) const {
+    visualization_msgs::MarkerArray array;
+    visualization_msgs::Marker clear;
+    clear.header.frame_id = frame_id_;
+    clear.header.stamp = stamp;
+    clear.action = visualization_msgs::Marker::DELETEALL;
+    array.markers.push_back(clear);
+
+    for (const Track2D& track : tracks) {
+      visualization_msgs::Marker box;
+      box.header.frame_id = frame_id_;
+      box.header.stamp = stamp;
+      box.ns = "roundabout_lidar_tracks";
+      box.id = track.id * 3;
+      box.type = visualization_msgs::Marker::CUBE;
+      box.action = visualization_msgs::Marker::ADD;
+      box.pose.position.x = track.x;
+      box.pose.position.y = track.y;
+      box.pose.position.z = track.z;
+      box.pose.orientation.w = 1.0;
+      box.scale.x = std::max(0.1, track.size_x);
+      box.scale.y = std::max(0.1, track.size_y);
+      box.scale.z = std::max(0.1, track.size_z);
+      box.color = track.has_moved ? color(0.1F, 1.0F, 0.2F, 0.45F)
+                                  : color(1.0F, 0.7F, 0.0F, 0.35F);
+      box.lifetime = ros::Duration(0.3);
+      array.markers.push_back(box);
+
+      visualization_msgs::Marker velocity = box;
+      velocity.id = track.id * 3 + 1;
+      velocity.type = visualization_msgs::Marker::ARROW;
+      velocity.pose.position.x = 0.0;
+      velocity.pose.position.y = 0.0;
+      velocity.pose.position.z = 0.0;
+      velocity.scale.x = 0.15;
+      velocity.scale.y = 0.3;
+      velocity.scale.z = 0.3;
+      velocity.color = color(1.0F, 0.2F, 0.8F, 1.0F);
+      geometry_msgs::Point start;
+      start.x = track.x;
+      start.y = track.y;
+      start.z = track.z + 0.5;
+      geometry_msgs::Point end = start;
+      end.x += track.velocity_x;
+      end.y += track.velocity_y;
+      velocity.points = {start, end};
+      array.markers.push_back(velocity);
+
+      visualization_msgs::Marker label = box;
+      label.id = track.id * 3 + 2;
+      label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+      label.pose.position.z = track.z + 1.5;
+      label.scale.x = 0.0;
+      label.scale.y = 0.0;
+      label.scale.z = 0.7;
+      label.color = color(1.0F, 1.0F, 1.0F, 1.0F);
+      std::ostringstream text;
+      text << "ID " << track.id << "  "
+           << std::hypot(track.velocity_x, track.velocity_y) << " m/s";
+      label.text = text.str();
+      array.markers.push_back(label);
+    }
+
+    if (!valid) {
+      visualization_msgs::Marker warning;
+      warning.header.frame_id = frame_id_;
+      warning.header.stamp = stamp;
+      warning.ns = "roundabout_lidar_tracks";
+      warning.id = 999999;
+      warning.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+      warning.action = visualization_msgs::Marker::ADD;
+      warning.pose.position.x = center_x_;
+      warning.pose.position.y = center_y_;
+      warning.pose.position.z = 3.0;
+      warning.pose.orientation.w = 1.0;
+      warning.scale.z = 1.0;
+      warning.color = color(1.0F, 0.1F, 0.1F, 1.0F);
+      warning.text = "LiDAR tracker invalid";
+      warning.lifetime = ros::Duration(0.3);
+      array.markers.push_back(warning);
+    }
+    return array;
+  }
+
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+  ros::Subscriber odom_sub_;
+  ros::Subscriber cloud_sub_;
+  ros::Publisher tracks_pub_;
+  ros::Publisher markers_pub_;
+  ros::Publisher roi_cloud_pub_;
+  ros::Publisher vehicle_cloud_pub_;
+  ros::Publisher aligned_cloud_pub_;
+
+  std::mutex odom_mutex_;
+  std::mutex process_mutex_;
+  OdomSnapshot odom_;
+  CentroidTracker tracker_;
+  TrackerConfig tracker_config_;
+  ros::Time last_process_time_;
+  ros::Time last_tracker_stamp_;
+  ros::Time last_param_sync_{0};
+  bool have_previous_ego_ = false;
+  double previous_ego_x_ = 0.0;
+  double previous_ego_y_ = 0.0;
+
+  bool enabled_ = false;
+  std::string cloud_topic_;
+  std::string odom_topic_;
+  std::string output_topic_;
+  std::string markers_topic_;
+  std::string roi_cloud_topic_;
+  std::string vehicle_cloud_topic_;
+  std::string aligned_cloud_topic_;
+  std::string section_topic_ = "/mission/active_section";
+  bool section_gating_enabled_ = true;
+  std::string current_section_id_;
+  std::vector<std::string> current_executors_;
+  ros::Time last_section_time_;
+  bool have_section_status_ = false;
+  ros::Subscriber section_sub_;
+  std::mutex section_mutex_;
+  std::string frame_id_;
+  std::string expected_cloud_frame_;
+  std::string input_mode_ = "sensor_nonground";
+  double max_processing_hz_ = 12.0;
+  double processing_radius_ = 80.0;
+  double odom_timeout_ = 0.35;
+  double cloud_timeout_ = 0.5;
+  double reset_jump_distance_ = 5.0;
+  double center_x_ = 0.0;
+  double center_y_ = 0.0;
+  double inner_radius_ = 8.0;
+  double outer_radius_ = 18.0;
+  double sensor_x_ = 1.1;
+  double sensor_y_ = 0.0;
+  double sensor_z_ = 1.33;
+  double sensor_yaw_ = 0.0;
+  double min_range_ = 1.5;
+  double max_range_ = 60.0;
+  double min_z_ = -0.8;
+  double max_z_ = 2.5;
+  double ring_margin_ = 3.0;
+  double nonground_min_intensity_ = 90.0;
+  double raw_ground_percentile_ = 20.0;
+  double raw_ground_clearance_ = 0.25;
+  double voxel_size_ = 0.2;
+  double cluster_tolerance_ = 0.8;
+  int cluster_min_points_ = 5;
+  int cluster_max_points_ = 1500;
+  double min_length_ = 0.4;
+  double max_length_ = 8.0;
+  double min_width_ = 0.15;
+  double max_width_ = 6.0;
+  double min_height_ = 0.2;
+  double max_height_ = 4.0;
+  VehicleShapeFilterConfig shape_filter_config_;
+  // 고정 구조물(중앙분리대 등) 제외 원. map 프레임 기준.
+  struct ExclusionZone {
+    double x = 0.0;
+    double y = 0.0;
+    double radius = 0.0;
+  };
+  std::vector<ExclusionZone> exclusion_zones_;
+};
+
+}  // namespace roundabout_lidar_tracker
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "roundabout_lidar_tracker");
+  roundabout_lidar_tracker::RoundaboutLidarTrackerNode node;
+  ros::AsyncSpinner spinner(2);
+  spinner.start();
+  ros::waitForShutdown();
+  return 0;
+}

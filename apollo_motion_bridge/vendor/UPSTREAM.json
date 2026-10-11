@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ApolloAuto/apollo",
+  "commit": "d53aa3da47a06a08e6d0cd175d5623a34fa0d6aa",
+  "sha256": {
+    "modules/perception/lidar_tracking/tracker/measurement/measurement_collection.cc": "46914c2405842f258245e1d9eeeb430736eaae79e6b1b81ea9b0e644489ebd18",
+    "modules/perception/lidar_tracking/tracker/measurement/measurement_collection.h": "04f79a9cc34609e2ffa2cc0319f19c6b40ca5b5090d92b0fe909e37186832d2b",
+    "LICENSE": "bfeea761e813af3e836f7be407ac39b98a742d419879059bcaea15b56d9a2e90"
+  }
+}

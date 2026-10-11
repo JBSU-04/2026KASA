@@ -1,0 +1,8 @@
+prefix=/home/kuuve/catkin_ws/src/new_lane/build/devel
+
+Name: new_lane
+Description: Description of new_lane
+Version: 0.0.0
+Cflags: -I/home/kuuve/catkin_ws/src/new_lane/build/devel/include -I/home/kuuve/catkin_ws/src/new_lane/include
+Libs: -L${prefix}/lib 
+Requires: roscpp rospy std_msgs waypoint_maker message_runtime

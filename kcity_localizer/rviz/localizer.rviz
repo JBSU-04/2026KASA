@@ -1,0 +1,76 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+Visualization Manager:
+  Global Options:
+    Fixed Frame: map
+    Frame Rate: 30
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 10
+      Plane Cell Count: 100
+    - Class: rviz/MarkerArray
+      Name: MGeoMap
+      Enabled: true
+      Marker Topic: /localization/map_markers
+    - Class: rviz/PointCloud2
+      Name: MergedLidar
+      Enabled: true
+      Topic: /merged_lidar
+      Queue Size: 3
+      Size (m): 0.08
+      Style: Flat Squares
+      Color Transformer: AxisColor
+      Position Transformer: XYZ
+      Selectable: true
+      Use Fixed Frame: true
+    - Class: rviz/PointCloud2
+      Name: NoGroundCloud
+      Enabled: true
+      Topic: /no_ground_cloud
+      Queue Size: 3
+      Size (m): 0.1
+      Style: Flat Squares
+      Color Transformer: FlatColor
+      Color: 255; 80; 80
+      Position Transformer: XYZ
+      Selectable: true
+      Use Fixed Frame: true
+    - Class: rviz/MarkerArray
+      Name: TTCTracks
+      Enabled: true
+      Marker Topic: /tracked_objects_markers
+    - Class: rviz/Image
+      Name: YoloFusion
+      Enabled: true
+      Image Topic: /fusion/yolo_validated
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Normalize Range: true
+    - Class: rviz/Marker
+      Name: Ego
+      Enabled: true
+      Marker Topic: /localization/ego_marker
+    - Class: rviz/Pose
+      Name: CurrentPose
+      Enabled: true
+      Topic: /localization/current_pose
+      Shape: Arrow
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Name: Current View
+      Distance: 400
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0

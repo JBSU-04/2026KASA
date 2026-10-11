@@ -1,0 +1,49 @@
+최종 목표
+: Multimodal SMPC를 저수준 차량 제어기로 사용하는 것이 아닌 주변 차량의 주행, 행동 불확실성을 고려하여 EV와 TV의 차선 변경 가능성을 예측하고 차선변경을 가능하게 만들기 위한 EV 종방향 제어(가속, 감소, 양보, 대기)를 결정하는 stochastic behavior planner(높은 수준의 행동 결정기) 구현
+
+
+  
+ ~ 8.20
+ 
+ 구현
+ 
+ Horizon 위험도 
+ : dt * N  만큼의 horizon 의 각 step 에서 mode 확률 가중 위험을 계산 
+ 
+ max risk 
+ 기존 : 각 mode 의 horizon 에서의 max risk 값을 모든 step 에서 사용 
+ 개선 : 모든 risk_by_step 각 step 에서 검사 /  clearance, 전후방 gap, TTC 추가 검사 
+ 
+ 행동 후보
+ : 바로 변경, 대기(유지) 후 변경, 양보(감속) 후 변경
+ 행동 우선순위
+ : 즉시 변경 -> 속도 유지 -> 감속 -> 가속(아직 비활성화)
+ 
+ t_LC
+ 부분 구현 : {0.4, 0.8, 1.2, 1.6, 2.0}s 후의 미래 후보를 매 20Hz 재평가
+ 
+ ACC 연동
+ :SMPC 는 감속 트리거 전달, ACC에서 최종 속도 발행 
+ 
+ TV 예측(초급)
+ front의 경우에는 nominal/brake , rear의 경우에는 nominal/accelerate heuristic
+ -> 처음 초기값은 파라미터 설정, 이후 차량의 frenet 좌표,상대속도, gap, TTC를 활용하여 accel, brake의 확률 계산 
+ 
+ cavariance(불확실성)
+ : 시간이 증가할수로 scalar sigma 를 사용, mode 별 계산하지 않음
+ 
+ lateral(사용 안하는중)
+ : TV가 차선 변경을 하지 않을 것을 가정
+ 
+ 
+ 8.21
+ 기존 : 정지에서는 무조건 change number, 8초 timeout
+ 개선 : 경로의 끝점에 도달한 상황과 같이 차량이 정지, 저속했을때 target lane의 LC 안전 판단을 한다 -> 안전하다고 판단되면 target lane을 변경
+ + 저속에서 차량이 급하게 꺾이는 것을 방지하기 위해 연속 곡선 생성 
+ 
+ 기존 : SMPC 에서 차량 중심 4초 예측 blend 생성
+ 개선 : waypoint system에서 사용하는 4초 차선 보간 경로 사용, 저속에서는 생성한 연속 곡선을 EV의 trajectory 사용
+ + waypoint system 도 수정
+ 
+ 8.24
+ 속도 twist.x -> compertitoin topic 변경

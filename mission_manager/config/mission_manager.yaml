@@ -1,0 +1,13 @@
+input_topics:
+  - /mission/constraints/roundabout
+  # mission_command_adapter 가 음영구간 미션을 변환해 넣는다.
+  # 해당 미션 노드를 안 띄우면 adapter 가 active=false 로만 발행하므로
+  # fail_closed 가 걸리지 않는다.
+  - /mission/constraints/static_obstacle
+  - /mission/constraints/dynamic_obstacle
+  - /mission/constraints/traffic_light
+  - /mission/constraints/obstacle_stop
+output_topic: /mission/behavior_constraint
+update_rate_hz: 20.0
+input_timeout: 0.5
+fail_closed_after_active: true

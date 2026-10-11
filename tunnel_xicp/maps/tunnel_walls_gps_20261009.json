@@ -1,0 +1,51 @@
+{
+  "format_version": 1,
+  "frame": "map",
+  "source_frame": "velodyne_ground",
+  "origin": [
+    302665.26383715635,
+    4123727.0398684195,
+    0.0
+  ],
+  "road_heading_rad": -2.65010793622819,
+  "sensor_offset": [
+    1.1,
+    0.0,
+    1.33
+  ],
+  "voxel_m": 0.2,
+  "wall_height_sensor_m": [
+    0.0,
+    1.5
+  ],
+  "wall_normal_max_abs_z": 0.3,
+  "points": 11163,
+  "pcd_sha256": "b4b37391da69bad844574a31453a194313dbddb668f96e103a49a300fb3564d4",
+  "bounds_local": [
+    [
+      -162.71990966796875,
+      -138.8646697998047,
+      1.3322198390960693
+    ],
+    [
+      -18.189598083496094,
+      -39.91969299316406,
+      2.828120708465576
+    ]
+  ],
+  "limitations": "GPS NORMAL user-confirmed empty drives; 3 distinct scan support, observed cross-drive conflicts excluded. Unsampled space UNKNOWN. No primary localization replacement.",
+  "empty_drives": [
+    [
+      "bags/competition_2026-10-09-19-05-14.bag",
+      "bags/competition_heavy_2026-10-09-19-05-13.bag"
+    ],
+    [
+      "bags/competition_2026-10-09-19-06-02.bag",
+      "bags/competition_heavy_2026-10-09-19-06-01.bag"
+    ]
+  ],
+  "gps_required": "normal",
+  "source_map": "src/new_lane/config/tunnel_static_gps_20261009.npz",
+  "version": "gps_empty_20261009",
+  "support_patch_m": 0.2
+}

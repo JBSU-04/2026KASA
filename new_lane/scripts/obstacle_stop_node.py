@@ -1,0 +1,2532 @@
+#!/usr/bin/env python3
+"""
+동적 장애물 정지 중재 노드
+
+MPC(/ctrl_cmd_raw)가 낸 명령을 그대로 흘려보내다가, 정지판단구역(전방 거리 +
+좌우 폭) 안에 dynamic 장애물이 있으면 그 명령을 정지 명령으로 덮어써서
+최종 /ctrl_cmd로 발행한다.
+
+장애물 위치는 obstacle_perception_node가 이미 계산해서 /obstacle_info에
+실어주는 position_ego(현재 ego 기준 상대좌표, 전방=x, 좌측=y)를 그대로 쓴다.
+"""
+
+import json
+import os
+import threading
+from contextlib import nullcontext
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from tunnel_occupancy_geometry import swept_owned_cells,body_cells_risk
+from obstacle_geometry import footprint, body_overlap, overlap, rectangle
+from apollo_motion_bridge.risk import swept_conflict
+import math
+import numpy as np
+
+import rospy
+from std_msgs.msg import String, Bool, ColorRGBA, Float64, Float64MultiArray, UInt8
+from nav_msgs.msg import Odometry, Path
+from visualization_msgs.msg import Marker, MarkerArray
+from morai_msgs.msg import CtrlCmd
+from waypoint_maker.msg import Lane
+
+try:
+    from aeb_safety.msg import AebCommand
+except ImportError:
+    AebCommand = None
+
+
+class ObstacleStopNode:
+    def __init__(self):
+        rospy.init_node('obstacle_stop_node')
+
+        # 전부 launch 파라미터로 뺌
+        self.stop_zone_min_forward = rospy.get_param('~stop_zone_min_forward', 0.0)   # 이 거리(m) 이상
+        self.stop_zone_max_forward = rospy.get_param('~stop_zone_max_forward', 18.0)  # 이 거리(m) 이하만 위험구역
+        self.stop_zone_width = rospy.get_param('~stop_zone_width', 4.5)               # 좌우 폭(m), 중심선 기준 +-width/2
+        self.stop_zone_max_z = rospy.get_param('~stop_zone_max_z', 2.0)               # Z축 상한 (차량 높이 이상 배제)
+        self.stop_brake = rospy.get_param('~stop_brake', 1.0)                         # 정지 시 brake 값(0~1)
+        self.require_confirmed = rospy.get_param('~require_confirmed', False)
+        self.obstacle_timeout = rospy.get_param('~obstacle_timeout', 1.0)             # 이 시간 이상 /obstacle_info 안 오면 정지 판단 보류
+
+        # 트래킹/확정 노이즈로 장애물이 한두 프레임 빠졌다 잡혔다 하는데, near를
+        # 그 즉시 반영하면 정지가 걸렸다 풀렸다 반복해서 실제로는 못 멈춤.
+        # 한번 켜지면 이 시간(s) 동안은 새 obstacle_info가 안 들어와도 정지 유지.
+        self.predictive_risk = rospy.get_param('/motion_tracking/dynamic_risk', {})
+        self.common_scene_enabled=bool(rospy.get_param("/tunnel_recovery/common_scene_enabled",True))
+        self.motion_fresh_sec = float(rospy.get_param('~motion_fresh_sec', 1.0))
+        self.stop_hold_sec = rospy.get_param('~stop_hold_sec', 1.2)
+
+        # 정적 장애물 회피(obstacle_avoidance_node)와 동일한 코리도 판정 방식:
+        # 기준 경로(waypoint)로부터의 수직 거리(dist_to_path) 및 물체 외형 반폭(half_extent)을
+        # 계산하여 물체 가장자리가 path_corridor_radius 이내일 때(또는 in_trigger_corridor) 정지 대상 판정.
+        self.use_path_corridor = rospy.get_param('~use_path_corridor', True)
+        self.path_corridor_radius = float(rospy.get_param('~path_corridor_radius', rospy.get_param('~stop_corridor_radius', 1.5)))
+        self.collision_corridor_radius = float(rospy.get_param('~collision_corridor_radius', 4.0))
+        self.stop_corridor_radius = self.path_corridor_radius  # 하위 호환성 유지
+        # 터널 기준경로 및 차체 근접 보호 폭. 실제 주행경로 판정과는 분리한다.
+        self.tunnel_path_corridor_radius = float(rospy.get_param(
+            '~tunnel_path_corridor_radius', self.path_corridor_radius))
+        self.tunnel_avoidance_corridor_radius = self._load_avoidance_corridor_radius()
+        self.ego_speed = 0.0
+        self.path_x = []
+        self.path_y = []
+
+        # CSV 웨이포인트 idx 기준: 0~이 값은 정적 미션 구간, 이후는 동적 미션
+        # 구간으로 코스가 고정되어 있음(대회 설계).
+        #  - 정적 구간(idx <= split): 여기 나오는 장애물은 전부 정적이 보장되므로
+        #    이 노드는 절대 정지시키지 않는다(회피는 obstacle_avoidance_node가 전담).
+        #  - 동적 구간(idx > split): 동적으로 확인된 물체만 판단한다. 경로 안은
+        #    즉시 정지하고, 경로 밖은 속도 벡터의 시간 충돌까지 확인한다.
+        self.static_dynamic_split_idx = rospy.get_param('~static_dynamic_split_idx', 1430)
+        # 동적 미션 구간의 끝. 원본 코스는 split 뒤가 곧 코스 끝이라 상한이
+        # 필요 없었지만, 전체 랩에서는 split 이후로 중앙분리대와 회전교차로가
+        # 이어진다. 상한이 없으면 그 구조물에도 즉시정지가 걸린다.
+        # 음수면 상한 없음 == 원본과 동일한 거동.
+        self.dynamic_zone_max_idx = rospy.get_param('~dynamic_zone_max_idx', -1)
+        # 자차 기준점에서 차체 앞범퍼까지(m). 이 거리를 뺀 만큼만 달려간다.
+        self.ttc_ego_front_m = rospy.get_param('~ttc_ego_front_m', 2.0)
+        # Once an ID has reliable motion evidence, keep its dynamic identity
+        # briefly through a sparse/occluded scan. This is classification memory,
+        # separate from the final stop-hold timer.
+        self.dynamic_memory_sec = float(rospy.get_param(
+            '~dynamic_memory_sec', 2.0))
+        # VLP-16에서 터널 벽의 세로 모서리가 차량 크기 박스로 끊겨 잡히면
+        # ego-motion 잔차 때문에 dynamic으로 승격될 수 있다. 사람/동물/차량은
+        # 살리고, 높고 길며 폭이 얇은 수직 벽 조각만 M8에서 제거한다.
+        self.tunnel_wall_min_vertical_thickness = float(rospy.get_param(
+            '~tunnel_wall_min_vertical_thickness', 2.0))
+        self.tunnel_wall_min_top_elevation = float(rospy.get_param(
+            '~tunnel_wall_min_top_elevation', 2.2))
+        self.tunnel_wall_min_length = float(rospy.get_param(
+            '~tunnel_wall_min_length', 1.5))
+        self.tunnel_wall_max_width = float(rospy.get_param(
+            '~tunnel_wall_max_width', 1.0))
+        # ★ 접근 즉시정지(2026-09-25). 대향차선 쪽(좌측)에서 우리 경로 쪽으로
+        #   다가오는 동적 물체는 TTC/스윕 시간겹침 예측 없이 바로 정지한다.
+        #   움직임 확인(동적 판정·유효 속도·연속 2회 증거)은 그대로 요구한다 -
+        #   정지물 박스가 한 번 튀는 2~6 m/s 가짜 횡이동을 거르는 장치다.
+        #   터널(M8)은 대향 차량이 많아 기본 제외(approach_in_tunnel).
+        self.approach_stop_enabled = bool(rospy.get_param('~approach_stop_enabled', True))
+        self.approach_min_lateral_speed = float(rospy.get_param('~approach_min_lateral_speed', 0.8))
+        self.approach_max_lateral = float(rospy.get_param('~approach_max_lateral', 8.0))
+        self.approach_sides = str(rospy.get_param('~approach_sides', 'left'))
+        self.approach_in_tunnel = bool(rospy.get_param('~approach_in_tunnel', False))
+        # 음영구간(M8) 랜덤 정적/동적 장애물 (2026-09-26).
+        #   M3 규칙(경로 안이면 무조건 정지)을 그대로 쓰면 정적 장애물 앞에서 멈춰
+        #   회피 노드의 회피 경로를 못 탄다(17:09 백: 회피 +1.3 m 계획 중 AEB 1.0).
+        #   경로 안 물체를: 동적(또는 최근 동적) -> 정지 / 정지 확인된 정적 -> 회피에
+        #   맡김(M2) / 미확정 -> 가까우면 정지해 판별 대기, 멀면 통과(감속은 kick).
+        self.tunnel_static_avoid_enabled = bool(rospy.get_param('~tunnel_static_avoid_enabled', True))
+        self.tunnel_static_confirm_sec = float(rospy.get_param('~tunnel_static_confirm_sec', 0.8))
+        self.tunnel_unknown_stop_distance = float(rospy.get_param('~tunnel_unknown_stop_distance_m', 10.0))
+        self.tunnel_dynamic_restatic_sec = float(rospy.get_param('~tunnel_dynamic_restatic_sec', 3.0))
+        # ★ 2026-09-29 (19:23 백) 터널 미확정 정지 보완.
+        #   (1) 원거리 정적 확정 이어받기: far 검출(raw_temporal_far, 세계좌표 누적이라
+        #       본래 정적)이 확정한 자리(tunnel_far_static_match_m 안)에 생긴 근거리
+        #       '미확정' 트랙은 정적으로 본다. 낮은 장애물(윗면 0.33 m)은 /nonground 가
+        #       10 m 밖에서 지면으로 지워 근거리 트랙이 9 m 에서야 생겼고, 미확정이라
+        #       10 m 정지 규칙에 걸려 3.7 m 앞 급정지했다(far 는 16.7 m 에서 확정).
+        #   (2) 관측 끊긴 트랙 제외: observation_age > tunnel_stale_track_sec 이고 동적
+        #       확정 이력이 없으면 정지 근거로 쓰지 않는다(플래너 회피가 맡음).
+        #       - 낮은 장애물은 5 m 안(라이다 사각)에서 안 보여 정지 확정을 못 해 정지 유지.
+        #       - 건너간 동적 물체의 유령 조각(id42, 마지막 속도 3.59 고정)이 차로 중앙에
+        #         남아 3.5 s 이상 정지(백 끝까지).
+        self.tunnel_far_static_inherit = bool(rospy.get_param('~tunnel_far_static_inherit', True))
+        self.tunnel_far_static_match_m = float(rospy.get_param('~tunnel_far_static_match_m', 1.8))
+        self.tunnel_far_static_memory_sec = float(rospy.get_param('~tunnel_far_static_memory_sec', 6.0))
+        self.tunnel_stale_track_sec = float(rospy.get_param('~tunnel_stale_track_sec', 1.0))
+        self._tunnel_far_static = []   # [(wx, wy, stamp)]
+        # ★ 2026-09-30 (17:53 백) 정적 장애물의 동적 오판 방지.
+        #   원거리 검출이 정적으로 확정한 자리(tunnel_far_static_match_m 안)의 물체는
+        #   트래커가 dynamic 이라 해도, 실제 위치가 tunnel_far_static_move_m 이상 움직여야
+        #   동적으로 본다. 17:53 백: 2번째 정적 장애물(좌측 +1.3~2.4 m)을 5 m 옆에서
+        #   지날 때 클러스터가 흔들려 dyn -> 회피 실패 + 동적 정지로 4 s 멈췄다.
+        self.tunnel_far_static_move_m = float(rospy.get_param('~tunnel_far_static_move_m', 1.0))
+        # ★ 2026-09-30 터널 동적 판정 히스테리시스.
+        #   진입: 속도 >= tunnel_dyn_on_speed 가 tunnel_dyn_on_hits 연속(새 관측 기준)
+        #   해제: 속도 < tunnel_dyn_off_speed (또는 관측 끊김) 가 tunnel_dyn_off_sec 지속
+        #   그 사이(0.5~1.0 m/s)는 직전 상태 유지. 멈춘 물체의 박스 흔들림(0.8~0.9 m/s
+        #   한두 프레임)이 동적 판정을 되살려 정적 전환 타이머를 리셋하지 않게 한다.
+        self.tunnel_dyn_on_speed = float(rospy.get_param('~tunnel_dyn_on_speed', 1.0))
+        self.tunnel_dyn_off_speed = float(rospy.get_param('~tunnel_dyn_off_speed', 0.5))
+        self.tunnel_dyn_off_sec = float(rospy.get_param('~tunnel_dyn_off_sec', 0.5))
+        self.tunnel_dyn_on_hits = int(rospy.get_param('~tunnel_dyn_on_hits', 2))
+        self._dyn_hyst = {}            # id -> {'on', 'hits', 'low_since'}
+        # ★ 2026-09-30 (19:19 백) 월드 이동량 보강.
+        #   빠른 진입: tunnel_dyn_fast_window 안에 tunnel_dyn_fast_move_m 이상 일관되게 이동하면
+        #   2회 조건 없이 즉시 동적(19:19: 좌측에서 5.6 m/s 로 가로지른 물체를 속도 플래그가
+        #   켜졌다 꺼졌다 해 0.5 s 늦게 잡고 충돌).
+        #   정적 게이트: 최근 tunnel_dyn_gate_span 초 월드 평균 속도가
+        #   tunnel_dyn_min_world_speed 미만이면 트래커 속도와 무관하게 동적 진입 금지
+        #   (19:19: 옆으로 지나던 정적 장애물이 0.1~0.3 m 흔들리며 1.1~1.4 m/s 로 찍혀 정지).
+        #   동적 상태에서 월드 평균 속도가 tunnel_dyn_off_speed 미만이면 해제 쪽으로 센다.
+        self.tunnel_dyn_fast_window = float(rospy.get_param('~tunnel_dyn_fast_window', 0.45))
+        self.tunnel_dyn_fast_move_m = float(rospy.get_param('~tunnel_dyn_fast_move_m', 1.0))
+        self.tunnel_dyn_fast_lat_m = float(rospy.get_param('~tunnel_dyn_fast_lat_m', 0.8))
+        self.tunnel_far_dyn_confirm_sec = float(rospy.get_param('~tunnel_far_dyn_confirm_sec', 0.5))
+        # ★ 2026-09-30 (20:07 백) 배경맵 움직임(/tunnel/bg_moving, 원본 점군) 정지.
+        #   저상 동적 장애물은 트래커(/nonground)가 9~10 m 에서야 봤지만 배경맵은 17~19 m 부터
+        #   보고 움직이기 시작한 순간(12~13 m)을 잡는다. 코리도 안이면 즉시 정지, 밖이면
+        #   경로 쪽으로 tunnel_bg_moving_min_toward 이상 다가올 때 정지(느린 물체 포함).
+        #   근처(tunnel_bg_moving_match_m) 트래커 물체는 바로 동적으로 올린다.
+        self.tunnel_bg_moving_enabled = bool(rospy.get_param('~tunnel_bg_moving_enabled', True))
+        self.tunnel_bg_moving_timeout = float(rospy.get_param('~tunnel_bg_moving_timeout', 0.3))
+        self.tunnel_bg_moving_min_toward = float(rospy.get_param('~tunnel_bg_moving_min_toward', 0.3))
+        self.tunnel_bg_moving_half_width = float(rospy.get_param('~tunnel_bg_moving_half_width', 0.3))
+        self.tunnel_bg_moving_match_m = float(rospy.get_param('~tunnel_bg_moving_match_m', 1.5))
+        self.tunnel_bg_static_validation_enabled = bool(rospy.get_param(
+            '~tunnel_bg_static_validation_enabled', True))
+        self.tunnel_bg_static_fresh_sec = float(rospy.get_param(
+            '~tunnel_bg_static_fresh_sec', 0.3))
+        self._bg_validation_objects = []
+        self._bg_moving = []
+        self._bg_moving_t = -1.0e9
+        # ★ 2026-10-01 M3(동적 장애물 구간) 정적 전환: 동적이었던 물체가 경로 위에서
+        #   m3_restatic_sec 동안 월드 평균 속도 m3_still_speed 미만이면 static_ids 로 넘겨
+        #   플래너가 회피한다(공간이 모자라면 reverse_escape_node 가 후진).
+        self.m3_static_handoff_enabled = bool(rospy.get_param('~m3_static_handoff_enabled', True))
+        self.m3_restatic_sec = float(rospy.get_param('~m3_restatic_sec', 2.0))
+        self.m3_still_speed = float(rospy.get_param('~m3_still_speed', 0.3))
+        self._m3_still_since = {}
+        # 동적이었다가 바로 앞에서 멈춘 물체를 정적으로 넘긴 직후에는 플래너가
+        # 부족한 종방향 거리에서 회피를 실행하지 못하게 제동을 유지한다. 후진
+        # 명령은 최우선 경로로 이 제동을 선점하고, 물러나 gap이 커지면 자동 해제된다.
+        self.tunnel_swept_guard_enabled = bool(rospy.get_param('~tunnel_swept_guard_enabled', True)) and bool(rospy.get_param('/tunnel_recovery/enabled', True))
+        self.handoff_guard_enabled = bool(rospy.get_param(
+            '~handoff_guard_enabled', True))
+        self.handoff_guard_front_overhang = float(rospy.get_param(
+            '~handoff_guard_front_overhang_m', 3.85))
+        self.handoff_guard_trigger_gap = float(rospy.get_param(
+            '~handoff_guard_trigger_gap_m', 5.0))
+        self.handoff_guard_min_gap = float(rospy.get_param(
+            '~handoff_guard_min_gap_m', -3.0))
+        self.handoff_guard_hold_sec = float(rospy.get_param(
+            '~handoff_guard_hold_sec', 1.0))
+        # 인계 제동은 '자차가 실제로 따라가는 경로(/local_path, 회피 중이면 회피 경로)
+        # 위, 앞범퍼에서 경로를 따라 trigger_gap 안'에 그 물체가 있을 때만 건다.
+        # 예전에는 자차 정면 x 거리만 봐서, 후진 뒤 회피 경로로 옆을 지나가는 중에도
+        # 다시 걸려 섰다(2026-10-01 20:41 백: 물체가 경로에서 2.0 m 옆인데 정지).
+        # M8 실제 경로 폭은 tunnel_avoidance_corridor_radius를 사용한다.
+        self.handoff_guard_path_timeout = float(rospy.get_param(
+            '~handoff_guard_path_timeout_sec', 0.5))
+        self.local_path_xy = None
+        self.local_path_s = None
+        self.local_path_time = -1e9
+        self.ego_xy = None
+        self.handoff_guard_until = None
+        self.handoff_guard_ids = set()
+        self.tunnel_dyn_gate_span = float(rospy.get_param('~tunnel_dyn_gate_span', 0.5))
+        self.tunnel_dyn_min_world_speed = float(rospy.get_param('~tunnel_dyn_min_world_speed', 0.6))
+        # 터널 접근 즉시정지 / 예측 범위
+        self.tunnel_approach_sides = str(rospy.get_param('~tunnel_approach_sides', 'both'))
+        self.tunnel_approach_max_lateral = float(rospy.get_param('~tunnel_approach_max_lateral', 6.0))
+        # 경로 방향 속도가 이보다 큰 물체(대향/같은 방향 차량)는 접근 정지에서 뺀다 [m/s]
+        self.tunnel_approach_max_long_speed = float(rospy.get_param('~tunnel_approach_max_long_speed', 2.0))
+        self.tunnel_predict_lat_min = float(rospy.get_param('~tunnel_predict_lat_min', -4.0))
+        # 코리도 밖 접근/예측 판정에만 쓰는 터널 전방 범위(코리도 안 즉시정지는 stop_zone_max_forward)
+        self.tunnel_predict_max_forward = float(rospy.get_param('~tunnel_predict_max_forward', 25.0))
+        # 터널 코리도 안 즉시정지 전방 범위(도심은 stop_zone_max_forward). 2026-09-30: 인식하면 바로
+        # 반응하도록 25 m (launch). 미확정 물체 정지는 tunnel_unknown_stop_distance 그대로.
+        self.tunnel_stop_max_forward = float(rospy.get_param('~tunnel_stop_max_forward', 25.0))
+        self.tunnel_predict_lat_max = float(rospy.get_param('~tunnel_predict_lat_max', 5.5))
+        self._pos_hist = {}            # id -> [(t, wx, wy)]
+        # ★ 2026-10-05 M3(0.csv 동적 장애물 구간) 정지 판정.
+        #   2차 코리도(즉시정지)를 m3_path_corridor_radius 로 좁히고(1차 수집 코리도는 그대로),
+        #   그 밖에서는 '기준경로 쪽으로 다가오는' 동적만 정지한다. 정적 물체가 동적으로 오판된
+        #   흔들림(14:52 백: 중앙분리봉이 클러스터 병합으로 경로 방향 2~3.6 m/s)을 막기 위해
+        #   세계좌표 이동 속도 하한 + 경로 쪽 법선과의 각 제한 + 연속 측정 + 도달 시간을 본다.
+        self.m3_path_corridor_radius = float(rospy.get_param('~m3_path_corridor_radius', 1.4))
+        self.m3_approach_gate_enabled = bool(rospy.get_param('~m3_approach_gate_enabled', True))
+        self.m3_approach_min_speed = float(rospy.get_param('~m3_approach_min_speed', 0.8))
+        self.m3_approach_max_angle_deg = float(rospy.get_param('~m3_approach_max_angle_deg', 50.0))
+        self.m3_approach_hits = int(rospy.get_param('~m3_approach_hits', 2))
+        self.m3_approach_horizon_s = float(rospy.get_param('~m3_approach_horizon_s', 4.0))
+        self.m3_approach_lookback_s = float(rospy.get_param('~m3_approach_lookback_s', 0.5))
+        self.m3_approach_untracked_speed = float(rospy.get_param('~m3_approach_untracked_speed', 1.2))
+        # 2026-10-06(13:05:27/13:06:03 백): 길가에 서 있다가 차가 6~10 m 앞에 왔을 때 출발하는 횡단 물체.
+        #   0.5 s 이동 창에 정지 구간이 섞여 출발 속도를 낮게 재(far_4.8s), 2회 확인까지 0.28 s 늦었다.
+        #   가까운 물체(앞범퍼 m3_approach_near_m 안)는 짧은 창 + 1회 확인으로 판정한다.
+        self.m3_approach_min_dt = float(rospy.get_param('~m3_approach_min_dt', 0.3))
+        self.m3_approach_near_m = float(rospy.get_param('~m3_approach_near_m', 15.0))
+        self.m3_approach_hits_near = int(rospy.get_param('~m3_approach_hits_near', 1))
+        # 2026-10-06(16:27:55 백): 짧은 창 + 1회 확인으로 정지 물체 위치 떨림(0.2~0.3 m)이 '1.2 m/s 접근'이 돼
+        #   5 번 오정지. 창 안에서 경로 쪽으로 실제 이동한 거리 >= min_disp 를 요구하고(짧은 창이 모자라면
+        #   long 창까지 늘려 본다), 1회 확인은 near_disp 이상 확실히 움직였고 트래커가 '정지'라 하지 않을 때만.
+        self.m3_approach_min_disp = float(rospy.get_param('~m3_approach_min_disp_m', 0.45))
+        self.m3_approach_long_s = float(rospy.get_param('~m3_approach_long_s', 0.5))
+        self.m3_approach_near_disp = float(rospy.get_param('~m3_approach_near_disp_m', 0.6))
+        self.m3_tracker_still_speed = float(rospy.get_param('~m3_tracker_still_speed', 0.4))
+        # 2026-10-06(16:41:24 백 36.48 s, id170): 서 있던 물체 트랙이 0.28 s 동안 1.5 m 튀었다 돌아온 것을 접근으로 판정.
+        #   한 스텝 속도 > jump_speed 또는 창 안에서 경로 반대쪽으로 reversal_m 이상 갔다 돌아온 이력이 있으면 '튐'.
+        #   튐인데 마지막 스텝이 더 다가오지 않으면 무시, 계속 다가오면 2회 확인(즉시 1회 판정 금지).
+        self.m3_jump_speed = float(rospy.get_param('~m3_jump_speed', 6.0))
+        self.m3_reversal_m = float(rospy.get_param('~m3_reversal_m', 0.5))
+        # ★ 2026-10-06 동적 구간 위험 기반 속도. 카메라 선감속(구간 내내 6.5 m/s) 대신, 길가에 서 있는 '출발 가능한'
+        #   물체마다 "지금 m3_pass_assumed_speed 로 출발해도 멈출 수 있거나 먼저 지나갈 수 있는" 최대 속도를 구하고
+        #   (감속 m3_risk_decel 여유 포함) 가장 낮은 값을 /obstacle_stop/m3_risk_speed_mps 로 낸다.
+        #   배경맵(m3_bgmap_cells: [idx_lo, idx_hi, lat_lo, lat_hi])과 줄지어 선 중앙 분리 물체는 후보에서 뺀다
+        #   (충돌/정지 판단에는 영향 없음, '미리 감속'에만 적용).
+        # 2026-10-06: 멈춰 있던 물체(직전 m3_onset_still_n 측정이 m3_onset_still_m 안)가 한 측정에서 경로 쪽으로
+        #   m3_onset_step_m 이상 움직이면(튐 아님) 첫 이동 측정에서 바로 판정한다(이전엔 두 번째 이동 측정, 0.1 s 늦음).
+        #   횡단 물체는 출발 직전까지 0.1 m 안에서 고정, 노이즈 물체는 평소에도 흔들리거나 튄다.
+        self.m3_onset_enabled = bool(rospy.get_param('~m3_onset_enabled', False))   # 재생: 이득 ≤0.07 s, 오정지 5 건 증가 - 기본 끔
+        self.m3_onset_step = float(rospy.get_param('~m3_onset_step_m', 0.25))
+        self.m3_onset_still_m = float(rospy.get_param('~m3_onset_still_m', 0.08))
+        self.m3_onset_still_n = int(rospy.get_param('~m3_onset_still_n', 3))
+        self.m3_risk_enabled = bool(rospy.get_param('~m3_risk_speed_enabled', False))   # 재생 결과 중앙값 4.5 m/s(더 느림) - 기본 끔
+        self.m3_risk_v_max = float(rospy.get_param('~m3_risk_v_max', 12.0))
+        self.m3_risk_v_min = float(rospy.get_param('~m3_risk_v_min', 4.5))
+        self.m3_risk_decel = float(rospy.get_param('~m3_risk_decel', 2.5))
+        self.m3_risk_react = float(rospy.get_param('~m3_risk_react_s', 0.6))
+        self.m3_risk_lookahead = float(rospy.get_param('~m3_risk_lookahead_m', 40.0))
+        self.m3_risk_lat_max = float(rospy.get_param('~m3_risk_lat_max_m', 8.5))
+        self.m3_divider_band = [float(v) for v in rospy.get_param('~m3_divider_band_m', [1.1, 2.2])]
+        self.m3_divider_neighbor_m = float(rospy.get_param('~m3_divider_neighbor_m', 12.0))
+        self.m3_bgmap_cells = [list(map(float, c)) for c in rospy.get_param('~m3_bgmap_cells', [])]
+        self.m3_risk_pub = rospy.Publisher('/obstacle_stop/m3_risk_speed_mps', Float64, queue_size=1)
+        self._m3_risk_last = None
+        # 정지/통과 비교: 정지 가능하면 정지, 못 멈추지만 차 꼬리가 물체보다 먼저(여유 m3_pass_margin_s)
+        #   지나가면 통과, 둘 다 아니면 정지. 13:05:27 은 정지 판단 때 앞범퍼가 이미 횡단선에 걸려 충돌했다.
+        self.m3_pass_through_enabled = bool(rospy.get_param('~m3_pass_through_enabled', True))
+        self.m3_reaction_s = float(rospy.get_param('~m3_reaction_s', 0.3))
+        self.m3_brake_decel = float(rospy.get_param('~m3_brake_decel', 5.0))
+        self.m3_pass_margin_s = float(rospy.get_param('~m3_pass_margin_s', 0.5))
+        self.m3_stop_margin_m = float(rospy.get_param('~m3_stop_margin_m', 1.0))
+        # 통과 판단의 물체 횡속도 하한. 출발 직후 0.25 s 창은 가속 중이라 1.4 m/s 로 낮게 잰다(13:06:03 id43 은
+        #   실제 3.4 m/s 로 1 s 만에 경로에 들어왔다). 측정값과 이 값 중 큰 값을 쓴다(보수적).
+        self.m3_pass_assumed_speed = float(rospy.get_param('~m3_pass_assumed_speed', 3.5))
+        self.m3_front_overhang = float(rospy.get_param('~m3_front_overhang_m', 3.85))
+        self.m3_rear_overhang = float(rospy.get_param('~m3_rear_overhang_m', 0.79))
+        self.m3_body_half_width = float(rospy.get_param('~m3_body_half_width_m', 1.25))
+        self._m3_approach_hits = {}    # id -> (연속 횟수, 마지막 측정 시각)
+        self._m3_world_vel = {}        # id -> 최근 세계좌표 이동 속도 (vx, vy)
+        # M2/M3 경계: 동적구간 판정을 물체가 놓인 기준경로 idx 로(자차 idx 가 split 을 넘어도
+        # 옆을 지나는 M2 정적 장애물로는 정지하지 않는다, 10-04 22:33 백).
+        self.zone_by_object_idx = bool(rospy.get_param('~zone_by_object_idx', True))
+        # 앞범퍼(base_link 기준 x) - 이보다 뒤에 있는 정적 물체는 M3 즉시정지 대상에서 뺀다.
+        self.m3_pass_beside_max_x = float(rospy.get_param('~m3_pass_beside_max_x', 3.85))
+        # ★ 동적/정적 중재(플래너와 공유): /obstacle_stop/dynamic_state (JSON)
+        #   hold       : 동적 물체 때문에 정지 중 - 플래너는 회피 경로를 새로 만들지 않는다
+        #   dynamic_ids: 지금 동적으로 보는 id - 플래너는 정적 회피 대상에서 뺀다
+        #   static_ids : 동적이었다가 경로 위에 tunnel_dynamic_restatic_sec 넘게 멈춘 id
+        #                - 플래너는 정적 장애물로 회피한다
+        self._ever_dyn = {}            # id -> 마지막 동적 시각
+        self._frame_dyn = set()
+        self._frame_static = set()
+        self._stop_by_dynamic = False
+        self._state_lock = threading.RLock()
+        self.coverage_pub = rospy.Publisher("/obstacle_stop/path_speed_limit_mps", Float64, queue_size=1)
+        self._bg_motion_history = {}
+        self._first_stop_reason = None
+        self.dyn_state_pub = rospy.Publisher('/obstacle_stop/dynamic_state', String, queue_size=1)
+        # ★ 배경맵 벽/턱 조각 id (tunnel_wall_detector 가 배경맵으로 판정)
+        self._bg_ids = set()
+        self._bg_ids_t = 0.0
+        # ★ 2026-09-29 (20:27 백) 터널 벽/턱 조각 제외(config/tunnel_wall_profile.yaml).
+        #   자차가 기울거나 벽 쪽으로 붙으면 벽 조각이 자차 기준 y -1.7~-2.4 로 들어와
+        #   위의 자차 기준 벽 ROI(y < -2.4)를 통과했다. 기준경로 idx 별 실측 경계와
+        #   물체의 실제 횡위치(추측항법 - 벽 보정)를 비교한다.
+        self.tunnel_wall_piece_filter = bool(rospy.get_param('~tunnel_wall_piece_filter_enabled', True))
+        self.tunnel_wall_piece_margin = float(rospy.get_param('~tunnel_wall_piece_margin', 0.3))
+        prof = rospy.get_param('~tunnel_wall_profile', [])
+        self.tunnel_wall_profile = [float(v) for v in prof] if len(prof) % 3 == 0 else []
+        self.tunnel_wall_offset = 0.0
+        self.tunnel_wall_offset_t = 0.0
+        self.tunnel_limits = None
+        self.tunnel_limits_t = 0.
+        self._fragment_links = {}
+        self.path_idx = []
+        self._tunnel_dynamic_seen = {}
+        self._dynamic_seen = {}
+        # A single VLP-16 box/track jump must not turn a fixed obstacle into a
+        # dynamic stop target.  Keep a short evidence counter per track; a
+        # confirmed tracker state can still react quickly, while provisional
+        # motion needs two consecutive observations.
+        self._dynamic_evidence_hits = {}
+        self._dynamic_evidence_last_seen = {}
+        self.current_waypoint_idx = None
+        self.tunnel_cells_authoritative_enabled=bool(rospy.get_param('~tunnel_cells_authoritative_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self.tunnel_motion_evidence_enabled=bool(rospy.get_param('~tunnel_motion_evidence_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self._body_sweep_cache={}
+        self.tunnel_swept_stop_enabled=bool(rospy.get_param("~tunnel_swept_stop_enabled",True)) and bool(rospy.get_param("/tunnel_recovery/enabled",True))
+        self.current_lane_number = 0
+        self.mission_mode = ''
+
+        self.dynamic_obstacle_near = False
+        import m8_geometry_native
+        m8_geometry_native.enabled=bool(rospy.get_param('/tunnel_recovery/native_geometry_enabled',True))
+        self.speed_input_valid=True;self.speed_input_stamp=-1e9
+        rospy.Subscriber('/localization/speed_valid',Bool,self.speed_valid_callback,queue_size=1)
+        self.avoidance_failed = False   # 회피 경로를 못 찾았을 때(/avoidance_failed) 비상정지
+        self.last_obstacle_info_time = None
+        self.stop_hold_until = None
+        self._m8_hold_owners = set()
+        self.m8_static_hold_release_enabled=bool(rospy.get_param('/tunnel_recovery/static_hold_release_enabled',True))
+
+        # 원본 제어 사슬에서는 이 노드가 MPC 명령을 받아 최종 /ctrl_cmd 를
+        # 발행한다. arbiter/adapter 구성에서는 출력 토픽만 우회한다.
+        ctrl_topic = rospy.get_param('~ctrl_cmd_topic', '/control/obstacle_stop_cmd')
+        self.ctrl_pub = rospy.Publisher(ctrl_topic, CtrlCmd, queue_size=1)
+        self.marker_pub = rospy.Publisher('/obstacle_stop/visualization', MarkerArray, queue_size=1)
+
+        # 기본(비중재) 제어 사슬의 후진 탈출 연결. reverse_escape_node가 보내는
+        # 명령과 기어가 둘 다 신선한 동안에만 최종 제어를 선점한다. 이렇게 해야
+        # avoidance_failed 정지가 후진 가속 명령을 다시 덮어쓰지 않는다.
+        # control_arbiter를 쓰는 구성에서는 launch에서 false로 꺼서 발행자가
+        # 겹치지 않게 한다.
+        self.reverse_direct_control = bool(rospy.get_param(
+            '~reverse_direct_control', True))
+        self.reverse_cmd_timeout = float(rospy.get_param(
+            '~reverse_cmd_timeout_sec', 0.3))
+        self.reverse_cmd = None
+        self.reverse_cmd_time = -1e9
+        self.reverse_gear = 4
+        self.reverse_gear_time = -1e9
+        if self.reverse_direct_control:
+            self.gear_pub = rospy.Publisher('/control/gear', UInt8, queue_size=1)
+            rospy.Subscriber('/control/reverse_cmd', CtrlCmd,
+                             self.reverse_cmd_callback, queue_size=1)
+            rospy.Subscriber('/control/reverse_gear', UInt8,
+                             self.reverse_gear_callback, queue_size=1)
+        else:
+            self.gear_pub = None
+
+        if AebCommand is not None:
+            self.aeb_pub = rospy.Publisher('/aeb/command', AebCommand, queue_size=1)
+        else:
+            self.aeb_pub = None
+
+        self.last_steering = 0.0
+
+        rospy.Subscriber('/final_waypoint', Lane, self.waypoint_callback, queue_size=1)
+        self.occupancy_cells=None;self.occupancy_cells_stamp=-1e9;self.occupancy_resolution=.1
+        if rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True):
+            from occupancy_avoidance.msg import TunnelScene
+            from tunnel_native_scene import scene_dict
+            rospy.Subscriber('/tunnel/perception_scene_native',TunnelScene,lambda m:self.occupancy_geometry_cb(scene_dict(m)),queue_size=1,buff_size=2**24,tcp_nodelay=True)
+        else:
+            rospy.Subscriber('/tunnel/perception_scene' if rospy.get_param('/tunnel_recovery/common_scene_enabled',True) else '/occupancy_avoidance/obstacles',String,self.occupancy_geometry_cb,queue_size=1)
+        rospy.Subscriber('/obstacle_info', String, self.obstacle_info_callback, queue_size=1)
+        raw_cmd_topic = rospy.get_param('~ctrl_cmd_raw_topic', '/ctrl_cmd_raw')
+        rospy.Subscriber(raw_cmd_topic, CtrlCmd, self.ctrl_cmd_callback, queue_size=1)
+        rospy.Subscriber('/avoidance_failed', Bool, self.avoidance_failed_callback, queue_size=1)
+        # TTC 판정에 자차 속도가 필요하다. 자차가 얼마나 빨리 그 지점에
+        # 도달하는지를 모르면 '시간이 겹치는가'를 계산할 수 없다.
+        rospy.Subscriber('/odom', Odometry, self.odom_callback, queue_size=1)
+        rospy.Subscriber('/local_path', Path, self.local_path_callback, queue_size=1)
+        rospy.Subscriber('/tunnel/wall_offset', Float64, self._wall_offset_cb, queue_size=1)
+        rospy.Subscriber('/tunnel/wall_limits', Float64MultiArray, self._wall_limits_cb, queue_size=1)
+        rospy.Subscriber('/tunnel/background_ids', String, self._bg_ids_cb, queue_size=1)
+        rospy.Subscriber('/tunnel/bg_moving', String, self._bg_moving_cb, queue_size=1)
+
+        # 20Hz 주기적 정지 감시 타이머: /ctrl_cmd_raw 가 안 들어오는 환경(use_stop_adapter, use_arbiter 등)에서도
+        # 동적 장애물 정지 요구를 즉시 발행할 수 있도록 보장
+        rospy.Timer(rospy.Duration(0.05), self.timer_callback)
+
+        rospy.loginfo(
+            "[obstacle_stop] started. zone=[%.1f, %.1f]m forward, width=%.1fm, "
+            "동적구간 idx %d~%s, 입력=%s -> 출력=%s, 직접 후진=%s",
+            self.stop_zone_min_forward, self.stop_zone_max_forward, self.stop_zone_width,
+            self.static_dynamic_split_idx,
+            self.dynamic_zone_max_idx if self.dynamic_zone_max_idx >= 0 else '끝',
+            '/ctrl_cmd_raw', ctrl_topic,
+            'ON' if self.reverse_direct_control else 'OFF')
+        rospy.spin()
+
+    def corridor_radius(self, tunnel=None):
+        """기준 코리도 폭. 음영구간이면 tunnel_path_corridor_radius."""
+        if tunnel is None:
+            tunnel = (self.mission_mode == 'tunnel' and self.current_lane_number == 3)
+        return self.tunnel_path_corridor_radius if tunnel else self.path_corridor_radius
+
+    def _load_avoidance_corridor_radius(self):
+        fallback = self.tunnel_path_corridor_radius
+        raw = rospy.get_param('~tunnel_avoidance_corridor_radius', fallback)
+        try:
+            radius = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            radius = float('nan')
+        if not math.isfinite(radius) or radius <= 0:
+            rospy.logwarn('[obstacle_stop] invalid tunnel_avoidance_corridor_radius=%r; '
+                          'using tunnel_path_corridor_radius=%.2f', raw, fallback)
+            return fallback
+        return radius
+
+    def _driven_corridor_radius(self, tunnel=None):
+        if tunnel is None:
+            tunnel = self.mission_mode == 'tunnel' and self.current_lane_number == 3
+        if tunnel:
+            return getattr(self, 'tunnel_avoidance_corridor_radius', self.tunnel_path_corridor_radius)
+        return self.path_corridor_radius
+
+    def odom_callback(self, msg):
+        with getattr(self, '_state_lock', nullcontext()):
+            self.ego_speed = float(msg.twist.twist.linear.x)
+            self.ego_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+            q = msg.pose.pose.orientation
+            self.ego_yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
+            self.ego_pose_time = msg.header.stamp.to_sec()
+
+    def local_path_callback(self, msg):
+        with getattr(self, '_state_lock', nullcontext()):
+            if msg.header.frame_id != 'map':
+                return
+            stamp = msg.header.stamp.to_sec()
+            if stamp <= 0 or not -.05 <= rospy.Time.now().to_sec()-stamp <= .5:
+                return
+            if len(msg.poses) < 2:
+                return
+            xy = np.array([[p.pose.position.x, p.pose.position.y] for p in msg.poses])
+            if not np.isfinite(xy).all():
+                return
+            seg = np.hypot(np.diff(xy[:, 0]), np.diff(xy[:, 1]))
+            self.local_path_xy = xy
+            self.local_path_s = np.concatenate([[0.0], np.cumsum(seg)])
+            self.local_path_time = stamp
+            self._path_snapshot = (xy, self.local_path_s, stamp)
+
+    def driven_path_edge(self, obs, now):
+        """None means unavailable, never a clearance claim; use line segments."""
+        snap=getattr(self,'_path_snapshot',None)
+        xy=snap[0] if snap else getattr(self,'local_path_xy',None)
+        pw = obs.get('position_world')
+        age = now-(snap[2] if snap else getattr(self,'local_path_time',-1e9))
+        if xy is None or len(xy) < 2 or not pw or len(pw) < 2 or not -.05 <= age <= .5:
+            return None
+        if getattr(self,'current_lane_number',-1)==3 and getattr(self,'mission_mode','')=='tunnel' and getattr(self,'ego_xy',None) is not None:
+            ego=np.asarray(self.ego_xy);v0=np.diff(xy,axis=0);l2=np.sum(v0*v0,axis=1)
+            u0=np.clip(np.sum((ego-xy[:-1])*v0,axis=1)/np.maximum(l2,1e-9),0,1)
+            j0=int(np.argmin(np.linalg.norm(xy[:-1]+u0[:,None]*v0-ego,axis=1)))
+            # Retain current body at the exact current pose; the remaining
+            # swept path begins at current progress, not old path origin.
+            xy=np.vstack([xy[j0]+u0[j0]*v0[j0],xy[j0+1:]])
+        p = np.asarray(pw[:2], dtype=float)
+        if not np.isfinite(p).all():
+            return None
+        a, v = xy[:-1], np.diff(xy, axis=0)
+        lengths = np.sum(v*v, axis=1)
+        good = lengths > 1e-8
+        if not good.any():
+            return None
+        a, v, lengths = a[good], v[good], lengths[good]
+        if np.dot(p-xy[-1], v[-1]) >= 0:
+            return None
+        u = np.sum((p-a)*v, axis=1)/lengths
+        distance = np.linalg.norm(p-(a+np.clip(u, 0, 1)[:, None]*v), axis=1)
+        j = int(np.argmin(distance))
+        # Do not declare an object beyond the finite path horizon clear.
+        if (j == len(a)-1 and u[j] >= 1) or (j == 0 and u[j] < 0):
+            return None
+        if obs.get('footprint_world'):
+            tangent=v[j]/math.sqrt(lengths[j]);normal=np.array([-tangent[1],tangent[0]])
+            half=max(abs(float((np.asarray(q)-p)@normal)) for q in footprint(obs))
+        else:half=.5*float(obs.get('width',0.) or 0.)
+        return max(0.,float(distance[j])-half)
+
+    def occupancy_geometry_cb(self,msg):
+        try:
+            data=msg if isinstance(msg,dict) else json.loads(msg.data)
+            if 'collision_cells_world' not in data:return
+            cells=np.asarray(data['collision_cells_world'],float).reshape((-1,2))
+            if not np.isfinite(cells).all():return
+            self.occupancy_cells=cells;self.occupancy_cells_stamp=float(data.get('geometry_stamp',-1e9))
+            self.occupancy_resolution=float(data.get('cell_resolution',.1))
+        except (ValueError,TypeError):return
+
+    def future_body_conflict(self,obs,now):
+        """Static/unknown geometry: actual future rectangles, never old corridor."""
+        xy=getattr(self,'local_path_xy',None);ego=getattr(self,'ego_xy',None)
+        if xy is None or len(xy)<2 or ego is None or not -.05<=now-getattr(self,'local_path_time',-1e9)<=.5:return None
+        v=np.diff(xy,axis=0);length=np.linalg.norm(v,axis=1)
+        if np.any(length<1e-6):return None
+        u=np.clip(np.sum((ego-xy[:-1])*v,axis=1)/(length*length),0,1)
+        j=int(np.argmin(np.linalg.norm(xy[:-1]+u[:,None]*v-ego,axis=1)))
+        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+                getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',-1)==3):
+            stamp=float(obs.get('collision_geometry_stamp',-1e9))
+            if not obs.get('collision_geometry_valid',False) or not -.05<=now-stamp<=.35:return None
+            cells=obs.get('occupied_cells_world',[])
+            key=(int(obs.get('id',-1)),stamp,xy.tobytes(),tuple(np.asarray(ego)),float(getattr(self,'ego_yaw',0.)))
+            cache=getattr(self,'_body_sweep_cache',{})
+            if key in cache:return cache[key]
+            value=swept_owned_cells(cells,xy,ego,getattr(self,'ego_yaw',0.),getattr(self,'occupancy_resolution',.1),max(10.,getattr(self,'ego_speed',0.)*.3+getattr(self,'ego_speed',0.)**2/5.+4.))
+            if len(cache)>100:cache.clear()
+            cache[key]=value;self._body_sweep_cache=cache
+            return value
+        if self.actual_body_risk(obs):return True
+        if self.driven_path_edge(obs,now) is None:return None
+        poly=footprint(obs);remaining=0.
+        cells=getattr(self,'occupancy_cells',None)
+        if not -.05<=now-getattr(self,'occupancy_cells_stamp',-1e9)<=.35:cells=None
+        for k in range(j,len(v)):
+            tangent=v[k]/length[k];yaw=math.atan2(tangent[1],tangent[0])
+            start=u[k]*length[k] if k==j else 0.
+            for d in np.arange(start,length[k]+1e-6,.1):
+                center=xy[k]+d*tangent;mid=.5*(3.85-.79)
+                body=rectangle(center[0]+mid*tangent[0],center[1]+mid*tangent[1],yaw,4.64+.4,1.9+.4)
+                if cells is not None:
+                    delta=cells-center;longitudinal=delta[:,0]*tangent[0]+delta[:,1]*tangent[1];lateral=-delta[:,0]*tangent[1]+delta[:,1]*tangent[0]
+                    gap=np.hypot(np.maximum(np.maximum(-.79-longitudinal,longitudinal-3.85),0),np.maximum(np.abs(lateral)-.95,0))
+                    if np.any(gap<.2+self.occupancy_resolution*.7072):return True
+                elif overlap(poly,body):return True
+            remaining+=length[k]-start
+            if remaining>max(10.,getattr(self,"ego_speed",0.)*.3+getattr(self,"ego_speed",0.)**2/5.+4.):break
+        return False
+
+    def tunnel_handoff_conflict(self, obs, now):
+        """M8 guard uses accepted future body sweep; None never means clear."""
+        risk = self.future_body_conflict(obs, now)
+        self._handoff_guard_reason = ('future_body_clear' if risk is False else
+                                      'future_body_conflict' if risk is True else
+                                      'path_or_geometry_unknown')
+        return risk
+
+    def m8_static_hold_clear(self, objects, now):
+        """Release only the original stop owners on a fresh safe body sweep.
+
+        Missing owners, dynamic/unknown motion, or unavailable geometry are not
+        proof of clearance. Parent ID changes use the observed track identity.
+        """
+        owners = getattr(self, '_m8_hold_owners', set())
+        if not getattr(self, 'm8_static_hold_release_enabled', True): return False
+        if not owners: return False
+        for owner in owners:
+            matches = [o for o in objects if owner in (int(o.get('id',-1)),
+                                                        int(o.get('observed_track_id',-2)))]
+            if not matches: return False
+            for o in matches:
+                if (o.get('perception_source') != 'common_scene' or
+                    o.get('motion_state') == 'dynamic' or
+                    not o.get('static_certified',False) or
+                    not -.05 <= now-float(o.get('last_seen',-1e9)) <= .35 or
+                    self.actual_body_risk(o) or self.tunnel_handoff_conflict(o,now) is not False):
+                    return False
+        return True
+
+    def tunnel_measured_static(self, obs, now):
+        """Independent rolling evidence, not the track's long-lived anchor."""
+        oid = int(obs.get('id', -1))
+        if not hasattr(self, '_measured_static'):
+            self._measured_static = {}
+        seen = obs.get('last_seen')
+        fresh = (seen is not None and 0 <= now-float(seen) <= .3 and
+                 float(obs.get('observation_age', 1e9)) <= .3)
+        if not fresh or not obs.get('confirmed', False) or self._coherent_measured_motion(oid):
+            self._measured_static.pop(oid, None)
+            return False
+        speeds = [self._world_speed(oid, span) for span in (.3, .5)]
+        h = getattr(self, '_pos_hist', {}).get(oid, [])
+        if not h or not 0 <= now-h[-1][0] <= .3:
+            self._measured_static.pop(oid, None)
+            return False
+        recent = [p for p in h if h[-1][0]-p[0] <= .5] if h else []
+        spread = max((math.hypot(p[1]-recent[-1][1], p[2]-recent[-1][2])
+                      for p in recent), default=1e9)
+        if (len(recent) >= 3 and all(v is not None and v < .3 for v in speeds)
+                and spread < .25):
+            stable_start = now
+            if h and h[-1][0]-h[0][0] >= .8-1e-6 and all(
+                    math.hypot(p[1]-h[-1][1], p[2]-h[-1][2]) < .25 for p in h):
+                stable_start = h[0][0]
+            proof = self._measured_static.get(oid)
+            since = proof[0] if proof and now-proof[1] <= .3 else stable_start
+            self._measured_static[oid] = (since, now)
+            return (now-since >= .8 or float(obs.get('stationary_sec', 0)) >= .8
+                    or obs.get('motion_state') == 'static')
+        # A brief box-fit change can preserve established evidence, but missing
+        # measurement windows, long changes, and coherent motion never can.
+        proof = self._measured_static.get(oid)
+        return bool(proof and all(v is not None for v in speeds) and
+                    now-proof[1] <= .3 and
+                    (now-proof[0] >= .8 or obs.get('motion_state') == 'static'))
+
+    def handoff_on_driven_path(self, obs):
+        """물체가 주행 경로 위, 앞범퍼에서 경로를 따라 trigger_gap 안에 있는지.
+
+        반환 (판정, 경로까지 가장자리 거리, 경로 거리 gap). 주행 경로나 자차 위치가
+        없으면(None) 판단할 수 없으므로 호출 쪽이 예전 기준(자차 정면 x 거리)을 쓴다.
+        """
+        world = obs.get('position_world')
+        now = rospy.Time.now().to_sec()
+        fresh = 0 <= now - self.local_path_time <= self.handoff_guard_path_timeout
+        if (not fresh or self.local_path_xy is None or self.ego_xy is None or
+                world is None or len(world) < 2):
+            return None, None, None
+        xy, arc = self.local_path_xy, self.local_path_s
+        d_obs = np.hypot(xy[:, 0] - float(world[0]), xy[:, 1] - float(world[1]))
+        j = int(np.argmin(d_obs))
+        i = int(np.argmin(np.hypot(xy[:, 0] - self.ego_xy[0], xy[:, 1] - self.ego_xy[1])))
+        width = float(obs.get('width', 0.0) or 0.0)
+        length = float(obs.get('length', 0.0) or 0.0)
+        half = 0.5 * (width if width > 0.0 else max(length, width))
+        edge = max(0.0, float(d_obs[j]) - half)
+        if self.mission_mode == 'tunnel' and self.current_lane_number == 3:
+            edge = self.driven_path_edge(obs, now)
+            if edge is None:
+                return None, None, None
+        gap = float(arc[j] - arc[i]) - 0.5 * length - self.handoff_guard_front_overhang
+        on_path = (edge <= self._driven_corridor_radius() and
+                   self.handoff_guard_min_gap <= gap <= self.handoff_guard_trigger_gap)
+        return on_path, edge, gap
+
+    def waypoint_callback(self, msg):
+        self.path_x = [wp.pose.pose.position.x for wp in msg.waypoints]
+        self.path_y = [wp.pose.pose.position.y for wp in msg.waypoints]
+        self.path_idx = [wp.waypoint_index for wp in msg.waypoints]
+        if msg.waypoints:
+            self.current_waypoint_idx = msg.waypoints[0].waypoint_index
+            self.current_lane_number = getattr(msg.waypoints[0], 'lane_number', 0)
+
+    
+    def publish_visualization(self):
+        markers = MarkerArray()
+        
+        # 1. Corridor Marker (map frame)
+        if self.path_x and self.path_y:
+            m1 = Marker()
+            m1.header.frame_id = "map"
+            m1.header.stamp = rospy.Time.now()
+            m1.ns = "corridor"
+            m1.id = 0
+            m1.type = Marker.LINE_STRIP
+            m1.action = Marker.ADD
+            m1.scale.x = self.corridor_radius() * 2.0  # Width of the corridor
+            m1.color = ColorRGBA(0.0, 1.0, 0.0, 0.3)      # Semi-transparent green
+            m1.pose.orientation.w = 1.0
+            
+            # Subsample path to reduce marker size if needed, but since it's local path, it's short
+            from geometry_msgs.msg import Point
+            for px, py in zip(self.path_x, self.path_y):
+                p = Point()
+                p.x = px
+                p.y = py
+                p.z = 0.0
+                m1.points.append(p)
+            markers.markers.append(m1)
+            
+        # 2. Stop Box Marker (ego frame)
+        m2 = Marker()
+        # Usually ego frame is "ego" or "base_link". We'll use "base_link"
+        m2.header.frame_id = "base_link"
+        m2.header.stamp = rospy.Time.now()
+        m2.ns = "stop_box"
+        m2.id = 1
+        m2.type = Marker.CUBE
+        m2.action = Marker.ADD
+        
+        # Box dimensions
+        length = self.stop_zone_max_forward - self.stop_zone_min_forward
+        width = self.stop_zone_width
+        
+        m2.scale.x = length
+        m2.scale.y = width
+        m2.scale.z = 2.0  # 2m height for visualization
+        
+        # Box center
+        m2.pose.position.x = self.stop_zone_min_forward + length / 2.0
+        m2.pose.position.y = 0.0
+        m2.pose.position.z = 1.0
+        m2.pose.orientation.w = 1.0
+        
+        # Color: Red if stopping, Yellow otherwise
+        if self.dynamic_obstacle_near:
+            m2.color = ColorRGBA(1.0, 0.0, 0.0, 0.5)
+        else:
+            m2.color = ColorRGBA(1.0, 1.0, 0.0, 0.3)
+            
+        markers.markers.append(m2)
+        
+        self.marker_pub.publish(markers)
+
+    def dist_to_path(self, wx, wy):
+        if not self.path_x:
+            return 0.0  # 경로 아직 없으면 필터링하지 않음(기존 동작 유지)
+        best = float('inf')
+        for px, py in zip(self.path_x, self.path_y):
+            d = math.hypot(wx - px, wy - py)
+            if d < best:
+                best = d
+        return best
+
+    def actual_body_risk(self,obs):
+        ego=getattr(self,'ego_xy',None)
+        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+                getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',0)==3 and
+                obs.get('collision_geometry_valid',False) and ego is not None and
+                -.05<=rospy.Time.now().to_sec()-float(obs.get('collision_geometry_stamp',-1e9))<=.35):
+            return body_cells_risk(obs.get('occupied_cells_world',[]),ego,getattr(self,'ego_yaw',0.),getattr(self,'occupancy_resolution',.1))
+        if ego is not None and obs.get('position_world'):
+            # 2026-10-07(15:09:56 백): 누적 유지(retained) 외곽선은 지나간 점이 지워지지 않아 부푼다
+            #   (차체와 겹침 0 m, 지금 관측 외곽선 1.73 m, 엔진 점유 2.30 m) -> 근접 정지로 영구 정지.
+            #   지금 관측한 외곽선이 있으면 그것으로 차체 근접을 본다.
+            observed=obs.get('observed_footprint_world')
+            if observed and len(observed)>=3:
+                obs=dict(obs);obs['footprint_world']=observed
+            return body_overlap(obs,ego,getattr(self,'ego_yaw',0.))
+        x,y=obs.get('position_ego',[1e9,1e9])[:2]
+        return (-.99-.5*float(obs.get('length',0))<=x<=4.05+.5*float(obs.get('length',0)) and
+                abs(y)<=1.15+.5*float(obs.get('width',0)))
+
+    def path_coverage(self,now):
+        snap=getattr(self,'_path_snapshot',None)
+        xy=snap[0] if snap else getattr(self,'local_path_xy',None)
+        stamp=snap[2] if snap else getattr(self,'local_path_time',0.)
+        ego=getattr(self,'ego_xy',None)
+        if xy is None or len(xy)<2 or ego is None or not -.05<=now-stamp<=.5:return 0.
+        if not np.isfinite(xy).all() or not -.05<=now-getattr(self,"ego_pose_time",now)<=.3:return 0.
+        v=np.diff(xy,axis=0);l=np.linalg.norm(v,axis=1);good=l>1e-6
+        if not good.all():return 0.
+        raw_u=np.sum((np.asarray(ego)-xy[:-1])*v,axis=1)/(l*l)
+        u=np.clip(raw_u,0,1)
+        j=int(np.argmin(np.linalg.norm(xy[:-1]+u[:,None]*v-np.asarray(ego),axis=1)))
+        # 2026-10-07(16:19:44 백): 정지 중 경로 첫 점이 자차 위치와 같아 부동소수로 u=-1e-9 가 되면 커버리지 0 ->
+        #   상한 0 -> 영영 출발 못 함(6.9 s, 4.5 s 정지). 시작점 뒤 0.5 m 까지는 시작점으로 본다.
+        if (j==0 and raw_u[j]*l[0]<-.5) or (j==len(v)-1 and raw_u[j]>1):return 0.
+        return max(0.,float(l[j]*(1-u[j])+l[j+1:].sum())-4.05)
+
+    def coverage_speed_cap(self,now):
+        # v*reaction + v²/(2a) must fit inside the collision-validated prefix.
+        available=self.path_coverage(now);a=2.5;reaction=.3
+        return max(0.,math.sqrt((a*reaction)**2+2*a*available)-a*reaction)
+
+    def bg_motion_verified(self,o,now):
+        h=getattr(self,'_bg_motion_history',{}).get(int(o.get('id',-1)),[])
+        h=[q for q in h if 0<=now-q[0]<=.6]
+        if len(h)<3 or h[-1][0]-h[0][0]<.2-1e-6:return False
+        mid=len(h)//2
+        a=np.array(h[mid][1:])-np.array(h[0][1:]);b=np.array(h[-1][1:])-np.array(h[mid][1:])
+        return float(a@b)>0 and np.linalg.norm(a+b)>=.15
+
+    def _driven_predictive_conflict(self, obs, vector, allow_prefix=False):
+        """None means incomplete/stale horizon: use the conservative legacy model."""
+        if getattr(self,"ego_xy",None) is None:return None
+        now = rospy.Time.now().to_sec()
+        snap=getattr(self,'_path_snapshot',None)
+        xy=snap[0] if snap else getattr(self,'local_path_xy',None)
+        path_stamp=snap[2] if snap else getattr(self,'local_path_time',0.)
+        ego = getattr(self, 'ego_xy', None)
+        pw = obs.get('position_world')
+        if (xy is None or len(xy) < 2 or ego is None or not pw or len(pw) < 2 or
+                not -.05 <= now-path_stamp <= .5 or
+                not -.05 <= now-getattr(self, 'ego_pose_time', 0.) <= .3):
+            return None
+        v = np.diff(xy, axis=0);length = np.linalg.norm(v, axis=1)
+        if np.any(length <= 1e-6):
+            return None
+        u = np.sum((np.asarray(ego)-xy[:-1])*v, axis=1)/(length*length)
+        projections = xy[:-1]+np.clip(u,0,1)[:,None]*v
+        j = int(np.argmin(np.linalg.norm(projections-ego, axis=1)))
+        if (j == 0 and u[j]*length[0] < -.5) or (j == len(v)-1 and u[j] > 1):
+            return None
+        arc = np.r_[0., np.cumsum(length)]
+        origin = arc[j]+np.clip(u[j],0,1)*length[j]
+        horizon = float(self.predictive_risk.get('horizon',4.))
+        speed = max(0., self.ego_speed)
+        complete=arc[-1]-origin >= speed*horizon+self.ttc_ego_front_m
+        if not complete:
+            if not allow_prefix or arc[-1]-origin<=self.ttc_ego_front_m:return None
+            horizon=min(horizon,max(0.,(arc[-1]-origin-self.ttc_ego_front_m)/max(speed,.01)))
+        owned_cells=None
+        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+                getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',-1)==3):
+            stamp=float(obs.get('collision_geometry_stamp',-1e9))
+            if not obs.get('collision_geometry_valid',False) or not -.05<=now-stamp<=.35:return None
+            owned_cells=np.asarray(obs.get('occupied_cells_world',[]),float).reshape((-1,2))
+        radius = min(1.5,max(.15,float(obs.get('radius',.35))))
+        std = max(0.,float(obs.get('vel_std',0.)))
+        for t in np.arange(0., horizon+1e-6, .1):
+            at = origin+speed*t
+            k = min(int(np.searchsorted(arc,at,side='right')-1),len(v)-1)
+            tangent = v[k]/length[k]
+            center = xy[k]+(at-arc[k])*tangent
+            if t == 0:
+                center = np.asarray(ego)
+                yaw = getattr(self, 'ego_yaw', math.atan2(tangent[1],tangent[0]))
+                tangent = np.array([math.cos(yaw),math.sin(yaw)])
+            delta = np.asarray(pw[:2])+np.asarray(vector[:2])*t-center
+            longitudinal = float(delta@tangent)
+            lateral = float(delta@np.array([-tangent[1],tangent[0]]))
+            padding = float(self.predictive_risk.get('margin',.35))+min(
+                float(self.predictive_risk.get('uncertainty_cap',1.5)),
+                float(self.predictive_risk.get('uncertainty_sigma',2.))*std*t)
+            dx = max(-2.8-longitudinal, longitudinal-self.ttc_ego_front_m, 0.)
+            dy = max(abs(lateral)-self.stop_zone_width*.5,0.)
+            if owned_cells is not None:
+                delta_cells=owned_cells+np.asarray(vector[:2])*t-center
+                a=delta_cells@tangent;d=delta_cells@np.array([-tangent[1],tangent[0]])
+                pad=padding+getattr(self,'occupancy_resolution',.1)*.7072
+                conflict=bool(np.any((a>=-.79-pad)&(a<=3.85+pad)&(abs(d)<=.95+pad)))
+            elif obs.get('footprint_world'):
+                shifted=[(x+vector[0]*t,y+vector[1]*t) for x,y in footprint(obs)]
+                yaw=math.atan2(tangent[1],tangent[0]);mid=.5*(3.85-.79)
+                body=rectangle(center[0]+mid*tangent[0],center[1]+mid*tangent[1],yaw,4.64+2*padding,1.9+2*padding)
+                conflict=overlap(shifted,body)
+            else:conflict=math.hypot(dx,dy)<=radius+padding
+            if conflict:return True,'driven_swept_t%.2f'%t
+        return False, 'driven_no_time_overlap' if complete else 'driven_validated_prefix_%.2fs'%horizon
+
+    def _predictive_conflict(self, obs):
+        cfg = self.predictive_risk
+        pe = obs.get('position_ego', [float('inf'), 0.0])
+        ox, oy = float(pe[0]), float(pe[1])
+        tunnel_roi = (self.mission_mode == 'tunnel' and self.current_lane_number == 3)
+        max_fwd = self.tunnel_predict_max_forward if tunnel_roi else self.stop_zone_max_forward
+        if not (self.stop_zone_min_forward <= ox <= max_fwd
+                and abs(oy) <= float(cfg.get('lateral_range', 6.0))):
+            return False, 'outside_prediction_roi'
+
+        # 터널 모드(M8, 3.csv)에서는 터널 우측 벽(oy < -2.4m) 및 좌측 보도/벽(oy > 5.5m) 클러스터의
+        # 잔차 속도로 인한 허위 충돌 예측을 원천 배제 (실측 터널 단면 반영)
+        tunnel = (self.mission_mode == 'tunnel' and self.current_lane_number == 3)
+        # 벽/턱 조각은 이제 앞단(배경맵/프로파일 필터)에서 빠지므로 우측을 턱 부근까지 넓힌다.
+        if tunnel and (oy < self.tunnel_predict_lat_min or oy > self.tunnel_predict_lat_max):
+            return False, 'tunnel_wall_roi'
+        radius = min(1.5, max(0.15, float(obs.get('radius', 0.35))))
+        half_w = self.stop_zone_width * 0.5
+        margin = float(cfg.get('margin', 0.35))
+        fresh = float(obs.get('observation_age', 0.0)) <= self.motion_fresh_sec
+        signed_ego_lat = float(obs.get('ego_y_rate_signed', 0.0))
+        toward_ego = -math.copysign(1.0, oy) * signed_ego_lat
+        fast_lat_min = float(cfg.get('fast_lateral_min', 1.2))
+        fast_lateral = toward_ego >= fast_lat_min
+        valid = fresh and bool(obs.get('velocity_valid', False))
+        # A coherent scan-pose-compensated regression is usable before the
+        # longer-baseline box velocity converges. Never use raw ego y motion
+        # as the slow-crossing evidence: turning ego rotates static scenery.
+        provisional = fresh and bool(obs.get('observed_motion_valid', False))
+        observed = obs.get('observed_velocity', [0.0, 0.0])
+        valid = valid or provisional
+        if not valid:
+            # Outside-corridor prediction is allowed only from a fresh,
+            # trustworthy velocity vector. Dynamic identity memory is handled
+            # by _dynamic_zone_stop and cannot manufacture a TTC by itself.
+            return False, 'motion_unavailable'
+        vector = obs['velocity'] if obs.get('velocity_valid', False) else observed
+        if tunnel:
+            driven = self._driven_predictive_conflict(obs, vector, allow_prefix=tunnel)
+            self._prediction_path = 'local' if driven is not None else 'reference_fallback'
+            if driven is not None:
+                return driven
+        vx, vy = [float(x) for x in vector[:2]]
+        yaw = obs.get('ego_yaw')
+        if yaw is None:
+            w = obs.get('position_world', [0.0,0.0])
+            yaw = obs.get('ego_yaw', self._path_yaw_at(float(w[0]), float(w[1])))
+        c, sn = math.cos(float(yaw)), math.sin(float(yaw))
+        longitudinal, lateral = c*vx+sn*vy, -sn*vx+c*vy
+        std = max(0.0, float(obs.get('vel_std', 0.0)))
+        # Outside objects must show signed approach; do not extrapolate the
+        # residual velocity of stationary roadside structures into our lane.
+        in_path = bool(obs.get('in_trigger_corridor', False))
+        if not in_path:
+            # Apollo's world-frame box candidates can jump when the visible
+            # face changes. The ego-frame transverse rate is independent
+            # evidence and cleanly separated the latest fixed poles (<=0.31)
+            # from the crossing person (3.69 m/s by scan three).
+            observed_toward = -math.copysign(1.0, oy) * (-sn*observed[0]+c*observed[1])
+            slow_supported = (provisional and observed_toward >=
+                              float(cfg.get('slow_lateral_min', 0.50)))
+            if not (fast_lateral or slow_supported):
+                return False, 'no_ego_lateral_support_%.2f' % toward_ego
+            toward = -math.copysign(1.0, oy)*lateral
+            if toward <= (0.2 if slow_supported else max(0.25, 0.5*std)):
+                return False, 'no_supported_lateral_approach'
+        # For this straight mission section, the signed three-scan ego-frame
+        # displacement is a cleaner lateral observation than a partial box in
+        # map coordinates. It is used only after the strong-motion gate above.
+        if fast_lateral and not provisional:
+            lateral = signed_ego_lat
+        horizon = float(cfg.get('horizon', 4.0))
+        # Bounded uncertainty margin; not a calibrated collision probability.
+        closing = max(self.ego_speed-longitudinal, 0.1)
+        lead_time = min(horizon, max(0.0, ox-self.ttc_ego_front_m)/closing)
+        padding = margin + min(float(cfg.get('uncertainty_cap', 1.5)),
+            float(cfg.get('uncertainty_sigma', 2.0))*std*lead_time)
+        conflict, t = swept_conflict((ox,oy),
+            (longitudinal-max(self.ego_speed,0.0), lateral), half_w,
+            self.ttc_ego_front_m, 2.8, radius, horizon, padding)
+        return conflict, ('swept_t%.2f' % t if conflict else 'no_time_overlap')
+
+    def _approaching_path(self, obs, world_vel=None):
+        """좌측(대향차선 쪽)에서 경로 쪽으로 다가오는 중인지(TTC 없이).
+
+        경로 쪽 횡속도 = 월드 속도(유효 속도 벡터)를 자차 방향으로 돌린 값.
+        월드 박스 속도는 보이는 면이 바뀌면 튈 수 있어 자차 기준 횡변화율
+        (3스캔 ego_y_rate 또는 스캔-자세 보정 관측 속도)도 같은 쪽을 가리켜야 한다.
+        """
+        if not self.approach_stop_enabled:
+            return False, 'approach_disabled'
+        tunnel = (self.mission_mode == 'tunnel' and self.current_lane_number == 3)
+        if tunnel and not self.approach_in_tunnel:
+            return False, 'approach_tunnel_off'
+        pe = obs.get('position_ego', [float('inf'), 0.0])
+        oy = float(pe[1])
+        max_lat = self.tunnel_approach_max_lateral if tunnel else self.approach_max_lateral
+        if abs(oy) > max_lat:
+            return False, 'approach_too_far_lateral'
+        sides = self.tunnel_approach_sides if tunnel else self.approach_sides
+        if sides == 'left' and oy <= 0.0:
+            return False, 'approach_right_side'
+        side = math.copysign(1.0, oy)
+        if world_vel is not None:
+            vector = world_vel
+        else:
+            vector = obs.get('velocity') if obs.get('velocity_valid', False) else obs.get('observed_velocity')
+        if not vector or len(vector) < 2:
+            return False, 'approach_no_vector'
+        vx, vy = float(vector[0]), float(vector[1])
+        yaw = obs.get('ego_yaw')
+        if yaw is None:
+            w = obs.get('position_world', [0.0, 0.0])
+            yaw = self._path_yaw_at(float(w[0]), float(w[1]))
+        c, sn = math.cos(float(yaw)), math.sin(float(yaw))
+        lat_v = -sn * vx + c * vy
+        # 경로 방향 성분이 크더라도 횡 성분이 더 크면(비스듬히 가로지름) 접근으로 본다.
+        if tunnel and abs(c * vx + sn * vy) > max(self.tunnel_approach_max_long_speed,
+                                                  1.5 * abs(lat_v)):
+            # 경로 방향으로 빠르게 가는 물체(대향/같은 방향 차량)는 가로질러 오는 게 아니다.
+            return False, 'approach_longitudinal_%.1f' % (c * vx + sn * vy)
+        toward = -side * (-sn * vx + c * vy)
+        toward_ego = -side * float(obs.get('ego_y_rate_signed', 0.0))
+        observed = obs.get('observed_velocity', [0.0, 0.0])
+        observed_toward = -side * (-sn * float(observed[0]) + c * float(observed[1])) \
+            if obs.get('observed_motion_valid', False) else 0.0
+        v_min = (max(self.approach_min_lateral_speed, self.tunnel_dyn_on_speed)
+                 if tunnel else self.approach_min_lateral_speed)
+        # 월드 이동 벡터는 3개 이상 측정의 일관된 이동으로 이미 검증됐다.
+        supported = (world_vel is not None or toward_ego >= v_min or observed_toward >= v_min)
+        if toward >= v_min and supported:
+            return True, 'approach_%.2f' % toward
+        return False, 'approach_not_toward_%.2f_%.2f' % (toward, toward_ego)
+
+    def _bg_moving_cb(self, msg):
+        with getattr(self, '_state_lock', nullcontext()):
+            try:
+                self._bg_moving = list(json.loads(msg.data).get('objects', []))
+                self._bg_moving_t = rospy.Time.now().to_sec()
+                if not hasattr(self,'_bg_motion_history'):self._bg_motion_history={}
+                for o in self._bg_moving:
+                    oid=int(o.get('id',-1));h=self._bg_motion_history.setdefault(oid,[])
+                    if not h or self._bg_moving_t-h[-1][0]>=.07:
+                        h.append((self._bg_moving_t,float(o['x']),float(o['y'])))
+                        self._bg_motion_history[oid]=h[-6:]
+                self._bg_motion_history={k:h for k,h in self._bg_motion_history.items() if self._bg_moving_t-h[-1][0]<=2.}
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+    def _bg_moving_fresh(self):
+        if getattr(self,"mission_mode","")=="tunnel" and getattr(self,"common_scene_enabled",False):return False
+        return (self.tunnel_bg_moving_enabled and self._bg_moving and
+                rospy.Time.now().to_sec() - self._bg_moving_t <= self.tunnel_bg_moving_timeout)
+
+    def _bg_moving_near(self, pw):
+        """트래커 물체(세계좌표)가 배경맵 움직임 물체와 같은가."""
+        if not pw or len(pw) < 2 or not self._bg_moving_fresh():
+            return False
+        m2 = self.tunnel_bg_moving_match_m ** 2
+        return any((float(o['x']) - pw[0]) ** 2 + (float(o['y']) - pw[1]) ** 2 <= m2 and
+                   self._bg_validated_moving(o)[0]
+                   for o in self._bg_moving)
+
+    def m8_motion_evidence(self,obs,now):
+        """Independent fresh observations, shape stability, velocity and direction."""
+        oid=int(obs.get('id',-1));stamp=float(obs.get('last_seen',-1e9))
+        if not hasattr(self,'_m8_motion_samples'):self._m8_motion_samples={}
+        samples=self._m8_motion_samples.setdefault(oid,[])
+        pw=obs.get('observed_position_world',obs.get('position_world'))
+        poly=obs.get('observed_footprint_world') or obs.get('footprint_world')
+        if not pw or not poly or not -.05<=now-stamp<=.3:return False,'stale_or_unobserved'
+        yaw=float(obs.get('footprint_yaw',0.));c,s=math.cos(yaw),math.sin(yaw);q=np.asarray(poly,float)
+        size=np.ptp(np.column_stack([c*q[:,0]+s*q[:,1],-s*q[:,0]+c*q[:,1]]),axis=0)
+        observed=obs.get('observed_motion_valid',False);valid=observed or obs.get('velocity_valid',False)
+        velocity=np.asarray(obs.get('observed_velocity') if observed else obs.get('velocity',[0.,0.]),float)
+        speed=float(np.linalg.norm(velocity[:2]))
+        if not samples or stamp>samples[-1][0]+1e-4:samples.append((stamp,np.asarray(pw[:2],float),size,valid,speed,velocity[:2],q.copy()))
+        samples[:]=[a for a in samples if 0<=now-a[0]<=.4][-4:]
+        if len(samples)<2:return False,'awaiting_distinct_motion_scans'
+        a,b=samples[-2:];dt=b[0]-a[0]
+        if not .05<=dt<=.3 or not(a[3]and b[3]) or min(a[4],b[4])<.8:return False,'velocity_unconfirmed'
+        if np.any(abs(b[2]-a[2])>.10+.2*np.maximum(a[2],b[2])):return False,'visible_shape_changed'
+        step=b[1]-a[1];distance=float(np.linalg.norm(step));v=b[5];norm=float(np.linalg.norm(v))
+        if distance<.05 or norm<.8 or float(step@v)<.7*distance*norm:return False,'displacement_inconsistent'
+        # A changing visible face moves a centroid without translating both
+        # physical boundaries. Compare measured surfaces along motion direction.
+        direction=v/norm;old=a[6]@direction;new=b[6]@direction
+        front=float(new.max()-old.max());rear=float(new.min()-old.min())
+        if min(front,rear)<.03 or abs(front-rear)>.03+.3*min(front,rear):
+            return False,'surface_boundaries_not_translating'
+        return True,'two_fresh_shape_stable_motion_scans'
+
+    def _coherent_measured_motion(self, oid):
+        """Fresh real centers must move across both halves, not just jump once.
+
+        The short window lets a formerly stationary object start moving without
+        waiting for its old static label to expire; the long window admits slow
+        motion. Predicted/repeated centers cannot create additional evidence.
+        """
+        history = getattr(self, '_pos_hist', {}).get(oid, [])
+        if not history:
+            return False
+        last = history[-1][0]
+        for window in (0.4, 0.8):
+            pts = [p for p in history if last - p[0] <= window + 1e-6]
+            if len(pts) < 3 or pts[-1][0] - pts[0][0] < 0.25:
+                continue
+            mid = pts[len(pts) // 2]
+            ax, ay = mid[1] - pts[0][1], mid[2] - pts[0][2]
+            bx, by = pts[-1][1] - mid[1], pts[-1][2] - mid[2]
+            la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+            total = math.hypot(ax + bx, ay + by)
+            span = pts[-1][0] - pts[0][0]
+            if (total >= 0.25 and total / span >= 0.3 and
+                    la >= 0.2 * total and lb >= 0.2 * total and
+                    ax * bx + ay * by >= 0.7 * la * lb):
+                return True
+        return False
+
+    def _bg_validated_moving(self, candidate):
+        """Only a unique, fresh, independently observed static match can veto BG.
+
+        No match, ambiguity, stale data or missing evidence retains the original
+        BG safety response. A static label/location alone is never a veto.
+        """
+        if not getattr(self, 'tunnel_bg_static_validation_enabled', True):
+            return True, 'bg_validation_disabled'
+        observations = getattr(self, '_bg_validation_objects', [])
+        if not observations:
+            return True, 'bg_no_tracker_match'
+        now = rospy.Time.now().to_sec()
+        fresh_sec = getattr(self, 'tunnel_bg_static_fresh_sec', 0.3)
+        matches = []
+        for obs in observations:
+            pw = obs.get('position_world')
+            if (not pw or len(pw) < 2 or obs.get('source') == 'raw_temporal_far' or
+                    obs.get('infrastructure_candidate', False) or obs.get('passed', False)):
+                continue
+            seen = obs.get('last_seen')
+            if (seen is None or not 0.0 <= now - float(seen) <= fresh_sec or
+                    float(obs.get('observation_age', 1e9)) > fresh_sec):
+                continue
+            distance = math.hypot(float(candidate['x']) - float(pw[0]),
+                                  float(candidate['y']) - float(pw[1]))
+            if distance <= self.tunnel_bg_moving_match_m:
+                matches.append((distance, obs))
+        matches.sort(key=lambda item: item[0])
+        if not matches:
+            return True, 'bg_no_fresh_tracker_match'
+        if len(matches) > 1 and matches[1][0] - matches[0][0] < 0.3:
+            return True, 'bg_ambiguous_tracker_match'
+        obs = matches[0][1]
+        oid = int(obs.get('id', -1))
+        if self._coherent_measured_motion(oid):
+            return True, 'bg_new_real_motion_id_%d' % oid
+        if obs.get('static_certified', False):
+            return False, 'bg_matched_static_id_%d' % oid
+        moved = self._moved_m(oid)
+        speeds = [self._world_speed(oid, span) for span in (0.3, 0.5)]
+        # Both windows must exist. Missing/occluded evidence is not stillness.
+        if moved is None or any(v is None or not math.isfinite(v) for v in speeds):
+            return True, 'bg_tracker_motion_unavailable'
+        far_static = (self._far_static_match(obs) and
+                      moved < self.tunnel_far_static_move_m and max(speeds) < 0.6)
+        measured_static = (bool(obs.get('confirmed', False)) and
+                           float(obs.get('stationary_sec', 0.0)) >= 0.8 and
+                           max(speeds) < 0.3 and moved < 0.25)
+        if far_static or measured_static:
+            return False, 'bg_matched_static_id_%d' % oid
+        return True, 'bg_tracker_not_proven_static'
+
+    def _m3_still(self, oid, obs, now):
+        """관측이 신선하고 월드 위치가 m3_restatic_sec 동안 멈춰 있었는가."""
+        fresh = float(obs.get('observation_age', 0.0)) <= self.motion_fresh_sec
+        wvs = [v for v in (self._world_speed(oid, 0.3), self._world_speed(oid, 0.5))
+               if v is not None]
+        still = (fresh and wvs and min(wvs) < self.m3_still_speed and
+                 abs(float(obs.get('speed', 0.0))) < 1.0)
+        if not still:
+            self._m3_still_since.pop(oid, None)
+            return False
+        since = self._m3_still_since.setdefault(oid, now)
+        return now - since >= self.m3_restatic_sec
+
+    def _object_path_idx(self, obs):
+        """물체 최근접 기준경로 점의 waypoint_index (경로/위치 없으면 None)."""
+        pw = obs.get('position_world')
+        if not pw or len(pw) < 2 or not self.path_x or len(self.path_idx) != len(self.path_x):
+            return None
+        best, j = float('inf'), -1
+        for i, (px, py) in enumerate(zip(self.path_x, self.path_y)):
+            d = (px - pw[0]) ** 2 + (py - pw[1]) ** 2
+            if d < best:
+                best, j = d, i
+        return self.path_idx[j] if j >= 0 else None
+
+    def _m3_approach(self, obs, oid):
+        """세계좌표 이동으로 '기준경로 쪽으로 다가옴'을 판정. (통과, 사유, 세계 속도)."""
+        pw = obs.get('position_world')
+        h = self._pos_hist.get(oid)
+        if not pw or len(pw) < 2 or not h or len(h) < 2:
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'no_history', 0.0
+        t_last = h[-1][0]
+        pl = self._path_lateral(float(pw[0]), float(pw[1]))
+        if pl is None:
+            return False, 'no_path', 0.0
+        lat, tx, ty = pl
+        sign = -math.copysign(1.0, lat)
+
+        def window(lookback):
+            old = [q for q in h if t_last - q[0] >= lookback]
+            ref = old[-1] if old else h[0]
+            dt = t_last - ref[0]
+            if dt < self.m3_approach_min_dt:
+                return None
+            dx, dy = h[-1][1] - ref[1], h[-1][2] - ref[2]
+            # 경로 쪽으로 실제 이동한 거리 [m]. 트랙 튐(한 스텝 > jump_speed)과 관측 끊김(> 0.3 s) 스텝은 빼고 센다
+            # (16:41:24 id162 / 16:27:55 id163: 이웃 정지 물체와 트랙이 바뀌며 1.4 m 튐).
+            seg = [q for q in h if q[0] >= ref[0] - 1e-6]
+            disp = 0.0
+            for a, b in zip(seg, seg[1:]):
+                dts = b[0] - a[0]
+                step = math.hypot(b[1] - a[1], b[2] - a[2])
+                if dts <= 1e-3 or dts > 0.3 or step / dts > self.m3_jump_speed:
+                    continue
+                disp += sign * (-ty * (b[1] - a[1]) + tx * (b[2] - a[2]))
+            return dx / dt, dy / dt, disp
+        win = None
+        for lb in (self.m3_approach_lookback_s, self.m3_approach_long_s):
+            w = window(lb)
+            if w is None:
+                continue
+            win = w
+            if math.hypot(w[0], w[1]) >= self.m3_approach_min_speed and w[2] >= self.m3_approach_min_disp:
+                break
+        if win is None:
+            return False, 'short_history', 0.0
+        vx, vy, disp = win
+        speed = math.hypot(vx, vy)
+        # 트래킹 튐 검사(최근 long 창 안 위치 이력)
+        recent = [q for q in h if t_last - q[0] <= self.m3_approach_long_s + 1e-6]
+        prog = [sign * (-ty * q[1] + tx * q[2]) for q in recent]   # 경로 쪽 진행 좌표
+        jumpy, last_step = False, 0.0
+        for a, b, pa, pb in zip(recent, recent[1:], prog, prog[1:]):
+            dt_s = b[0] - a[0]
+            if dt_s > 1e-3 and math.hypot(b[1] - a[1], b[2] - a[2]) / dt_s > self.m3_jump_speed:
+                jumpy = True
+            last_step = pb - pa
+        if prog:
+            k_min = min(range(len(prog)), key=lambda k: prog[k])
+            if prog[0] - prog[k_min] >= self.m3_reversal_m and prog[-1] - prog[k_min] >= self.m3_reversal_m:
+                jumpy = True
+        if jumpy and last_step < 0.05:
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'track_jump', speed
+        onset = False
+        if self.m3_onset_enabled and len(h) >= self.m3_onset_still_n + 1:
+            prev = h[-(self.m3_onset_still_n + 1):-1]
+            mx = sum(q[1] for q in prev) / len(prev)
+            my = sum(q[2] for q in prev) / len(prev)
+            still = max(math.hypot(q[1] - mx, q[2] - my) for q in prev) <= self.m3_onset_still_m
+            a, b = h[-2], h[-1]
+            dts = b[0] - a[0]
+            step_toward = sign * (-ty * (b[1] - a[1]) + tx * (b[2] - a[2]))
+            step_len = math.hypot(b[1] - a[1], b[2] - a[2])
+            if (still and 1e-3 < dts <= 0.3 and step_toward >= self.m3_onset_step and
+                    step_len / dts <= self.m3_jump_speed and step_toward >= 0.7 * step_len):
+                onset = True
+                vx, vy = (b[1] - a[1]) / dts, (b[2] - a[2]) / dts
+                speed = math.hypot(vx, vy)
+                disp = max(disp, step_toward)
+                self._m3_world_vel[oid] = (vx, vy)
+        self._m3_world_vel[oid] = (vx, vy)
+        toward = sign * (-ty * vx + tx * vy)
+        hits, last = self._m3_approach_hits.get(oid, (0, None))
+        meas = obs.get('last_seen', t_last)
+        if speed < self.m3_approach_min_speed:
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'slow_%.2f' % speed, speed
+        if toward <= 0.0 or toward < speed * math.cos(math.radians(self.m3_approach_max_angle_deg)):
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'angle_%.0fdeg' % math.degrees(math.acos(max(-1.0, min(1.0, toward / speed)))), speed
+        w = float(obs.get('width', 0.0) or 0.0)
+        edge = max(0.0, abs(lat) - 0.5 * w)
+        t_reach = max(0.0, edge - self.m3_path_corridor_radius) / max(toward, 1e-3)
+        if t_reach > self.m3_approach_horizon_s:
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'far_%.1fs' % t_reach, speed
+        if disp < self.m3_approach_min_disp and not onset:
+            self._m3_approach_hits.pop(oid, None)
+            return False, 'jitter_%.2fm' % disp, speed
+        if meas != last:
+            hits += 1
+        self._m3_approach_hits[oid] = (hits, meas)
+        fx = float((obs.get('position_ego') or [1e9])[0])
+        trk_v = obs.get('velocity') or [0.0, 0.0]
+        tracker_still = (bool(obs.get('velocity_valid', False)) and obs.get('motion_state') == 'static' and
+                         math.hypot(*[float(v) for v in trk_v[:2]]) < self.m3_tracker_still_speed)
+        strong = (fx - self.m3_front_overhang <= self.m3_approach_near_m and
+                  (disp >= self.m3_approach_near_disp or onset) and not tracker_still)   # disp 는 튐·끊김 스텝을 뺀 실제 이동
+        need = self.m3_approach_hits_near if strong else self.m3_approach_hits
+        if hits < need:
+            return False, 'confirming_%d' % hits, speed
+        return True, 'approach_%.2fmps_t%.1f' % (toward, t_reach), speed
+
+    def _m3_pass_through(self, obs):
+        """횡단 물체: 멈출 수 있으면 None(정지). 못 멈추고 차 꼬리가 먼저 지나가면 여유 시간[s], 아니면 None."""
+        if not self.m3_pass_through_enabled:
+            return None
+        pe = obs.get('position_ego') or []
+        if len(pe) < 2:
+            return None
+        v = max(0.0, self.ego_speed)
+        if v < 1.0:
+            return None
+        x, y = float(pe[0]), float(pe[1])
+        half_l = 0.5 * float(obs.get('length', 0.5) or 0.5)
+        half_w = 0.5 * float(obs.get('width', 0.5) or 0.5)
+        gap = x - half_l - self.m3_front_overhang
+        stop_dist = v * self.m3_reaction_s + v * v / (2.0 * max(0.5, self.m3_brake_decel))
+        if stop_dist <= gap - self.m3_stop_margin_m:
+            return None                              # 멈출 수 있다 -> 정지
+        vel = self._m3_world_vel.get(int(obs.get('id', -1)))
+        if vel is None:
+            return None
+        # 세계좌표 이동 속도(_m3_approach 와 같은 창)를 자차 좌표 횡성분으로(자차 쪽으로 오는 성분).
+        yaw = getattr(self, 'ego_yaw', None)
+        if yaw is None:
+            return None
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        vy = -s_ * float(vel[0]) + c * float(vel[1])
+        toward = -math.copysign(1.0, y) * vy
+        if toward <= 0.1:
+            return None
+        toward = max(toward, self.m3_pass_assumed_speed)
+        t_arrive = max(0.0, abs(y) - half_w - self.m3_body_half_width) / toward
+        t_clear = (x + half_l + self.m3_rear_overhang + 0.5) / v
+        margin = t_arrive - t_clear
+        if margin >= self.m3_pass_margin_s:
+            rospy.logwarn_throttle(0.5, '[obstacle_stop] M3 pass-through: id=%s x=%.1f y=%.1f v=%.1f '
+                                   'stop %.1fm > gap %.1fm, clear %.2fs < arrive %.2fs',
+                                   obs.get('id'), x, y, v, stop_dist, gap, t_clear, t_arrive)
+            return margin
+        return None
+
+    def _m3_ok(self, v, x, y, hl, hw):
+        """속도 v, 물체 (x 앞, y 옆)에서 지금 출발해도 멈출 수 있거나 먼저 지나갈 수 있는가."""
+        gap = x - hl - self.m3_front_overhang
+        if v * self.m3_risk_react + v * v / (2.0 * max(0.5, self.m3_brake_decel)) <= gap - self.m3_stop_margin_m:
+            return True
+        t_arrive = max(0.0, abs(y) - hw - self.m3_body_half_width) / max(0.1, self.m3_pass_assumed_speed)
+        t_clear = (x + hl + self.m3_rear_overhang + 0.5) / max(0.1, v)
+        return t_clear + self.m3_pass_margin_s <= t_arrive
+
+    def _m3_candidate_speed(self, x, y, hl, hw):
+        """후보 하나에 대한 상한: 앞으로 가까워지는 모든 거리 x' 에서 안전한 속도를 감속 여유로 이어 붙인 최솟값."""
+        vs = [self.m3_risk_v_max - 0.25 * k for k in range(int((self.m3_risk_v_max - self.m3_risk_v_min) / 0.25) + 1)]
+        best = self.m3_risk_v_max
+        xp = x
+        while xp >= -self.m3_rear_overhang:
+            v_ok = next((v for v in vs if self._m3_ok(v, xp, y, hl, hw)), self.m3_risk_v_min)
+            best = min(best, math.sqrt(v_ok * v_ok + 2.0 * self.m3_risk_decel * max(0.0, x - xp)))
+            xp -= 0.5
+        return max(self.m3_risk_v_min, best)
+
+    def _m3_in_bgmap(self, idx, lat):
+        return any(c[0] <= idx <= c[1] and c[2] - 0.25 <= lat <= c[3] + 0.25 for c in self.m3_bgmap_cells)
+
+    def _m3_risk_speed(self, obs_list):
+        """동적 구간 위험 기반 속도 상한과 후보 목록."""
+        objs = []
+        for o in obs_list:
+            pw = o.get('observed_position_world', o.get('position_world'))
+            pe = o.get('position_ego') or []
+            if not pw or len(pw) < 2 or len(pe) < 2:
+                continue
+            pl = self._path_lateral(float(pw[0]), float(pw[1]))
+            if pl is None:
+                continue
+            idx = self._object_path_idx(o)
+            objs.append((o, float(pe[0]), float(pe[1]), pl[0], idx))
+        cand = []
+        for o, x, y, lat, idx in objs:
+            if x < -self.m3_rear_overhang or x > self.m3_risk_lookahead:
+                continue
+            w = float(o.get('width', 0.5) or 0.5)
+            ln = float(o.get('length', 0.5) or 0.5)
+            edge = abs(lat) - 0.5 * w
+            if edge <= self.m3_path_corridor_radius or abs(lat) > self.m3_risk_lat_max:
+                continue            # 코리도 안(정지 판단 담당) / 너무 먼 물체
+            if o.get('motion_state') == 'dynamic':
+                continue            # 이미 움직이는 물체는 정지/통과 판단이 맡는다
+            if idx is not None and self._m3_in_bgmap(idx, lat):
+                continue
+            lo, hi = self.m3_divider_band
+            if idx is not None and lo <= lat <= hi and any(
+                    o2 is not o and i2 is not None and lo <= l2 <= hi and
+                    0 < abs(i2 - idx) <= self.m3_divider_neighbor_m * 10
+                    for o2, _, _, l2, i2 in objs):
+                continue            # 줄지어 선 중앙 분리 물체
+            cand.append((int(o.get('id', -1)), x, y, 0.5 * ln, 0.5 * w))
+        v = self.m3_risk_v_max
+        limiting = None
+        for oid, x, y, hl, hw in cand:
+            vc = self._m3_candidate_speed(x, y, hl, hw)
+            if vc < v:
+                v, limiting = vc, oid
+        return v, limiting, len(cand)
+
+    def _path_lateral(self, wx, wy):
+        """기준경로 기준 (부호 있는 횡거리, 접선 단위벡터). 경로 없으면 None."""
+        if len(self.path_x) < 2:
+            return None
+        best, j = float('inf'), 0
+        for i, (px, py) in enumerate(zip(self.path_x, self.path_y)):
+            d = (px - wx) ** 2 + (py - wy) ** 2
+            if d < best:
+                best, j = d, i
+        j2, j1 = min(j + 1, len(self.path_x) - 1), max(j - 1, 0)
+        tx, ty = self.path_x[j2] - self.path_x[j1], self.path_y[j2] - self.path_y[j1]
+        n = math.hypot(tx, ty)
+        if n < 1e-6:
+            return None
+        tx, ty = tx / n, ty / n
+        lat = -ty * (wx - self.path_x[j]) + tx * (wy - self.path_y[j])
+        return lat, tx, ty
+
+    def _bg_moving_stop(self, o):
+        accepted, reason = self._bg_validated_moving(o)
+        self._bg_verification_reason = reason
+        self._bg_path_used = 'reference_fallback'
+        bx = float(o.get('bx', 1e9))
+        if not (self.stop_zone_min_forward <= bx <= self.tunnel_stop_max_forward):
+            return False, 'bg_moving_out_of_range'
+        now = rospy.Time.now().to_sec()
+        obs = dict(position_world=[float(o['x']), float(o['y'])],
+                   position_ego=[bx, float(o.get('by', 0.)), 0.],
+                   width=2*self.tunnel_bg_moving_half_width,
+                   radius=self.tunnel_bg_moving_half_width, vel_std=0.)
+        vector = [float(o.get('vx', 0.)), float(o.get('vy', 0.))]
+        # Identical finite-segment/time-swept corridor to tracker objects.
+        # A stale/short path is unavailable, never proof of clearance.
+        # Current physical occupancy is immediate; off-path future motion needs repeated evidence.
+        if self.actual_body_risk(obs):return True,'bg_current_body_overlap'
+        if not accepted:return False,reason
+        if not self.bg_motion_verified(o,now):
+            edge=self.driven_path_edge(obs,now)
+            if edge is not None and edge<=self._driven_corridor_radius(True) and bx<=self.ttc_ego_front_m:
+                return True,'bg_current_path_overlap'
+            return False,'bg_motion_awaiting_three_observations'
+        history=[q for q in self._bg_motion_history[int(o.get("id",-1))] if 0<=now-q[0]<=.6]
+        dt=history[-1][0]-history[0][0]
+        vector=[(history[-1][k]-history[0][k])/dt for k in (1,2)]
+        driven = self._driven_predictive_conflict(obs, vector, allow_prefix=True)
+        if driven is not None:
+            self._bg_path_used = 'local'
+            return driven[0], 'bg_' + driven[1]
+        edge = self.driven_path_edge(obs, now)
+        if edge is not None:
+            self._bg_path_used = 'local_current_reference_prediction'
+            if edge <= self._driven_corridor_radius(True):
+                return True, 'bg_moving_in_driven_path'
+        pl = self._path_lateral(float(o['x']), float(o['y']))
+        if pl is None:
+            return False, 'bg_moving_no_path'
+        lat, tx, ty = pl
+        # Only use reference current occupancy when local occupancy is unavailable.
+        if edge is None and abs(lat)-self.tunnel_bg_moving_half_width <= self.corridor_radius(True):
+            return True, 'bg_moving_in_path'
+        if abs(lat) > self.tunnel_approach_max_lateral:
+            return False, 'bg_moving_too_far_lateral'
+        toward = -math.copysign(1., lat)*(-ty*vector[0]+tx*vector[1])
+        if toward >= self.tunnel_bg_moving_min_toward:
+            return True, 'bg_moving_approach_%.2f' % toward
+        return False, 'bg_moving_not_toward_%.2f' % toward
+
+    def _local_path_unavailable_reason(self, obs, now):
+        xy = getattr(self, 'local_path_xy', None)
+        if xy is None or len(xy) < 2: return 'missing_or_invalid'
+        if not -.05 <= now-getattr(self, 'local_path_time', -1e9) <= .5: return 'stale'
+        if self.driven_path_edge(obs, now) is None: return 'outside_finite_horizon'
+        return None
+
+    def _bg_ids_cb(self, msg):
+        try:
+            self._bg_ids = set(int(i) for i in json.loads(msg.data).get('ids', []))
+            self._bg_ids_t = rospy.Time.now().to_sec()
+        except (ValueError, TypeError):
+            pass
+
+    def _far_static_match(self, obs):
+        pw = obs.get('position_world')
+        if not pw or len(pw) < 2:
+            return False
+        m2 = self.tunnel_far_static_match_m ** 2
+        for fx, fy, _ in getattr(self, '_tunnel_far_static', []):
+            if (pw[0] - fx) ** 2 + (pw[1] - fy) ** 2 <= m2:
+                return True
+        return False
+
+    def _moved_m(self, oid):
+        """최근 ~1 s 동안 실제 위치 이동 [m]. 이력이 0.6 s 보다 짧으면 None."""
+        h = self._pos_hist.get(oid)
+        if not h or h[-1][0] - h[0][0] < 0.6:
+            return None
+        t_last = h[-1][0]
+        old = [q for q in h if t_last - q[0] >= 0.8]
+        ref = old[-1] if old else h[0]
+        return math.hypot(h[-1][1] - ref[1], h[-1][2] - ref[2])
+
+    def _world_fast_motion(self, oid, yaw):
+        """최근 tunnel_dyn_fast_window 동안 월드 좌표로 빠르고 일관되게 움직였는가.
+
+        반환 (vx, vy) [m/s] 또는 None. 측정 3개 이상, 총 이동 >= tunnel_dyn_fast_move_m,
+        앞/뒤 두 구간이 각각 25% 이상이고 같은 방향(cos >= 0.7)이어야 한다
+        (측정 간격이 고르지 않아 40% 로는 19:19 횡단 물체(1.62/0.92 m)가 빠졌다).
+        보이는 면이 바뀌어 중심이 한 번 튀는 것(한 구간에 몰린 이동)은 통과하지 못한다.
+        자차 진행방향 기준 횡 이동이 tunnel_dyn_fast_lat_m 이상이고 종 이동의 절반 이상이어야
+        한다: 다가갈수록 박스가 길어져 중심이 진행방향으로 ~2 m 밀린 정적 장애물(19:17
+        id22/id24, 횡 0.2~0.4 m)과 벽을 따라 미끄러지는 벽 조각을 뺀다.
+        """
+        h = self._pos_hist.get(oid)
+        if not h or len(h) < 3:
+            return None
+        t_last = h[-1][0]
+        pts = [q for q in h if t_last - q[0] <= self.tunnel_dyn_fast_window]
+        if len(pts) < 3:
+            return None
+        dt = pts[-1][0] - pts[0][0]
+        if dt < 0.25:
+            return None
+        mid = pts[len(pts) // 2]
+        ax, ay = mid[1] - pts[0][1], mid[2] - pts[0][2]
+        bx, by = pts[-1][1] - mid[1], pts[-1][2] - mid[2]
+        tx, ty = pts[-1][1] - pts[0][1], pts[-1][2] - pts[0][2]
+        total = math.hypot(tx, ty)
+        la, lb = math.hypot(ax, ay), math.hypot(bx, by)
+        if total < self.tunnel_dyn_fast_move_m:
+            return None
+        if la < 0.25 * total or lb < 0.25 * total:
+            return None
+        if (ax * bx + ay * by) < 0.7 * la * lb:
+            return None
+        c, sn = math.cos(yaw), math.sin(yaw)
+        lat = abs(-sn * tx + c * ty)
+        lon = abs(c * tx + sn * ty)
+        if lat < self.tunnel_dyn_fast_lat_m or lat < 0.5 * lon:
+            return None
+        return tx / dt, ty / dt
+
+    def _world_speed(self, oid, lookback):
+        """최근 lookback 초 월드 평균 속도 [m/s]. 이력이 lookback 보다 짧으면 None.
+
+        창을 길게(0.8 s) 잡으면 트랙 초반 박스가 커지며 중심이 밀린 것(19:19 id4,
+        폭 0.35 -> 0.95 m, 0.9 m 이동)이 섞여 정적 물체가 1.1 m/s 로 나온다.
+        """
+        h = self._pos_hist.get(oid)
+        if not h:
+            return None
+        t_last = h[-1][0]
+        old = [q for q in h if t_last - q[0] >= lookback]
+        if not old:
+            return None
+        ref = old[-1]
+        dt = t_last - ref[0]
+        if dt <= 1.0e-3:
+            return None
+        return math.hypot(h[-1][1] - ref[1], h[-1][2] - ref[2]) / dt
+
+    def _wall_offset_cb(self, msg):
+        self.tunnel_wall_offset = float(msg.data)
+        self.tunnel_wall_offset_t = rospy.Time.now().to_sec()
+
+    def _wall_profile_at(self, idx):
+        prof = self.tunnel_wall_profile
+        n = len(prof) // 3
+        if n < 2 or idx < prof[0] or idx > prof[(n - 1) * 3]:
+            return 0.0, 0.0
+        lo, hi = 0, n - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if prof[mid * 3] <= idx:
+                lo = mid
+            else:
+                hi = mid
+        i0, i1 = prof[lo * 3], prof[hi * 3]
+        f = (idx - i0) / (i1 - i0) if i1 > i0 else 0.0
+        r0, r1 = prof[lo * 3 + 1], prof[hi * 3 + 1]
+        l0, l1 = prof[lo * 3 + 2], prof[hi * 3 + 2]
+        right = r0 + f * (r1 - r0) if (r0 < 0.0 and r1 < 0.0) else 0.0
+        left = l0 + f * (l1 - l0) if (l0 > 0.0 and l1 > 0.0) else 0.0
+        return right, left
+
+    def _wall_limits_cb(self, msg):
+        self.tunnel_limits = None
+        if len(msg.data) >= 3 and msg.data[0] > .5 and all(math.isfinite(v) for v in msg.data[:3]):
+            self.tunnel_limits = tuple(msg.data[1:3])
+        self.tunnel_limits_t = rospy.Time.now().to_sec()
+
+    def _is_tunnel_wall_piece(self, obs):
+        self._wall_reason = 'none'
+        if obs.get('perception_source')=='common_scene':return False
+        pw = obs.get('position_world')
+        # Coherent inward normal motion protects crossings, not ego-y jitter.
+        if pw and len(pw) >= 2 and len(self.path_x) >= 2:
+            j = int(np.argmin((np.asarray(self.path_x)-pw[0])**2+(np.asarray(self.path_y)-pw[1])**2))
+            j1, j2 = max(0, min(j, len(self.path_x)-2)), min(j+1, len(self.path_x)-1)
+            tx, ty = self.path_x[j2]-self.path_x[j1], self.path_y[j2]-self.path_y[j1]
+            norm = math.hypot(tx, ty)
+            if norm > 1e-6:
+                lat = (-ty*(pw[0]-self.path_x[j])+tx*(pw[1]-self.path_y[j]))/norm
+                offset_age = rospy.Time.now().to_sec()-getattr(self,'tunnel_wall_offset_t',0.)
+                if 0 <= offset_age <= .5:
+                    lat -= getattr(self,'tunnel_wall_offset',0.)
+                v = obs.get('observed_velocity', [])
+                if (obs.get('observed_motion_valid', False) and len(v) >= 2 and
+                        0 <= float(obs.get('observation_age', 1e9)) <= .3 and
+                        -math.copysign(1., lat)*(-ty*v[0]+tx*v[1])/norm >= .5):
+                    self._wall_reason = 'inward_motion_protected'
+                    return False
+        # 배경맵(벽/턱) 판정이 최신이면 그걸 먼저 쓴다(프로파일보다 위치가 정확하다).
+        if (rospy.Time.now().to_sec() - self._bg_ids_t < 0.5 and
+                int(obs.get('observed_track_id', obs.get('id', -1))) in self._bg_ids):
+            self._wall_reason = 'background_map'
+            return True
+        if not self.tunnel_wall_piece_filter:
+            return False
+        pw = obs.get('position_world')
+        if not pw or len(pw) < 2 or len(self.path_x) < 2 or len(self.path_idx) != len(self.path_x):
+            return False
+        px = np.asarray(self.path_x); py = np.asarray(self.path_y)
+        d2 = (px - pw[0]) ** 2 + (py - pw[1]) ** 2
+        j = int(np.argmin(d2))
+        j2 = min(j + 1, len(px) - 1)
+        j1 = j2 - 1 if j2 > 0 else 0
+        tx, ty = px[j2] - px[j1], py[j2] - py[j1]
+        norm = math.hypot(tx, ty)
+        if norm < 1e-6:
+            return False
+        tx, ty = tx / norm, ty / norm
+        lat = -ty * (pw[0] - px[j]) + tx * (pw[1] - py[j])
+        offset_age = rospy.Time.now().to_sec() - self.tunnel_wall_offset_t
+        off = self.tunnel_wall_offset if 0 <= offset_age <= .5 else 0.0
+        lat -= off
+        right, left = self._wall_profile_at(self.path_idx[j])
+        m = self.tunnel_wall_piece_margin
+        piece = (right < 0.0 and lat <= right + m) or (left > 0.0 and lat >= left - m)
+        if piece:
+            self._wall_reason = 'profile'
+            return True
+        limits = getattr(self, 'tunnel_limits', None)
+        age = rospy.Time.now().to_sec()-getattr(self, 'tunnel_limits_t', 0.)
+        if limits is not None and 0 <= age <= .5 and self.ego_xy is not None:
+            ex, ey = self.ego_xy
+            ej = int(np.argmin((px-ex)**2+(py-ey)**2))
+            ei = min(ej, len(px)-2)
+            etx, ety = px[ei+1]-px[ei], py[ei+1]-py[ei]
+            en = math.hypot(etx, ety)
+            if en > 1e-6:
+                vehicle_d = (-ety*(ex-px[ej])+etx*(ey-py[ej]))/en-off
+                piece = lat <= vehicle_d-limits[0]+m or lat >= vehicle_d+limits[1]-m
+                if piece:
+                    self._wall_reason = 'live_limits'
+        return piece
+
+    def _is_tunnel_wall_like(self, obs):
+        vertical = float(obs.get('vertical_thickness', 0.0))
+        top = float(obs.get('top_elevation', 0.0))
+        length = abs(float(obs.get('length', 0.0)))
+        width = abs(float(obs.get('width', 0.0)))
+        major = max(length, width)
+        minor = min(length, width)
+        return (vertical >= self.tunnel_wall_min_vertical_thickness and
+                top >= self.tunnel_wall_min_top_elevation and
+                major >= self.tunnel_wall_min_length and
+                minor <= self.tunnel_wall_max_width)
+
+    def _associate_fragments(self, objects, now):
+        """Stop-only classification links; original planner geometry stays intact."""
+        links = getattr(self, '_fragment_links', {})
+        active = set()
+        for frag in objects:
+            if (frag.get('motion_state') != 'unknown' or
+                    max(float(frag.get('length',0)),float(frag.get('width',0))) > 1.2 or
+                    float(frag.get('observation_age',1e9)) > .3 or
+                    self._coherent_measured_motion(int(frag['id']))):
+                continue
+            for parent in objects:
+                if (parent['id'] == frag['id'] or not parent.get('confirmed') or
+                        parent.get('motion_state') == 'dynamic' or
+                        self._dyn_hyst.get(int(parent['id']), {}).get('on', False) or
+                        now-self._tunnel_dynamic_seen.get(int(parent['id']), -1e9) < self.tunnel_dynamic_restatic_sec or
+                        max(float(parent.get('length',0)),float(parent.get('width',0))) < 1.5 or
+                        float(parent.get('observation_age',1e9)) > .3):
+                    continue
+                fp, pp = frag.get('position_world'), parent.get('position_world')
+                if not fp or not pp:
+                    continue
+                yaw = float(parent.get('ego_yaw',0.)); c,s = math.cos(yaw),math.sin(yaw)
+                dx,dy = fp[0]-pp[0],fp[1]-pp[1]
+                if (abs(c*dx+s*dy) > .5*(float(parent['length'])+float(frag.get('length',0)))+.3 or
+                    abs(-s*dx+c*dy) > .5*(float(parent['width'])+float(frag.get('width',0)))+.3):
+                    continue
+                key = (int(frag['id']),int(parent['id']));active.add(key)
+                stamp = min(float(frag.get('last_seen',now)), float(parent.get('last_seen',now)))
+                count,last = links.get(key,(0,-1.))
+                if stamp > last+1e-4:
+                    count += 1;last = stamp
+                links[key] = (count,last)
+                if count >= 2 and self.tunnel_measured_static(parent,now):
+                    frag['_static_parent_id'] = int(parent['id'])
+                break
+        self._fragment_links = {k:v for k,v in links.items() if k in active and now-v[1] <= .3}
+
+    def _dynamic_zone_stop(self, obs, in_stop_zone, in_corridor,
+                           in_forward_range, now, tunnel=False):
+        """Two and only two stop branches for the dynamic mission.
+
+        1) A dynamically identified object already inside the reference-path
+           corridor stops immediately.
+        2) A dynamically identified object outside it needs a fresh velocity
+           vector and a predicted time-overlap with the ego swept corridor.
+        """
+        if tunnel and obs.get('perception_source')=='common_scene':
+            if obs.get('m8_restatic',False):
+                oid=int(obs.get('id',-1))
+                self._dynamic_seen.pop(oid,None);self._tunnel_dynamic_seen.pop(oid,None)
+                self._dyn_hyst.pop(oid,None)
+                self._frame_static.add(oid);self._frame_dyn.discard(oid)
+            if self.actual_body_risk(obs):return True,'common_scene_near_body'
+            motion=obs.get('motion_state','unknown')
+            if motion!='dynamic':return False,'common_scene_'+motion
+            vector=obs.get('velocity_world',[0.,0.])
+            result=self._driven_predictive_conflict(obs,vector,allow_prefix=True)
+            if result is not None:return result[0],'common_scene_dynamic_'+result[1]
+            return False,'common_scene_dynamic_path_unknown'
+        if obs.get('background_excluded',False):return False,'background_excluded'
+        oid = int(obs.get('id', -1))
+        # Unit-level callers and rolling upgrades may enter this method before
+        # the new state member exists.  Keep the decision fail-safe and local.
+        if not hasattr(self, '_dynamic_evidence_hits'):
+            self._dynamic_evidence_hits = {}
+        if not hasattr(self, '_dynamic_evidence_last_seen'):
+            self._dynamic_evidence_last_seen = {}
+        fresh = float(obs.get('observation_age', 0.0)) <= self.motion_fresh_sec
+        signed_lat = abs(float(obs.get('ego_y_rate_signed', 0.0)))
+        speed = abs(float(obs.get('speed', 0.0)))
+        velocity_valid = bool(obs.get('velocity_valid', False))
+        observed_valid = bool(obs.get('observed_motion_valid', False))
+        dynamic_streak = int(obs.get('dynamic_streak', 0))
+        stationary_sec = float(obs.get('stationary_sec', 0.0))
+
+        # Static boxes often produce one 2~6 m/s apparent lateral jump when
+        # their visible face changes.  Raw ego_y_rate alone is therefore not
+        # motion evidence.  It must be backed by a valid scan/world velocity.
+        coherent_motion = ((observed_valid or velocity_valid) and speed >= 0.8 and
+            obs.get('motion_state') != 'static' and
+            (signed_lat >= float(self.predictive_risk.get('slow_lateral_min', 0.50)) or speed >= 1.2))
+        tracker_dynamic = ((obs.get('motion_state') == 'dynamic' or (velocity_valid and dynamic_streak >= 2)) and
+                           speed >= 0.8)
+        if tunnel and obs.get('static_certified', False) and not self._coherent_measured_motion(oid):
+            tracker_dynamic = coherent_motion = False
+        evidence = fresh and (tracker_dynamic or coherent_motion)
+
+        # Once a track has stayed in place, a later box-fit wobble must clear
+        # the dynamic identity instead of extending it for another two seconds.
+        stable_static = stationary_sec >= 0.8 and speed < 0.8
+        measurement_stamp = obs.get('last_seen')
+        previous_measurement = self._dynamic_evidence_last_seen.get(oid)
+        new_measurement = (measurement_stamp is None or
+                           previous_measurement is None or
+                           float(measurement_stamp) > float(previous_measurement) + 1.0e-4)
+        if stable_static:
+            self._dynamic_evidence_hits.pop(oid, None)
+            self._dynamic_evidence_last_seen.pop(oid, None)
+            self._dynamic_seen.pop(oid, None)
+            evidence = False
+        elif new_measurement:
+            if evidence:
+                self._dynamic_evidence_hits[oid] = min(
+                    3, self._dynamic_evidence_hits.get(oid, 0) + 1)
+            else:
+                self._dynamic_evidence_hits[oid] = 0
+            if measurement_stamp is not None:
+                self._dynamic_evidence_last_seen[oid] = float(measurement_stamp)
+
+        dynamic_now = fresh and (
+            tracker_dynamic or self._dynamic_evidence_hits.get(oid, 0) >= 2)
+        if dynamic_now:
+            self._dynamic_seen[oid] = now
+        dynamic_confirmed = dynamic_now or (
+            oid in self._dynamic_seen and
+            now - self._dynamic_seen[oid] <= self.dynamic_memory_sec)
+
+        world_fast = None
+        m8_evidence=True
+        if tunnel and getattr(self,'tunnel_motion_evidence_enabled',False):
+            m8_evidence,self._m8_motion_reason=self.m8_motion_evidence(obs,now)
+            if not hasattr(self,'_m8_motion_reasons'):self._m8_motion_reasons={}
+            self._m8_motion_reasons[oid]=self._m8_motion_reason
+        if tunnel:
+            st = self._dyn_hyst.setdefault(oid, {'on': False, 'hits': 0, 'low_since': None,
+                                                 'on_since': None})
+            parent_static = bool(obs.get('static_certified', False)) and (not m8_evidence if getattr(self,'tunnel_motion_evidence_enabled',False) else not self._coherent_measured_motion(oid))
+            raw_on = m8_evidence and not parent_static and fresh and speed >= self.tunnel_dyn_on_speed and (
+                obs.get('motion_state') == 'dynamic' or
+                (velocity_valid and dynamic_streak >= 2) or
+                ((observed_valid or velocity_valid) and obs.get('motion_state') != 'static'))
+            yaw_w = obs.get('ego_yaw')
+            if yaw_w is None and len(obs.get('position_world', [])) >= 2:
+                yaw_w = self._path_yaw_at(float(obs['position_world'][0]),
+                                          float(obs['position_world'][1]))
+            world_fast = (self._world_fast_motion(oid, float(yaw_w))
+                          if fresh and yaw_w is not None else None)
+            # 짧은 창(0.3 s)과 긴 창(gate_span) 중 작은 쪽: 긴 창만 쓰면 트랙 초반 박스가 커지며
+            # 밀린 중심(19:19 id4)이 섞이고, 짧은 창만 쓰면 박스 흔들림이 섞인다.
+            wvs = [v for v in (self._world_speed(oid, 0.3),
+                               self._world_speed(oid, self.tunnel_dyn_gate_span)) if v is not None]
+            world_v = min(wvs) if wvs else None
+            world_still = (world_v is not None and world_v < self.tunnel_dyn_min_world_speed)
+            if parent_static and fresh and getattr(self,'tunnel_motion_evidence_enabled',False):
+                st.update(on=False,hits=0,low_since=None,on_since=None)
+            if not st['on']:
+                if new_measurement:
+                    if world_still:
+                        st['hits'] = 0
+                    elif raw_on:
+                        st['hits'] += 1
+                    elif not (fresh and speed >= self.tunnel_dyn_on_speed and
+                              obs.get('motion_state') != 'static'):
+                        # 속도는 계속 높은데 유효 플래그만 빠진 프레임은 카운트를 유지한다.
+                        st['hits'] = 0
+                bg_moving = self._bg_moving_near(obs.get('position_world'))
+                if m8_evidence and (world_fast is not None or bg_moving or st['hits'] >= self.tunnel_dyn_on_hits):
+                    st['on'] = True
+                    st['low_since'] = None
+                    st['on_since'] = now
+                    if world_fast is not None:
+                        rospy.loginfo_throttle(
+                            0.5, "[obstacle_stop] 월드 이동 빠른 동적 진입: id=%s v=(%.1f,%.1f)",
+                            oid, world_fast[0], world_fast[1])
+            else:
+                world_low = (world_v is not None and world_v < self.tunnel_dyn_off_speed)
+                if speed < self.tunnel_dyn_off_speed or not fresh or world_low:
+                    if st['low_since'] is None:
+                        st['low_since'] = now
+                    if now - st['low_since'] >= self.tunnel_dyn_off_sec:
+                        st['on'] = False
+                        st['hits'] = 0
+                        st['low_since'] = None
+                        st['on_since'] = None
+                else:
+                    st['low_since'] = None
+            dynamic_now = st['on']
+            dynamic_confirmed = st['on']
+            if dynamic_now:
+                self._dynamic_seen[oid] = now
+            else:
+                self._dynamic_seen.pop(oid, None)
+
+        # 원거리 정적 자리 + 실제로 안 움직임 -> 동적이 아니다(클러스터 흔들림).
+        if tunnel and (dynamic_now or dynamic_confirmed) and self._far_static_match(obs):
+            moved = self._moved_m(oid)
+            if moved is None or moved < self.tunnel_far_static_move_m:
+                dynamic_now = False
+                dynamic_confirmed = False
+                self._dynamic_seen.pop(oid, None)
+                getattr(self, '_tunnel_dynamic_seen', {}).pop(oid, None)
+                self._ever_dyn.pop(oid, None)
+                if oid in self._dyn_hyst:
+                    self._dyn_hyst[oid].update({'on': False, 'hits': 0, 'low_since': None, 'on_since': None})
+                rospy.loginfo_throttle(
+                    1.0, "[obstacle_stop] 원거리 정적 자리 물체 dyn 무시: id=%s moved=%s",
+                    oid, ('%.2f' % moved) if moved is not None else '-')
+        if tunnel:
+            recent = (oid in getattr(self, '_tunnel_dynamic_seen', {}) and
+                      now - self._tunnel_dynamic_seen[oid] <= self.tunnel_dynamic_restatic_sec)
+            if dynamic_now or dynamic_confirmed or recent:
+                self._frame_dyn.add(oid)
+                self._ever_dyn[oid] = now
+        elif self.m3_static_handoff_enabled and (dynamic_now or dynamic_confirmed):
+            self._frame_dyn.add(oid)
+            self._ever_dyn[oid] = now
+
+        verified_static = (tunnel and not dynamic_confirmed and
+                           (self.tunnel_measured_static(obs, now) or '_static_parent_id' in obs or
+                            (obs.get('static_certified', False) and not self._coherent_measured_motion(oid))))
+        if tunnel and dynamic_confirmed:
+            getattr(self, '_measured_static', {}).pop(oid, None)
+        # Classification must not depend on whether the avoidance path is clear.
+        static_ready = (tunnel and not dynamic_confirmed and not recent and
+                        (verified_static or (speed < self.tunnel_dyn_on_speed and
+                         (stationary_sec >= self.tunnel_static_confirm_sec or
+                          obs.get('motion_state') == 'static'))))
+        if static_ready and oid in self._ever_dyn:
+            self._frame_static.add(oid)
+            self._frame_dyn.discard(oid)
+        if tunnel and dynamic_now:
+            self._tunnel_dynamic_seen[oid] = now
+
+        if tunnel:
+            driven_edge = self.driven_path_edge(obs, now)
+            if driven_edge is not None:
+                driven_conflict = driven_edge <= self._driven_corridor_radius(tunnel)
+                # 2026-10-09(14:56:06 백): 근거리가 한 번도 확인 못 한 원거리 단독 객체(노면 오검출)로 근접 정지했다.
+                #   출처가 아직 raw_temporal_far 면 근거리 미확인이므로 근접 정지 근거로 쓰지 않는다(엔진 점유가 맡는다).
+                body_risk = (obs.get('source', '') != 'raw_temporal_far') and self.actual_body_risk(obs)
+                if body_risk:
+                    return True, 'tunnel_body_proximity'
+                if (getattr(self,'tunnel_cells_authoritative_enabled',False) and not dynamic_confirmed and not recent):
+                    measured_sweep=self.future_body_conflict(obs,now)
+                    if measured_sweep is False:return False,'tunnel_measured_future_body_clear'
+                    if measured_sweep is True:driven_conflict=True
+                # 2026-10-08(11:43:05 백): 앞범퍼 앞 근거리 사각에 멈춰 관측이 끊긴 물체(인지 blind_hold)는
+                #   관측 나이와 무관하게 주행 경로에 걸리면 정지한다(놓아서 두 번 충돌).
+                if obs.get('blind_hold', False) and driven_conflict:
+                    return True, 'tunnel_blind_hold'
+                if dynamic_confirmed or recent:
+                    vector=obs.get('velocity') if velocity_valid else obs.get('observed_velocity')
+                    if fresh and vector and len(vector)>=2 and all(math.isfinite(float(v)) for v in vector[:2]):
+                        swept=self._driven_predictive_conflict(obs,vector,allow_prefix=True)
+                        if swept is not None:
+                            return swept[0],('tunnel_dynamic_'+swept[1])
+                # Unavailable paths retain the conservative reference fallback.
+                if dynamic_confirmed or recent:
+                    velocity = obs.get('velocity', [])
+                    if (fresh and (velocity_valid or observed_valid) and len(velocity) >= 2
+                            and all(math.isfinite(float(v)) for v in velocity[:2])):
+                        pw = obs.get('position_world', [])
+                        if len(pw) >= 2:
+                            for dt in (.3, .6, .9, 1.2, 1.5):
+                                predicted = dict(obs, position_world=[pw[0]+velocity[0]*dt,
+                                                                    pw[1]+velocity[1]*dt])
+                                edge = self.driven_path_edge(predicted, now)
+                                if edge is not None and edge <= self._driven_corridor_radius(tunnel):
+                                    driven_conflict = True
+                                    break
+                    in_corridor = in_corridor or driven_conflict or body_risk
+                else:
+                    in_corridor = driven_conflict or body_risk
+                    if not in_corridor:
+                        return False, 'tunnel_driven_path_clear'
+                in_stop_zone = in_forward_range and in_corridor
+
+        if (tunnel and not dynamic_confirmed and not recent and
+                float(obs.get('observation_age',0.)) > .3 and
+                obs.get('motion_state') == 'unknown'):
+            body = self.actual_body_risk(obs)
+            if not body:
+                return False, 'tunnel_stale_unknown_no_refresh'
+
+        # 1) 차량 주행 경로(코리도) 내부의 장애물:
+        # 동적 장애물 미션 구간(3700~4900)은 회피 기동이 비활성화(Passthrough)되므로,
+        # 주행 경로 복도(in_stop_zone) 내에 장애물이 감지되면 동적/정적/미확정(unknown)과
+        # 무관하게 즉시 정지해야 충돌을 방지할 수 있다.
+        if in_stop_zone:
+            if tunnel and getattr(self, 'tunnel_static_avoid_enabled', False):
+                recent_dynamic = (oid in getattr(self, '_tunnel_dynamic_seen', {}) and
+                                  now - self._tunnel_dynamic_seen[oid] <= self.tunnel_dynamic_restatic_sec)
+                if dynamic_confirmed or recent_dynamic:
+                    # 18 m(stop_zone_max_forward) 너머는 동적 상태가 tunnel_far_dyn_confirm_sec
+                    # 유지돼야 정지(20:27 백: 21 m 의 새 드문 클러스터가 측정마다 0.8~1.5 m 튀어
+                    # 바로 dynamic -> 전방 제한을 없애자 원거리 오정지).
+                    fx_far = float(obs.get('position_ego', [0.0])[0])
+                    st_f = self._dyn_hyst.get(oid) or {}
+                    on_since = st_f.get('on_since')
+                    if (fx_far > self.stop_zone_max_forward and dynamic_confirmed and
+                            (on_since is None or now - on_since < self.tunnel_far_dyn_confirm_sec)):
+                        return False, 'tunnel_far_dynamic_unconfirmed'
+                    return True, 'tunnel_in_path_dynamic'
+                if obs.get('source', '') == 'raw_temporal_far':
+                    return False, 'tunnel_far_static_proposal'
+                # 관측 끊긴(동적 이력 없는) 트랙은 정지 근거가 아니다.
+                if float(obs.get('observation_age', 0.0)) > getattr(self, 'tunnel_stale_track_sec', 1.0):
+                    return False, 'tunnel_stale_track'
+                # far 가 정적으로 확정한 자리의 근거리 트랙은 정적으로 이어받는다.
+                # 속도 조건은 두지 않는다: 낮은 정적 물체의 속도 추정이 1.98 m/s 로
+                # 튀어(19:49 백) 이어받기가 막혔다. 실제로 움직이는 물체는 위의
+                # dynamic_confirmed / recent_dynamic 분기가 먼저 정지시킨다.
+                if (getattr(self, 'tunnel_far_static_inherit', False) and
+                        len(obs.get('position_world', [])) >= 2):
+                    wx, wy = float(obs['position_world'][0]), float(obs['position_world'][1])
+                    m2 = self.tunnel_far_static_match_m ** 2
+                    for fx, fy, _ in getattr(self, '_tunnel_far_static', []):
+                        if (wx - fx) ** 2 + (wy - fy) ** 2 <= m2:
+                            return False, 'tunnel_static_from_far'
+                static_ok = verified_static or (speed < self.tunnel_dyn_on_speed and (
+                    stationary_sec >= self.tunnel_static_confirm_sec or
+                    obs.get('motion_state') == 'static'))
+                if static_ok:
+                    if oid in self._ever_dyn:
+                        # 동적이었다가 경로 위에 멈춤 -> 정적 전환(플래너가 회피)
+                        self._frame_static.add(oid)
+                        return False, 'tunnel_dynamic_became_static'
+                    return False, 'tunnel_static_avoid'
+                fwd = float(obs.get('position_ego', [1e9])[0])
+                if getattr(self,"tunnel_swept_stop_enabled",False) and self.future_body_conflict(obs,now) is False:
+                    return False,'tunnel_future_body_clear'
+                if fwd <= self.tunnel_unknown_stop_distance:
+                    return True, 'tunnel_in_path_unknown_near'
+                return False, 'tunnel_in_path_unknown_far'
+            # ★ 2026-10-01 M3: 동적이었다가 경로 위에 멈춘 물체는 정적으로 넘겨 플래너가
+            #   회피한다(그 밖의 M3 정지 동작은 그대로). 멈춘 판정은 월드 위치 기준.
+            if (not tunnel and self.m3_static_handoff_enabled and oid in self._ever_dyn and
+                    not dynamic_now and self._m3_still(oid, obs, now)):
+                self._frame_static.add(oid)
+                return False, 'm3_dynamic_became_static'
+            # ★ 2026-10-05 M3: 한 번도 동적이 아니었던 정적 물체가 앞범퍼보다 뒤(차 옆)면 지나가는 중이다
+            #   (10-04 22:33 백: M2 마지막 정적 장애물 옆 x=0.5 m 에서 정지).
+            if (not tunnel and not dynamic_confirmed and oid not in self._ever_dyn and
+                    obs.get('motion_state') == 'static' and
+                    float(obs.get('position_ego', [1e9])[0]) < self.m3_pass_beside_max_x):
+                return False, 'm3_static_beside_passing'
+            return True, ('in_path_dynamic' if dynamic_confirmed else 'in_path_obstacle')
+
+        fwd_ok = in_forward_range
+        if tunnel:
+            fx = float(obs.get('position_ego', [1e9])[0])
+            fwd_ok = self.stop_zone_min_forward <= fx <= self.tunnel_predict_max_forward
+        if not tunnel and self.m3_approach_gate_enabled:
+            # M3: 2차 코리도 밖은 기준경로 쪽으로 다가오는 동적만 정지(기존 접근/시간겹침 대신).
+            if not (fwd_ok and not in_corridor):
+                return False, 'not_outside'
+            ok, why, speed_w = self._m3_approach(obs, oid)
+            if not ok:
+                return False, 'outside_m3_' + why
+            if not (dynamic_confirmed or speed_w >= self.m3_approach_untracked_speed):
+                return False, 'outside_m3_not_dynamic_%.2f' % speed_w
+            passing = self._m3_pass_through(obs)
+            if passing is not None:
+                return False, 'm3_pass_through_%.2fs' % passing
+            return True, 'outside_m3_' + why
+        if not (fwd_ok and not in_corridor and dynamic_confirmed):
+            return False, 'not_dynamic_or_not_outside'
+        # 터널: 월드 좌표로 빠르고 일관되게 움직인 물체는 트래커 속도 플래그/연속 조건 없이
+        # 그 이동 벡터로 바로 접근 판정한다.
+        if tunnel and world_fast is not None:
+            approach, approach_why = self._approaching_path(obs, world_vel=world_fast)
+            if approach:
+                return True, 'outside_world_' + approach_why
+        if not (fresh and (bool(obs.get('velocity_valid', False)) or
+                          bool(obs.get('observed_motion_valid', False)))):
+            return False, 'outside_velocity_unavailable'
+        # Outside objects must exhibit sustained motion (dynamic_streak >= 2 or 2+ hits)
+        # to prevent single-scan box-fit jitter on roadside structures from triggering emergency stop.
+        if dynamic_streak < 2 and self._dynamic_evidence_hits.get(oid, 0) < 2:
+            return False, 'outside_insufficient_streak'
+        # 2) 접근 즉시정지: 경로 쪽으로 다가오는 게 확인되면 시간겹침 예측 없이 정지.
+        approach, approach_why = self._approaching_path(obs)
+        if approach:
+            return True, 'outside_' + approach_why
+        if not self.predictive_risk.get('enabled', False):
+            return False, 'prediction_disabled'
+        conflict, why = self._predictive_conflict(obs)
+        return conflict, ('outside_' + why)
+
+    def _path_yaw_at(self, wx, wy):
+        """기준경로에서 (wx,wy) 최근접점의 진행방향(rad)."""
+        if len(self.path_x) < 2:
+            return 0.0
+        best, j = float('inf'), 0
+        for i, (px, py) in enumerate(zip(self.path_x, self.path_y)):
+            d = (px - wx) ** 2 + (py - wy) ** 2
+            if d < best:
+                best, j = d, i
+        j2 = min(j + 1, len(self.path_x) - 1)
+        j1 = max(j - 1, 0)
+        return math.atan2(self.path_y[j2] - self.path_y[j1],
+                          self.path_x[j2] - self.path_x[j1])
+
+    def obstacle_info_callback(self, msg):
+        with getattr(self, '_state_lock', nullcontext()):
+            self.last_obstacle_info_time = rospy.Time.now()
+
+            try:
+                data = json.loads(msg.data)
+            except ValueError:
+                return
+
+            # 고주로(lane_number != 0, 1/2/3차선)에서는 도심 정적/동적 장애물 정지 노드가 절대 개입하지 않는다.
+            # 고주로의 앞차 추종 및 차선 안전 간격 제어는 ACC/SMPC 가 전담한다.
+            self.mission_mode = data.get('mission_mode', '')
+            tunnel = self.mission_mode == 'tunnel' and self.current_lane_number == 3
+            is_highway = (self.current_lane_number is not None and self.current_lane_number != 0 and not tunnel)
+            if is_highway:
+                self.dynamic_obstacle_near = False
+                return
+
+            # 도심(0.csv) 구간 판별: M2 정적구간(<= split) / M3 동적구간(split ~ dynamic_zone_max_idx)
+            # 웨이포인트가 아직 없으면 안전하게 motion_state 기반 폴백.
+            in_static_zone = (self.current_waypoint_idx is not None and
+                               self.current_waypoint_idx <= self.static_dynamic_split_idx)
+            in_dynamic_zone = (self.current_waypoint_idx is not None and
+                                self.static_dynamic_split_idx < self.current_waypoint_idx <= (self.dynamic_zone_max_idx if self.dynamic_zone_max_idx >= 0 else 4900))
+            past_dynamic_zone = (self.current_waypoint_idx is not None and
+                                 self.dynamic_zone_max_idx >= 0 and
+                                 self.current_waypoint_idx > self.dynamic_zone_max_idx)
+            if tunnel:
+                in_static_zone, in_dynamic_zone, past_dynamic_zone = False, True, False
+
+            half_width = self.stop_zone_width / 2.0
+            near = False
+            near_dynamic = False
+            handoff_guard_ids = set()
+            cleared_handoff_ids = set()
+            obs_list = data.get('collision_objects', data.get('obstacles', []))
+            self._bg_validation_objects = obs_list if tunnel else []
+            self._frame_dyn = set()
+            self._frame_static = set()
+            stop_decisions = []
+            t_now = rospy.Time.now().to_sec()
+            for o in obs_list:
+                pw = o.get('observed_position_world', o.get('position_world'))
+                if pw and len(pw) >= 2:
+                    h = self._pos_hist.setdefault(int(o.get('id', -1)), [])
+                    # 측정 시각 기준(같은 측정이 반복 발행되면 한 번만). 관측 끊긴 트랙이
+                    # 수신 시각으로 '정지'처럼 쌓이지 않게 한다.
+                    ls = o.get('last_seen')
+                    t_meas = float(ls) if ls is not None else t_now
+                    if not h or t_meas > h[-1][0] + 1.0e-4:
+                        h.append((t_meas, float(pw[0]), float(pw[1])))
+                    while h and h[-1][0] - h[0][0] > 1.5:
+                        h.pop(0)
+            if tunnel and getattr(self, 'tunnel_far_static_inherit', False):
+                now_s = rospy.Time.now().to_sec()
+                for o in obs_list:
+                    if (o.get('source', '') == 'raw_temporal_far' and
+                            o.get('motion_state') == 'static' and
+                            len(o.get('position_world', [])) >= 2):
+                        self._tunnel_far_static.append(
+                            (float(o['position_world'][0]), float(o['position_world'][1]), now_s))
+                self._tunnel_far_static = [
+                    f for f in self._tunnel_far_static
+                    if now_s - f[2] <= self.tunnel_far_static_memory_sec][-200:]
+            elif not tunnel:
+                self._tunnel_far_static = []
+            if tunnel:
+                self._associate_fragments(obs_list, t_now)
+            for obs in obs_list:
+                if obs.get('infrastructure_candidate', False):
+                    continue  # retained by the path planner as collision geometry
+                if tunnel and self._is_tunnel_wall_piece(obs):
+                    stop_decisions.append({'id': int(obs.get('id',-1)), 'stop': False,
+                        'reason': 'tunnel_wall_excluded', 'wall_reason': self._wall_reason})
+                    rospy.loginfo_throttle(
+                        1.0, "[obstacle_stop] 터널 벽/턱 조각 제외(프로파일): id=%s pos_ego=%s",
+                        obs.get('id', -1), obs.get('position_ego'))
+                    continue
+                if tunnel and self._wall_reason != 'inward_motion_protected' and self._is_tunnel_wall_like(obs):
+                    rospy.loginfo_throttle(
+                        1.0,
+                        "[obstacle_stop] 터널 벽 조각 제외: id=%s pos_ego=%s "
+                        "vertical=%.2f top=%.2f size=(%.2f,%.2f)",
+                        obs.get('id', -1), obs.get('position_ego'),
+                        float(obs.get('vertical_thickness', 0.0)),
+                        float(obs.get('top_elevation', 0.0)),
+                        float(obs.get('length', 0.0)),
+                        float(obs.get('width', 0.0)))
+                    continue
+                if self.require_confirmed and not obs.get('confirmed', False):
+                    if not (tunnel and obs.get('perception_source')=='common_scene' and self.actual_body_risk(obs)):continue
+                if obs.get('passed', False):
+                    continue
+
+                x, y, _z = obs.get('position_ego', [1e9, 1e9, 0.0])
+                if _z > self.stop_zone_max_z:
+                    continue
+
+                # 전방 종방향 거리 범위 체크 (ego x: 전방 min ~ max 거리)
+                max_fwd = self.tunnel_stop_max_forward if tunnel else self.stop_zone_max_forward
+                in_forward_range = (self.stop_zone_min_forward <= x <= max_fwd)
+
+                # ★ 정적 장애물(obstacle_avoidance_node)과 완전히 동일한 기준경로 코리도 계산
+                world = obs.get('position_world')
+                if world is not None and self.path_x:
+                    d2p = self.dist_to_path(world[0], world[1])
+                else:
+                    d2p = 0.0
+
+                # 충돌 반경(collision_corridor_radius=4.0m) 밖이면 완전 기각
+                risk_enabled = in_dynamic_zone and self.predictive_risk.get('enabled', False)
+                corridor_limit = (max(self.collision_corridor_radius,
+                    float(self.predictive_risk.get('lateral_range', 6.0)))
+                    if risk_enabled else self.collision_corridor_radius)
+                if self.use_path_corridor and d2p > corridor_limit:
+                    continue
+
+                # 물체 가장자리(edge) 거리 = 경로까지 거리 - 횡방향 반폭.
+                # ★ 2026-09-25: max(length, width)/2 -> width/2. 인지의 width 가 경로
+                #   좌우 방향 크기다. 길이(진행방향)까지 쓰면 도로를 따라 긴 노변
+                #   구조물이 경로 쪽으로 부풀었다.
+                #     실측(18:19 백): 교통섬 신호등 기둥(표지판·연석과 합쳐져 L 1.38~1.50,
+                #     W 0.35)이 경로 우측 2.12~2.24 m 에 있었는데 edge 1.43~1.49 로
+                #     코리도(1.5) 안 판정 -> 동적 구간에서 장애물 없이 3 초 정지.
+                #     폭 기준이면 1.95~2.06 이라 정지하지 않는다.
+                #   width 가 없으면 예전처럼 큰 쪽을 쓴다.
+                _w = float(obs.get('width', 0.0) or 0.0)
+                half_extent = 0.5 * (_w if _w > 0.0 else
+                                     max(float(obs.get('length', 0.0)), _w))
+                edge_dist = max(0.0, d2p - half_extent)
+
+                # M8의 인지 태그는 reference corridor와 ego corridor의 OR이다.
+                # 회피 중 다음 정적 장애물을 살리는 데에는 유효하지만, 대향차가
+                # 자차 정면 가까이 보일 때도 true가 된다. 동적 정지는 여기서 최신
+                # 기준경로 거리로 다시 계산해 그 보조 태그를 즉시정지에 쓰지 않는다.
+                corridor_r = (self.m3_path_corridor_radius if (in_dynamic_zone and not tunnel)
+                              else self.corridor_radius(tunnel))
+                reference_in_corridor = (edge_dist <= corridor_r)
+                if in_dynamic_zone or tunnel:
+                    in_corridor = reference_in_corridor
+                elif 'in_trigger_corridor' in obs:
+                    in_corridor = bool(obs['in_trigger_corridor'])
+                else:
+                    in_corridor = reference_in_corridor
+
+                # 경로 코리도 사용 시: 차체 기준 직사각형(abs(y) <= half_width) 대신 도로 곡률을 따르는 in_corridor 사용
+                if self.use_path_corridor:
+                    in_stop_zone = in_forward_range and in_corridor
+                else:
+                    in_stop_zone = in_forward_range and (abs(y) <= half_width)
+
+                if past_dynamic_zone:
+                    # 미션 구간 밖 - 중앙분리대/가드레일/타 차량은 여기서 판단하지 않는다.
+                    is_near_this_obs = False
+                elif in_static_zone:
+                    # 코스 설계상 이 구간엔 정적 장애물만 나옴이 보장됨 -> 절대 정지 안 함
+                    # (회피는 obstacle_avoidance_node가 전담, 진짜 회피 실패시엔 /avoidance_failed로 별도 비상정지).
+                    is_near_this_obs = False
+                elif (in_dynamic_zone and not tunnel and self.zone_by_object_idx and
+                      self._object_path_idx(obs) is not None and
+                      self._object_path_idx(obs) <= self.static_dynamic_split_idx):
+                    # 물체는 아직 M2(정적) 구간 위에 있다 - 지나가는 정적 장애물로 정지하지 않음.
+                    is_near_this_obs = False
+                elif in_dynamic_zone:
+                    self._prediction_path = None
+                    is_near_this_obs, why = self._dynamic_zone_stop(
+                        obs, in_stop_zone, in_corridor, in_forward_range,
+                        self.last_obstacle_info_time.to_sec(), tunnel=tunnel)
+                    stop_decisions.append({'id': int(obs.get('id', -1)),
+                        'stop': bool(is_near_this_obs), 'reason': why,
+                        'path': ('local' if tunnel and self.driven_path_edge(obs, t_now) is not None else 'reference_fallback'),
+                        'reference_edge_m': edge_dist,
+                        'driven_edge_m': self.driven_path_edge(obs, t_now) if tunnel else None})
+                    stop_decisions[-1].update({'prediction_path': self._prediction_path,
+                        'prediction_time_sec': (float(why.rsplit('_t',1)[1]) if '_t' in why and why.rsplit('_t',1)[1].replace('.','',1).isdigit() else None),
+                        'static_parent_id': obs.get('static_parent_id', obs.get('_static_parent_id')),
+                        'occupancy_state':obs.get('occupancy_state'),
+                        'occupancy_reason':obs.get('occupancy_reason'),
+                        'geometry_source':'world_footprint' if obs.get('footprint_world') else 'legacy_rectangle',
+                        'local_path_age_sec': t_now-getattr(self, 'local_path_time', -1e9),
+                        'path_fallback_reason': self._local_path_unavailable_reason(obs, t_now),
+                        'wall_reason': getattr(self,'_wall_reason','none')})
+                    if (self.handoff_guard_enabled and
+                            why in ('tunnel_dynamic_became_static',
+                                    'm3_dynamic_became_static')):
+                        if tunnel and getattr(self, 'tunnel_swept_guard_enabled', True):
+                            risk = self.tunnel_handoff_conflict(obs, t_now)
+                            if risk is False:
+                                cleared_handoff_ids.add(int(obs.get('id', -1)))
+                                continue
+                            handoff_guard_ids.add(int(obs.get('id', -1)))
+                            continue
+                        on_path, path_edge, path_gap = self.handoff_on_driven_path(obs)
+                        if on_path is None:
+                            # 주행 경로를 모를 때만 예전 기준(자차 정면 x 거리)으로 판단한다.
+                            length = float(obs.get('length', 0.0) or 0.0)
+                            gap = x - 0.5 * length - self.handoff_guard_front_overhang
+                            on_path = (self.handoff_guard_min_gap <= gap
+                                       <= self.handoff_guard_trigger_gap)
+                        elif not on_path:
+                            rospy.loginfo_throttle(
+                                1.0, '[obstacle_stop] 인계 제동 제외: id=%s 주행경로에서 %.2f m '
+                                '(기준 %.2f), 경로거리 gap %.1f m', obs.get('id', -1), path_edge,
+                                self._driven_corridor_radius(tunnel), path_gap)
+                        if on_path:
+                            handoff_guard_ids.add(int(obs.get('id', -1)))
+                    if in_forward_range and not is_near_this_obs:
+                        rospy.loginfo_throttle(
+                            1.0,
+                            "[obstacle_stop] 정지 제외: id=%s pos_ego=(%.1f,%.1f) "
+                            "in_corridor=%s motion=%s speed=%.2f (%s)",
+                            obs.get('id', -1), x, y, in_corridor,
+                            obs.get('motion_state'), float(obs.get('speed', 0.0)),
+                            why)
+                else:
+                    # 일반 구간: dynamic 장애물이 코리도 내에 들어왔을 때 즉시 정지
+                    is_near_this_obs = (obs.get('motion_state') == 'dynamic') and in_stop_zone
+
+                if is_near_this_obs:
+                    near = True
+                    if in_dynamic_zone and (why == 'tunnel_in_path_dynamic' or
+                                            str(why).startswith('outside_') or
+                                            why == 'in_path_dynamic'):
+                        near_dynamic = True
+                    rospy.loginfo_throttle(
+                        0.5,
+                        "[obstacle_stop] STOP TRIGGERED by id=%s pos_ego=(%.1f,%.1f) d2p=%.2f edge=%.2f in_corridor=%s (confirmed=%s, motion=%s)",
+                        obs.get('id', -1), x, y, d2p, edge_dist, in_corridor,
+                        obs.get('confirmed'), obs.get('motion_state'))
+                    # 동적/정적 분류를 모든 물체에 대해 채우려고 멈추지 않고 계속 본다.
+                    continue
+
+                rospy.loginfo_throttle(
+                    0.5,
+                    "[obstacle_stop] DEBUG obs id=%s pos_ego=(%.1f,%.1f) d2p=%.2f edge=%.2f in_corridor=%s motion=%s confirmed=%s",
+                    obs.get('id', -1), x, y, d2p, edge_dist, in_corridor,
+                    obs.get('motion_state'), obs.get('confirmed'))
+
+            # 배경맵 움직임 물체(원본 점군): 트래커가 아직 못 본 저상 동적 장애물.
+            if tunnel and self._bg_moving_fresh():
+                for bo in self._bg_moving:
+                    bstop, bwhy = self._bg_moving_stop(bo)
+                    stop_decisions.append({'id': bo.get('id', -1), 'source': 'bg_moving',
+                        'stop': bool(bstop), 'reason': bwhy,
+                        'verification': self._bg_verification_reason, 'path': self._bg_path_used,
+                        'local_path_age_sec': t_now-getattr(self, 'local_path_time', -1e9)})
+                    if bstop:
+                        near = True
+                        near_dynamic = True
+                        rospy.loginfo_throttle(
+                            0.5, "[obstacle_stop] STOP TRIGGERED by bg_moving #%s ego=(%.1f,%+.1f) "
+                            "v=(%.1f,%.1f) %s (%s)", bo.get('id'), float(bo.get('bx', 0.0)),
+                            float(bo.get('by', 0.0)), float(bo.get('vx', 0.0)),
+                            float(bo.get('vy', 0.0)), bo.get('kind', ''), bwhy)
+                    elif bwhy.startswith('bg_matched_static_'):
+                        rospy.loginfo_throttle(
+                            1.0, '[obstacle_stop] 배경 이동 후보 정적 검증 제외: bg_id=%s (%s)',
+                            bo.get('id'), bwhy)
+
+            # 동적으로 확인된 ID는 잠깐의 가림/희소 스캔 동안만 기억한다.
+            stamp = self.last_obstacle_info_time.to_sec()
+            self._dynamic_seen = {
+                oid: seen for oid, seen in self._dynamic_seen.items()
+                if stamp - seen <= self.dynamic_memory_sec
+            }
+            self._tunnel_dynamic_seen = {
+                oid: seen for oid, seen in getattr(self, '_tunnel_dynamic_seen', {}).items()
+                if tunnel and stamp - seen <= self.tunnel_dynamic_restatic_sec
+            }
+            live_ids = {int(o.get('id', -1)) for o in obs_list}
+            self._dynamic_evidence_hits = {
+                oid: hits for oid, hits in self._dynamic_evidence_hits.items()
+                if oid in live_ids
+            }
+            self._dynamic_evidence_last_seen = {
+                oid: stamp for oid, stamp in self._dynamic_evidence_last_seen.items()
+                if oid in live_ids
+            }
+
+            live = {int(o.get('id', -1)) for o in obs_list}
+            self._pos_hist = {k: v for k, v in self._pos_hist.items() if k in live}
+            self._m3_approach_hits = {k: v for k, v in self._m3_approach_hits.items() if k in live}
+            self._m3_world_vel = {k: v for k, v in self._m3_world_vel.items() if k in live}
+            self._m3_still_since = {k: v for k, v in self._m3_still_since.items() if k in live}
+            self._dyn_hyst = {k: v for k, v in self._dyn_hyst.items() if k in live}
+            self._ever_dyn = {k: v for k, v in self._ever_dyn.items()
+                              if k in live and stamp - v <= 30.0}
+            self._measured_static = {k: v for k, v in getattr(self, '_measured_static', {}).items()
+                                     if k in live and t_now-v[1] <= .5}
+
+            now = rospy.Time.now()
+            if near:
+                self.stop_hold_until = now + rospy.Duration(self.stop_hold_sec)
+                self._stop_by_dynamic = near_dynamic
+                if tunnel:
+                    self._m8_hold_owners = {int(d['id']) for d in stop_decisions
+                                           if d.get('stop') and d.get('id') is not None}
+            elif tunnel and self.m8_static_hold_clear(obs_list, t_now):
+                self.stop_hold_until = None
+                self._m8_hold_owners = set()
+                self._stop_by_dynamic = False
+
+            if tunnel and getattr(self, 'tunnel_swept_guard_enabled', True):
+                # Release old guards on an accepted, fresh collision-free path,
+                # including objects that no longer enter the handoff branch.
+                for obs in obs_list:
+                    oid = int(obs.get('id', -1))
+                    if oid in self.handoff_guard_ids and self.tunnel_handoff_conflict(obs, t_now) is False:
+                        cleared_handoff_ids.add(oid)
+                self.handoff_guard_ids.difference_update(cleared_handoff_ids)
+                handoff_guard_ids.difference_update(cleared_handoff_ids)
+                if not self.handoff_guard_ids and not handoff_guard_ids and cleared_handoff_ids:
+                    self.handoff_guard_until = None
+            if handoff_guard_ids:
+                self.handoff_guard_until = now + rospy.Duration(self.handoff_guard_hold_sec)
+                self.handoff_guard_ids = handoff_guard_ids
+            handoff_guard = (self.handoff_guard_until is not None and
+                             now < self.handoff_guard_until)
+            if not handoff_guard:
+                self.handoff_guard_ids = set()
+
+
+            held = self.stop_hold_until is not None and now < self.stop_hold_until
+            if held != self.dynamic_obstacle_near:
+                rospy.loginfo("[obstacle_stop] dynamic_obstacle_near: %s -> %s", self.dynamic_obstacle_near, held)
+            self.dynamic_obstacle_near = held
+            if not held:
+                self._stop_by_dynamic = False
+            if hasattr(self,'coverage_pub'):
+                self.coverage_pub.publish(Float64(data=self.coverage_speed_cap(now.to_sec()) if tunnel else 9999.))
+            hazard=next((d for d in stop_decisions if d.get('stop')),None)
+            if hazard and not getattr(self,'_first_stop_reason',None):
+                self._first_stop_reason={'id':hazard.get('id'),'reason':hazard.get('reason'),'time':now.to_sec()}
+            if not getattr(self,'_first_stop_reason',None) and (self.avoidance_failed or handoff_guard):
+                self._first_stop_reason={'id':None,'reason':'avoidance_failed' if self.avoidance_failed else 'handoff_guard','time':now.to_sec()}
+            if not held and not self.avoidance_failed and not handoff_guard:self._first_stop_reason=None
+            m3_risk = None
+            if self.m3_risk_enabled and in_dynamic_zone and not tunnel:
+                m3_risk = self._m3_risk_speed(obs_list)
+                self.m3_risk_pub.publish(Float64(data=m3_risk[0]))
+            self.dyn_state_pub.publish(String(data=json.dumps({
+                'm3_risk_speed': None if m3_risk is None else round(m3_risk[0], 2),
+                'm3_risk_limiting_id': None if m3_risk is None else m3_risk[1],
+                'm3_risk_candidates': None if m3_risk is None else m3_risk[2],
+                'hold': bool(held and self._stop_by_dynamic and (tunnel or in_dynamic_zone)),
+                'dynamic_ids': sorted(self._frame_dyn - self._frame_static),
+                'static_ids': sorted(self._frame_static),
+                # 현재 정적으로 인계됐더라도 처음에는 동적으로 확인됐는지 RViz와
+                # 후진 노드에서 구분할 수 있도록 최대 30초간의 이력을 함께 보낸다.
+                'ever_dynamic_ids': sorted(self._ever_dyn.keys()),
+                'handoff_guard': bool(handoff_guard),
+                'handoff_guard_ids': sorted(self.handoff_guard_ids),
+                'motion_evidence_reason':getattr(self,'_m8_motion_reason','legacy'),
+                'handoff_guard_reason': getattr(self, '_handoff_guard_reason', 'none'),
+                'handoff_cleared_ids': sorted(cleared_handoff_ids),
+                'brake_required': bool(self.m8_speed_error() or held or handoff_guard or self.avoidance_failed),
+                'hold_remaining_sec': max(0., (self.stop_hold_until-now).to_sec()) if self.stop_hold_until else 0.,
+                'brake_reason': ('speed_input_expired' if self.m8_speed_error() else 'avoidance_failed' if self.avoidance_failed else
+                                 'handoff_guard' if handoff_guard else
+                                 'current_hazard' if near else 'stop_hold' if held else 'clear'),
+                'first_stop':getattr(self,'_first_stop_reason',None),
+                'validated_path_remaining_m':self.path_coverage(now.to_sec()) if tunnel else None,
+                'path_speed_limit_mps':self.coverage_speed_cap(now.to_sec()) if tunnel else None,
+                'stop_decisions': stop_decisions,
+            })))
+        
+            self.publish_visualization()
+
+
+    def speed_valid_callback(self,msg):
+        self.speed_input_valid=bool(msg.data);self.speed_input_stamp=rospy.Time.now().to_sec()
+
+    def m8_speed_error(self):
+        return (rospy.get_param('/tunnel_recovery/speed_integrity_enabled',True) and
+                getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',-1)==3 and
+                (not getattr(self,'speed_input_valid',True) or
+                 rospy.Time.now().to_sec()-getattr(self,'speed_input_stamp',-1e9)>.5))
+
+    def avoidance_failed_callback(self, msg):
+        self.avoidance_failed = msg.data
+
+    def reverse_cmd_callback(self, msg):
+        self.reverse_cmd = msg
+        self.reverse_cmd_time = rospy.Time.now().to_sec()
+
+    def reverse_gear_callback(self, msg):
+        gear = int(msg.data)
+        if gear not in (1, 2, 3, 4):
+            rospy.logwarn_throttle(2.0, '[obstacle_stop] 잘못된 후진 기어 요청: %d', gear)
+            return
+        self.reverse_gear = gear
+        self.reverse_gear_time = rospy.Time.now().to_sec()
+
+    def publish_reverse_if_active(self):
+        """신선한 후진 명령+기어를 한 쌍으로 전달하고 선점 여부를 반환한다."""
+        if not self.reverse_direct_control or self.reverse_cmd is None:
+            return False
+        now = rospy.Time.now().to_sec()
+        cmd_age = now - self.reverse_cmd_time
+        gear_age = now - self.reverse_gear_time
+        active = (0.0 <= cmd_age <= self.reverse_cmd_timeout and
+                  0.0 <= gear_age <= self.reverse_cmd_timeout)
+        if not active:
+            return False
+        self.ctrl_pub.publish(self.reverse_cmd)
+        self.gear_pub.publish(UInt8(data=self.reverse_gear))
+        return True
+
+    def timer_callback(self, _evt):
+        # 후진 상태 머신이 활성화된 동안에는 기존 동적정지/회피실패 제동보다
+        # 후진 명령이 우선한다. reverse_escape_node 자체가 후방 물체와 동적
+        # 장애물을 감시하며 위험 시 제동 명령을 보낸다.
+        if not self.m8_speed_error() and self.publish_reverse_if_active():
+            return
+        now = rospy.Time.now()
+        handoff_guard = (self.handoff_guard_until is not None and
+                         now < self.handoff_guard_until)
+        is_stop = self.m8_speed_error() or self.dynamic_obstacle_near or self.avoidance_failed or handoff_guard
+        if is_stop:
+            # 1. /aeb/command 발행 (control_arbiter 사용 시 즉각적인 긴급 제동 1.0)
+            if self.aeb_pub is not None:
+                aeb_cmd = AebCommand()
+                aeb_cmd.header.stamp = rospy.Time.now()
+                aeb_cmd.source = 'dynamic_obstacle_stop'
+                aeb_cmd.emergency = True
+                aeb_cmd.stage = AebCommand.STAGE_FULL
+                aeb_cmd.brake = self.stop_brake
+                if self.m8_speed_error():
+                    aeb_cmd.reason = 'speed_input_expired'
+                elif self.dynamic_obstacle_near:
+                    aeb_cmd.reason = 'dynamic_obstacle_near'
+                elif handoff_guard:
+                    aeb_cmd.reason = 'dynamic_to_static_wait_reverse'
+                else:
+                    aeb_cmd.reason = 'avoidance_failed'
+                self.aeb_pub.publish(aeb_cmd)
+
+            # 2. /control/obstacle_stop_cmd 또는 /ctrl_cmd 로 정지 명령 발행
+            # /ctrl_cmd_raw 가 안 들어오는 환경에서도 obstacle_stop_adapter 가 인지할 수 있도록 보장
+            out = CtrlCmd()
+            out.longlCmdType = 1
+            out.steering = self.last_steering
+            out.velocity = 0.0
+            out.acceleration = 0.0
+            out.accel = 0.0
+            out.brake = self.stop_brake
+            self.ctrl_pub.publish(out)
+
+    def ctrl_cmd_callback(self, raw_cmd):
+        self.last_steering = raw_cmd.steering
+
+        # MPC 콜백 사이에서도 후진 명령이 전진 명령으로 덮이지 않게 한다.
+        if not self.m8_speed_error() and self.publish_reverse_if_active():
+            return
+
+        tunnel = self.mission_mode == 'tunnel' and self.current_lane_number == 3
+        is_highway = (self.current_lane_number is not None and self.current_lane_number != 0 and not tunnel)
+        past_dynamic = (self.current_waypoint_idx is not None and
+                        self.dynamic_zone_max_idx >= 0 and
+                        self.current_waypoint_idx > self.dynamic_zone_max_idx)
+        in_static = (self.current_waypoint_idx is not None and
+                     self.current_waypoint_idx <= self.static_dynamic_split_idx)
+        zone_needs_obstacle_info = not (is_highway or past_dynamic or in_static)
+        zone_needs_obstacle_info = zone_needs_obstacle_info or tunnel
+
+        # /obstacle_info가 한동안 안 왔으면(인지 노드 다운 등) 안전하게 정지 유지
+        stale = (
+            zone_needs_obstacle_info and (
+                self.last_obstacle_info_time is None or
+                (rospy.Time.now() - self.last_obstacle_info_time).to_sec() > self.obstacle_timeout
+            )
+        )
+
+        now = rospy.Time.now()
+        handoff_guard = (self.handoff_guard_until is not None and
+                         now < self.handoff_guard_until)
+        if self.m8_speed_error() or self.dynamic_obstacle_near or self.avoidance_failed or handoff_guard or stale:
+            out = CtrlCmd()
+            out.longlCmdType = raw_cmd.longlCmdType
+            out.steering = raw_cmd.steering   # 조향은 유지, 급격한 직진 복귀 방지
+            out.velocity = 0.0
+            out.acceleration = 0.0
+            out.accel = 0.0
+            out.brake = self.stop_brake
+            self.ctrl_pub.publish(out)
+        else:
+            self.ctrl_pub.publish(raw_cmd)
+
+
+if __name__ == '__main__':
+    try:
+        ObstacleStopNode()
+    except rospy.ROSInterruptException:
+        pass

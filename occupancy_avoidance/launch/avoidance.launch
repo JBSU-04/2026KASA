@@ -1,0 +1,18 @@
+<launch>
+  <arg name="static_zone_min_idx" default="2400"/>
+  <arg name="static_dynamic_split_idx" default="3700"/>
+  <arg name="tl_guard_enabled" default="true"/>
+  <!-- 2026-10-05: true = 서비스 모드(누적 점유 장애물 + 후보 경로만 발행, 경로/회피실패/속도는 obstacle_avoidance_node) -->
+  <arg name="service_mode" default="true"/>
+  <node pkg="occupancy_avoidance" type="occupancy_avoidance_node" name="occupancy_avoidance" output="screen" respawn="true">
+    <rosparam command="load" file="$(find occupancy_avoidance)/config/avoidance.yaml"/>
+    <rosparam command="load" file="$(find new_lane)/config/curb_edges.yaml"/>
+    <rosparam command="load" file="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+    <param name="csv0" value="$(find waypoint_system)/data/default/0.csv"/>
+    <param name="csv3" value="$(find waypoint_system)/data/default/3.csv"/>
+    <param name="static_zone_min_idx" value="$(arg static_zone_min_idx)"/>
+    <param name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+    <param name="tl_guard_enabled" value="$(arg tl_guard_enabled)"/>
+    <param name="service_mode" value="$(arg service_mode)"/>
+  </node>
+</launch>

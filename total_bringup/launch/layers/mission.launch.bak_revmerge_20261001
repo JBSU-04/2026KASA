@@ -1,0 +1,135 @@
+<launch>
+  <!-- ===================================================================
+       미션 계층.
+
+       모든 미션은 /mission/constraints/<name> 으로 BehaviorConstraint 만
+       발행한다. 조향이나 /ctrl_cmd 를 직접 건드리지 않는다.
+       mission_manager 가 합성하고, constraint_to_speed_cap 이 속도캡으로
+       바꿔 MPC 입력(/smpc/target_speed_mps)으로 넣는다. 그래야 MPC 가
+       감속을 스스로 계획하고 종방향 권한이 겹치지 않는다.
+
+       roslaunch 는 위에서 아래로 읽는다. arg 선언을 먼저 모아 둔다.
+       =================================================================== -->
+
+  <!-- ========== 인자 ========== -->
+  <arg name="use_mission_manager" default="true"/>
+  <arg name="use_mission_adapter" default="true"/>
+
+  <!-- MPC 가 실제로 구독하는 이름(control.launch 의 external_acc_topic 과
+       반드시 같아야 함). constraint_to_speed_cap 이 구간별로(M6/M7 은 ACC
+       중계, 그 외는 자기 미션 캡) 이 이름의 유일한 발행자가 된다.
+       smpc_lane_change 원본 이름(/smpc/target_speed_mps) 은 그대로 두고
+       ACC 원본값은 raw_acc_topic 으로 구독만 한다 - 자세한 이유는
+       constraint_to_speed_cap.py 주석 참고. -->
+  <arg name="cap_direct_topic" default="/smpc/target_speed_mps_gated"/>
+
+  <!-- M1~M4 신호등. map_localizer 가 mgeo 정지선 + /traffic_light_color 로
+       /localization/stop_required 를 내면 BehaviorConstraint 로 포장한다.
+       실제 정지 활성 범위는 missions.yaml 의
+       traffic_light_mission.active_idx_ranges 에서 제한한다. -->
+  <arg name="use_traffic_light" default="false"/>
+
+  <!-- M3 동적 장애물. object_tracking_node(/lidar_perception/tracked_objects)
+       기반. 속도만 제한하고 경로는 건드리지 않는다. -->
+  <arg name="use_dynamic_obstacle" default="false"/>
+
+  <!-- M2 정적 장애물. 속도 제약만 낸다. 경로 회피는 planning 계층의
+       obstacle_avoidance_node 와 local_path_mux 가 담당한다. -->
+  <arg name="use_static_obstacle" default="false"/>
+
+  <!-- A안: 정동적 트리 방식 그대로. static_dynamic_split_idx 기준으로
+       앞쪽은 회피(obstacle_avoidance_node), 뒤쪽은 정지(obstacle_stop_node).
+       split 은 M2(정적 @3096)와 M3(동적 @4305) 사이인 3700.
+       정지 명령은 /ctrl_cmd 로 직접 나가지 않고 어댑터가 미션 계약으로 옮긴다. -->
+  <arg name="use_obstacle_stop" default="false"/>
+  <arg name="static_dynamic_split_idx" default="3700"/>
+  <arg name="obstacle_stop_sections" default="[M3]"/>
+  <!-- 원본(정동적)에서는 obstacle_stop_node 가 /ctrl_cmd 를 직접 발행해
+       MPC 명령을 덮어쓰는 방식이었다. 검증된 구성이라 기본으로 둔다.
+       use_stop_adapter:=true 면 /control/obstacle_stop_cmd 로 우회해
+       BehaviorConstraint 로 바꾼다(arbiter 방식과 짝). -->
+  <arg name="use_stop_adapter" default="false"/>
+  <!-- 동적 정지 구간의 끝(CSV idx). 음수면 상한 없음(정동적 원본 거동). -->
+  <arg name="obstacle_stop_end_idx" default="4900"/>
+
+  <!-- M5 회전교차로.
+       kcity_roundabout.launch 는 control_constraint_gateway 까지 띄운다.
+       그 게이트웨이는 /ctrl_cmd 를 직접 발행해 단일 publisher 계약을 깨고
+       MPC 와 종방향 권한이 겹친다. 그래서 하위 런치 둘만 직접 붙인다.
+       LiDAR 지면제거는 전 미션 공통 GroundGrid /nonground 를 직수한다. -->
+  <arg name="use_roundabout" default="false"/>
+  <arg name="roundabout_config"
+       default="$(find mission_planner)/config/sites/kcity_roundabout_utm.yaml"/>
+  <arg name="roundabout_cloud_topic" default="/nonground"/>
+  <arg name="roundabout_input_mode"  default="sensor_nonground"/>
+
+  <!-- ========== 공통 ========== -->
+  <!-- 구간 라우터는 위치의 순수 함수다. 미션 실패가 전파되지 않는다.
+       시퀀스 관측기는 기록만 하고 아무것도 차단하지 않는다. -->
+  <node pkg="mission_supervisor" type="section_router.py" name="section_router"
+        output="screen"/>
+  <node pkg="mission_supervisor" type="sequence_monitor.py" name="sequence_monitor"
+        output="screen"/>
+  <node pkg="mission_supervisor" type="constraint_to_speed_cap.py"
+        name="constraint_to_speed_cap" output="screen">
+    <param name="direct_speed_topic" value="$(arg cap_direct_topic)"/>
+  </node>
+
+  <include if="$(arg use_mission_manager)"
+           file="$(find mission_manager)/launch/mission_manager.launch"/>
+
+  <!-- 음영구간 미션(non_gps_msgs/MissionCommand) -> BehaviorConstraint -->
+  <node if="$(arg use_mission_adapter)" pkg="mission_supervisor"
+        type="mission_command_adapter.py" name="mission_command_adapter"
+        output="screen"/>
+
+  <!-- ========== 미션 실행기 ========== -->
+  <node if="$(arg use_traffic_light)" pkg="mission_supervisor"
+        type="traffic_light_mission.py" name="traffic_light_mission"
+        output="screen"/>
+
+  <!-- 구형 직사각형 박스 로직(dynamic_obstacle_mission_node)은 커브길 오작동
+       문제가 있어 사용하지 않음. 대신 obstacle_stop_node 가 동적 장애물을 커버함.
+  <node if="$(arg use_dynamic_obstacle)" pkg="mission_pkg"
+        type="dynamic_obstacle_mission_node" name="dynamic_obstacle_mission_node"
+        output="screen">
+    <rosparam command="load" file="$(find mission_pkg)/config/dynamic_obstacle.yaml"/>
+  </node>
+  -->
+
+  <node if="$(arg use_static_obstacle)" pkg="mission_pkg"
+        type="static_obstacle_mission_node" name="static_obstacle_mission_node"
+        output="screen">
+    <rosparam command="load" file="$(find mission_pkg)/config/static_obstacle.yaml"/>
+  </node>
+
+  <group if="$(arg use_obstacle_stop)">
+    <include file="$(find new_lane)/launch/obstacle_stop.launch">
+      <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+      <arg name="dynamic_zone_max_idx" value="$(arg obstacle_stop_end_idx)"/>
+      <arg name="ctrl_cmd_topic"
+           value="$(eval '/control/obstacle_stop_cmd' if arg('use_stop_adapter') else '/ctrl_cmd')"/>
+    </include>
+    <node if="$(arg use_stop_adapter)" pkg="mission_supervisor"
+          type="obstacle_stop_adapter.py" name="obstacle_stop_adapter" output="screen">
+      <rosparam param="sections" subst_value="true">$(arg obstacle_stop_sections)</rosparam>
+    </node>
+  </group>
+
+  <group if="$(arg use_roundabout)">
+    <include file="$(find roundabout_lidar_tracker)/launch/roundabout_lidar_tracker.launch">
+      <arg name="config_file"           value="$(arg roundabout_config)"/>
+      <arg name="cloud_topic"           value="$(arg roundabout_cloud_topic)"/>
+      <arg name="odom_topic"            value="/odom"/>
+      <arg name="input_mode"            value="$(arg roundabout_input_mode)"/>
+      <arg name="expected_cloud_frame"  value="velodyne_ground"/>
+    </include>
+    <include file="$(find mission_planner)/launch/roundabout_mission.launch">
+      <arg name="config_file"              value="$(arg roundabout_config)"/>
+      <arg name="odom_topic"               value="/odom"/>
+      <arg name="route_topic"              value="/local_path"/>
+      <arg name="localization_valid_topic" value="/localization/valid"/>
+      <arg name="constraint_topic"         value="/mission/constraints/roundabout"/>
+    </include>
+  </group>
+</launch>

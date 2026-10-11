@@ -1,0 +1,8 @@
+<launch>
+  <arg name="config_file"
+       default="$(find mission_manager)/config/mission_manager.yaml" />
+  <node pkg="mission_manager" type="mission_manager_node"
+        name="mission_manager" output="screen" required="true">
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
+</launch>

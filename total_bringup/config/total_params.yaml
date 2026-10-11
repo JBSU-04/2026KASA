@@ -1,0 +1,22 @@
+# Ioniq 5 Specs
+vehicle:
+  wheelbase: 3.000
+  front_overhang: 0.845
+  rear_overhang: 0.790
+  max_steering_angle: 40.0
+  min_turning_radius: 5.87
+
+# MPC Tracking Specs
+# 주의: 이 키는 /mpc_path_tracking/Lf 로 올라가는데 mpc.h 는 전역 NodeHandle 로
+#       /Lf 를 읽는다(ros::NodeHandle nh). 즉 여기 값은 MPC 에 반영되지 않는다.
+#       실제로 먹는 값은 mpc_path_tracking/config/mpc_params.yaml 의 최상위 Lf 다.
+#       기록용으로만 남긴다.
+mpc_path_tracking:
+  Lf: 3.000  # Sync with wheelbase (실효값 아님 — 위 주석 참조)
+
+# Sensor Voxel Limits for Network Load Mitigation
+lidar:
+  voxel_size: 0.2
+  cropbox_max_x: 20.0
+  cropbox_max_y: 10.0
+  cropbox_max_z: 2.0

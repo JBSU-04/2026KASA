@@ -1,0 +1,22 @@
+<launch>
+  <arg name="image_topic" default="/image_jpeg/compressed" />
+  <arg name="compressed" default="true" />
+  <arg name="repo_root" default="$(env HOME)/TwinLiteNet-main" />
+  <arg name="weights" default="$(arg repo_root)/pretrained/best.pth" />
+  <arg name="device" default="cuda" />
+  <arg name="output_topic" default="/twinlitenet/overlay" />
+  <arg name="show" default="false" />
+
+  <node pkg="twinlitenet_morai_ros"
+        type="twinlitenet_morai_node.py"
+        name="twinlitenet_morai_node"
+        output="screen">
+    <param name="image_topic" value="$(arg image_topic)" />
+    <param name="compressed" value="$(arg compressed)" />
+    <param name="repo_root" value="$(arg repo_root)" />
+    <param name="weights" value="$(arg weights)" />
+    <param name="device" value="$(arg device)" />
+    <param name="output_topic" value="$(arg output_topic)" />
+    <param name="show" value="$(arg show)" />
+  </node>
+</launch>

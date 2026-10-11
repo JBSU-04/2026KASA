@@ -1,0 +1,145 @@
+#pragma once
+#include <grid_map_core/grid_map_core.hpp>
+#include <octomap/OcTree.h>
+#include <array>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace occupancy_avoidance {
+struct Point { double x=0,y=0,z=0; };
+struct Pose { double stamp=0,x=0,y=0,z=0,yaw=0,speed=0; };
+struct Reference { double x=0,y=0,yaw=0; int idx=0; };
+struct Edge { int first=0,last=0; double right=-1,left=-1; };
+struct DynamicRegion { double x=0,y=0,yaw=0,length=0,width=0; };
+struct CertifiedTrigger { std::vector<Point> footprint; double stamp=-1; };
+struct LiveEdges { Pose pose; double right=0,left=0,right_slope=0,left_slope=0; bool valid=false; };
+struct Config {
+  double resolution=.1, length=80, width=30;
+  double sensor_x=1.1,sensor_y=0,sensor_z=1.33,sensor_height=1.765;
+  double half_width=.95,front=3.85,rear=.79,curb_margin=.1,obstacle_margin=.2;
+  double rear_observation_distance=5.;
+  double min_height=.06,max_height=2.8,transient_sec=.35,scan_timeout=.35;
+  double knot_ds=1.0,lateral_step=.2,horizon=40,max_curvature=.18;
+  double approach_horizon=50;
+  double approach_obstacle_margin=.2;
+  bool trigger_enabled=true;
+  double trigger_half_width=1.5,trigger_distance=30,trigger_hold=3;
+  double traffic_range=80,traffic_timeout=.7,traffic_gap_min=10,traffic_gap_max=20;
+  double traffic_decel=1.5;
+  int static_planning_start_idx=2100,static_zone_min_idx=2400;
+  double max_lateral_accel=2.5,max_slope=.45,max_lateral_jerk=.035;
+  double target_speed=8.333,braking=2.5,reaction=.3,open_right=4.5,open_left=7.0;
+  double return_min_distance=12,return_min_time=2,return_tolerance=.2;
+  double return_center_weight=2;
+  double return_overshoot=.1,cruise_offset=.15,cruise_heading=.05235987756;
+  double cruise_path_offset=.2,cruise_preview=8,cruise_hold=.5;
+  double live_boundary_distance=6,live_boundary_heading=.08726646260;
+  // Same transition-length rule as legacy new_lane spatial center return.
+  double spatial_return_accel=1.5,spatial_return_jerk=8,spatial_return_min_speed=4.5;
+  double spatial_return_min_length=6,spatial_return_max_length=32;
+  int confirm_scans=3,clear_scans=3;
+};
+struct TrafficState {
+  bool enabled=false,seen=false,required=false;
+  double distance=-1,stop_target=-1,distance_stamp=-1,required_stamp=-1;
+};
+struct Result {
+  std::vector<Reference> path;
+  std::vector<std::array<double,4>> corridor; // x,y,lower d,upper d
+  bool clear=false,held=false,avoiding=false,returning=false;
+  std::string reason;
+  std::string motion_state="STOP",speed_limit_reason="no_valid_path",boundary_source="open";
+  std::string return_rejection_reason="not_requested";
+  double failure_distance=-1;
+  double planning_horizon=0;
+  double approach_blockage_distance=-1;
+  int trigger_count=0;bool trigger_held=false,traffic_held=false;
+  std::string trigger_reason="disabled";
+  double trigger_nearest=-1,return_complete_distance=-1,traffic_stop_target=-1;
+  double speed_cap=0,max_curvature=0,minimum_curb_clearance=1e9,compute_ms=0;
+  size_t static_voxels=0,transient_voxels=0;
+};
+class Engine {
+ public:
+  explicit Engine(Config config=Config());
+  void reset();
+  void setRoad(std::vector<Reference> road, std::vector<Edge> edges);
+  void setLiveEdges(const LiveEdges& edges){live_=edges;}
+  // Full, gravity-aligned sensor returns: preserve 3D beam heights for clearing.
+  bool integrate(const Pose&,const std::vector<Point>& returns,
+                 const std::vector<Point>& ground={},const std::vector<DynamicRegion>& dynamic={});
+  Result plan(const Pose&,const std::vector<Reference>& route);
+  // Hypothetical recovery never changes live planning history or map evidence.
+  std::unique_ptr<Engine> recoverySnapshot() const;
+  // Planning copies keep continuity; hypothetical recovery copies deliberately do not.
+  std::unique_ptr<Engine> planningSnapshot() const;
+  void adoptPlanning(const Engine& planned);
+  // Build and validate a curved connection from the actual pose, including its entire tail.
+  bool connect(const Pose&,const std::vector<Reference>&,double,
+               std::vector<Reference>&,std::string* reason=nullptr) const;
+  Result evaluateEscape(const Pose&,const std::vector<Reference>& route) const;
+  bool validateReverse(const std::vector<Reference>&,double,std::string* reason=nullptr) const;
+  bool locate(double x,double y,Reference& out) const;
+  void adoptEscape(const std::vector<Reference>& path){last_path_=path;avoidance_session_=true;aligned_since_=-1;}
+  void setConditionalDividers(std::vector<Edge> candidates);
+  std::vector<Edge> conditionalDividers(double now) const;
+  double dividerObservationStamp() const {return divider_seen_;}
+  void updateEdges(std::vector<Edge> edges){edges_=std::move(edges);}
+  void setRearObservation(double distance){cfg_.rear_observation_distance=distance;}
+  // Existing verified static geometry is an admission hint only, never collision occupancy.
+  void setCertifiedTriggers(std::vector<CertifiedTrigger> objects){certified_triggers_=std::move(objects);}
+  void setTraffic(const TrafficState& state){traffic_=state;}
+  bool validate(const std::vector<Reference>& path,double now,std::string* reason=nullptr,double* failure_distance=nullptr) const;
+  std::pair<double,double> bounds(int idx) const;
+  bool boundaryKnown(int idx,bool left) const;
+  std::string boundarySource(int idx) const;
+  const grid_map::GridMap& grid() const { return grid_; }
+  const Config& config() const { return cfg_; }
+  double lastScan() const { return last_scan_; }
+  size_t staticCount() const;
+  uint64_t geometryDigest() const;
+  size_t count() const { return evidence_.size(); }
+ private:
+  struct Evidence { Point p; int hits=0,misses=0; double first=0,last=0,last_clear=0; bool fixed=false; };
+  Config cfg_;
+  std::unique_ptr<octomap::OcTree> tree_;
+  std::map<uint64_t,Evidence> evidence_;
+  grid_map::GridMap grid_;
+  std::vector<Reference> road_,last_path_;
+  std::vector<Edge> edges_,base_edges_,divider_candidates_;
+  double divider_seen_=-1;int divider_hits_=0,divider_first_=-1,divider_last_=-1;
+  void observeDividers(const Pose&,const std::vector<Point>&);
+  void applyConditionalEdges(double now);
+  struct RoadNode { size_t point=0; int left=-1,right=-1; unsigned axis=0; };
+  std::vector<RoadNode> road_tree_;
+  int buildRoad(std::vector<size_t>&,size_t,size_t,unsigned);
+  void queryRoad(int,double,double,double&,const Reference*&) const;
+  std::map<std::pair<int,int>,std::vector<Point>> obstacle_bins_;
+  std::map<std::pair<int,int>,double> ground_visibility_;
+  double origin_x_=0,origin_y_=0,origin_z_=0,last_scan_=-1,last_pose_stamp_=-1;
+  double ground_plane_[3]={0,0,0};
+  Pose scan_pose_;
+  double measured_curvature_=0;
+  double aligned_since_=-1;
+  bool avoidance_session_=false;
+  bool spatial_return_active_=false;
+  bool approach_fallback_in_progress_=false;
+  LiveEdges live_;
+  TrafficState traffic_;
+  std::vector<CertifiedTrigger> certified_triggers_;
+  std::vector<Point> held_trigger_;double trigger_seen_=-1;
+  void selectTrigger(const Pose&,const std::vector<Reference>&,Result&);
+  bool approvalPath(Result&,const Pose&,const std::vector<Reference>&,double,const std::string&);
+  bool initialized_=false;
+  uint64_t key(const octomap::OcTreeKey&) const;
+  const Reference* nearestRoad(double x,double y) const;
+  bool roadInside(double x,double y,double inset,double* clearance=nullptr) const;
+  bool bodyClear(const Reference&,double now,std::string* reason=nullptr) const;
+  bool liveBoundaryApplies(int idx) const;
+  void updateMotion(Result&,const Pose&,const std::vector<Reference>&);
+  void rebuild(double now);
+  std::vector<Reference> resample(const std::vector<Reference>&,double ds) const;
+};
+} // namespace occupancy_avoidance

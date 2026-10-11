@@ -1,0 +1,2155 @@
+#!/usr/bin/env python3
+"""
+라이다 단독 장애물 인지 노드 (정적/동적 겸용, world(UTM) 좌표 기반)
+
+카메라+라이다 융합(PointPainting) 방식은 근접 시차/타이밍 스큐로 인한 위치
+노이즈가 정적/동적 오분류, 근거리 투영 불일치 등 연쇄적인 문제의 근본 원인이라
+전부 걷어내고 라이다 점군 클러스터링만으로 장애물을 검출/추적한다.
+
+파이프라인:
+  1. 라이다(/demo/nonground) 점군을 거리/자기차량 박스로 1차 필터링
+  2. 점군을 유클리드 거리 기반 클러스터링(cKDTree connectivity, Union-Find)
+  3. 각 클러스터 중심을 world(UTM) 좌표로 변환하고 이전 프레임 트랙과 매칭
+     (world 좌표에서 추적해야 ego 자신의 이동이 속도추정에 안 섞임)
+  4. 최근 프레임들의 world 위치 변화로 속도 추정 -> 정적/동적 분류 (히스테리시스 포함)
+  5. ego 기준 x좌표(전방 거리)가 음수로 전환되면 "통과(passed)"로 판정
+  6. 결과를 JSON 문자열로 /obstacle_info(std_msgs/String) 토픽에 발행
+
+이 노드가 발행하는 각 장애물 정보 (JSON 필드):
+  id            : 추적 ID (정수, 같은 물체는 계속 같은 id)
+  class_name    : 항상 "obstacle" (클래스 구분 없음, 카메라 없이는 알 수 없음)
+  position_ego  : [x, y, z] - 차량(base_link) 기준 현재 상대좌표 (전방=x, 좌측=y, 상방=z)
+  position_world: [x, y] - world(UTM) 절대좌표 (Frenet 플래너 등 경로 계획용)
+  speed         : world 좌표 기준 추정 속도 (m/s)
+  motion_state  : "static" | "dynamic" | "unknown"(속도 추정에 필요한 이력이 아직 부족)
+  source        : 항상 "lidar_only"
+  passed        : true/false - ego 기준 후방으로 빠졌는지 (회피 통과 판정용)
+  confirmed     : true/false - 클러스터 점 개수가 최소기준(min_points_for_confirm)을 넘었는지
+"""
+
+import math
+import time
+import json
+from collections import deque
+from scipy.optimize import linear_sum_assignment
+
+import rospy
+import numpy as np
+from apollo_motion_bridge import MotionObservation, adopt_velocity, load_library
+from apollo_motion_bridge.mission_profiles import FILTER_KEYS, validate_profiles
+import tf.transformations as tft
+
+from sensor_msgs.msg import PointCloud2
+from nav_msgs.msg import Odometry, Path
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+import sensor_msgs.point_cloud2 as pc2
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+
+# ============================================================
+# world <-> ego(base_link) 좌표 변환 헬퍼
+# ============================================================
+def ego_to_world(ego_xy, ego_pose):
+    """ego_xy: [x, y] (전방=x, 좌측=y). ego_pose: (world_x, world_y, yaw)."""
+    wx, wy, yaw = ego_pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    x = wx + c * ego_xy[0] - s * ego_xy[1]
+    y = wy + s * ego_xy[0] + c * ego_xy[1]
+    return np.array([x, y], dtype=np.float64)
+
+
+def world_to_ego(world_xy, ego_pose):
+    wx, wy, yaw = ego_pose
+    dx = world_xy[0] - wx
+    dy = world_xy[1] - wy
+    c, s = math.cos(yaw), math.sin(yaw)
+    x = c * dx + s * dy
+    y = -s * dx + c * dy
+    return np.array([x, y], dtype=np.float64)
+
+
+def pointcloud2_to_xyz_array_fast(msg, relative_field=''):
+    """pc2.read_points()로 점 하나씩 파이썬 for문 돌리면 벨로다인 프레임당 수만
+    점을 언패킹하느라 프레임당 수백ms가 걸려서, /obstacle_info 실제 발행 주기가
+    라이다 10Hz가 아니라 ~1.5Hz(0.6~0.7초)까지 떨어지는 원인이었음(동적 장애물
+    확정에 필요한 dynamic_confirm_count 프레임 수를 채우는 데 그만큼 시간이 더
+    걸려서 정지가 늦어짐). np.frombuffer로 numpy 레벨에서 한 번에 변환한다."""
+    field_offset = {f.name: f.offset for f in msg.fields}
+    if not all(k in field_offset for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), dtype=np.float32)
+
+    names = ['x', 'y', 'z']
+    if relative_field and relative_field in field_offset:
+        names.append(relative_field)
+    dtype = np.dtype({
+        'names': names,
+        'formats': [np.float32] * len(names),
+        'offsets': [field_offset[name] for name in names],
+        'itemsize': msg.point_step,
+    })
+    n = len(msg.data) // msg.point_step
+    arr = np.frombuffer(msg.data, dtype=dtype, count=n)
+    pts = np.stack([arr[name] for name in names], axis=-1).astype(np.float32)
+    pts = pts[~np.isnan(pts).any(axis=1)]
+    return pts
+
+
+def estimate_extent(points_xy):
+    """점군(N,2)의 ego 기준 bounding extent -> (length, width, radius).
+    외곽 잡음 점(outlier)에 의한 크기 폭발을 막기 위해 분위수를 사용하고,
+    도로 주행 장애물 물리적 상한을 적용한다."""
+    if len(points_xy) >= 6:
+        p_min = np.percentile(points_xy, 5, axis=0)
+        p_max = np.percentile(points_xy, 95, axis=0)
+        length = float(p_max[0] - p_min[0])
+        width = float(p_max[1] - p_min[1])
+    else:
+        length = float(points_xy[:, 0].max() - points_xy[:, 0].min())
+        width = float(points_xy[:, 1].max() - points_xy[:, 1].min())
+
+    # 상한은 '오인식 방어'용이지 실물 축소용이 아니다.
+    #   실측 2026-09-09 (15:11 주행, competition_heavy bag):
+    #   카고박스 실제 폭 1.75m / 높이 1.06m 인데 상한 1.5 에 걸려 1.50 으로
+    #   깎였다. 회피 노드는 그 값으로 장애물 사각형을 만들어 계획했고,
+    #   실제보다 0.25m 좁게 본 만큼 경로가 물체를 관통해 차가 박았다
+    #   (통과 시 장애물 ego_y=+0.48m < 차체 반폭 0.95m).
+    #   물체가 클수록 더 많이 깎이므로, 큰 장애물일 때 가장 위험해진다.
+    # 상한을 차선 폭 수준으로 올려 실물을 그대로 전달하고, 비정상 거대
+    # 클러스터(연석/벽 병합)는 _reject_ground_residue 의 SVD 형상 필터가
+    # 따로 거른다 - 그게 원래 그 필터의 역할이다.
+    length = max(0.35, min(length, 3.0))
+    width = max(0.35, min(width, 2.6))
+    radius = 0.5 * math.hypot(length, width)
+    radius = max(0.25, min(radius, 2.0))
+    return length, width, radius
+
+
+def _cluster_gap(pts_a, pts_b):
+    """두 클러스터의 '표면 간 최단거리'(gap). 중심거리와 달리 물체 크기에
+    영향받지 않아서, 큰 물체가 쪼개진 경우도 작은 물체와 같은 기준으로
+    병합할 수 있다. 점 수가 많으면 O(NM) 이 부담이라 바운딩박스 간 거리로
+    먼저 걸러낸다(박스가 겹치면 gap=0)."""
+    a, b = pts_a[:, :2], pts_b[:, :2]
+    amin, amax = a.min(axis=0), a.max(axis=0)
+    bmin, bmax = b.min(axis=0), b.max(axis=0)
+    # 축별 바운딩박스 간격 - 겹치면 0
+    dx = max(0.0, max(amin[0] - bmax[0], bmin[0] - amax[0]))
+    dy = max(0.0, max(amin[1] - bmax[1], bmin[1] - amax[1]))
+    box_gap = math.hypot(dx, dy)
+    # 박스 기준으로도 이미 먼 쌍은 정확한 계산이 필요 없다(호출부 문턱보다
+    # 크면 어차피 병합 안 된다). 박스 간격은 실제 gap 의 하한이다.
+    if box_gap > 1.0:
+        return box_gap
+    # 가까운 쌍만 정확히. 점이 많으면 솎아서 비용을 제한한다.
+    sa = a[::max(1, len(a) // 60)]
+    sb = b[::max(1, len(b) // 60)]
+    d2 = ((sa[:, None, :] - sb[None, :, :]) ** 2).sum(axis=2)
+    return float(np.sqrt(d2.min()))
+
+
+def merge_close_clusters(clusters, merge_dist, near_range=0.0, near_dist=0.0):
+    """가까이서 볼수록 라이다가 차체 표면 디테일(범퍼/휠/거울 등)을 더 세밀하게
+    찍어서, eps를 아무리 조절해도 물체 하나가 여러 클러스터로 쪼개지는 걸 못
+    막는다. 클러스터링 다음 단계에서, 중심점끼리 merge_dist보다 가까운
+    클러스터들은 같은 물체의 파편으로 보고 하나로 합친다."""
+    n = len(clusters)
+    if n < 2:
+        return clusters
+
+    centers = np.array([c[0][:2] for c in clusters])
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            # 중심간 거리로만 재면 큰 물체가 쪼개진다 - 폭 1.75m 카고박스가
+            # 두 클러스터로 갈라지면 중심거리가 0.45m 로 merge_dist(0.35)를
+            # 넘어 병합이 거부됐다(실측 2026-09-09). 중심거리는 물체 크기에
+            # 비례해 커지므로, 물체의 '표면 간 거리(gap)'로 재야 크기와
+            # 무관하게 일관된다.
+            gap = _cluster_gap(clusters[i][1], clusters[j][1])
+            # 근거리(자차 기준)에서는 문턱을 키운다 - 같은 물체가 링마다
+            # 갈라져 조각 간 거리가 커 보이는 구간이다.
+            thr = merge_dist
+            if near_range > 0.0:
+                ri = float(np.linalg.norm(centers[i][:2]))
+                rj = float(np.linalg.norm(centers[j][:2]))
+                if min(ri, rj) <= near_range:
+                    thr = max(thr, near_dist)
+            if gap < thr:
+                # 합쳤을 때 횡방향(좌우 y) 폭이 상한을 넘으면 연석-장애물
+                # 병합이나 지그재그 배치된 두 드럼이 하나로 뭉개지는 것이므로
+                # 병합하지 않는다. 다만 1.8 은 실측 카고박스(1.75) 를 간신히
+                # 넘는 값이라 위험했다 - 차선 폭까지 올린다.
+                combined_y_span = max(clusters[i][1][:, 1].max(), clusters[j][1][:, 1].max()) - \
+                                  min(clusters[i][1][:, 1].min(), clusters[j][1][:, 1].min())
+                if combined_y_span <= 2.6:
+                    union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    merged = []
+    for idx_list in groups.values():
+        pts = np.concatenate([clusters[i][1] for i in idx_list], axis=0)
+        center = pts.mean(axis=0)
+        merged.append((center, pts))
+    return merged
+
+
+def cluster_lidar_points(points, eps, min_cluster_points, max_cluster_points,
+                         far_range=0.0, far_min_points=0, preserve_large=False):
+    """points: (N,3) ego 기준 필터링된 라이다 점. eps 이내로 연결된 점들을 하나의
+    클러스터로 묶는다(Union-Find). min_cluster_points 미만인 클러스터는 버린다.
+    max_cluster_points를 넘는 클러스터도 버린다 - 가드레일/연석처럼 길게 이어진
+    라인이 통째로 하나의 거대 클러스터로 뭉쳐서 엉뚱한 위치에 중심점이 찍히는
+    것을 막기 위함.
+    반환: [(center_xyz, cluster_pts), ...]"""
+    n = len(points)
+    if n < min_cluster_points:
+        return []
+
+    tree = cKDTree(points[:, :2])
+    pairs = tree.query_pairs(r=eps, output_type='ndarray')
+
+    # 파이썬 for문 기반 union-find는 밀집한 프레임(pairs 수만 개)에서 여전히
+    # 병목이 됨. scipy의 C 구현 connected_components로 대체 (결과는 동일).
+    if len(pairs) > 0:
+        row, col = pairs[:, 0], pairs[:, 1]
+        adj = coo_matrix((np.ones(len(row), dtype=bool), (row, col)), shape=(n, n))
+        _, labels = connected_components(adj, directed=False)
+    else:
+        labels = np.arange(n)
+
+    results = []
+    for root in np.unique(labels):
+        idx = np.nonzero(labels == root)[0]
+        cluster_pts = points[idx]
+        # ★ 원거리에서는 최소 점 수를 낮춘다.
+        #   VLP-16 은 링 간 수직각이 2deg 라, 높이 h 물체에 두 링이 동시에
+        #   닿는 거리는 h/tan(2deg) ~ 28*h 이내뿐이다. 그보다 멀면 링이 하나만
+        #   닿고, 그 하나가 물체 상단 모서리를 스치면 점이 2개 이하로 떨어져
+        #   min_cluster_points(3)를 못 채운다.
+        #     실측 2026-09-09(17:08): 고도 0.79m 물체(id10)가 9.3m 에서야
+        #     처음 잡혔다. 같은 자리 다른 물체(id11/12)는 24m 에 잡혔다 -
+        #     링이 물체 중앙을 지난 운 좋은 경우였다. 즉 경계선에서 검출이
+        #     들쭉날쭉했고, 그래서 두번째 장애물 인지가 늦었다.
+        #   원거리 노면 잔차 방어는 고도 문턱/형상 필터가 따로 맡는다.
+        n_pts = len(idx)
+        min_req = min_cluster_points
+        if far_range > 0.0 and far_min_points > 0:
+            r = float(np.linalg.norm(cluster_pts[:, :2].mean(axis=0)))
+            if r >= far_range:
+                min_req = min(min_req, far_min_points)
+        if n_pts < min_req or n_pts > max_cluster_points:
+            continue
+        # 도로 연석이나 긴 가드레일/벽면처럼 비정상적으로 길게 늘어진 클러스터 제외
+        span_x = float(cluster_pts[:, 0].max() - cluster_pts[:, 0].min())
+        span_y = float(cluster_pts[:, 1].max() - cluster_pts[:, 1].min())
+        if not preserve_large and (span_y > 2.2 or span_x > 4.5):
+            continue
+        center = cluster_pts.mean(axis=0)
+        results.append((center, cluster_pts))
+    return results
+
+
+# ============================================================
+# 등속(CV) 칼만 필터 - 클러스터 중심 노이즈 흡수용
+# ============================================================
+class CVKalman2D:
+    """상태 [x, y, vx, vy], 등속 모델. world(UTM) 좌표계에서 돈다.
+
+    ★ 왜 필요한가 (실측 2026-09-10, 12:43:42 백):
+      클러스터 중심은 관측 각도에 따라 프레임마다 튄다. 특히 연석처럼
+      '길게 이어진' 구조는 보이는 구간이 바뀌면서 중심이 선을 따라
+      미끄러진다. id19(연석, 고도 0.08m)는 ego_y 가 -2.28~-2.03 으로
+      거의 고정인데 world 누적 변위가 11.75m 나왔다(ego 대비 3.4배).
+
+      예전 대응은 '프레임간 이동이 max_plausible_speed 를 넘으면 버퍼
+      전체를 버리고 static 고정'이었다. 그 부작용이 치명적이었다:
+      횡단 강아지(실측 4.7m/s)가 문턱 3.0 에 걸려 speed=0.00 /
+      motion_state=static 이 되고, 그러면 정지 노드의 TTC 예측이
+      아예 돌지 않는다. 동적 구간 정지/가속 반복의 직접 원인이다.
+
+      문턱을 올리면 미끄러짐(3.4배)이 그대로 통과해 고정물이 동적으로
+      잡힌다. 버리는 게 아니라 '평활'해야 한다 - 그게 칼만이다.
+      일관된 방향의 이동은 누적되고, 앞뒤로 튀는 미끄러짐은 상쇄된다.
+    """
+
+    def __init__(self, pos, timestamp, q_accel=1.5, r_base=0.05, r_slope=0.004):
+        # 상태: 위치는 관측으로 초기화, 속도는 0 (모르니까)
+        self.x = np.array([pos[0], pos[1], 0.0, 0.0], dtype=np.float64)
+        # 공분산: 위치는 관측 수준, 속도는 '전혀 모름'(보행자 상한^2 수준)
+        self.P = np.diag([0.25, 0.25, 25.0, 25.0]).astype(np.float64)
+        self.t = float(timestamp)
+        # 가속 잡음 밀도 [m/s^2]. 보행자/자전거가 낼 수 있는 가속 수준.
+        # 키우면 추종이 빨라지지만 노이즈도 같이 따라간다.
+        self.q_accel = float(q_accel)
+        # 관측 잡음: 거리 제곱에 비례(점 밀도 희박화). 원거리 40m 에서
+        # 26점이면 중심이 20~30cm 흔들린다는 실측과 맞춘 계수.
+        self.r_base = float(r_base)
+        self.r_slope = float(r_slope)
+
+    def predict(self, timestamp):
+        dt = float(timestamp) - self.t
+        if dt <= 0.0:
+            return
+        # dt 가 비정상적으로 크면(트랙 공백) 등속 외삽을 믿을 수 없다.
+        dt = min(dt, 0.5)
+        F = np.array([[1.0, 0.0, dt,  0.0],
+                      [0.0, 1.0, 0.0, dt],
+                      [0.0, 0.0, 1.0, 0.0],
+                      [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+        # 이산 가속 잡음(표준 CV 모델)
+        q = self.q_accel ** 2
+        dt2, dt3, dt4 = dt * dt, dt ** 3, dt ** 4
+        Q = np.array([[dt4 / 4.0, 0.0,       dt3 / 2.0, 0.0],
+                      [0.0,       dt4 / 4.0, 0.0,       dt3 / 2.0],
+                      [dt3 / 2.0, 0.0,       dt2,       0.0],
+                      [0.0,       dt3 / 2.0, 0.0,       dt2]],
+                     dtype=np.float64) * q
+        self.x = F.dot(self.x)
+        self.P = F.dot(self.P).dot(F.T) + Q
+        self.t = float(timestamp)
+
+    def update(self, pos, timestamp, dist_to_ego):
+        self.predict(timestamp)
+        r = self.r_base + self.r_slope * float(dist_to_ego) ** 2
+        R = np.diag([r, r]).astype(np.float64)
+        # H = [[1,0,0,0],[0,1,0,0]] - 위치만 관측
+        z = np.array([pos[0], pos[1]], dtype=np.float64)
+        y = z - self.x[:2]
+        S = self.P[:2, :2] + R
+        try:
+            K = self.P[:, :2].dot(np.linalg.inv(S))
+        except np.linalg.LinAlgError:
+            return
+        self.x = self.x + K.dot(y)
+        self.P = self.P - K.dot(self.P[:2, :])
+        # 수치 안정화(대칭성 유지)
+        self.P = 0.5 * (self.P + self.P.T)
+
+    @property
+    def velocity(self):
+        return self.x[2:4].copy()
+
+    @property
+    def speed(self):
+        return float(np.linalg.norm(self.x[2:4]))
+
+    @property
+    def vel_std(self):
+        """속도 추정의 표준편차(2D 합성). 신뢰도 게이트에 쓴다."""
+        return float(math.sqrt(max(self.P[2, 2] + self.P[3, 3], 0.0)))
+
+
+# ============================================================
+# 트래킹용 물체 하나를 표현하는 클래스 (world 좌표 기준)
+# ============================================================
+class ObstacleTrack:
+    _next_id = 0
+    # 앵커 재설정 문턱(m). 측위/클러스터 중심 노이즈보다 크고, 보행자의
+    # 실제 이동보다 작아야 한다. 실측상 정적 물체의 중심 산포는 0.2~0.5m 다.
+    STATIONARY_MOVE_EPS = 0.6
+
+    def __init__(self, class_name, position_world, z, timestamp,
+                 confirmed=True, source='lidar_only', static_speed_threshold=0.3,
+                 min_motion_baseline_sec=0.5, dynamic_confirm_count=3,
+                 motion_speed_window_sec=0.6, max_plausible_speed=6.0,
+                 motion_z_threshold=2.0, motion_z_var_floor=0.15,
+                 length=0.5, width=0.5, radius=0.5,
+                 kf_enabled=True, kf_q_accel=1.5, kf_r_base=0.05,
+                 kf_r_slope=0.004, kf_vel_std_max=2.0,
+                 ego_rate_window_sec=0.6, position_ego=None):
+        self.id = ObstacleTrack._next_id
+        ObstacleTrack._next_id += 1
+
+        self.class_name = class_name
+        self.position = np.array(position_world, dtype=np.float64)  # world(UTM) [x, y]
+        self.z = z  # 마지막으로 확인된 ego 기준 높이 (디버그/참고용)
+        self.confirmed = confirmed
+        self.source = source
+        self.min_motion_baseline_sec = min_motion_baseline_sec
+        self.static_speed_threshold = static_speed_threshold
+        self.dynamic_confirm_count = dynamic_confirm_count
+        self.motion_speed_window_sec = motion_speed_window_sec
+        self.max_plausible_speed = max_plausible_speed
+        self.motion_z_threshold = motion_z_threshold
+        self.motion_z_var_floor = motion_z_var_floor
+
+        # 대략적인 크기 (라이다 점군의 ego 기준 bounding extent, m)
+        self.length = min(2.0, max(0.35, length))
+        self.width = min(1.5, max(0.35, width))
+        self.radius = min(1.2, max(0.25, radius))
+        # 기준경로 트리거 코리도(1.4m) 안인가. 프레임마다 갱신된다.
+        # False 면 '충돌 검사 전용' - 회피를 새로 시작시키지는 않는다.
+        self.in_trigger_corridor = True
+
+        self.history = [(timestamp, self.position.copy())]  # world 위치 이력 (속도 추정용)
+        self.last_seen = timestamp
+
+        # ★ 칼만 필터(등속 CV). 점프를 '버리는' 대신 '평활'한다.
+        #   kf_enabled=False 면 예전 점프거부+변위평균 경로로 되돌아간다.
+        self.kf_enabled = bool(kf_enabled)
+        self.kf_vel_std_max = float(kf_vel_std_max)
+        self.kf = (CVKalman2D(self.position, timestamp, q_accel=kf_q_accel,
+                              r_base=kf_r_base, r_slope=kf_r_slope)
+                   if self.kf_enabled else None)
+
+        # ★ ego 기준 횡위치(ego_y) 이력. 고정 구조물과 횡단체를 가르는
+        #   유일하게 작동하는 지표다(실측 3.5배 분리, 아래 ego_y_rate 참고).
+        self.ego_rate_window_sec = float(ego_rate_window_sec)
+        self.ego_history = []
+        if position_ego is not None:
+            self.ego_history.append((timestamp, float(position_ego[0]),
+                                     float(position_ego[1])))
+        self.ego_y_rate = 0.0
+        # Signed short-window rate (+left in the current ego frame).  The
+        # absolute p90 above remains for diagnostics; collision prediction
+        # needs the sign to distinguish entering from leaving our corridor.
+        self.ego_y_rate_signed = 0.0
+
+        self.velocity_valid = False
+        self.observed_velocity = np.zeros(2, dtype=np.float64)
+        self.observed_motion_valid = False
+        self.motion_down_count = 0
+        self.top_elevation = None
+        self.vertical_thickness = None
+        self.speed = 0.0
+        self.velocity = np.zeros(2, dtype=np.float32)
+        self.motion_state = "unknown"
+        self.dynamic_streak = 0  # 연속으로 몇 번 threshold를 넘겼는지 (히스테리시스용)
+        # ★ 장기 고정 판정용. history 는 10프레임(~1초)만 남아서 '몇 초째
+        #   같은 자리인가'를 알 수 없다. 연석/폴 같은 영구 구조물과, 출발
+        #   대기 중이지만 곧 움직일 보행자 더미를 가르는 데 쓴다.
+        #   anchor = 마지막으로 '유의미하게 움직인' 시점의 위치/시각.
+        self.anchor_pos = self.position.copy()
+        self.anchor_time = timestamp
+        self.stationary_sec = 0.0
+
+    def update(self, position_world, z, timestamp, confirmed=None, source=None, class_name=None,
+               length=None, width=None, radius=None, position_ego=None,
+               dist_to_ego=None):
+        self.position = np.array(position_world, dtype=np.float64)
+        self.z = z
+        self.last_seen = timestamp
+        if confirmed is not None:
+            self.confirmed = confirmed
+        if source is not None:
+            self.source = source
+        if class_name is not None:
+            self.class_name = class_name
+        # 크기 추정: 노이즈나 일시적 파편으로 한 번 커진 값이 영구 고착되지 않도록
+        # 상한 클램프 및 EMA(지수이동평균) 적용
+        if length is not None:
+            self.length = min(2.0, max(0.35, 0.7 * self.length + 0.3 * length))
+        if width is not None:
+            self.width = min(1.5, max(0.35, 0.7 * self.width + 0.3 * width))
+        if radius is not None:
+            self.radius = min(1.2, max(0.25, 0.7 * self.radius + 0.3 * radius))
+
+        self.history.append((timestamp, self.position.copy()))
+        if len(self.history) > 10:
+            self.history.pop(0)
+
+        # 앵커에서 이 거리 이상 벗어나면 '움직였다'로 보고 앵커를 재설정한다.
+        # 그 전까지는 같은 자리에 머문 시간이 계속 누적된다.
+        moved = float(np.linalg.norm(self.position - self.anchor_pos))
+        if moved > ObstacleTrack.STATIONARY_MOVE_EPS:
+            self.anchor_pos = self.position.copy()
+            self.anchor_time = timestamp
+        self.stationary_sec = float(timestamp - self.anchor_time)
+
+        # 칼만 갱신. 관측 잡음은 거리에 따라 커진다.
+        if self.kf is not None:
+            d_ego = (float(dist_to_ego) if dist_to_ego is not None
+                     else float(np.linalg.norm(self.position)))
+            self.kf.update(self.position, timestamp, d_ego)
+
+        # ego 기준 횡위치 이력 갱신
+        if position_ego is not None:
+            self.ego_history.append((timestamp, float(position_ego[0]),
+                                     float(position_ego[1])))
+            cutoff = timestamp - max(self.ego_rate_window_sec * 2.0, 1.0)
+            self.ego_history = [e for e in self.ego_history if e[0] >= cutoff]
+            self._update_ego_y_rate(timestamp)
+
+        self._update_observed_motion()
+        self._update_motion_state()
+
+    def _update_observed_motion(self):
+        """Short-window world motion, already corrected for ego pose at scan time.
+
+        A signed regression and residual gate reject alternating centroid jitter.
+        This is provisional evidence, independent of the KF covariance gate.
+        """
+        self.observed_motion_valid = False
+        recent = [(t, p) for t, p in self.history
+                  if self.last_seen - t <= 0.6]
+        if len(recent) < 3 or recent[-1][0] - recent[0][0] < 0.15:
+            return
+        ts = np.array([t - recent[0][0] for t, _ in recent])
+        pts = np.array([p for _, p in recent], dtype=np.float64)
+        ts -= ts.mean()
+        delta = pts - pts.mean(axis=0)
+        velocity = (ts[:, None] * delta).sum(axis=0) / max(ts @ ts, 1e-9)
+        residual = np.sqrt(np.mean(np.sum((delta - ts[:, None] * velocity)**2, axis=1)))
+        steps = np.diff(pts, axis=0)
+        coherence = np.linalg.norm(pts[-1] - pts[0]) / max(np.linalg.norm(steps, axis=1).sum(), 1e-9)
+        self.observed_velocity = velocity
+        self.observed_motion_valid = bool(
+            residual <= 0.08 and coherence >= 0.9 and
+            0.08 <= np.linalg.norm(pts[-1] - pts[0]) and
+            0.25 <= np.linalg.norm(velocity) <= 10.0)
+
+    def _update_ego_y_rate(self, t_now):
+        """ego 기준 횡위치의 변화율 [m/s]. 고정 구조물 배제용 판별자.
+
+        ★ 왜 world 가 아니라 ego 인가 (실측 2026-09-10, 12:43:42 백):
+          world 좌표 지표는 전부 역전됐다 - 고정물이 횡단체보다 더 크게
+          나왔다.
+
+            지표                  횡단체          고정물 최대
+            world 누적변위        7.28 / 4.09     11.75 (id19 연석)
+            world 프레임간 p90    6.79 / 5.42      9.24 (id3)
+            speed(점프거부 출력)  0.00 / 0.00      1.14  ← 죽어 있었음
+            ego_y 변화율 p90      6.26 / 4.77      1.26  ← 3.5배 분리
+
+          원인은 두 가지가 겹친 것이다. (a) 측위 튐이 world 좌표에만
+          실리고, (b) 연석처럼 이어진 구조는 보이는 구간이 바뀌며 중심이
+          선을 따라 미끄러진다. 둘 다 자차 기준 '옆으로 다가오는가'에는
+          영향을 주지 않는다. 그래서 ego_y 가 살아남는다.
+
+          주의: ego_y 는 자차 회전에도 반응한다. 미션 구간이 직선이라
+          현재는 문제가 없지만, 곡선 구간에서 쓰려면 자차 yaw rate 로
+          보정해야 한다.
+        """
+        win = [e for e in self.ego_history
+               if t_now - e[0] <= self.ego_rate_window_sec]
+        if len(win) < 3:
+            self.ego_y_rate = 0.0
+            self.ego_y_rate_signed = 0.0
+            return
+        rates = []
+        for k in range(1, len(win)):
+            dt = win[k][0] - win[k - 1][0]
+            if dt <= 1e-3:
+                continue
+            rates.append(abs(win[k][2] - win[k - 1][2]) / dt)
+        if not rates:
+            self.ego_y_rate = 0.0
+            self.ego_y_rate_signed = 0.0
+            return
+        # p90. 평균은 간헐적 진입(몇 프레임만 빠르게 들어옴)을 희석시킨다.
+        self.ego_y_rate = float(np.percentile(np.asarray(rates), 90.0))
+        total_dt = win[-1][0] - win[0][0]
+        self.ego_y_rate_signed = (
+            float((win[-1][2] - win[0][2]) / total_dt)
+            if total_dt > 1e-3 else 0.0)
+
+    def _update_motion_state(self):
+        self.velocity_valid = False
+        if len(self.history) < 3:
+            self.motion_state = "unknown"
+            return
+
+        # 프레임 간 순간속도를 평균내면 위치 노이즈가 dt로 나뉘면서 그대로 몇 m/s로
+        # 증폭되어 정적 장애물도 dynamic으로 오판됨. 대신 일정 시간 구간의 전체
+        # 변위를 그 경과시간으로 나눠서(baseline을 확보) 노이즈를 상쇄시킨다.
+        # p0를 버퍼 전체(최대 10프레임)의 가장 오래된 값으로 고정하면, 정지 상태가
+        # 한동안 이어지다 막 움직이기 시작했을 때 그 오래된 "정지 시절" 위치가
+        # 계속 평균을 희석시켜서 실제로 움직인 지 1초 넘게 지나야 속도가 threshold를
+        # 넘는 문제가 있었음. motion_speed_window_sec 이내의 가장 오래된 샘플로
+        # p0를 잡아서, 오래된 정지 이력이 최신 속도 추정을 계속 희석하지 못하게 한다.
+        t1, p1 = self.history[-1]
+        t0, p0 = self.history[0]
+        for t, p in self.history:
+            if t1 - t <= self.motion_speed_window_sec:
+                t0, p0 = t, p
+                break
+        dt = t1 - t0
+        if dt <= 0:
+            self.motion_state = "unknown"
+            return
+
+        # baseline(dt) 자체가 너무 짧으면(트랙이 막 생성된 직후 등) 표본 수 조건(>=3)을
+        # 채웠어도 노이즈가 여전히 증폭됨. 최소 경과시간을 요구해서 그 전까지는
+        # 안전한 기본값인 "static"으로 둔다.
+        if dt < self.min_motion_baseline_sec:
+            self.motion_state = "unknown"
+            return
+
+        # ★ 위치 점프(트랙 재연결/클러스터 중심 이동) 배제.
+        #   한 프레임에 물리적으로 불가능한 거리를 뛰면 그건 이동이 아니라
+        #   관측 오류다. 그런데 그 점프가 motion_speed_window_sec 안에 남아
+        #   있는 동안 speed 가 계속 그 값으로 고정돼, 1회 오류가 수 초간
+        #   dynamic 판정을 유지한다.
+        #     실측 2026-09-09(17:27, 동적 장애물 없던 주행): id11 이 한
+        #     프레임에 1.89m 점프한 뒤 계속 정지 상태인데 speed 가 3.92 로
+        #     굳어 10프레임 동안 dynamic 오판됐다. 같은 주행에서 정적 물체
+        #     4개가 dynamic 으로 오판됐고 최대 8.89m/s(32km/h)까지 튀었다.
+        #   보행자 상한(약 3m/s)의 2배를 넘는 프레임 간 이동은 버린다.
+        #   ※ 2026-09-10 변경: 점프를 '버리고 static 고정' 하는 방식을 폐기하고
+        #     칼만 필터로 평활하는 방식으로 바꿨다. 폐기 이유는 CVKalman2D
+        #     주석 참고 - 요약하면 횡단 강아지(4.7m/s)가 문턱 3.0 에 걸려
+        #     speed=0.00/static 이 되고, 그러면 정지 노드 TTC 가 아예 안 돈다.
+        #     문턱을 올리는 건 해법이 아니다(중심 미끄러짐이 통과한다).
+        if self.kf is not None:
+            # 속도 분산이 아직 크면(트랙 생성 직후, 관측 공백 직후) 속도를
+            # 못 믿는다. 버리지는 않되 dynamic 판정에는 쓰지 않는다.
+            if self.kf.vel_std > self.kf_vel_std_max:
+                self.speed = 0.0
+                self.velocity = np.zeros(2, dtype=np.float32)
+                self.motion_state = "unknown"
+                self.dynamic_streak = 0
+                return
+            self.velocity = self.kf.velocity.astype(np.float32)
+            self.speed = self.kf.speed
+            # 물리 상한 클램프. 보행자/자전거 상한을 크게 넘는 추정은
+            # 필터가 수렴 중이거나 오연관(association)이다. 상한에서 자른다.
+            if self.speed > self.max_plausible_speed:
+                scale = self.max_plausible_speed / max(self.speed, 1e-6)
+                self.velocity = (self.velocity * scale).astype(np.float32)
+                self.speed = float(self.max_plausible_speed)
+            dist = self.speed * dt
+        else:
+            dist = float(np.linalg.norm(p1 - p0))
+            self.speed = float(dist / dt)
+            # 방향까지 남긴다. RViz 에서 동적 트랙의 진행방향 화살표로 쓰는데,
+            # 정적 물체가 동적으로 오판될 때 화살표가 사방으로 튀는 걸로 바로 보인다.
+            self.velocity = ((p1 - p0) / dt).astype(np.float32)
+        self.velocity_valid = True
+        rospy.loginfo_throttle(0.3,
+            "[motion_debug] id=%d dt=%.2f p0=(%.2f,%.2f) p1=(%.2f,%.2f) dist=%.2f speed=%.2f",
+            self.id, dt, p0[0], p0[1], p1[0], p1[1], dist, self.speed)
+
+        # ★ 분산 정규화 판정(two-sample z-test 간소화).
+        #   속도를 '절대 문턱'과만 비교하면, 정적 물체의 관측 흔들림이 그
+        #   문턱을 넘나드는 구간(jitter band)에서 반드시 오판이 난다.
+        #     실측 2026-09-09(동적 장애물 없던 주행): 정적 물체의 프레임간
+        #     속도가 90% 분위에서 이미 2.09 m/s 로, 보행자 속도대와 겹쳤다.
+        #     그래서 절대 문턱을 아무리 낮춰도 오판이 53% 아래로 안 줄었다.
+        #   해법은 '얼마나 움직였나'를 '얼마나 흔들리나'로 나누는 것이다.
+        #   윈도우를 앞뒤 두 구간으로 갈라 평균 위치 차이를 구하고, 그 차이가
+        #   위치 산포 대비 유의한지 본다(z-score). 같은 1.89m 점프라도
+        #   산포가 큰 트랙에서는 z 가 작아 dynamic 이 되지 않는다.
+        #   참고: arxiv 2606.09350 (Uncertainty-Aware LiDAR Motion Classification)
+        #        - 거기선 검출기가 낸 분산을 쓰고, 우리는 위치 이력의 표본
+        #          산포로 대신한다(검출기 분산이 없다).
+        # z-test 는 '점프거부' 시절의 보완장치였다. 칼만이 켜져 있으면
+        # 산포는 이미 필터가 흡수했고, 원본 history 산포로 다시 게이트를
+        # 걸면 이중 차단이 된다(횡단체가 여기서 또 죽는다). 칼만의
+        # vel_std 게이트가 같은 역할을 더 정확히 한다.
+        z_ok = True
+        if self.kf is None and self.motion_z_threshold > 0.0:
+            win = [(t, q) for t, q in self.history
+                   if t1 - t <= self.motion_speed_window_sec]
+            if len(win) >= 4:
+                half = len(win) // 2
+                a = np.array([q for _, q in win[:half]], dtype=np.float64)
+                bq = np.array([q for _, q in win[half:]], dtype=np.float64)
+                disp = float(np.linalg.norm(bq.mean(axis=0) - a.mean(axis=0)))
+                # 두 표본의 위치 산포(표준오차). 0 이 되면 분모가 터지므로
+                # 바닥값을 둔다 - 라이다 중심 추정의 실측 산포 수준.
+                va = float(np.var(a, axis=0).sum()) / max(len(a), 1)
+                vb = float(np.var(bq, axis=0).sum()) / max(len(bq), 1)
+                se = math.sqrt(max(va + vb, self.motion_z_var_floor ** 2))
+                z = disp / se
+                z_ok = (z >= self.motion_z_threshold)
+                rospy.loginfo_throttle(0.5,
+                    "[motion_z] id=%d disp=%.2f se=%.2f z=%.1f (>=%.1f? %s) speed=%.2f",
+                    self.id, disp, se, z, self.motion_z_threshold, z_ok, self.speed)
+
+        # 노이즈로 threshold를 한 번 넘겼다고 바로 dynamic으로 뒤집으면 실제로
+        # 정지해있는 장애물도 깜빡임. 연속으로 여러 번 넘겨야만(히스테리시스)
+        # dynamic으로 인정하고, 한 번이라도 아래로 내려가면 스트릭을 리셋한다.
+        # 절대 속도와 z-score 를 AND 로 묶는다 - 산포가 극단적으로 작으면
+        # 미세 이동도 z 가 커지므로, 속도 하한이 그걸 막는다.
+        if self.speed > self.static_speed_threshold and z_ok:
+            self.dynamic_streak += 1
+        else:
+            self.dynamic_streak = 0
+
+        if self.dynamic_streak >= self.dynamic_confirm_count:
+            self.motion_state = "dynamic"
+        elif self.motion_state == "dynamic":
+            self.motion_down_count = (self.motion_down_count + 1
+                                      if self.speed < 0.6 * self.static_speed_threshold else 0)
+            if self.motion_down_count >= 3:
+                self.motion_state = "static"
+        else:
+            self.motion_state = "static"
+        if self.dynamic_streak >= self.dynamic_confirm_count:
+            self.motion_down_count = 0
+
+    def is_stale(self, now, timeout=1.0):
+        return (now - self.last_seen) > timeout
+
+
+# ============================================================
+# 메인 노드
+# ============================================================
+class ObstaclePerceptionNode:
+    def __init__(self):
+        rospy.init_node('obstacle_perception_node', anonymous=True)
+
+        # ---- 전부 launch 파일에서 조정 가능한 파라미터로 ----
+        self.min_range = rospy.get_param('~min_range', 1.5)
+        self.max_range = rospy.get_param('~max_range', 15.0)
+        self.min_points_for_confirm = rospy.get_param('~min_points_for_confirm', 4)
+        self.max_association_dist = rospy.get_param('~max_association_dist', 1.5)
+        # 근거리 2차 병합. 이 거리 안에서는 병합 문턱을 near_merge_dist 로 키운다.
+        self.near_merge_range = rospy.get_param('~near_merge_range', 8.0)
+        self.near_merge_dist = rospy.get_param('~near_merge_dist', 0.9)
+        # ★ 자차 전방 코리도. 기준경로 코리도와 OR 로 묶어 트리거를 판정한다.
+        #   회피로 차가 경로에서 벗어난 동안에도 '내 앞 물체'를 놓치지 않는다.
+        self.ego_corridor_enabled = rospy.get_param('~ego_corridor_enabled', True)
+        self.ego_corridor_range = rospy.get_param('~ego_corridor_range', 20.0)
+        # ★ 원거리 최소 점 수 완화. 이 거리 이상에서는 far_min_points 로 낮춘다.
+        self.far_cluster_range = rospy.get_param('~far_cluster_range', 12.0)
+        self.far_min_points = rospy.get_param('~far_min_points', 2)
+        # 원거리 저점수 클러스터(SVD 형상검사 불가)에 요구하는 최소 고도.
+        # 노면 잔차(0.11~0.20m)를 넘고 실제 장애물은 통과하는 값.
+        self.far_low_point_elevation = rospy.get_param('~far_low_point_elevation', 0.30)
+        # 위 문턱을 거리에 따라 완화한다(저상 장애물 원거리 인지).
+        # start_m 까지는 far_low_point_elevation 그대로, end_m 이상에서는
+        # far_elev_relax_min, 그 사이는 선형. min 을 0 으로 두면 비활성.
+        self.far_elev_relax_start_m = float(
+            rospy.get_param('~far_elev_relax_start_m', 15.0))
+        self.far_elev_relax_end_m = float(
+            rospy.get_param('~far_elev_relax_end_m', 30.0))
+        self.far_elev_relax_min = float(
+            rospy.get_param('~far_elev_relax_min', 0.18))
+        # 완화를 적용할 경로 횡거리 상한(m). 이보다 멀면 기존 문턱을 쓴다.
+        # 0 이하면 횡방향 제한 없음(구버전 동작).
+        self.far_elev_relax_max_lateral_m = float(
+            rospy.get_param('~far_elev_relax_max_lateral_m', 1.7))
+        # --- 조각 정렬 검사 (쪼개진 연석/노견 기각) ---
+        self.align_reject_enabled = rospy.get_param('~align_reject_enabled', True)
+        # 이 개수 이상이 한 직선에 늘어서야 구조물로 본다.
+        self.align_min_count = rospy.get_param('~align_min_count', 4)
+        # 묶음의 주축 길이가 이보다 길어야 한다(m).
+        self.align_min_length = rospy.get_param('~align_min_length', 6.0)
+        # 직교 퍼짐이 이보다 좁아야 '직선'이다(m).
+        self.align_max_width = rospy.get_param('~align_max_width', 1.2)
+        # 자차 중심선에서 이만큼(m) 이상 치우친 것만 검사 대상(경로 위 실물 보호).
+        self.align_min_offset = rospy.get_param('~align_min_offset', 0.4)
+        # 기준경로에서 이보다 가까운 클러스터는 라인 판정에서 빼서 보호한다.
+        # (경로 중앙의 실물을 라인 일부로 오인해 버리지 않도록)
+        self.align_protect_lateral = rospy.get_param('~align_protect_lateral', 0.6)
+        # 라인의 '고도 상승 기울기' 하한(m/m). 이보다 완만하면 노면이 아니라
+        # 일렬로 놓인 실물로 보고 살린다. 실측 노면은 0.036 (2.06deg).
+        self.align_min_height_slope = rospy.get_param(
+            '~align_min_height_slope', 0.015)
+        # 동적 구간 고도 문턱. 보행자/더미가 대상이라 정적(저상 박스)보다 높게
+        # 잡아 노면 잔차를 막는다 - 동적 구간의 잔차는 곧 급정지로 이어진다.
+        self.min_obstacle_elevation_dynamic = rospy.get_param(
+            '~min_obstacle_elevation_dynamic', 0.30)
+        # 정적/동적 경계 idx. competition.launch 의 static_dynamic_split_idx 와 같다.
+        self.static_dynamic_split_idx = rospy.get_param(
+            '~static_dynamic_split_idx', 3700)
+        self.cluster_eps = rospy.get_param('~cluster_eps', 0.6)
+        self.cluster_max_points = rospy.get_param('~cluster_max_points', 300)
+        self.merge_cluster_dist = rospy.get_param('~merge_cluster_dist', 3.0)
+        self.track_timeout = rospy.get_param('~track_timeout', 1.5)
+        self.static_speed_threshold = rospy.get_param('~static_speed_threshold', 0.3)
+        self.min_motion_baseline_sec = rospy.get_param('~min_motion_baseline_sec', 0.5)
+        self.dynamic_confirm_count = rospy.get_param('~dynamic_confirm_count', 3)
+        self.motion_speed_window_sec = rospy.get_param('~motion_speed_window_sec', 0.6)
+        # 프레임 간 이동이 이 속도(m/s)를 넘으면 '점프'로 보고 그 버퍼의 속도
+        # 추정을 버린다. 보행자 상한(~3m/s)의 약 2배.
+        self.max_plausible_speed = rospy.get_param('~max_plausible_speed', 3.0)
+        # ★ 칼만 필터(등속 CV). 클러스터 중심 미끄러짐/측위 튐 평활.
+        #   false 로 두면 예전 '점프거부 + 변위평균' 경로로 되돌아간다.
+        self.kf_enabled = rospy.get_param('~kf_enabled', True)
+        self.kf_q_accel = rospy.get_param('~kf_q_accel', 1.5)
+        self.kf_r_base = rospy.get_param('~kf_r_base', 0.05)
+        self.kf_r_slope = rospy.get_param('~kf_r_slope', 0.004)
+        # 속도 추정 표준편차가 이 값을 넘으면 dynamic 판정에 쓰지 않는다.
+        self.kf_vel_std_max = rospy.get_param('~kf_vel_std_max', 2.0)
+        # ★ ego_y 변화율 판별자. 고정 구조물(연석/폴/표지판) 배제용.
+        #   실측(12:43:42 백) 횡단체 4.77~6.26 / 고정물 최대 1.26 → 문턱 2.0
+        self.ego_rate_window_sec = rospy.get_param('~ego_rate_window_sec', 0.6)
+        # 분산 정규화 판정(z-test). 0 이면 끈다(절대 속도 문턱만 사용).
+        self.motion_z_threshold = rospy.get_param('~motion_z_threshold', 2.0)
+        # 위치 산포의 바닥값(m). 산포가 0 이면 z 가 무한대가 되므로 하한을 둔다.
+        self.motion_z_var_floor = rospy.get_param('~motion_z_var_floor', 0.15)
+
+        # 자기 차량 자신을 클러스터링하지 않도록 제외하는 박스 (라이다 프레임, m).
+        # 라이다 프레임 기준이므로 장착 위치를 옮기면 반드시 같이 움직여야 한다.
+        # 후축 기준 차체 x=-0.790..3.845 이고 장착이 x=+1.4 이므로
+        # 라이다 기준 -2.19..2.45, 여유 0.2 를 더해 -2.39..2.65.
+        # 2026-09-07 장착 최종 1.4 로 갱신. 이 값이 실제보다 크면 센서 앞쪽
+        # 실제 장애물이 '자차'로 지워져 바로 앞 저상 장애물이 클러스터링 전에
+        # 사라진다 - 이 노드가 Frenet 에 /obstacle_info 를 직접 공급하므로
+        # 여기서 지워지면 회피 판단에서 통째로 빠진다.
+        self.self_x_min = rospy.get_param('~self_x_min', -2.09)
+        self.self_x_max = rospy.get_param('~self_x_max', 2.95)
+        self.self_y_min = rospy.get_param('~self_y_min', -0.85)
+        self.self_y_max = rospy.get_param('~self_y_max', 0.85)
+
+        # 관심영역(ROI) - 이 범위 밖 점은 클러스터링 자체를 안 함
+        # (도로 훨씬 밖의 잡동사니를 애초에 후보에서 제외)
+        self.roi_x_min = rospy.get_param('~roi_x_min', -5.0)
+        self.roi_x_max = rospy.get_param('~roi_x_max', 20.0)
+        self.roi_y_min = rospy.get_param('~roi_y_min', -2.8)
+        self.roi_y_max = rospy.get_param('~roi_y_max', 2.8)
+        self.roi_z_min = rospy.get_param('~roi_z_min', -1.45)
+        self.roi_z_max = rospy.get_param('~roi_z_max', 2.5)
+
+        # 지면 위 최소 고도. roi_z_min 은 센서 좌표계 '절대' z 라 지면
+        # (실측 -1.598)과 거의 같아서 노면 잔차를 전혀 못 거른다.
+        # 지면 분류 뒤에도 남는 작은 잔차가 클러스터링되면
+        # 폭 1.0~1.3m 짜리 '유령 장애물'이 되어 회피 코리도를 통째로 막는다.
+        # 실측 2026-09-07 19:40 정지 사례: 회피 대상 6개 중 4개가 고도
+        # 0.04~0.05m 였고(폭 1.03/1.26m), 이들이 y=0.06~1.94 를 덮어
+        # 금지구간을 -1.30~+3.72 로 만들어 Frenet 1400 후보가 전탈락했다.
+        # 진짜 카고박스(id46)는 고도 0.38m 였고, 그것만 있었다면 좌우 양쪽으로
+        # 회피 가능했다.
+        #   실측 분포 - 진짜 장애물 0.16~0.38m(박스)/1.44m(표지판)
+        #               노면 잔차   0.04~0.05m
+        # 0.18 은 연석(10~15cm)과 아스팔트 잔차를 확실히 차단하고, 35cm 박스/드럼을 수용.
+        self.min_obstacle_elevation = rospy.get_param(
+            '~min_obstacle_elevation', 0.18)
+        # 지면이 센서 좌표계에서 갖는 z. lidar_ttc_tracker 의
+        # ground_z_below_sensor 와 같은 값이어야 한다(2026-09-17 실측 1.754,
+        # 단일 출처는 total_bringup/config/lidar_extrinsic.yaml).
+        self.ground_z = rospy.get_param('~ground_z', -1.754)
+        # 공용 기준값(부호 반대)과 어긋나면 경고. 위 설명 참고.
+        _shared_h = rospy.get_param('/lidar_extrinsic/z_from_ground', None)
+        if _shared_h is not None and abs(float(_shared_h) + self.ground_z) > 0.005:
+            rospy.logwarn(
+                '[obstacle_perception] 센서고 불일치: ground_z %.3f m vs '
+                '공용 /lidar_extrinsic/z_from_ground %.3f m',
+                self.ground_z, float(_shared_h))
+
+        # --- 형상 필터 (연석/노면잔차 배제). 전에는 코드에 하드코딩돼 있어서
+        #     현장에서 못 만졌다. 값의 의미는 tuning_perception.yaml 참고. ---
+        self.curb_max_aspect = rospy.get_param('~curb_max_aspect', 8.0)
+        self.curb_linear_min_length = rospy.get_param('~curb_linear_min_length', 2.5)
+        self.curb_linear_max_width = rospy.get_param('~curb_linear_max_width', 0.35)
+        self.low_obstacle_top_m = rospy.get_param('~low_obstacle_top_m', 0.35)
+        self.low_obstacle_min_thickness = rospy.get_param('~low_obstacle_min_thickness', 0.06)
+        self.low_obstacle_min_points = rospy.get_param('~low_obstacle_min_points', 3)
+        # 평면(두께 없음) 검사를 적용할 최대 거리.
+        # 8.0 이었을 때 11~16m 노면 표식(정지선/화살표)이 검사를 건너뛰고
+        # 장애물로 올라왔다(실측 2026-09-08: 고도 0.15~0.18m, 두께 0.01m).
+        # 원거리에서 두께가 0 이 되는 건 링이 한 줄만 닿을 때인데, 실측상
+        # 24m 카고박스(높이 0.83m)는 -3deg(지면교차 30.5m)와 -1deg 두 링에
+        # 맞아 두께 0.83m 가 관측된다. 30m 까지는 두께로 갈라도 안전하다.
+        self.flat_check_max_range = rospy.get_param('~flat_check_max_range', 30.0)
+        # 두께 검사를 적용할 고도 상한. 이보다 높은 물체는 두께를 안 본다.
+        self.low_obstacle_flat_top_m = rospy.get_param('~low_obstacle_flat_top_m', 0.20)
+        # VLP-16 링 간 수직각(2deg)의 tan. 거리 r 에서 두 링의 높이차 추정에
+        # 쓴다 - 물체 높이가 그보다 작으면 링이 하나만 닿아 두께가 0 이 되므로
+        # 두께 검사를 건너뛴다(구조적으로 못 만족하는 조건을 요구하지 않는다).
+        self.ring_vert_sep_tan = rospy.get_param('~ring_vert_sep_tan', 0.035)
+        # 첫 프레임에 바로 confirmed 로 볼 최소 고도(m). 이보다 낮은 물체는
+        # 2프레임 연속 같은 자리에서 보여야 확정된다. 노면 표식(고도 0.14~0.18m)
+        # 을 걸러내는 주 방어선이라, 카고박스(0.83m)·라바콘보다는 낮게 둔다.
+        self.init_confirm_elevation = rospy.get_param('~init_confirm_elevation', 0.30)
+        # 저상 물체(top < low_obstacle_top_m)의 길이 상한(m).
+        # 라바콘/카고박스는 1m 안팎, 노면 표식·연석은 그보다 길게 이어진다.
+        self.low_obstacle_max_length = rospy.get_param('~low_obstacle_max_length', 1.8)
+        # 정적 장애물 구간 밖에서 쓸 고도 문턱(m).
+        # src_최적(kcity2026_stack)이 같은 구조를 쓴다 - 저상 박스를 살려야 하는
+        # 정적 구간에서만 문턱을 낮추고(h_min=0.10), 그 밖에서는 0.30 으로 올려
+        # 노면 누출을 막는다. 우리는 전 구간에 0.12 를 써서 정적 구간 밖에서도
+        # 노면 표식(실측 고도 0.14~0.18m)이 장애물로 올라왔다.
+        self.min_obstacle_elevation_outside = rospy.get_param(
+            '~min_obstacle_elevation_outside', 0.20)
+        # 정동적 미션 구간(정적 회피 + 동적 정지). 이 안에서만 낮은 문턱을 쓴다.
+        self.static_zone_min_idx = rospy.get_param('~static_zone_min_idx', 2400)
+        self.static_zone_max_idx = rospy.get_param('~static_zone_max_idx', 4900)
+
+        # 공통 GroundGrid의 비지면 점군과 셀별 지면 상대높이를 받는다.
+        # 앞단 IMU 보정이 급가감속 피치를 제거하고, 이 노드는 미션별 ROI와
+        # 클러스터 형상 판정만 담당한다.
+        self.lidar_topic = rospy.get_param('~lidar_topic', '/nonground')
+        self.ground_relative_field = rospy.get_param(
+            '~ground_relative_field', 'ground_relative')
+        self.use_ground_relative = bool(self.ground_relative_field)
+
+        # 신호등 지주(pole) 제외. K-City 실주행 로그(2026-09-03)에서 확인됨:
+        # M2 정적 회피 구간에서 정지 판정된 static 클러스터 하나가 mgeo
+        # 신호등 노드(C1256W000070)에서 0.86m 거리 - 라이다가 지주 하단을
+        # 그대로 장애물로 잡은 것. 지주는 노선 설계상 경로 corridor 안에
+        # 있을 수 있는데(교차로 모서리), 미션이 요구하는 회피 대상(드럼 등)이
+        # 아니므로 알려진 위치는 트랙 생성 자체에서 제외한다.
+        # mgeo 좌표는 로컬 프레임이라 프로젝트 공통 원점(302595.0, 4124145.0)을
+        # 더해 UTM 절대좌표로 변환한다(kcity_roundabout_utm.yaml과 동일 변환).
+        self.infra_exclusion_radius_m = rospy.get_param('~infra_exclusion_radius_m', 2.0)
+
+        # --- 미션 구간별 마커 필터 (RViz 시각화 전용) ---
+        # 다른 미션 파이프라인이 잡은 것까지 한 화면에 뜨면 튜닝 때 뭘 보는지
+        # 알 수 없다. 현재 waypoint idx 가 정동적 구간 안일 때만 마커를 낸다.
+        self.marker_filter_by_section = rospy.get_param(
+            '~marker_filter_by_section', True)
+        self.section_gating_enabled = rospy.get_param(
+            '~section_gating_enabled', True)
+        self.section_start_idx = rospy.get_param('~section_start_idx', 2400)
+        self.section_end_idx = rospy.get_param('~section_end_idx', 4900)
+        # 이 idx 를 경계로 앞은 정적 회피, 뒤는 동적 정지 구간이다.
+        self.static_dynamic_split_idx = rospy.get_param(
+            '~static_dynamic_split_idx', 3700)
+        self.current_wp_idx = -1
+        self.current_lane = -1
+        self.active_section_msg = None
+        self.active_section_t = 0.0
+        try:
+            from mission_supervisor.msg import SectionState as _SecState
+            rospy.Subscriber('/mission/active_section', _SecState,
+                             self.active_section_callback, queue_size=1)
+        except Exception:
+            rospy.logwarn('[obstacle_perception] /mission/active_section 구독 생략')
+
+        # --- 1차 선별: 기준경로 코리도 ---
+        # 자차 기준 직사각형(roi_*)만으로는 곡선에서 경로가 박스를 벗어난다.
+        # 실제로 봐야 하는 건 '내가 갈 경로' 좌우이므로, /local_path 로부터의
+        # 횡거리로 먼저 거르고 그 다음에 직사각형 ROI 를 적용한다.
+        # (new_lane/obstacle_avoidance_node 의 path_corridor_radius 와 같은 개념)
+        self.use_path_corridor = rospy.get_param('~use_path_corridor', True)
+        # 1차(점 수집) 폭: 넓게 잡는다. 여기서 버린 점은 다시 못 보므로,
+        # 경로가 휘거나 측위가 흔들려도 진짜 장애물이 안 잘리게 여유를 준다.
+        # 클러스터를 온전한 모양으로 만들려면 물체 전체가 들어와야 한다.
+        self.path_corridor_gather_half_width = rospy.get_param(
+            '~path_corridor_gather_half_width', 4.0)
+        # 2차(판정) 폭: 클러스터 중심이 경로에서 이 안이어야 '내 경로 위
+        # 장애물'로 인정한다. 실제로 반응할 대상을 여기서 고른다.
+        self.path_corridor_half_width = rospy.get_param(
+            '~path_corridor_half_width', 1.7)
+        # 3차(충돌): 회피 후보 경로가 지나갈 수 있는 폭까지 장애물을 남긴다.
+        #   트리거 코리도(1.4m)로 걸러버리면, 회피를 시작한 뒤 회피 경로가
+        #   지나가는 자리에 있는 장애물이 목록에 없어서 프레넷이 그걸 '없는 것'
+        #   으로 보고 그 위로 경로를 그린다(실제로 박았다).
+        #   new_lane 의 max_road_width_left(4.5) + robot_radius 여유만큼 잡는다.
+        self.collision_corridor_half_width = rospy.get_param(
+            '~collision_corridor_half_width', 6.0)
+        # 경로를 못 받았을 때 코리도 필터를 건너뛸지(True) 막을지(False).
+        # True 가 안전한 기본값 - 경로가 없다고 장애물을 통째로 무시하면 위험하다.
+        self.path_corridor_skip_if_no_path = rospy.get_param(
+            '~path_corridor_skip_if_no_path', True)
+        # 경로점 솎기 간격(원본 0.1m 간격 기준). 크면 빠르지만 곡선에서
+        # 코리도가 각져서 바깥쪽을 조금 놓친다. 5 = 0.5m 간격.
+        # 경로를 솎을 때 유지할 점 간격(m). 인덱스가 아니라 실제 거리 기준이라
+        # CSV 경로(0.1m 간격)든 프레넷 경로(0.35m 간격)든 같은 해상도가 된다.
+        self.path_corridor_decimate_m = float(rospy.get_param(
+            '~path_corridor_decimate_m', 0.5))
+        self.path_xy = None          # ego 프레임 경로점 (N,2)
+        self.path_stamp = 0.0
+        self.infra_points = self._load_infra_points(
+            rospy.get_param('~traffic_light_json_path', ''),
+            rospy.get_param('~infra_map_origin_x', 302595.0),
+            rospy.get_param('~infra_map_origin_y', 4124145.0))
+
+        self.pose_history = deque(maxlen=300)
+        self.scan_pose = None
+        self.path_world = None
+        self.pose_max_age = float(rospy.get_param('~pose_max_age', 0.15))
+        self.motion_backend = rospy.get_param('/motion_tracking/backend', 'legacy')
+        self.motion_config = rospy.get_param('/motion_tracking/dynamic', {})
+        self.cluster_voxel_m = float(rospy.get_param('~cluster_voxel_m', 0.0))
+        self.mission_filter_profiles = validate_profiles(rospy.get_param(
+            '~mission_filter_profiles', {}))
+        self.filter_defaults = {key: getattr(self, key) for key in FILTER_KEYS}
+        self.filter_profile = None
+        self.mission_zone = 'out_of_section'
+        self.boundary_objects = []
+        if self.motion_backend == 'apollo_measurement':
+            load_library()
+        self.latest_ego_pose = None  # (world_x, world_y, yaw), /odom 에서 갱신
+        self.tracks = []
+
+        self.info_pub = rospy.Publisher('/obstacle_info', String, queue_size=10)
+        self.marker_pub = rospy.Publisher('/obstacle_markers', MarkerArray, queue_size=10)
+
+        rospy.Subscriber('/odom', Odometry, self.odom_callback, queue_size=1)
+        # 현재 waypoint idx. 미션 구간별 마커 필터에 쓴다(시각화 전용이라
+        # 검출/추적 로직에는 영향이 없다).
+        from waypoint_maker.msg import Lane as _WpLane2
+        try:
+            from waypoint_maker.msg import State as _WpState
+            rospy.Subscriber('/gps_state', _WpState,
+                             self.gps_state_callback, queue_size=1)
+        except Exception:
+            rospy.logwarn('[obstacle_perception] /gps_state 구독 실패 - '
+                          '미션 구간 마커 필터가 꺼진다')
+        # GroundGrid 결과를 구독하고 roi_z_min/max는 남은 잡음을 거르는
+        # 느슨한 안전망으로만 쓴다.
+        # 기준경로. 장애물 1차 선별(경로 코리도)에 쓴다.
+        # ★ 인지는 계획의 결과(/local_path = 회피 경로)를 읽지 않는다.
+        #   회피가 켜지면 /local_path 가 회피 경로로 바뀌는데, 그걸 코리도
+        #   기준으로 쓰면 '피할수록 그 장애물이 코리도 밖으로 밀려나 사라지는'
+        #   폐루프가 생긴다(회피 -> 미검출 -> 해제 -> 재검출 반복).
+        #   기준은 회피와 무관한 원본 경로여야 한다. /final_waypoint 는
+        #   local_path_publisher 가 CSV + 차선변경 블렌딩만 반영해 내는
+        #   경로라 회피 영향을 받지 않는다(그 노드 주석에도 명시돼 있다).
+        #   같은 토픽에서 현재 waypoint idx/lane 도 같이 꺼낸다(구간별 고도
+        #   문턱, 마커 필터용). /gps_state 에는 waypoint_index 가 없다
+        #   (current_state, lane_number, dist, parking_dist 뿐).
+        try:
+            rospy.Subscriber('/final_waypoint', _WpLane2,
+                             self.final_waypoint_callback, queue_size=1)
+        except Exception:
+            rospy.logwarn('[obstacle_perception] /final_waypoint 구독 실패 - '
+                          '경로 코리도와 구간별 고도 문턱이 모두 꺼진다')
+        rospy.Subscriber(self.lidar_topic, PointCloud2, self.lidar_callback, queue_size=1)
+
+        rospy.loginfo("Obstacle Perception node started (lidar-only). infra_points=%d",
+                      len(self.infra_points))
+        rospy.spin()
+
+    @staticmethod
+    def _load_infra_points(json_path, origin_x, origin_y):
+        """mgeo 신호등 노드 좌표를 UTM 절대좌표 Nx2 배열로 로드한다.
+        경로가 비었거나 못 읽으면 빈 배열(필터 사실상 비활성)을 반환한다."""
+        if not json_path:
+            return np.empty((0, 2), dtype=np.float64)
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+            pts = [(item['point'][0] + origin_x, item['point'][1] + origin_y)
+                   for item in data if item.get('point')]
+            return np.array(pts, dtype=np.float64) if pts else np.empty((0, 2))
+        except Exception as e:
+            rospy.logwarn("[obstacle_perception] infra json load failed (%s): %s",
+                          json_path, e)
+            return np.empty((0, 2), dtype=np.float64)
+
+    def _near_known_infra(self, pos_world):
+        if self.infra_points.shape[0] == 0:
+            return False
+        d = np.linalg.norm(self.infra_points - pos_world[:2], axis=1)
+        return bool(np.min(d) <= self.infra_exclusion_radius_m)
+
+    def odom_callback(self, msg):
+        q = msg.pose.pose.orientation
+        _, _, yaw = tft.euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.latest_ego_pose = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            yaw,
+        )
+        stamp = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        if self.pose_history and stamp <= self.pose_history[-1][0]:
+            if stamp < self.pose_history[-1][0]:
+                self.pose_history.clear()
+                self.tracks.clear()
+            else:
+                return
+        self.pose_history.append((stamp, self.latest_ego_pose))
+
+    def _pose_at(self, stamp):
+        samples = list(self.pose_history)
+        if not samples:
+            return None
+        if stamp <= samples[0][0]:
+            return samples[0][1] if samples[0][0] - stamp <= self.pose_max_age else None
+        for (ta, a), (tb, b) in zip(samples, samples[1:]):
+            if ta <= stamp <= tb:
+                f = (stamp - ta) / max(tb - ta, 1e-9)
+                dyaw = math.atan2(math.sin(b[2]-a[2]), math.cos(b[2]-a[2]))
+                return (a[0]+f*(b[0]-a[0]), a[1]+f*(b[1]-a[1]), a[2]+f*dyaw)
+        return samples[-1][1] if stamp - samples[-1][0] <= self.pose_max_age else None
+
+    def _sync_params(self):
+        t_now = rospy.Time.now().to_sec()
+        if hasattr(self, '_last_param_sync_t') and t_now - self._last_param_sync_t < 1.0:
+            return
+        self._last_param_sync_t = t_now
+        try:
+            self.cluster_eps = float(rospy.get_param('~cluster_eps', self.cluster_eps))
+            self.merge_cluster_dist = float(rospy.get_param('~merge_cluster_dist', self.merge_cluster_dist))
+            self.self_y_min = float(rospy.get_param('~self_y_min', self.self_y_min))
+            self.self_y_max = float(rospy.get_param('~self_y_max', self.self_y_max))
+            self.min_obstacle_elevation = float(rospy.get_param('~min_obstacle_elevation', self.min_obstacle_elevation))
+            self.path_corridor_half_width = float(rospy.get_param('~path_corridor_half_width', self.path_corridor_half_width))
+            self.curb_max_aspect = float(rospy.get_param('~curb_max_aspect', self.curb_max_aspect))
+            self.curb_linear_min_length = float(rospy.get_param('~curb_linear_min_length', self.curb_linear_min_length))
+            self.curb_linear_max_width = float(rospy.get_param('~curb_linear_max_width', self.curb_linear_max_width))
+            self.min_points_for_confirm = int(rospy.get_param('~min_points_for_confirm', self.min_points_for_confirm))
+            self.low_obstacle_top_m = float(rospy.get_param('~low_obstacle_top_m', self.low_obstacle_top_m))
+            self.low_obstacle_min_thickness = float(rospy.get_param('~low_obstacle_min_thickness', self.low_obstacle_min_thickness))
+            self.low_obstacle_min_points = int(rospy.get_param('~low_obstacle_min_points', self.low_obstacle_min_points))
+            self.max_association_dist = float(rospy.get_param(
+                '~max_association_dist', self.max_association_dist))
+            # ★ 칼만/ego_rate 실시간 튜닝. 새로 만들어지는 트랙에만 적용된다
+            #   (기존 트랙은 생성 시 값을 들고 있다) - 피팅 중에는 한 바퀴
+            #   돌아 트랙이 갈려야 반영된다.
+            self.kf_q_accel = float(rospy.get_param('~kf_q_accel', self.kf_q_accel))
+            self.kf_r_base = float(rospy.get_param('~kf_r_base', self.kf_r_base))
+            self.kf_r_slope = float(rospy.get_param('~kf_r_slope', self.kf_r_slope))
+            self.kf_vel_std_max = float(rospy.get_param(
+                '~kf_vel_std_max', self.kf_vel_std_max))
+            self.ego_rate_window_sec = float(rospy.get_param(
+                '~ego_rate_window_sec', self.ego_rate_window_sec))
+            self.max_plausible_speed = float(rospy.get_param(
+                '~max_plausible_speed', self.max_plausible_speed))
+            # 2026-09-09 추가분도 실시간 튜닝 대상에 넣는다.
+            self.min_obstacle_elevation_dynamic = float(rospy.get_param(
+                '~min_obstacle_elevation_dynamic', self.min_obstacle_elevation_dynamic))
+            self.min_obstacle_elevation_outside = float(rospy.get_param(
+                '~min_obstacle_elevation_outside', self.min_obstacle_elevation_outside))
+            self.init_confirm_elevation = float(rospy.get_param(
+                '~init_confirm_elevation', self.init_confirm_elevation))
+            self.low_obstacle_max_length = float(rospy.get_param(
+                '~low_obstacle_max_length', self.low_obstacle_max_length))
+            self.flat_check_max_range = float(rospy.get_param(
+                '~flat_check_max_range', self.flat_check_max_range))
+            self.far_cluster_range = float(rospy.get_param(
+                '~far_cluster_range', self.far_cluster_range))
+            self.far_min_points = int(rospy.get_param(
+                '~far_min_points', self.far_min_points))
+            self.far_low_point_elevation = float(rospy.get_param(
+                '~far_low_point_elevation', self.far_low_point_elevation))
+            self.far_elev_relax_start_m = float(rospy.get_param(
+                '~far_elev_relax_start_m', self.far_elev_relax_start_m))
+            self.far_elev_relax_end_m = float(rospy.get_param(
+                '~far_elev_relax_end_m', self.far_elev_relax_end_m))
+            self.far_elev_relax_min = float(rospy.get_param(
+                '~far_elev_relax_min', self.far_elev_relax_min))
+            self.far_elev_relax_max_lateral_m = float(rospy.get_param(
+                '~far_elev_relax_max_lateral_m',
+                self.far_elev_relax_max_lateral_m))
+            self.collision_corridor_half_width = float(rospy.get_param(
+                '~collision_corridor_half_width', self.collision_corridor_half_width))
+            self.ego_corridor_range = float(rospy.get_param(
+                '~ego_corridor_range', self.ego_corridor_range))
+            self.near_merge_range = float(rospy.get_param(
+                '~near_merge_range', self.near_merge_range))
+            self.near_merge_dist = float(rospy.get_param(
+                '~near_merge_dist', self.near_merge_dist))
+            self.align_reject_enabled = bool(rospy.get_param(
+                '~align_reject_enabled', self.align_reject_enabled))
+            self.align_min_count = int(rospy.get_param(
+                '~align_min_count', self.align_min_count))
+            self.align_min_length = float(rospy.get_param(
+                '~align_min_length', self.align_min_length))
+            self.align_max_width = float(rospy.get_param(
+                '~align_max_width', self.align_max_width))
+            self.align_min_offset = float(rospy.get_param(
+                '~align_min_offset', self.align_min_offset))
+            self.align_protect_lateral = float(rospy.get_param(
+                '~align_protect_lateral', self.align_protect_lateral))
+            self.align_min_height_slope = float(rospy.get_param(
+                '~align_min_height_slope', self.align_min_height_slope))
+        except Exception:
+            pass
+
+    def active_section_callback(self, msg):
+        self.active_section_msg = msg
+        self.active_section_t = rospy.Time.now().to_sec()
+
+    def lidar_callback(self, msg):
+        for key, value in self.filter_defaults.items():
+            setattr(self, key, value)
+        self._sync_params()
+        self.filter_defaults = {key: getattr(self, key) for key in FILTER_KEYS}
+        if self.latest_ego_pose is None:
+            return  # world 좌표 변환 불가 -> odom 아직 없으면 보류
+
+        in_section, zone = self._in_mission_section()
+        self.mission_zone = zone
+        self.boundary_objects = []
+        # Restore defaults before applying each profile, so tunnel tuning never
+        # leaks back into M2/M3. GroundGrid and its input remain shared.
+        profile = self.mission_filter_profiles.get(zone, {})
+        for key, value in self.filter_defaults.items():
+            setattr(self, key, profile.get(key, value))
+        if self.filter_profile != zone:
+            self.tracks.clear()
+            self.filter_profile = zone
+            rospy.loginfo('[obstacle_perception] filter profile=%s', zone)
+        if self.section_gating_enabled and not in_section:
+            # 정동적 구간 외: 점군 클러스터링 연산 스킵 및 마커/트랙 완전 소거
+            # 단, downstream 노드(obstacle_stop_node)의 stale timeout(급제동) 방지를 위해
+            # 빈 obstacles 정보를 담은 /obstacle_info는 정상 발행한다.
+            if len(self.tracks) > 0:
+                self.tracks = []
+            self.publish_tracks()
+            self.publish_empty_markers()
+            return
+
+        now = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        self.scan_pose = self._pose_at(now)
+        if self.scan_pose is None:
+            rospy.logwarn_throttle(1.0, '[obstacle_perception] no synchronized odom for scan')
+            self._age_out_tracks(rospy.Time.now().to_sec())
+            self.publish_tracks()
+            return
+        if self.path_world is not None:
+            self.path_xy = np.array([world_to_ego(p, self.scan_pose) for p in self.path_world])
+        arr = pointcloud2_to_xyz_array_fast(msg, self.ground_relative_field)
+        if len(arr) == 0:
+            self._age_out_tracks(rospy.Time.now().to_sec())
+            self.publish_tracks()
+            self.publish_markers()
+            return
+        dist = np.linalg.norm(arr[:, :2], axis=1)
+        self_filter = (
+            (arr[:, 0] >= self.self_x_min) & (arr[:, 0] <= self.self_x_max) &
+            (arr[:, 1] >= self.self_y_min) & (arr[:, 1] <= self.self_y_max)
+        )
+        roi_filter = (
+            (arr[:, 0] >= self.roi_x_min) & (arr[:, 0] <= self.roi_x_max) &
+            (arr[:, 1] >= self.roi_y_min) & (arr[:, 1] <= self.roi_y_max) &
+            (arr[:, 2] >= self.roi_z_min) & (arr[:, 2] <= self.roi_z_max)
+        )
+        # 1차(수집): 기준경로 좌우를 '넓게' 잡아 후보 점을 모은다. 여기서
+        #   버린 점은 다시 못 보므로 좁히지 않는다. 클러스터가 온전한 모양을
+        #   갖추려면 물체 전체가 들어와야 하고, 경로가 휘거나 측위가 흔들려도
+        #   진짜 장애물이 잘리면 안 된다.
+        #   좁히는 판정은 클러스터가 만들어진 뒤 _filter_ground_residue 에서
+        #   중심 기준으로 한다(2차).
+        corridor = self._path_corridor_mask(
+            arr, self.path_corridor_gather_half_width)
+        mask = ((dist > self.min_range) & (dist < self.max_range) &
+                (~self_filter) & roi_filter & corridor)
+        filtered = arr[mask]
+        if self.cluster_voxel_m > 0.0 and len(filtered):
+            # Keep real 3D representatives (and ground-relative fields), not
+            # averaged points that flatten low obstacles into the road.
+            cells = np.floor(filtered[:, :3] / self.cluster_voxel_m).astype(np.int64)
+            _, indices = np.unique(cells, axis=0, return_index=True)
+            filtered = filtered[indices]
+
+        # 필터 통과한 원본 점(클러스터링 이전)이 거리 구간별로 몇 개 찍히는지 확인.
+        # 이걸로 "10m 밖에서 라이다 반사 자체가 없는지" vs "점은 있는데
+        # min_points_for_confirm을 못 채워서 버려지는지"를 구분한다.
+        ahead_mask = (filtered[:, 0] > 0) & (np.abs(filtered[:, 1]) < 3.0)
+        ahead = filtered[ahead_mask]
+        if len(ahead) > 0:
+            ahead_dist = np.linalg.norm(ahead[:, :2], axis=1)
+            bins = [(15, 20), (10, 15), (7, 10), (5, 7), (3, 5), (0, 3)]
+            counts = {f"{lo}-{hi}m": int(np.sum((ahead_dist >= lo) & (ahead_dist < hi)))
+                      for lo, hi in bins}
+            rospy.loginfo_throttle(0.3,
+                "[obstacle_perception] DEBUG raw point count by distance (전방, |y|<3m): %s", counts)
+
+        clusters = cluster_lidar_points(filtered, self.cluster_eps,
+                                         self.min_points_for_confirm, self.cluster_max_points,
+                                         far_range=self.far_cluster_range,
+                                         far_min_points=self.far_min_points,
+                                         preserve_large=(zone == 'tunnel'))
+        clusters = merge_close_clusters(clusters, self.merge_cluster_dist)
+        # ★ 근거리 2차 병합.
+        #   가까워지면 같은 물체가 링 여러 개에 걸리면서 수직으로 갈라지고,
+        #   그 조각들이 각각 새 트랙으로 등록된다.
+        #     실측 2026-09-09(16:52): 한 물체 자리에 트랙 3개(id7 21m,
+        #     id11 11m, id12 5.6m)가 생겼고 상호거리는 0.66~0.69m 였다.
+        #     회피는 id7 로 계획했는데 실제 가장자리는 id12 쪽이라 0.16m
+        #     긁었다. 5.6m 에서 처음 뜬 id12 는 이미 피할 수 없는 거리다.
+        #   거리가 가까울수록 한 물체의 조각이 멀어 보이므로(각 분해능),
+        #   근거리에서만 문턱을 키워 다시 붙인다.
+        if self.near_merge_range > 0.0:
+            clusters = merge_close_clusters(
+                clusters, self.merge_cluster_dist,
+                near_range=self.near_merge_range,
+                near_dist=self.near_merge_dist)
+        clusters = self._reject_ground_residue(clusters)
+        self.associate_and_update_tracks(clusters, now)
+        self.publish_tracks()
+        self.publish_markers()
+
+    def _reject_ground_residue(self, clusters):
+        """지면에 붙어 있는 클러스터(=노면 잔차 및 연석)를 버린다.
+
+        판정은 클러스터의 '최고점(top)', '수직 두께(cluster_h)', 그리고 '2D 주축 형상(SVD)'으로 한다.
+        실제 장애물(카고박스 h>=0.35m, 드럼 h>=0.85m, 저상 장애물 h>=0.15m)은
+        입체적 두께를 형성하며 종횡비(aspect ratio)가 크지 않다.
+        반면 노면 잔차나 연석은 2~3점짜리 납작한 평면(cluster_h < 0.06m)이거나 가늘고 긴 선형(aspect > 8.0)이다.
+        """
+        self.boundary_objects = []
+        if not clusters:
+            return clusters
+
+        # --- 2차(판정): 클러스터 중심이 기준경로에서 얼마나 떨어졌나 ---
+        # 1차는 점을 넓게 모으는 단계였고, 실제로 '내 경로 위 장애물'인지는
+        # 물체 단위로 여기서 가린다. 점 단위로 좁히면 물체가 반쯤 잘려서
+        # 크기·형상 판정이 망가지지만, 중심으로 재면 물체는 온전한 채로
+        # 경로에서 벗어난 것만 버릴 수 있다.
+        lateral = None
+        if self.use_path_corridor and clusters:
+            centers = np.array([c[:2] for c, _ in clusters], dtype=np.float64)
+            lateral = self._path_lateral_dist(centers)
+
+        # 구간별 고도 문턱. idx 를 못 받았으면(측위 실패 등) 안전하게 낮은 쪽을
+        # 써서 장애물을 놓치지 않는다 - 오탐이 늘어도 못 보는 것보다 낫다.
+        # ★ 구간을 셋으로 나눈다. 예전에는 static_zone(2400~4900) 하나로 묶여
+        #   정적/동적이 같은 문턱(0.12)을 썼다. 그래서 동적 구간에서도 노면
+        #   잔차가 장애물로 올라왔고, obstacle_stop_node 가 동적 구간에서는
+        #   motion_state/confirmed 를 안 보기 때문에 그게 곧 급정지였다.
+        #     실측 2026-09-09(17:14): 고도 0.13m 잔차(id28)가 x=4.8m 에
+        #     2.4초간 고정돼 신호등 앞에서 3.7초 정지를 유발했다.
+        #   정적 구간만 낮은 문턱이 필요하다(저상 카고박스를 살려야 한다).
+        #   동적 구간은 보행자/더미가 대상이라 높아도 된다.
+        idx = self.current_wp_idx
+        in_static_zone = (self.static_zone_min_idx <= idx
+                          <= self.static_dynamic_split_idx)
+        in_dynamic_zone = (self.static_dynamic_split_idx < idx
+                           <= self.static_zone_max_idx)
+        if self.mission_zone == 'tunnel':
+            elev_min = self.min_obstacle_elevation
+        elif idx < 0:
+            # 측위 실패 - 가장 낮은 문턱으로 안전하게(놓치지 않는 쪽)
+            elev_min = self.min_obstacle_elevation
+        elif in_static_zone:
+            elev_min = self.min_obstacle_elevation
+        elif in_dynamic_zone:
+            elev_min = self.min_obstacle_elevation_dynamic
+        else:
+            elev_min = self.min_obstacle_elevation_outside
+        in_mission_zone = in_static_zone or in_dynamic_zone
+
+        kept = []
+        dropped = []
+        for ci, (center, pts) in enumerate(clusters):
+            # ★ 원거리 저점수(2점) 클러스터는 SVD 형상 검사(>=4점 필요)를
+            #   받지 못한다. 그 방어를 고도로 대신한다 - 노면 잔차는 지면에
+            #   붙어 있고(실측 0.11~0.20m), 진짜 장애물은 솟아 있다.
+            #   far_min_points 완화로 들어온 클러스터에만 적용한다.
+            if (len(pts) < self.min_points_for_confirm
+                    and self.far_low_point_elevation > 0.0):
+                top_q = (float(np.max(pts[:, 3])) if self.use_ground_relative
+                         and pts.shape[1] > 3
+                         else float(np.max(pts[:, 2])) - self.ground_z)
+                # 거리에 따라 문턱을 낮춘다(2026-09-21).
+                #
+                # 고정 0.30 이면 원거리 저상 장애물이 통째로 기각된다.
+                # VLP-16 은 링 간격 2 deg 라 0.35 m 짜리 콘에 맞는 링이
+                # 10 m 에서 1.0 개, 20 m 0.5 개, 30 m 0.3 개로 줄어든다.
+                # 링이 물체 윗부분을 못 맞으면 측정된 top 이 실제 높이보다
+                # 낮게 나오고, 그대로 0.30 에 걸린다.
+                #   실측(09-21 17:10 heavy, 118 프레임, 저상대역 점의
+                #   0.30 통과율): 10-15m 52.5% -> 25-30m 31.4%
+                #   -> 30-40m 17.6%. 30 m 너머는 82% 가 버려진다.
+                #
+                # 문턱을 낮춰도 안전한 이유는 노면 잔차 자체가 원거리에서
+                # 급감하기 때문이다. 같은 백에서 지면상대 0.35 m 미만 점은
+                # 프레임당 5-10m 4.36 개 -> 20-25m 0.14 -> 30-40m 0.25 로
+                # 약 17 배 줄어든다. 링이 성기어 잔차가 생길 자리도 적다.
+                #
+                # ★ 완화는 '경로 위' 물체에만 준다(2026-09-21).
+                #   완화를 횡방향 제한 없이 걸었더니 교차로 신호등 기둥
+                #   밑동/표지판 지주가 대량으로 통과했다. 실측(09-21 17:16
+                #   백): AEB 긴급 90회, 9.85 m/s 에서 완전정지 2회.
+                #   유발 물체는 경로 횡거리 2.3 m 부근이라 회피 코리도(1.5)
+                #   밖인데, 정지 노드만 stop_corridor_radius 3.2 m 를 써서
+                #   혼자 반응했다(회피는 미작동, /ctrl_cmd_raw 는 accel 0.49
+                #   인데 AEB 가 brake 1.00 으로 덮었다).
+                #   저상 장애물은 어차피 경로 위에 있어야 의미가 있으므로,
+                #   완화 혜택만 경로 근처로 한정하고 갓길 구조물은 기존
+                #   0.30 문턱으로 계속 기각한다. 정지 노드의 3.2 m 그물
+                #   자체는 건드리지 않는다(갓길 큰 물체는 계속 본다).
+                # far_elev_relax_* 를 0 으로 두면 기존 고정 문턱 그대로다.
+                near_path = True
+                if (self.far_elev_relax_max_lateral_m > 0.0
+                        and lateral is not None and ci < len(lateral)):
+                    near_path = (abs(float(lateral[ci]))
+                                 <= self.far_elev_relax_max_lateral_m)
+                dist_xy = float(np.hypot(center[0], center[1]))
+                elev_gate = self.far_low_point_elevation
+                if (near_path
+                        and self.far_elev_relax_end_m > self.far_elev_relax_start_m
+                        and self.far_elev_relax_min > 0.0):
+                    span = (self.far_elev_relax_end_m
+                            - self.far_elev_relax_start_m)
+                    ratio = (dist_xy - self.far_elev_relax_start_m) / span
+                    ratio = min(1.0, max(0.0, ratio))
+                    elev_gate = (self.far_low_point_elevation
+                                 + ratio * (self.far_elev_relax_min
+                                            - self.far_low_point_elevation))
+                if top_q < elev_gate:
+                    dropped.append((center, top_q,
+                                    f"far_lowpts_{len(pts)}_elev_{top_q:.2f}"
+                                    f"_gate_{elev_gate:.2f}"))
+                    continue
+
+            in_trigger = True
+            if lateral is not None:
+                # 중심이 코리도 밖이어도 물체 몸통이 경로를 침범하면 남긴다.
+                # 중심만 보면 옆으로 비스듬히 걸친 큰 물체를 놓친다.
+                half_extent = 0.5 * float(np.ptp(pts[:, :2], axis=0).max())
+                edge = lateral[ci] - half_extent
+                if self.mission_zone == 'tunnel':
+                    # A 20m-long side wall is not 10m wide. Test its actual
+                    # lateral footprint rather than an enclosing circle.
+                    edge = float(np.min(self._path_lateral_dist(pts[:, :2])))
+                if edge > self.collision_corridor_half_width:
+                    # 회피 폭 밖 - 어떤 후보 경로도 여기로 안 간다. 버린다.
+                    dropped.append((center, 0.0,
+                                    f"off_path_{lateral[ci]:.1f}m"))
+                    continue
+                # 충돌 코리도 안이지만 트리거 코리도 밖이면 '충돌 검사 전용'
+                # 으로만 남긴다(회피를 새로 시작시키지는 않는다).
+                in_trigger = (edge <= self.path_corridor_half_width)
+                # ★ 기준경로 코리도만 보면, 회피로 차가 옆으로 나가 있는 동안
+                #   '내 앞에 있는' 물체가 트리거에서 빠진다. 기준은 고정돼도
+                #   차량이 1.5m 밀려나 있으면 경로 기준 1.5m 안의 물체가
+                #   차에서는 3m 라, 다음 장애물이 목록에서 사라진다.
+                #     실측 2026-09-09(16:52): 차량 d 가 +0.90 -> +1.23 으로
+                #     커지는 순간 트리거 장애물 3개(T7/T11/T12)가 한꺼번에
+                #     사라졌다. "첫 장애물은 피하는데 두번째는 인식이 안 된다"
+                #     의 원인이다.
+                #   그래서 '차량 진행 경로(ego 전방)' 기준으로도 본다 -
+                #   둘 중 하나라도 안에 들면 트리거로 취급한다.
+                if not in_trigger and self.ego_corridor_enabled:
+                    # center 는 ego 프레임이다(x 전방, y 좌측).
+                    ex, ey = float(center[0]), float(center[1])
+                    if 0.0 < ex <= self.ego_corridor_range:
+                        ego_edge = (float(np.min(np.abs(pts[:, 1])))
+                                    if self.mission_zone == 'tunnel'
+                                    else abs(ey) - half_extent)
+                        if ego_edge <= self.path_corridor_half_width:
+                            in_trigger = True
+            z_max = float(np.max(pts[:, 2]))
+            z_min = float(np.min(pts[:, 2]))
+            top = (float(np.max(pts[:, 3])) if self.use_ground_relative
+                   and pts.shape[1] > 3 else z_max - self.ground_z)
+            cluster_h = z_max - z_min
+            n_pts = len(pts)
+
+            # 1. 지면 위 최고점(top) 기준 미달 시 탈락.
+            #    정적 장애물 구간에서만 낮은 문턱(카고박스/라바콘 보존),
+            #    그 밖에서는 높은 문턱(노면 표식 배제). src_최적과 같은 구조다.
+            if top < elev_min:
+                dropped.append((center, top, "elevation"))
+                continue
+
+            # 2. 2D 주축 형상 검사 (SVD): 연석 조각(가늘고 긺) 및 거대 선형 구조물 기각
+            xy = pts[:, :2] - pts[:, :2].mean(axis=0)
+            if len(xy) >= 4:
+                _, s, axes = np.linalg.svd(xy, full_matrices=False)
+                ext = np.ptp(xy @ axes.T, axis=0)
+                length, width = float(max(ext)), float(min(ext))
+                aspect = length / max(width, 0.05)
+
+                # 터널 주행 코리도 밖의 길고 얇은 종방향 군집은 벽면이다.
+                # 보이는 벽 구간의 중심이 프레임마다 움직이면 동적 장애물처럼
+                # 추적될 수 있으므로 판단/충돌 점군에서 제거한다. 코리도에
+                # 침입한 물체와 횡방향 장벽은 아래 일반 장애물 처리에 남긴다.
+                if (self.mission_zone == 'tunnel' and not in_trigger and
+                        length > self.curb_linear_min_length and
+                        width < self.curb_linear_max_width and
+                        abs(float(axes[0, 0])) > 0.75):
+                    dropped.append((center, top,
+                                    f"tunnel_wall_len_{length:.1f}"))
+                    continue
+
+                # 주축 방향 분석:
+                # - 연석/가드레일: 도로 방향(longitudinal, 시선 방향)으로 뻗어 있음.
+                # - 전방 장애물(박스, 바리케이드, 차량 등): 차선을 가로막는 횡방향(transverse, 시선 직교 방향).
+                # VLP-16은 8m 이상 원거리에서 0.4~0.5m 높이 물체에 1개 링만 닿으므로,
+                # 정면을 향한 평면/박스도 점군 두께가 ~0이라 종횡비가 20~40으로 계산된다.
+                # 따라서 시선 직교(차선 횡단) 형상은 연석 종횡비로 기각하면 안 된다.
+                r_norm = np.linalg.norm(center[:2])
+                if r_norm > 1e-3:
+                    r_unit = center[:2] / r_norm
+                    t_unit = np.array([-r_unit[1], r_unit[0]])
+                    cos_t = abs(float(np.dot(axes[0], t_unit)))
+                    is_transverse = (cos_t >= 0.707)  # 시선 직교(차선 가로막음)
+                else:
+                    is_transverse = False
+
+                # 2-1. 비정상적으로 긴 선형 구조물(연석, 가드레일, 벽체, 길이 2.5m 이상) 기각
+                if (length > self.curb_linear_min_length and
+                        width < self.curb_linear_max_width and
+                        self.mission_zone != 'tunnel'):
+                    dropped.append((center, top, f"linear_curb_len_{length:.1f}"))
+                    continue
+
+                # 2-1b. 저상 물체는 길이 상한도 본다. 라바콘·카고박스는 1m 안팎인데
+                #       연석·노면 표식은 훨씬 길게 이어진다(실측 2026-09-08:
+                #       16.4m 표식이 폭 1.12m 로 옆으로 퍼져 있었다).
+                #       폭 조건(2-1)만으로는 '길지만 두꺼운' 노면 패치를 못 거른다.
+                #       높이 있는 물체(top >= low_obstacle_top_m)는 이 검사에서 뺀다.
+                if (top < self.low_obstacle_top_m and
+                        length > self.low_obstacle_max_length):
+                    dropped.append((center, top, f"low_too_long_{length:.1f}"))
+                    continue
+
+                # 2-2. 도로를 따라 길게 뻗은(종방향) 연석 조각 기각
+                #      (차선을 가로막는 횡방향 물체나 높이 35cm 이상의 확실한 장애물은 제외)
+                if not is_transverse and top < self.low_obstacle_top_m:
+                    if aspect > self.curb_max_aspect and self.mission_zone != 'tunnel':
+                        dropped.append((center, top, f"curb_aspect_{aspect:.1f}"))
+                        continue
+
+            # 3. 저상 장애물 후보: 카고박스처럼 낮은 물체는 점이 적어도 최소 개수 이상이어야 함
+            if top < self.low_obstacle_top_m:
+                # 근거리(<8m) 및 극저상(<20cm)에서만 수직 두께 검사 적용.
+                # 원거리(>=8m)는 VLP-16 단일 링 히트로 물리적 수직 두께(cluster_h)가
+                # 0.01m 이하가 되므로, 수직 두께 대신 지면 대비 고도(top >= 0.12m)로 신뢰성 확보.
+                dist_to_ego = np.linalg.norm(center[:2])
+                # ★ 두께 검사는 '링이 2개 이상 닿을 수 있는 거리'에서만 쓴다.
+                #   VLP-16 은 링 간 수직 간격이 2deg 라, 거리 r 에서 두 링의
+                #   높이차는 r*tan(2deg) ~ 0.035*r 이다. 즉 물체 높이가 그보다
+                #   작으면 링이 하나만 닿아 두께가 구조적으로 0 이 된다
+                #   (예: 14m 에서 0.49m, 20m 에서 0.70m 보다 낮은 물체).
+                #   그런 물체에 두께 0.06 을 요구하면 '있는데 버린다'.
+                #     실측 2026-09-09(16:41): 고도 0.20 물체가 15.9m 에서야
+                #     잡혔고 0.35 물체는 14.2m 였다. 반면 같은 고도 0.32 물체가
+                #     경로 위(|y|<1.1)에서는 24.5m 에 잡혔다 - 점이 더 많이
+                #     모여 우연히 두 링에 걸린 경우다. 즉 이 게이트가
+                #     거리/횡위치에 따라 검출을 들쭉날쭉하게 만들고 있었다.
+                #   노면 잔차 방어는 고도 문턱(min_obstacle_elevation)과
+                #   형상 필터(SVD)가 이미 맡는다.
+                ring_sep_m = self.ring_vert_sep_tan * max(dist_to_ego, 1.0)
+                thickness_meaningful = (top >= ring_sep_m)
+                if (dist_to_ego < self.flat_check_max_range
+                        and top < self.low_obstacle_flat_top_m
+                        and thickness_meaningful):
+                    if cluster_h < self.low_obstacle_min_thickness:
+                        dropped.append((center, top, f"flat_residue_h_{cluster_h:.2f}"))
+                        continue
+                if n_pts < self.low_obstacle_min_points:
+                    dropped.append((center, top, f"too_few_pts_{n_pts}"))
+                    continue
+
+            kept.append((center, pts, in_trigger))
+
+        # ★ 조각 정렬 검사: 여러 클러스터가 한 직선 위에 늘어서 있으면
+        #   그건 개별 물체가 아니라 '쪼개진 선형 구조물'(연석/노견/가드레일)이다.
+        #
+        #   SVD 형상 필터는 클러스터 하나씩만 보므로, 연석이 조각나면 각
+        #   조각이 짧아서 curb_linear_min_length(2.5m)를 못 넘고 전부 통과한다.
+        #   near_merge 로 붙이기에는 조각 간격이 1~3m 로 너무 넓다.
+        #     실측 2026-09-10 (정지 상태, 급가감속 무관):
+        #       검출 8개가 5.6m~18.1m 에 걸쳐 일정 패턴으로 늘어섰다.
+        #         y    = -0.116 * 거리 - 0.109   (상관 -0.97)
+        #         고도 = +0.030 * 거리 - 0.017   (상관  0.79, 1.74deg 상승)
+        #       전부 W=L=0.35(최소 클램핑)이고 trigger 였다 - 이게 동적 구간
+        #       "가다 서다 반복"의 원인이었다.
+        #   이 단계의 노견은 실제 지면보다 높기 때문에 지면제거 문제가
+        #   아니라 형상 판정 문제다.
+        if self.align_reject_enabled and len(kept) >= self.align_min_count:
+            # lateral 은 원본 clusters 인덱스 기준이라 kept 와 어긋난다.
+            # kept 중심으로 다시 계산해 넘긴다.
+            kept_lat = None
+            if self.use_path_corridor:
+                kc = np.array([c[:2] for c, _p, _t in kept], dtype=np.float64)
+                kept_lat = self._path_lateral_dist(kc)
+            kept = self._reject_aligned_chain(kept, dropped, kept_lat)
+
+        if dropped:
+            rospy.loginfo_throttle(
+                1.0,
+                "[obstacle_perception] 노면 잔차/연석 %d개 제외 (idx=%d %s, 고도<%.2fm "
+                "또는 두께<0.06m/SVD): %s",
+                len(dropped), self.current_wp_idx,
+                "정동적구간" if in_mission_zone else "구간밖", elev_min,
+                ", ".join("(%.1f,%.1f h=%.2f reason=%s)" % (c[0], c[1], t, r)
+                          for c, t, r in dropped[:4]))
+        return kept
+
+    def _reject_aligned_chain(self, kept, dropped, lateral=None):
+        """한 직선 위에 정렬된 클러스터 묶음을 선형 구조물로 보고 기각한다.
+
+        판정: 전체 점을 모아 SVD 주축을 구하고
+          - 주축 길이가 충분히 길다(align_min_length)
+          - 직교 방향 퍼짐이 좁다(align_max_width)
+          - 구성 클러스터가 align_min_count 개 이상
+        이면 그 묶음 전체를 버린다.
+
+        경로 위 실물은 보호한다 - 기준경로 코리도 안(in_trigger)인 클러스터가
+        묶음에 섞여 있으면 그건 버리지 않는다. 연석은 경로 옆에 있고, 줄지어
+        놓인 라바콘도 코리도 안이면 살려야 하기 때문이다.
+        """
+        # 자차 기준 '한쪽 옆'으로 제한한다. 좌우를 섞으면 서로 다른 구조물이
+        # 한 직선으로 보일 수 있다.
+        for side in (-1, 1):
+            idxs = [i for i, (c, _p, _t) in enumerate(kept)
+                    if (c[1] * side) > self.align_min_offset]
+            if len(idxs) < self.align_min_count:
+                continue
+            # ★ 실물 보호 조건을 '코리도 안(in_trigger)' 으로 걸면 안 된다.
+            #   노면 라인은 기준경로에서 0.7~2.5m 에 걸쳐 있어 코리도(1.5m)
+            #   안에 상당수가 들어온다. 그러면 이 조건이 '항상' 발동해서
+            #   검사 자체가 영구히 스킵된다.
+            #     실측 2026-09-10: 경로상 실물 0개인데 검출 9개(전부 노면).
+            #     그 중 7개가 in_trigger=True 라 검사가 통째로 꺼져 있었다.
+            #   대신 '직선에서 벗어난 것'으로 실물을 보호한다 - 진짜 물체는
+            #   라인 위에 정렬되지 않으므로 아래 SVD 폭 조건이 그 역할을 한다.
+            #   경로 중앙(|lateral| 작음)에 있는 것만 별도로 지킨다.
+            if lateral is not None:
+                on_path = [i for i in idxs
+                           if lateral[i] < self.align_protect_lateral]
+                if on_path:
+                    # 경로 중앙에 있는 건 라인이 아니라 실물일 수 있다.
+                    # 그것만 빼고 나머지로 라인 판정을 계속한다.
+                    idxs = [i for i in idxs if i not in set(on_path)]
+                    if len(idxs) < self.align_min_count:
+                        continue
+            cs = np.array([kept[i][0][:2] for i in idxs], dtype=np.float64)
+            ctr = cs.mean(axis=0)
+            X = cs - ctr
+            if len(X) < 3:
+                continue
+            _u, _sv, axes = np.linalg.svd(X, full_matrices=False)
+            ext = np.ptp(X @ axes.T, axis=0)
+            length, width = float(max(ext)), float(min(ext))
+            if length < self.align_min_length or width > self.align_max_width:
+                continue
+            # ★ 노면 라인과 '일렬로 놓인 실물'을 가른다.
+            #   피치로 기운 노면은 고도가 거리에 비례해 오른다.
+            #   라바콘/드럼을 줄지어 놓은 것은 고도가 거리와 무관하게 일정하다.
+            #     실측 2026-09-10:
+            #       노면 9개  : 고도 = 0.036*dist - 0.112 (상관 +0.91, 2.06deg)
+            #       라바콘 줄 : 고도 기울기 0, 표준편차 0
+            #   이 조건이 없으면 경로 옆에 일렬로 놓인 라바콘이 전부 기각된다.
+            dists = np.array([float(np.linalg.norm(kept[i][0][:2])) for i in idxs])
+            tops = np.array([(float(np.max(kept[i][1][:, 3]))
+                              if self.use_ground_relative and kept[i][1].shape[1] > 3
+                              else float(np.max(kept[i][1][:, 2])) - self.ground_z)
+                             for i in idxs])
+            if len(dists) >= 3 and float(np.ptp(dists)) > 1e-3:
+                slope = float(np.polyfit(dists, tops, 1)[0])
+                # 고도가 거리에 따라 충분히 '오르지' 않으면 노면이 아니다.
+                if slope < self.align_min_height_slope:
+                    continue
+            for i in idxs:
+                c = kept[i][0]
+                dropped.append((c, 0.0,
+                                "aligned_chain_n%d_L%.1f_W%.2f"
+                                % (len(idxs), length, width)))
+            keep_set = set(range(len(kept))) - set(idxs)
+            kept = [kept[i] for i in sorted(keep_set)]
+            rospy.loginfo_throttle(
+                1.0,
+                "[obstacle_perception] 정렬된 선형 구조물 %d조각 기각 "
+                "(%s, 주축 %.1fm x %.2fm)",
+                len(idxs), "우측" if side < 0 else "좌측", length, width)
+        return kept
+
+    def associate_and_update_tracks(self, clusters, now):
+        # Global assignment with a separate unmatched choice for every detection.
+        pose = self.scan_pose or self.latest_ego_pose
+        detections = []
+        for item in clusters:
+            center, pts = item[:2]
+            world = ego_to_world(center[:2], pose)
+            if self._near_known_infra(world):
+                continue
+            top = float(np.max(pts[:, 3])) if pts.shape[1] > 3 else float(np.max(pts[:, 2])) - self.ground_z
+            thickness = float(np.ptp(pts[:, 2]))
+            detections.append((item, world, top, thickness))
+        n, m = len(detections), len(self.tracks)
+        costs = np.full((n, m+n), 12.0)
+        for i, (item, world, top, thickness) in enumerate(detections):
+            length, width, _ = estimate_extent(item[1][:, :2])
+            for j, track in enumerate(self.tracks):
+                dt = now - track.last_seen
+                if dt <= 0 or dt > self.track_timeout:
+                    costs[i, j] = 1e6
+                    continue
+                pred = track.position.copy()
+                covariance = np.eye(2) * 0.25
+                if track.kf is not None:
+                    F = np.array([[1,0,dt,0], [0,1,0,dt]], dtype=float)
+                    pred = F @ track.kf.x
+                    covariance = F @ track.kf.P @ F.T
+                delta = world - pred
+                distance = float(np.linalg.norm(item[0][:2]))
+                covariance += np.eye(2) * (self.kf_r_base + self.kf_r_slope * distance**2)
+                mahal = float(delta @ np.linalg.solve(covariance, delta))
+                shape = abs(length-track.length) + abs(width-track.width)
+                dh = abs(top-track.top_elevation) if track.top_elevation is not None else 0.0
+                if np.linalg.norm(delta) > self.max_association_dist or mahal > 9.21 or dh > 0.65:
+                    costs[i, j] = 1e6
+                else:
+                    costs[i, j] = mahal + 2.0 * shape + 4.0 * dh
+        assignments = dict(zip(*linear_sum_assignment(costs))) if n else {}
+        used_track_ids = set()
+        for i, (item, pos_world, top_elev, thickness) in enumerate(detections):
+            center, cluster_pts = item[:2]
+            in_trigger = bool(item[2]) if len(item) > 2 else True
+            z = float(center[2])
+            length, width, radius = estimate_extent(cluster_pts[:, :2])
+            j = assignments.get(i, m)
+            best_track = self.tracks[j] if j < m and costs[i, j] < 12.0 else None
+            if best_track is not None:
+                # 2프레임 이상 매칭 성공 시 confirmed
+                best_track.update(pos_world, z, now, confirmed=True, source='lidar_only',
+                                   length=length, width=width, radius=radius,
+                                   position_ego=center[:2],
+                                   dist_to_ego=float(np.linalg.norm(center[:2])))
+                best_track.top_elevation = top_elev
+                best_track.vertical_thickness = thickness
+                best_track.in_trigger_corridor = in_trigger
+                used_track_ids.add(best_track.id)
+            else:
+                # 최초 발견 프레임에 즉시 confirmed 로 볼지.
+                #
+                # 예전에는 '점 6개 이상' 이면 통과시켰는데, 노면 표식·차선이
+                # 그 문턱을 쉽게 넘는다(실측 2026-09-08: 정지 유발 표식 7점,
+                # 11.7m 표식 27점, 16.4m 표식 18점 - 셋 다 즉시 확정됐다).
+                # 점 개수는 '실재하는가' 의 근거가 못 된다 - 노면은 넓게 퍼져
+                # 있어서 오히려 점이 많다.
+                #
+                # 실재 여부의 근거는 '높이' 다. 노면 표식은 지면에 붙어 있고
+                # (실측 고도 0.14~0.18m), 진짜 장애물은 솟아 있다. 그래서
+                # 고도 문턱만 남기고 점 개수 우회로는 없앤다. 그 문턱을 못 넘는
+                # 물체는 다음 프레임에 같은 자리에서 다시 보이면 확정된다
+                # (아래 best_track 매칭 경로) - 노면 표식은 프레임마다 위치가
+                # 흔들려 매칭이 잘 안 되고, 실물은 map 좌표가 고정이라 붙는다.
+                top_elev = (float(np.max(cluster_pts[:, 3]))
+                            if self.use_ground_relative and cluster_pts.shape[1] > 3
+                            else float(np.max(cluster_pts[:, 2])) - self.ground_z)
+                init_confirmed = top_elev >= self.init_confirm_elevation
+                new_track = ObstacleTrack('obstacle', pos_world, z, now,
+                                           confirmed=init_confirmed, source='lidar_only',
+                                           static_speed_threshold=self.static_speed_threshold,
+                                           min_motion_baseline_sec=self.min_motion_baseline_sec,
+                                           dynamic_confirm_count=self.dynamic_confirm_count,
+                                           motion_speed_window_sec=self.motion_speed_window_sec,
+                                           max_plausible_speed=self.max_plausible_speed,
+                                           motion_z_threshold=self.motion_z_threshold,
+                                           motion_z_var_floor=self.motion_z_var_floor,
+                                           length=length, width=width, radius=radius,
+                                           kf_enabled=self.kf_enabled,
+                                           kf_q_accel=self.kf_q_accel,
+                                           kf_r_base=self.kf_r_base,
+                                           kf_r_slope=self.kf_r_slope,
+                                           kf_vel_std_max=self.kf_vel_std_max,
+                                           ego_rate_window_sec=self.ego_rate_window_sec,
+                                           position_ego=center[:2])
+                new_track.top_elevation = top_elev
+                new_track.vertical_thickness = thickness
+                new_track.in_trigger_corridor = in_trigger
+                self.tracks.append(new_track)
+                used_track_ids.add(new_track.id)
+
+            if self.motion_backend == 'apollo_measurement':
+                target = best_track if best_track is not None else new_track
+                if not hasattr(target, 'motion_observation'):
+                    target.motion_observation = MotionObservation('dynamic', **self.motion_config)
+                c, sn = math.cos(pose[2]), math.sin(pose[2])
+                world_points = np.asarray(cluster_pts[:, :3], dtype=np.float64).copy()
+                world_points[:, :2] = cluster_pts[:, :2] @ np.array([[c, sn], [-sn, c]]) + np.asarray(pose[:2])
+                motion = target.motion_observation
+                motion.update(world_points, now, pose[2])
+                if target.kf is not None:
+                    adopt_velocity(target.kf, motion)
+                # The legacy update has already advanced the classification once.
+                # Publish the measured vector independently of that label, so TTC
+                # need not wait for dynamic_confirm_count.
+                target.velocity = motion.velocity.copy()
+                target.speed = float(np.linalg.norm(motion.velocity))
+                target.velocity_valid = bool(motion.valid)
+                # Keep short-window, pose-compensated centroid regression as
+                # separate evidence. Do not overwrite it with the box estimate.
+                if not motion.valid:
+                    target.motion_state = 'unknown'
+                    target.apollo_dynamic_streak = 0
+                    target.apollo_static_since = None
+                elif target.speed > target.static_speed_threshold:
+                    target.apollo_static_since = None
+                    target.apollo_last_moving = now
+                    target.apollo_dynamic_streak = getattr(target, 'apollo_dynamic_streak', 0) + 1
+                    target.motion_state = ('dynamic' if target.apollo_dynamic_streak >= target.dynamic_confirm_count else 'unknown')
+                else:
+                    target.apollo_dynamic_streak = 0
+                    if getattr(target, 'apollo_static_since', None) is None:
+                        target.apollo_static_since = now
+                    recently_moving = now - getattr(target, 'apollo_last_moving', -1e9) < 2.0
+                    target.motion_state = ('dynamic' if recently_moving else
+                        ('static' if now-target.apollo_static_since >= 0.8 else 'unknown'))
+
+        self._age_out_tracks(now)
+
+    def _age_out_tracks(self, now):
+        kept_tracks = []
+        for t in self.tracks:
+            if not t.is_stale(now, self.track_timeout):
+                kept_tracks.append(t)
+                continue
+            # 확정된 정적 장애물이 자차 측면(-2.8 <= ego_x <= 2.5)에 위치해 있다면,
+            # 센서 음영/차체 간섭으로 점군이 잠시 끊겨도 조기 삭제하지 않고 보존
+            if self.latest_ego_pose is not None and t.confirmed and t.motion_state == 'static':
+                pe = world_to_ego(t.position, self.latest_ego_pose)
+                if -2.8 <= pe[0] <= 2.5 and abs(pe[1]) <= 4.5 and (now - t.last_seen) < 4.0:
+                    kept_tracks.append(t)
+                    continue
+        self.tracks = kept_tracks
+
+    def publish_tracks(self):
+        if self.latest_ego_pose is None:
+            return
+
+        # ★ 목록 분리.
+        #   obstacles          : 트리거 코리도(기준경로 1.4m) 안 - "회피를 시작할까"
+        #   collision_objects  : 충돌 코리도(6.0m) 안 전체 - "이 후보 경로가 안전한가"
+        #   분리 이유: 트리거 목록만 넘기면, 회피를 시작한 뒤 회피 경로가
+        #   지나가는 자리(기준경로에서 2~4m 옆)의 장애물이 목록에 없어서
+        #   프레넷이 그 위로 경로를 그린다. 실제로 박았다.
+        obstacles = []
+        collision_objects = []
+        for track in self.tracks:
+            position_ego = world_to_ego(track.position, self.latest_ego_pose)
+            # 자차 전장(~4.8m) 및 라이다 위치를 고려하여, 장애물이 차체 후미 완전히 뒤로 빠졌을 때만 passed 처리
+            passed = bool(position_ego[0] < -2.8)
+            entry = {
+                'id': track.id,
+                'class_name': track.class_name,
+                'position_ego': [float(position_ego[0]), float(position_ego[1]), float(track.z)],
+                'position_world': [float(track.position[0]), float(track.position[1])],
+                'length': round(track.length, 2),
+                'width': round(track.width, 2),
+                'radius': round(track.radius, 2),
+                'speed': round(track.speed, 3),
+                # world(UTM) 기준 속도 벡터. 정지 노드가 '내 경로 쪽으로
+                # 접근하는가'를 판정하는 데 쓴다 - 속도 크기만으로는 지나가는
+                # 물체와 다가오는 물체를 구분할 수 없다.
+                'velocity': [float(track.velocity[0]), float(track.velocity[1])],
+                'motion_state': track.motion_state,
+                'velocity_valid': bool(track.velocity_valid),
+                'velocity_backend': self.motion_backend,
+                'direction_std_rad': (track.motion_observation.direction_std
+                    if hasattr(track, 'motion_observation') and track.motion_observation.valid
+                    and track.speed >= 0.1 else None),
+                'ego_yaw': float(self.latest_ego_pose[2]),
+                'velocity_covariance': (track.motion_observation.covariance.reshape(-1).tolist()
+                    if hasattr(track, 'motion_observation') else
+                    (track.kf.P[2:4, 2:4].reshape(-1).tolist() if track.kf is not None else [])),
+                'observed_velocity': track.observed_velocity.tolist(),
+                'observed_motion_valid': bool(track.observed_motion_valid),
+                'observation_age': max(0.0, rospy.Time.now().to_sec() - track.last_seen),
+                'top_elevation': track.top_elevation,
+                'vertical_thickness': track.vertical_thickness,
+                'dynamic_streak': track.dynamic_streak,
+                'last_seen': track.last_seen,
+                'source': track.source,
+                'passed': passed,
+                'confirmed': track.confirmed,
+                'in_trigger_corridor': bool(track.in_trigger_corridor),
+                # 같은 자리에 머문 시간(s). 영구 구조물(연석/폴)과 출발 대기
+                # 중인 보행자 더미를 가르는 데 쓴다 - obstacle_stop_node 참고.
+                'stationary_sec': round(float(getattr(track, 'stationary_sec', 0.0)), 2),
+                # ego 기준 횡위치 변화율 p90 [m/s]. 진단·시각화용.
+                #   정지 판정은 이 값을 쓰지 않는다 - 칼만 velocity 를
+                #   경로 접선 기준으로 돌린 횡속도를 쓴다(같은 양을 더
+                #   정확하게 재는 것이고, 실측 분리도 동등했다:
+                #   ego_y_rate 3.79배 / |v_lateral| 3.76배).
+                #   오검출을 추적할 때 둘을 비교하면 원인이 빨리 갈린다.
+                'ego_y_rate': round(float(getattr(track, 'ego_y_rate', 0.0)), 3),
+                'ego_y_rate_signed': round(float(
+                    getattr(track, 'ego_y_rate_signed', 0.0)), 3),
+                # 칼만 속도 추정의 불확실도. 큰 값이면 속도를 믿지 말 것.
+                'vel_std': round(track.motion_observation.std if hasattr(track, 'motion_observation')
+                                 else (float(track.kf.vel_std) if track.kf is not None else -1.0), 3),
+            }
+            collision_objects.append(entry)
+            if track.in_trigger_corridor:
+                obstacles.append(entry)
+
+        collision_objects.extend(self.boundary_objects)
+        msg = String()
+        msg.data = json.dumps({'obstacles': obstacles,
+                               'collision_objects': collision_objects,
+                               'mission_mode': self.mission_zone,
+                               'stamp': rospy.Time.now().to_sec()})
+        self.info_pub.publish(msg)
+        n_extra = len(collision_objects) - len(obstacles)
+        if n_extra:
+            rospy.loginfo_throttle(
+                1.0,
+                "[obstacle_perception] 충돌검사 전용 %d개 (트리거 %d개, "
+                "코리도 %.1f/%.1fm)", n_extra, len(obstacles),
+                self.path_corridor_half_width,
+                self.collision_corridor_half_width)
+
+    def reference_path_callback(self, msg):
+        """기준경로(reference_path)를 ego 프레임으로 옮겨 둔다.
+
+        회피 경로가 아니라 원본 경로를 쓴다 - 구독 지점의 주석 참고.
+        map(UTM) 좌표라 점군(ego 프레임)과 직접 비교할 수 없어 odom 의
+        ego pose 로 역변환해 저장한다. 경로는 20Hz, 점군은 10Hz 라 매 점군마다
+        다시 계산하지 않고 여기서 한 번만 만든다.
+        """
+        if self.latest_ego_pose is None or not msg.waypoints:
+            return
+        ex, ey, eyaw = self.latest_ego_pose
+        pts = np.array([[w.pose.pose.position.x, w.pose.pose.position.y]
+                        for w in msg.waypoints], dtype=np.float64)
+        self.path_world = pts
+        d = pts - np.array([ex, ey])
+        c, s_ = math.cos(-eyaw), math.sin(-eyaw)
+        self.path_xy = np.stack([c * d[:, 0] - s_ * d[:, 1],
+                                 s_ * d[:, 0] + c * d[:, 1]], axis=1)
+        self.path_stamp = rospy.Time.now().to_sec()
+
+    def _path_lateral_dist(self, pts_xy):
+        """각 점의 '기준경로까지 최단 횡거리'. 경로가 없으면 None."""
+        fresh = (self.path_xy is not None and
+                 (rospy.Time.now().to_sec() - self.path_stamp) < 1.0 and
+                 len(self.path_xy) >= 2)
+        if not fresh:
+            return None
+        path = self._decimated_path()
+        d2 = ((np.asarray(pts_xy)[:, None, :2] - path[None, :, :]) ** 2).sum(axis=2)
+        return np.sqrt(d2.min(axis=1))
+
+    def _decimated_path(self):
+        """경로를 '실제 간격' 기준으로 솎는다.
+
+        예전에는 인덱스 기준(path_xy[::5])으로 솎았는데, 그건 CSV 원본 경로
+        (451점, 0.1m 간격)를 전제한 값이었다. 회피가 켜지면 /local_path 가
+        프레넷 경로(71점, 간격 0.35m, 최대 3.61m)로 바뀌고, 거기서 5칸을
+        건너뛰면 간격이 1.75m 가 된다. 점과 점 사이가 벌어진 만큼 '경로까지
+        최단거리' 가 과대평가된다.
+          실측 2026-09-08: 경로 정중앙(GT 16.4m, +0.3m)에 고정한 카고박스가
+          stride=1 이면 1.08m, stride=5 면 7.22m 로 계산돼 코리도 1.4m 밖으로
+          기각됐다(로그 reason=off_path_2.3~3.9m). 7배 과대평가다.
+        간격으로 자르면 경로 종류가 바뀌어도 해상도가 유지된다.
+        """
+        p = self.path_xy
+        if len(p) <= 2:
+            return p
+        seg = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        med = float(np.median(seg)) if len(seg) else 0.0
+        if med <= 1e-6:
+            return p
+        step = max(1, int(self.path_corridor_decimate_m / med))
+        out = p[::step]
+        return out if len(out) >= 2 else p
+
+    def _path_corridor_mask(self, arr, half_width=None):
+        """경로에서 half_width 안에 있는 점만 남기는 마스크.
+
+        경로가 없거나 오래됐으면 정책에 따라 전부 통과(기본) 또는 전부 차단.
+        점 N x 경로점 M 을 다 재면 비싸므로, 경로를 일정 간격으로 솎아 쓰고
+        (KD-tree 없이) 브로드캐스팅 한 번으로 최소거리를 구한다.
+        """
+        if not self.use_path_corridor:
+            return np.ones(len(arr), dtype=bool)
+        fresh = (self.path_xy is not None and
+                 (rospy.Time.now().to_sec() - self.path_stamp) < 1.0 and
+                 len(self.path_xy) >= 2)
+        if not fresh:
+            return (np.ones(len(arr), dtype=bool)
+                    if self.path_corridor_skip_if_no_path
+                    else np.zeros(len(arr), dtype=bool))
+
+        # 경로점이 0.1m 간격이라 그대로 쓰면 수천 개다. 솎아서 쓴다.
+        path = self._decimated_path()
+        r = float(self.path_corridor_half_width
+                  if half_width is None else half_width)
+
+        # N x M 브로드캐스팅은 8000점 x 90경로점에서 18ms 나온다(실측). 이
+        # 노드는 이미 콜백 주기가 라이다 10Hz 보다 느려서 그대로 얹으면 안 된다.
+        # 경로의 축정렬 바운딩박스 + 여유로 후보를 먼저 줄이고, 살아남은 점에만
+        # 정확한 거리 계산을 돌린다. 도로 위 점은 대부분 여기서 걸러진다.
+        # 솎은 간격의 절반을 여유에 더해야 구간 중간에서 놓치지 않는다.
+        seg = self.path_corridor_decimate_m
+        pad = r + seg
+        out = np.zeros(len(arr), dtype=bool)
+        near_box = (
+            (arr[:, 0] >= path[:, 0].min() - pad) &
+            (arr[:, 0] <= path[:, 0].max() + pad) &
+            (arr[:, 1] >= path[:, 1].min() - pad) &
+            (arr[:, 1] <= path[:, 1].max() + pad)
+        )
+        if not near_box.any():
+            return out
+        cand = arr[near_box, :2]
+        d2 = ((cand[:, None, :] - path[None, :, :]) ** 2).sum(axis=2)
+        out[near_box] = d2.min(axis=1) <= (r * r)
+        return out
+
+    def final_waypoint_callback(self, msg):
+        """현재 waypoint idx/lane + 기준경로. 둘 다 /final_waypoint 에서 온다."""
+        if msg.waypoints:
+            self.current_wp_idx = int(msg.waypoints[0].waypoint_index)
+            self.current_lane = int(getattr(msg.waypoints[0], 'lane_number', -1))
+        self.reference_path_callback(msg)
+
+    def gps_state_callback(self, msg):
+        """현재 waypoint idx / lane. 마커 필터 판정에만 쓴다."""
+        self.current_wp_idx = int(getattr(msg, 'waypoint_index', -1))
+        self.current_lane = int(getattr(msg, 'lane_number', -1))
+
+    def _in_mission_section(self):
+        """지금이 정동적(정적회피/동적정지) 미션 구간인가."""
+        if not self.section_gating_enabled and not self.marker_filter_by_section:
+            return True, 'all'
+
+        # 1. /mission/active_section 토픽 수신 시 최우선 사용
+        if self.active_section_msg is not None and (rospy.Time.now().to_sec() - self.active_section_t) < 1.5:
+            sec_id = getattr(self.active_section_msg, 'section_id', '')
+            execs = getattr(self.active_section_msg, 'executors', [])
+            if sec_id == 'M8':
+                return True, 'tunnel'
+            if sec_id in ('M2', 'M3') or 'static_obstacle' in execs or 'dynamic_obstacle' in execs:
+                zone = 'static' if (sec_id == 'M2' or 'static_obstacle' in execs) else 'dynamic'
+                return True, zone
+            return False, 'out_of_section'
+
+        # 2. 폴백: CSV 인덱스 및 lane 기준
+        if self.mission_zone == 'tunnel' and self.current_lane == 3:
+            # Section loss during GPS shadow must not disable perception.
+            # A fresh router message above is required to exit tunnel mode.
+            return True, 'tunnel'
+        idx = self.current_wp_idx
+        if self.current_lane not in (-1, 0):
+            return False, 'other_lane'
+        if idx < 0:
+            return False, 'no_idx'
+        start_idx = min(self.section_start_idx, 2400)
+        if not (start_idx <= idx <= self.section_end_idx):
+            return False, 'out_of_section'
+        zone = 'static' if idx < self.static_dynamic_split_idx else 'dynamic'
+        return True, zone
+
+    def publish_empty_markers(self):
+        arr = MarkerArray()
+        clear = Marker()
+        clear.header.frame_id = "map"
+        clear.header.stamp = rospy.Time.now()
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+        self.marker_pub.publish(arr)
+
+    def publish_markers(self):
+        in_section, zone = self._in_mission_section()
+
+        # 구간 밖이면 마커를 완전히 소거하여 타 미션 시각화와 간섭 방지
+        if not in_section:
+            self.publish_empty_markers()
+            return
+
+        arr = MarkerArray()
+
+        clear = Marker()
+        clear.header.frame_id = "map"
+        clear.action = Marker.DELETEALL
+        arr.markers.append(clear)
+
+        for track in self.tracks:
+            # 아직 확정 안 된 트랙은 노이즈일 수 있어 흐리게만 표시한다.
+            confirmed = getattr(track, 'confirmed', True)
+
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = rospy.Time.now()
+            m.ns = "obstacles"
+            m.id = track.id
+            m.type = Marker.CYLINDER
+            m.action = Marker.ADD
+            m.pose.position.x = float(track.position[0])
+            m.pose.position.y = float(track.position[1])
+            m.pose.position.z = 0.5
+            m.pose.orientation.w = 1.0
+            m.scale.x = max(track.width, track.length, 0.3)
+            m.scale.y = max(track.width, track.length, 0.3)
+            m.scale.z = 1.0
+            # 트리거 코리도 밖(= 충돌 검사 전용)은 더 흐리게 그려서, 화면에서
+            # "이건 회피를 시작시키는 물체가 아니다"가 바로 보이게 한다.
+            # 이게 구분 안 되면 옆 차로 물체를 회피 대상으로 오해하게 된다.
+            in_trig = bool(getattr(track, 'in_trigger_corridor', True))
+            m.color.a = (0.75 if confirmed else 0.25) * (1.0 if in_trig else 0.4)
+            if track.motion_state == 'dynamic':
+                m.color.r, m.color.g, m.color.b = 1.0, 0.35, 0.0   # 주황: 동적
+            elif track.motion_state == 'static':
+                m.color.r, m.color.g, m.color.b = 0.1, 0.5, 1.0    # 파랑: 정적
+            else:
+                m.color.r, m.color.g, m.color.b = 0.55, 0.55, 0.55  # 회색: 미확정
+            m.lifetime = rospy.Duration(0.3)
+            arr.markers.append(m)
+
+            # 동적 트랙은 속도 벡터를 화살표로 같이 보여준다 - 정적 오판을
+            # 눈으로 잡아내려면 방향이 있어야 한다.
+            if track.motion_state == 'dynamic' and track.speed > 0.1:
+                vel = getattr(track, 'velocity', None)
+                if vel is not None and len(vel) >= 2:
+                    ar = Marker()
+                    ar.header = m.header
+                    ar.ns = "obstacle_velocity"
+                    ar.id = track.id
+                    ar.type = Marker.ARROW
+                    ar.action = Marker.ADD
+                    ar.scale.x = 0.12          # shaft
+                    ar.scale.y = 0.25          # head
+                    ar.scale.z = 0.25
+                    ar.color.a = 0.9
+                    ar.color.r, ar.color.g, ar.color.b = 1.0, 0.35, 0.0
+                    p0 = Point(float(track.position[0]), float(track.position[1]), 1.0)
+                    p1 = Point(p0.x + float(vel[0]), p0.y + float(vel[1]), 1.0)
+                    ar.points = [p0, p1]
+                    ar.lifetime = rospy.Duration(0.3)
+                    arr.markers.append(ar)
+
+            label = Marker()
+            label.header = m.header
+            label.ns = "obstacle_labels"
+            label.id = track.id
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = m.pose.position.x
+            label.pose.position.y = m.pose.position.y
+            label.pose.position.z = 1.5
+            label.scale.z = 0.45
+            label.color.a = 1.0
+            if track.motion_state == 'dynamic':
+                label.color.r, label.color.g, label.color.b = 1.0, 0.6, 0.3
+            elif track.motion_state == 'static':
+                label.color.r, label.color.g, label.color.b = 0.5, 0.8, 1.0
+            else:
+                label.color.r = label.color.g = label.color.b = 0.8
+            state_kr = {'dynamic': '동적', 'static': '정적'}.get(
+                track.motion_state, '미확정')
+            mark = '' if confirmed else '?'
+            label.text = f"#{track.id}{mark} {state_kr} {track.speed:.1f}m/s"
+            label.lifetime = rospy.Duration(0.3)
+            arr.markers.append(label)
+
+        # 지금 어느 구간을 보고 있는지 화면에 띄운다.
+        banner = Marker()
+        banner.header.frame_id = "map"
+        banner.header.stamp = rospy.Time.now()
+        banner.ns = "section_banner"
+        banner.id = 0
+        banner.type = Marker.TEXT_VIEW_FACING
+        banner.action = Marker.ADD
+        ex, ey = (self.latest_ego_pose[0], self.latest_ego_pose[1]) \
+            if self.latest_ego_pose else (0.0, 0.0)
+        banner.pose.position.x = ex
+        banner.pose.position.y = ey
+        banner.pose.position.z = 3.0
+        banner.scale.z = 0.7
+        banner.color.a = 0.9
+        if zone == 'static':
+            banner.color.r, banner.color.g, banner.color.b = 0.4, 0.8, 1.0
+            zname = "정적 회피 구간"
+        elif zone == 'dynamic':
+            banner.color.r, banner.color.g, banner.color.b = 1.0, 0.6, 0.3
+            zname = "동적 정지 구간"
+        else:
+            banner.color.r = banner.color.g = banner.color.b = 0.9
+            zname = "구간필터 off"
+        banner.text = f"[{zname}] idx={self.current_wp_idx}  트랙 {len(self.tracks)}개"
+        banner.lifetime = rospy.Duration(0.5)
+        arr.markers.append(banner)
+
+        self.marker_pub.publish(arr)
+
+
+if __name__ == '__main__':
+    try:
+        ObstaclePerceptionNode()
+    except rospy.ROSInterruptException:
+        pass

@@ -1,0 +1,10 @@
+lane_steering_topic: /lane_perception/steering_angle
+lane_valid_topic: /lane_perception/valid
+static_mission_topic: /mission/static_obstacle/command
+dynamic_mission_topic: /mission/dynamic_obstacle/command
+control_command_topic: /control/command
+default_speed: 50.0
+default_accel: 0.2
+stop_when_lane_invalid: false
+command_timeout: 0.5
+ctrl_cmd_topic: /control/m8_cmd   # arbiter 가 /ctrl_cmd 단독 발행

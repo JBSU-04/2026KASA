@@ -1,0 +1,1230 @@
+#include <cmath>
+
+#include <gtest/gtest.h>
+
+#include "mission_planner/geometry.hpp"
+#include "mission_planner/roundabout_mission.hpp"
+
+namespace mission_planner {
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+RoundaboutConfig testConfig() {
+  RoundaboutConfig config;
+  config.enabled = true;
+  config.counter_clockwise = true;
+  config.center = {0.0, 0.0};
+  config.yield_point = {10.0, -2.0};
+  config.conflict_point = {10.0, 0.0};
+  config.exit_point = {0.0, 10.0};
+  config.entry_heading = 0.5 * kPi;
+  config.inner_radius = 8.0;
+  config.outer_radius = 12.0;
+  config.nominal_radius = 10.0;
+  config.activation_distance = 40.0;
+  config.decision_distance = 20.0;
+  config.approach_speed = 6.0;
+  config.ego_merge_time = 2.0;
+  config.rear_time_gap = 3.0;
+  config.safe_confirm_seconds = 0.5;
+  config.minimum_circulate_seconds = 0.5;
+  config.exit_hold_seconds = 0.5;
+  config.exit_detection_radius = 2.0;
+  config.exit_clear_distance = 8.0;
+  config.reset_jump_distance = 100.0;
+  return config;
+}
+
+RoundaboutInput approachInput(double now) {
+  RoundaboutInput input;
+  input.now = now;
+  input.ego.position = {10.0, -10.0};
+  input.ego.yaw = 0.5 * kPi;
+  input.ego.speed = 4.0;
+  input.ego.valid = true;
+  input.localization_valid = true;
+  input.tracker_stream_valid = true;
+  input.route = {{10.0, -30.0}, {10.0, -2.0}, {10.0, 0.0}, {9.8, 2.0}};
+  return input;
+}
+
+TrackedObject circulatingObject(int id, double angle, double speed) {
+  TrackedObject object;
+  object.id = id;
+  object.position = {10.0 * std::cos(angle), 10.0 * std::sin(angle)};
+  const double tangent = angle + 0.5 * kPi;
+  object.velocity_x = speed * std::cos(tangent);
+  object.velocity_y = speed * std::sin(tangent);
+  object.length = 4.0;
+  object.velocity_valid = true;
+  object.has_moved = true;
+  return object;
+}
+
+TEST(Geometry, UsesDirectionalCircularArc) {
+  EXPECT_NEAR(circleArcDistance(-0.25 * kPi, 0.0, 10.0, true),
+              2.5 * kPi, 1.0e-9);
+  EXPECT_NEAR(circleArcDistance(0.25 * kPi, 0.0, 10.0, false),
+              2.5 * kPi, 1.0e-9);
+  EXPECT_NEAR(normalizeAngle(3.0 * kPi), -kPi, 1.0e-9);
+}
+
+TEST(RoundaboutMission, EmptyRoundaboutCommitsAfterStableGap) {
+  RoundaboutMission mission(testConfig());
+
+  RoundaboutOutput first = mission.update(approachInput(0.0));
+  EXPECT_EQ(first.state, RoundaboutState::kApproach);
+  EXPECT_TRUE(first.constraint.stop_required);
+  EXPECT_EQ(first.constraint.reason, "confirming safe gap");
+
+  RoundaboutOutput confirmed = mission.update(approachInput(0.6));
+  EXPECT_EQ(confirmed.state, RoundaboutState::kCommit);
+  EXPECT_FALSE(confirmed.constraint.stop_required);
+
+  RoundaboutInput inside = approachInput(0.8);
+  inside.ego.position = {10.0, 0.0};
+  RoundaboutOutput circulating = mission.update(inside);
+  EXPECT_EQ(circulating.state, RoundaboutState::kCirculate);
+}
+
+TEST(RoundaboutMission, FastUpstreamVehicleBlocksEntry) {
+  RoundaboutMission mission(testConfig());
+  RoundaboutInput input = approachInput(0.0);
+  input.objects.push_back(circulatingObject(42, -0.30, 5.0));
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_EQ(output.state, RoundaboutState::kYield);
+  EXPECT_FALSE(output.gap_safe);
+  EXPECT_TRUE(output.constraint.stop_required);
+  EXPECT_EQ(output.blocking_object_id, 42);
+  EXPECT_LT(output.next_npc_ttc, 1.0);
+}
+
+TEST(RoundaboutMission, RearTimeCanBeUsedAsTotalTtcThreshold) {
+  RoundaboutConfig config = testConfig();
+  config.rear_time_gap = 1.5;
+  config.rear_time_is_total_ttc = true;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  // 충돌점까지 약 3초인 차량: 기존 merge+margin(약 4.8초)에는 막히지만
+  // total-TTC 모드의 설정값 1.5초보다 크므로 진입 가능한 gap이다.
+  input.objects.push_back(circulatingObject(43, -1.7, 5.0));
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_TRUE(output.gap_safe);
+  EXPECT_EQ(output.blocking_object_id, -1);
+  EXPECT_GT(output.next_npc_ttc, config.rear_time_gap);
+}
+
+TEST(RoundaboutMission, ReportsRawTtcAndAddsPredictionMarginToLimit) {
+  RoundaboutConfig config = testConfig();
+  config.rear_time_gap = 0.5;
+  config.rear_time_is_total_ttc = true;
+  config.prediction_uncertainty_time = 0.5;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.objects.push_back(circulatingObject(44, -0.5, 5.0));
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_FALSE(output.gap_safe);
+  EXPECT_NEAR(output.next_npc_ttc, 0.6, 1.0e-9);
+  EXPECT_NE(output.reason.find("TTC 0.60s < limit 1.00s"),
+            std::string::npos);
+  EXPECT_NE(output.reason.find("arc 3.00m / 5.00m/s"),
+            std::string::npos);
+}
+
+TEST(RoundaboutMission, UsesAverageDepartureSpeedForFrontGap) {
+  RoundaboutConfig config = testConfig();
+  config.front_standstill_distance = 0.0;
+  config.front_time_gap = 2.0;
+  config.front_departure_speed_ratio = 0.5;
+
+  RoundaboutInput blocked_input = approachInput(0.0);
+  blocked_input.ego.speed = 0.0;
+  blocked_input.objects.push_back(circulatingObject(45, 0.7, 5.0));
+  const RoundaboutOutput blocked = RoundaboutMission(config).update(blocked_input);
+  EXPECT_FALSE(blocked.gap_safe);
+  EXPECT_NE(blocked.reason.find("gap 5.00m < limit 6.00m"),
+            std::string::npos);
+
+  RoundaboutInput safe_input = approachInput(0.0);
+  safe_input.ego.speed = 0.0;
+  safe_input.objects.push_back(circulatingObject(46, 0.9, 5.0));
+  const RoundaboutOutput safe = RoundaboutMission(config).update(safe_input);
+  EXPECT_TRUE(safe.gap_safe);
+}
+
+TEST(RoundaboutMission, RequiresConfigurableFullStopBeforeGapCommit) {
+  RoundaboutConfig config = testConfig();
+  config.mandatory_stop_seconds = 2.0;
+  config.mandatory_stop_position_tolerance = 0.6;
+  config.mandatory_stop_speed_threshold = 0.25;
+  config.outer_radius = 10.0;
+  RoundaboutMission mission(config);
+
+  RoundaboutInput stopped = approachInput(0.0);
+  stopped.ego.position = {10.0, -3.5};
+  stopped.ego.speed = 0.0;
+  RoundaboutOutput start = mission.update(stopped);
+  EXPECT_EQ(start.state, RoundaboutState::kYield);
+  EXPECT_TRUE(start.constraint.stop_required);
+  EXPECT_NE(start.reason.find("mandatory stop 0.0/2.0s"), std::string::npos);
+
+  stopped.now = 1.9;
+  RoundaboutOutput holding = mission.update(stopped);
+  EXPECT_EQ(holding.state, RoundaboutState::kYield);
+  EXPECT_TRUE(holding.constraint.stop_required);
+
+  stopped.now = 2.1;
+  RoundaboutOutput completed = mission.update(stopped);
+  EXPECT_EQ(completed.state, RoundaboutState::kYield);
+  EXPECT_TRUE(completed.constraint.stop_required);
+  EXPECT_EQ(completed.reason, "confirming safe gap");
+
+  stopped.now = 2.7;
+  RoundaboutOutput committed = mission.update(stopped);
+  EXPECT_EQ(committed.state, RoundaboutState::kCommit);
+  EXPECT_FALSE(committed.constraint.stop_required);
+}
+
+TEST(RoundaboutMission, StaleTrackerStreamFailsClosedBeforeEntry) {
+  RoundaboutMission mission(testConfig());
+  RoundaboutInput input = approachInput(0.0);
+  input.tracker_stream_valid = false;
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_EQ(output.state, RoundaboutState::kYield);
+  EXPECT_TRUE(output.constraint.stop_required);
+  EXPECT_EQ(output.reason, "LiDAR tracker stream stale");
+}
+
+TEST(RoundaboutMission, StaticInfrastructureDoesNotBlockEntry) {
+  RoundaboutMission mission(testConfig());
+  RoundaboutInput input = approachInput(0.0);
+  TrackedObject structure = circulatingObject(11, 0.15, 0.0);
+  structure.has_moved = false;
+  input.objects.push_back(structure);
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_TRUE(output.gap_safe);
+  EXPECT_EQ(output.blocking_object_id, -1);
+}
+
+TEST(RoundaboutMission, UncertainNewTrackBlocksNearConflict) {
+  RoundaboutMission mission(testConfig());
+  RoundaboutInput input = approachInput(0.0);
+  TrackedObject uncertain = circulatingObject(12, -0.1, 0.0);
+  uncertain.velocity_valid = false;
+  uncertain.has_moved = false;
+  input.objects.push_back(uncertain);
+
+  const RoundaboutOutput output = mission.update(input);
+  EXPECT_FALSE(output.gap_safe);
+  EXPECT_EQ(output.blocking_object_id, 12);
+  EXPECT_EQ(output.reason, "object motion not confirmed");
+}
+
+TEST(RoundaboutMission, LongYieldRelaxesRearTtcToConfiguredFloor) {
+  RoundaboutConfig config = testConfig();
+  config.rear_time_is_total_ttc = true;
+  config.rear_time_gap = 3.0;
+  config.rear_ttc_relax_floor = 1.5;
+  config.rear_ttc_relax_max = 1.5;
+  config.gap_relax_start_seconds = 2.0;
+  config.gap_relax_rate = 0.5;
+  config.prediction_uncertainty_time = 0.5;
+  RoundaboutMission mission(config);
+
+  RoundaboutInput input = approachInput(1.0);
+  input.objects.push_back(circulatingObject(50, -1.5, 5.0));
+  EXPECT_FALSE(mission.update(input).gap_safe);
+
+  input.now = 5.0;
+  const RoundaboutOutput relaxed = mission.update(input);
+  EXPECT_TRUE(relaxed.gap_safe);
+  EXPECT_NEAR(relaxed.next_npc_ttc, 2.6, 1.0e-9);
+}
+
+TEST(RoundaboutMission, LongYieldRelaxesFrontGap) {
+  RoundaboutConfig config = testConfig();
+  config.rear_time_gap = 0.0;
+  config.prediction_uncertainty_time = 0.0;
+  config.front_time_gap = 2.0;
+  config.front_time_relax_floor = 1.0;
+  config.front_departure_speed_ratio = 0.5;
+  config.front_standstill_distance = 0.0;
+  config.gap_relax_start_seconds = 2.0;
+  config.gap_relax_rate = 0.5;
+  RoundaboutMission mission(config);
+
+  RoundaboutInput input = approachInput(1.0);
+  input.objects.push_back(circulatingObject(51, 0.7, 5.0));
+  EXPECT_FALSE(mission.update(input).gap_safe);
+
+  input.now = 5.0;
+  const RoundaboutOutput relaxed = mission.update(input);
+  EXPECT_TRUE(relaxed.gap_safe);
+  EXPECT_NEAR(relaxed.front_gap, 5.0, 1.0e-9);
+}
+
+TEST(RoundaboutMission, LongYieldShortensSafeConfirmation) {
+  RoundaboutConfig config = testConfig();
+  config.safe_confirm_seconds = 1.0;
+  config.safe_confirm_relax_floor = 0.2;
+  config.gap_relax_start_seconds = 2.0;
+  config.gap_relax_rate = 0.4;
+  RoundaboutMission mission(config);
+
+  RoundaboutInput blocked = approachInput(1.0);
+  blocked.objects.push_back(circulatingObject(52, -0.3, 5.0));
+  ASSERT_EQ(mission.update(blocked).state, RoundaboutState::kYield);
+
+  RoundaboutInput clear = approachInput(5.0);
+  EXPECT_EQ(mission.update(clear).state, RoundaboutState::kYield);
+  clear.now = 5.21;
+  EXPECT_EQ(mission.update(clear).state, RoundaboutState::kCommit);
+}
+
+TEST(RoundaboutMission, LongYieldDoesNotRelaxUncertainObjectBlock) {
+  RoundaboutMission mission(testConfig());
+  RoundaboutInput input = approachInput(1.0);
+  TrackedObject uncertain = circulatingObject(53, -0.1, 0.0);
+  uncertain.velocity_valid = false;
+  uncertain.has_moved = false;
+  input.objects.push_back(uncertain);
+  ASSERT_FALSE(mission.update(input).gap_safe);
+
+  input.now = 100.0;
+  const RoundaboutOutput still_blocked = mission.update(input);
+  EXPECT_FALSE(still_blocked.gap_safe);
+  EXPECT_EQ(still_blocked.blocking_object_id, 53);
+  EXPECT_EQ(still_blocked.reason, "object motion not confirmed");
+}
+
+TEST(RoundaboutMission, LocalizationLossStopsActiveMission) {
+  RoundaboutMission mission(testConfig());
+  mission.update(approachInput(0.0));
+
+  RoundaboutInput invalid = approachInput(0.1);
+  invalid.localization_valid = false;
+  const RoundaboutOutput output = mission.update(invalid);
+  EXPECT_EQ(output.state, RoundaboutState::kFailsafe);
+  EXPECT_TRUE(output.constraint.stop_required);
+  EXPECT_DOUBLE_EQ(output.constraint.max_speed, 0.0);
+}
+
+TEST(RoundaboutMission, CommitDoesNotReturnToYield) {
+  RoundaboutMission mission(testConfig());
+  mission.update(approachInput(0.0));
+  ASSERT_EQ(mission.update(approachInput(0.6)).state,
+            RoundaboutState::kCommit);
+
+  RoundaboutInput blocked = approachInput(0.7);
+  blocked.objects.push_back(circulatingObject(7, -0.2, 6.0));
+  const RoundaboutOutput output = mission.update(blocked);
+  EXPECT_EQ(output.state, RoundaboutState::kCommit);
+  EXPECT_FALSE(output.constraint.stop_required);
+}
+
+TEST(RoundaboutMission, TrackerLossAfterCommitUsesDegradedSpeed) {
+  RoundaboutConfig config = testConfig();
+  config.degraded_speed = 1.5;
+  config.tracker_stale_grace = 0.0;  // 순간 끊김 유예 없이 기존 동작 확인
+  RoundaboutMission mission(config);
+  mission.update(approachInput(0.0));
+  ASSERT_EQ(mission.update(approachInput(0.6)).state,
+            RoundaboutState::kCommit);
+
+  RoundaboutInput stale = approachInput(0.7);
+  stale.tracker_stream_valid = false;
+  const RoundaboutOutput output = mission.update(stale);
+  EXPECT_EQ(output.state, RoundaboutState::kCommit);
+  EXPECT_DOUBLE_EQ(output.constraint.max_speed, 1.5);
+  EXPECT_FALSE(output.constraint.stop_required);
+}
+
+TEST(RoundaboutMission, ClearsAfterSelectedExit) {
+  RoundaboutMission mission(testConfig());
+  mission.update(approachInput(0.0));
+  mission.update(approachInput(0.6));
+
+  RoundaboutInput inside = approachInput(0.8);
+  inside.ego.position = {10.0, 0.0};
+  ASSERT_EQ(mission.update(inside).state, RoundaboutState::kCirculate);
+
+  RoundaboutInput at_exit = approachInput(1.4);
+  at_exit.ego.position = {0.0, 10.0};
+  ASSERT_EQ(mission.update(at_exit).state, RoundaboutState::kExit);
+
+  RoundaboutInput clear = approachInput(2.0);
+  clear.ego.position = {-10.0, 10.0};
+  EXPECT_EQ(mission.update(clear).state, RoundaboutState::kIdle);
+}
+
+// 틈 선택: 들어가던 틈이 무너지면(늦게 잡힌 뒤차) 링 앞에서 설 수 있을 때 양보로 돌아가고
+// 양보선이 아니라 합류 구역 앞에 세운다.
+TEST(RoundaboutGapSelect, CommitAbortsWhenLateFollowerAppears) {
+  RoundaboutConfig config = testConfig();
+  config.yield_point = {10.0, -9.0};
+  config.conflict_point = {10.0, 0.0};
+  config.gap_select_enabled = true;
+  config.mandatory_stop_seconds = 0.0;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_commit_abort_confirm = 0.0;
+  config.comfortable_decel = 2.5;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  mission.update(input);
+  input.now = 0.1;
+  RoundaboutOutput out = mission.update(input);
+  ASSERT_EQ(out.state, RoundaboutState::kCommit);
+  // 출발 직후 합류점 6 m 상류에 8 m/s 차량이 새로 잡힌다.
+  input.now = 0.3;
+  input.ego.position = {10.0, -8.5};
+  input.ego.speed = 1.0;
+  TrackedObject late = circulatingObject(7, -0.6, 8.0);
+  input.objects = {late};
+  mission.update(input);
+  input.now = 0.4;
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_TRUE(out.constraint.stop_required);
+  // A cancelled entry must brake now rather than accelerate toward a later line.
+  EXPECT_DOUBLE_EQ(out.constraint.stop_distance, 0.0);
+  EXPECT_DOUBLE_EQ(out.constraint.max_speed, 0.0);
+}
+
+// 상류에서 다가오는 앞차를 먼저 보내는 틈으로 진입(COMMIT)하면, 앞차가
+// 합류점을 지나기 전까지 합류 구역 앞에 정지 목표를 둔다(2026-09-30 12:34 백).
+TEST(RoundaboutGapSelect, CommitHoldsBeforeZoneUntilUpstreamLeaderPasses) {
+  RoundaboutConfig config = testConfig();
+  config.yield_point = {10.0, -9.0};
+  config.conflict_point = {10.0, 0.0};
+  config.gap_select_enabled = true;
+  config.mandatory_stop_seconds = 0.0;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_front_headway = 0.3;
+  config.gs_rear_headway = 0.5;
+  config.gs_standstill_gap = 0.8;
+  config.gs_check_horizon = 2.0;
+  config.gs_speed_margin = 0.2;
+  config.gs_go_tolerance_front = 12.0;  // 앞차 쪽 대기와 상관없이 진입시켜 본다
+  config.gs_commit_front_tolerance = 12.0;
+  config.gs_leader_release_margin = 0.0;  // 앞차 통과 예측 해제 없이 기존 동작 확인
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  // 앞차: 합류점(각 0) 상류 약 6 m(각 -0.6 rad), 4 m/s. 뒤차 없음.
+  input.objects = {circulatingObject(3, -0.6, 4.0)};
+  mission.update(input);
+  input.now = 0.1;
+  RoundaboutOutput out = mission.update(input);
+  ASSERT_EQ(out.state, RoundaboutState::kCommit);
+  EXPECT_TRUE(out.constraint.stop_required);
+  EXPECT_GT(out.constraint.stop_distance, 1.0);
+  // 앞차가 합류점을 충분히 지나면 정지 목표가 풀린다.
+  input.now = 0.2;
+  input.objects = {circulatingObject(3, 0.6, 4.0)};
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kCommit);
+  EXPECT_FALSE(out.constraint.stop_required);
+}
+
+// 2026-10-05: 진입 확정 뒤 앞차가 자차 도착 전에 합류점을 비우면(움직이는 앞차) 세우지 않는다.
+//   앞차가 느리면(통과가 자차 도착보다 늦으면) 기존처럼 세운다.
+TEST(RoundaboutGapSelect, CommitReleasesWhenLeaderClearsBeforeArrival) {
+  for (double leader_speed : {4.0, 2.0}) {
+    RoundaboutConfig config = testConfig();
+    config.yield_point = {10.0, -9.0};
+    config.conflict_point = {10.0, 0.0};
+    config.gap_select_enabled = true;
+    config.mandatory_stop_seconds = 0.0;
+    config.gs_confirm_seconds = 0.0;
+    config.gs_front_headway = 0.3;
+    config.gs_rear_headway = 0.5;
+    config.gs_standstill_gap = 0.8;
+    config.gs_check_horizon = 2.0;
+    config.gs_speed_margin = 0.2;
+    config.gs_go_tolerance_front = 12.0;
+    config.gs_commit_front_tolerance = 12.0;
+    config.gs_leader_release_margin = 0.6;
+    config.gs_leader_release_accel = 1.0;
+    config.gs_leader_release_min_speed = 2.0;
+    RoundaboutMission mission(config);
+    RoundaboutInput input = approachInput(0.0);
+    input.ego.position = {10.0, -9.0};
+    input.ego.speed = 0.0;
+    input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+    input.objects = {circulatingObject(3, -0.6, leader_speed)};
+    mission.update(input);
+    input.now = 0.1;
+    RoundaboutOutput out = mission.update(input);
+    if (out.state != RoundaboutState::kCommit) continue;  // 느린 앞차는 진입 확정 전일 수 있다
+    if (leader_speed >= 4.0)
+      EXPECT_FALSE(out.constraint.stop_required) << out.constraint.reason;
+    else
+      EXPECT_TRUE(out.constraint.stop_required) << out.constraint.reason;
+  }
+}
+
+// 2026-10-05: 접근/양보 중 트래커 순간 끊김(유예 이내)은 판단을 끊지 않는다.
+TEST(RoundaboutMission, ShortTrackerStaleUsesGrace) {
+  RoundaboutConfig config = testConfig();
+  config.degraded_speed = 1.5;
+  config.tracker_stale_grace = 0.3;
+  RoundaboutMission mission(config);
+  mission.update(approachInput(0.0));
+  ASSERT_EQ(mission.update(approachInput(0.6)).state, RoundaboutState::kCommit);
+  RoundaboutInput stale = approachInput(0.7);
+  stale.tracker_stream_valid = false;
+  stale.tracker_stream_fresh = true;
+  const RoundaboutOutput output = mission.update(stale);
+  EXPECT_EQ(output.state, RoundaboutState::kCommit);
+  EXPECT_GT(output.constraint.max_speed, 1.5);
+}
+
+// 순차 판단: 앞차 대기 정지점은 원 판정 반경(outer + margin) 밖에 둔다.
+//   (12:57 백: 정지점이 반경 안이라 대기하러 가다 CIRCULATE 로 넘어갔다)
+TEST(RoundaboutGapSelect, SequentialHoldStopsOutsideCircle) {
+  RoundaboutConfig config = testConfig();
+  config.yield_point = {10.0, -9.0};
+  config.conflict_point = {10.0, 0.0};
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_skip_confirm = 0.0;
+  config.mandatory_stop_seconds = 0.0;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_standstill_gap = 0.8;
+  config.gs_front_headway = 0.3;
+  config.gs_rear_headway = 0.5;
+  config.gs_check_horizon = 2.0;
+  config.gs_speed_margin = 0.2;
+  config.gs_leader_release_margin = 0.0;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  input.objects = {circulatingObject(3, -0.6, 6.0)};
+  mission.update(input);
+  input.now = 0.1;
+  RoundaboutOutput out = mission.update(input);
+  ASSERT_EQ(out.state, RoundaboutState::kCommit) << out.reason;
+  ASSERT_TRUE(out.constraint.stop_required);
+  // 반경 12 + 0.5 = 12.5 -> y = -7.5, 자차(y=-9)에서 1.5 m
+  EXPECT_NEAR(out.constraint.stop_distance, 1.5, 0.2);
+}
+
+// 순차 판단: 목표 틈이 안 돼도 skip_confirm 동안은 패스하지 않는다(새 트랙 노이즈).
+TEST(RoundaboutGapSelect, SequentialSkipNeedsConfirmation) {
+  RoundaboutConfig config = testConfig();
+  config.yield_point = {10.0, -9.0};
+  config.conflict_point = {10.0, 0.0};
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.mandatory_stop_seconds = 0.0;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_skip_confirm = 0.3;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  // 합류점 바로 상류 6 m 차량: 그 앞 틈은 안 된다.
+  input.objects = {circulatingObject(3, -0.6, 4.0)};
+  RoundaboutOutput out = mission.update(input);
+  EXPECT_NE(out.reason.find("confirming skip"), std::string::npos) << out.reason;
+  input.now = 0.2;
+  out = mission.update(input);
+  EXPECT_NE(out.reason.find("confirming skip"), std::string::npos) << out.reason;
+  input.now = 0.4;
+  out = mission.update(input);
+  EXPECT_NE(out.reason.find("seq L3"), std::string::npos) << out.reason;
+}
+
+TEST(RoundaboutGapSelect, UpstreamSlotIsNotSkippedOnTransientRearRejection) {
+  auto config = testConfig();
+  config.yield_point = {10.0, -9.0};
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_skip_confirm = 0.3;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  input.objects = {circulatingObject(1, -1.0, 3.0)};
+  mission.update(input);
+  input.now = 0.4;
+  auto out = mission.update(input); // Select the space behind vehicle 1.
+  ASSERT_EQ(out.gap_leader_id, 1);
+  input.objects.push_back(circulatingObject(2, -1.5, 8.0));
+  input.now = 0.5;
+  mission.update(input);
+  input.now = 1.0; // Longer than skip_confirm, but leader is still upstream.
+  out = mission.update(input);
+  EXPECT_EQ(out.gap_leader_id, 1);
+  EXPECT_EQ(out.gap_follower_id, 2);
+  EXPECT_FALSE(out.gap_safe);
+  EXPECT_TRUE(out.constraint.stop_required);
+  input.objects[0] = circulatingObject(1, 0.0, 3.0);
+  input.now = 1.1;
+  out = mission.update(input);
+  EXPECT_EQ(out.gap_leader_id, 2); // A genuinely missed slot can still advance.
+}
+
+// 미확정(속도 확인 전) 상류 트랙도 뒤차로 넣어 진입을 막는다.
+TEST(RoundaboutGapSelect, UnconfirmedUpstreamTrackBlocksEntry) {
+  RoundaboutConfig config = testConfig();
+  config.yield_point = {10.0, -7.0};
+  config.gap_select_enabled = true;
+  config.mandatory_stop_seconds = 0.0;
+  config.gs_confirm_seconds = 0.0;
+  RoundaboutMission mission(config);
+  RoundaboutInput input = approachInput(0.0);
+  input.ego.position = {10.0, -7.0};  // 반경 12.2 m (링 밖), 합류점까지 7 m
+  input.ego.speed = 0.0;
+  TrackedObject young = circulatingObject(9, -0.9, 0.0);  // 상류 9 m
+  young.velocity_valid = false;
+  young.has_moved = false;
+  young.confirmed = false;
+  young.hit_count = 3;
+  input.objects = {young};
+  mission.update(input);
+  input.now = 0.2;
+  RoundaboutOutput out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  // 같은 물체가 오래 안 움직였으면(시설물) 무시하고 진입한다.
+  input.objects[0].hit_count = 200;
+  input.now = 0.4;
+  mission.update(input);
+  input.now = 0.6;
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kCommit);
+}
+
+TEST(RoundaboutMission, UnsafeTargetRemainsVisibleWithoutEntryApproval) {
+  RoundaboutConfig config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_skip_confirm = 0.3;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.speed = 0.0;
+  input.objects = {circulatingObject(1, -1.0, 6.0),
+                   circulatingObject(2, -1.5, 9.0)};
+  const auto output = mission.update(input);
+  EXPECT_FALSE(output.gap_safe);
+  EXPECT_TRUE(output.constraint.stop_required);
+  int selected = 0;
+  for (const auto& gap : output.gaps) {
+    if (!gap.selected) continue;
+    ++selected;
+    EXPECT_FALSE(gap.feasible);
+    EXPECT_FALSE(gap.go);
+  }
+  EXPECT_EQ(selected, 1);
+  ASSERT_FALSE(output.stream.empty());
+  EXPECT_TRUE(output.stream.front().measured_position_valid);
+  EXPECT_DOUBLE_EQ(output.stream.front().measured_position.x, input.objects.front().position.x);
+}
+
+TEST(RoundaboutGapSelect, RadialEntryAloneCannotReleaseYield) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_require_merge_progress = true;
+  config.mandatory_stop_seconds = 1.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = {10.0, -6.2}; // inside radius 12, still before merge zone
+  input.ego.speed = 0.0;
+  const auto out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_TRUE(out.constraint.stop_required);
+  input.now = 0.1;
+  input.ego.position = {10.0, -3.0}; // front has actually reached merge zone
+  EXPECT_EQ(mission.update(input).state, RoundaboutState::kCirculate);
+}
+
+TEST(RoundaboutGapSelect, MpcLimitChangesPredictedArrivalWithoutChangingController) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_use_mpc_prediction = true;
+  config.circulation_speed = 8.5;
+  auto input = approachInput(0.0);
+  input.ego.speed = 0.0;
+  input.prediction_accel_limit = 1.8;
+  input.prediction_speed_limit = 8.5;
+  RoundaboutMission fast(config);
+  const auto a = fast.update(input);
+  input.prediction_speed_limit = 3.1;
+  RoundaboutMission limited(config);
+  const auto b = limited.update(input);
+  EXPECT_NEAR(a.ego_prediction_speed, 8.5, 1e-9);
+  EXPECT_NEAR(b.ego_prediction_speed, 3.1, 1e-9);
+  // 6.7 m to the zone: accelerate at 1.8 to 3.1, then cruise.
+  EXPECT_NEAR(b.ego_zone_time, 0.2 + 3.1 / 1.8 +
+              (6.7 - 0.5 * 3.1 * 3.1 / 1.8) / 3.1, 1e-6);
+  EXPECT_GT(b.ego_zone_time, a.ego_zone_time + 0.29);
+  EXPECT_DOUBLE_EQ(b.constraint.max_speed, config.approach_speed);
+}
+
+TEST(RoundaboutGapSelect, MissingMpcFeedbackHoldsEntryThenRecovers) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_use_mpc_prediction = true;
+  config.gs_confirm_seconds = 0.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.speed = 0.0;
+  const auto missing = mission.update(input);
+  EXPECT_EQ(missing.state, RoundaboutState::kYield);
+  EXPECT_TRUE(missing.constraint.stop_required);
+  EXPECT_FALSE(missing.gap_safe);
+  EXPECT_NE(missing.reason.find("MPC prediction feedback unavailable"), std::string::npos);
+  input.now = 0.1;
+  input.prediction_speed_limit = 3.1;
+  EXPECT_EQ(mission.update(input).state, RoundaboutState::kCommit);
+}
+
+TEST(RoundaboutGapSelect, AbortBrakesDuringConfirmationAndCannotRecommitWhileMoving) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_require_merge_progress = true;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_commit_abort_confirm = 0.2;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = {10.0, -9.0};
+  input.ego.speed = 0.0;
+  ASSERT_EQ(mission.update(input).state, RoundaboutState::kCommit);
+  input.now = 0.1;
+  input.ego.position = {10.0, -6.2};
+  input.ego.speed = 0.8;
+  input.objects = {circulatingObject(7, -0.4, 8.0)};
+  auto out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kCommit);
+  EXPECT_TRUE(out.constraint.stop_required);
+  EXPECT_DOUBLE_EQ(out.constraint.max_speed, 0.0);
+  input.now = 0.4;
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_DOUBLE_EQ(out.constraint.stop_distance, 0.0);
+  input.now = 0.5;
+  input.objects.clear(); // gap clear, but vehicle has not finished stopping
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_DOUBLE_EQ(out.constraint.max_speed, 0.0);
+  input.now = 0.6;
+  input.ego.speed = 0.0;
+  EXPECT_EQ(mission.update(input).state, RoundaboutState::kCommit);
+}
+
+TEST(RoundaboutGapSelect, RepeatedLidarFrameDoesNotExtendVelocityHistory) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_speed_min_span = 0.8;
+  config.gs_speed_disagreement_limit = 1.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.speed = 0.0;
+  RoundaboutOutput out;
+  for (int i = 0; i <= 5; ++i) {
+    input.now = 0.2 * i;
+    input.objects_stamp = input.now;
+    // Position regression suggests 8 m/s; tracker says 4 m/s.
+    input.objects = {circulatingObject(1, -2.0 + 0.16 * i, 4.0)};
+    out = mission.update(input);
+  }
+  ASSERT_EQ(out.stream.size(), 1u);
+  EXPECT_NEAR(out.stream[0].speed, 5.0, 1e-6);
+  // Timer runs faster than LiDAR: use the sensor stamp, not timer time.
+  for (int i = 1; i <= 4; ++i) {
+    input.now = 1.0 + 0.05 * i;
+    out = mission.update(input);
+    ASSERT_EQ(out.stream.size(), 1u);
+    EXPECT_NEAR(out.stream[0].speed, 5.0, 1e-6);
+  }
+}
+
+TEST(RoundaboutGapSelect, DistantTargetIsWaitingNotRearUnsafeOrSkipped) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_max_wait = 0.1;
+  config.gs_leader_start_distance = 9.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.speed = 0.0;
+  input.objects = {circulatingObject(1, -2.0, 6.0)};
+  for (int i = 0; i < 7; ++i) {
+    input.now = i * 0.2;
+    const auto out = mission.update(input);
+    EXPECT_FALSE(out.gap_safe);
+    EXPECT_TRUE(out.constraint.stop_required);
+    // First reject the slot ahead of this car, then retain the slot behind it.
+    if (i < 2) continue;
+    EXPECT_NE(out.reason.find("exceeds prediction horizon"), std::string::npos);
+    EXPECT_EQ(out.reason.find("unsafe, confirming skip"), std::string::npos);
+  }
+}
+
+TEST(RoundaboutGapSelect, SingleEstimatorUsesSameArcUnitsForPositionAndSpeed) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_use_tracker_velocity = true;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0); input.ego.speed = 0.0;
+  auto object = circulatingObject(8, -0.8, 5.4);
+  object.position.x *= 0.9; object.position.y *= 0.9; // radius 9, nominal 10
+  input.objects = {object};
+  const auto out = mission.update(input);
+  ASSERT_EQ(out.stream.size(), 1U);
+  EXPECT_NEAR(out.stream[0].speed, 6.0, 1e-6);
+}
+
+TEST(RoundaboutGapSelect, PredictedPoseDoesNotBecomeSecondSpeedMeasurement) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_use_tracker_velocity = true;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0); input.ego.speed = 0.0;
+  for (int i = 0; i <= 12; ++i) {
+    input.now = i * 0.1; input.objects_stamp = input.now;
+    // Position drift could fool a second regression; reported raw speed is stable.
+    input.objects = {circulatingObject(8, -1.0 + i * 0.075, 5.4)};
+    const auto out = mission.update(input);
+    ASSERT_EQ(out.stream.size(), 1U);
+    EXPECT_NEAR(out.stream[0].speed, 5.4, 1e-6);
+  }
+}
+
+TEST(RoundaboutGapSelect, LeadFollowingKeepsPhysicalSpeedAfterArcConversion) {
+  auto config = testConfig();
+  config.gap_select_enabled = true;
+  config.gs_sequential = true;
+  config.gs_use_tracker_velocity = true;
+  config.gs_confirm_seconds = 0.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0); input.ego.speed = 0.0;
+  auto object = circulatingObject(8, 0.5, 5.4);
+  object.position.x *= 0.9; object.position.y *= 0.9;
+  input.objects = {object};
+  const auto out = mission.update(input);
+  ASSERT_EQ(out.state, RoundaboutState::kCommit);
+  ASSERT_TRUE(out.constraint.lead_vehicle_active);
+  EXPECT_NEAR(out.stream[0].speed, 6.0, 1e-6);
+  EXPECT_NEAR(out.stream[0].physical_speed, 5.4, 1e-6);
+  EXPECT_NEAR(out.constraint.lead_speed, 5.4, 1e-6);
+}
+
+TEST(RoundaboutGapSelect, SequentialToleranceCannotApproveFutureDeparture) {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_use_tracker_velocity = true;
+  config.gs_require_merge_progress = true;
+  config.gs_skip_confirm = config.gs_confirm_seconds = 0.0;
+  config.gs_seq_go_tolerance = 30.0; // Legacy permissive value must not bypass waiting.
+  config.yield_point = {10.0, -9.0};
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = config.yield_point;
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  input.objects = {circulatingObject(1, -1.6, 4.0)};
+  const auto out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_FALSE(out.gap_safe);
+  EXPECT_TRUE(out.constraint.stop_required);
+  EXPECT_NE(out.reason.find("wait"), std::string::npos) << out.reason;
+}
+
+TEST(RoundaboutGapSelect, MissingCommittedFollowerStopsWithoutSelectingAnotherGap) {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_use_tracker_velocity = config.gs_require_merge_progress = true;
+  config.gs_confirm_seconds = config.gs_skip_confirm = config.gs_commit_abort_confirm = 0.0;
+  config.yield_point = {10.0, -9.0};
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = config.yield_point;
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  input.objects = {circulatingObject(1, 0.5, 6.0), circulatingObject(2, -2.5, 1.0)};
+  auto out = mission.update(input);
+  ASSERT_EQ(out.state, RoundaboutState::kCommit) << out.reason;
+  input.now = 0.1;
+  input.objects.pop_back();
+  out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_TRUE(out.constraint.stop_required);
+  EXPECT_DOUBLE_EQ(out.constraint.max_speed, 0.0);
+  EXPECT_NE(out.reason.find("target_missing"), std::string::npos) << out.reason;
+  for (const auto& gap : out.gaps) {
+    if (!gap.selected) continue;
+    EXPECT_EQ(gap.leader_id, 1);
+    EXPECT_EQ(gap.follower_id, 2);
+    EXPECT_FALSE(gap.go);
+  }
+}
+
+TEST(RoundaboutGapSelect, MeasuredSlowdownAddsFrontWaitingWithoutChangingReportedSpeed) {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = config.gs_use_tracker_velocity = true;
+  config.gs_require_merge_progress = true;
+  config.gs_skip_confirm = 0.0;
+  config.gs_leader_start_distance = 0.0;
+  config.mandatory_stop_seconds = 100.0;
+  config.yield_point = {10.0, -9.0};
+  RoundaboutMission conservative(config);
+  config.gs_leader_decel_horizon = 0.0;
+  RoundaboutMission constant(config);
+  auto input = approachInput(0.0);
+  input.ego.position = config.yield_point;
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  RoundaboutOutput slow, normal;
+  for (int i = 0; i < 4; ++i) {
+    input.now = input.objects_stamp = 0.2 * i;
+    input.objects = {circulatingObject(1, -2.0 + i * 0.08, 6.0 - i * 0.5)};
+    slow = conservative.update(input);
+    normal = constant.update(input);
+  }
+  ASSERT_EQ(slow.stream.size(), 1u);
+  EXPECT_NEAR(slow.stream.front().speed, 4.5, 1e-6);
+  double slow_wait = -1.0, normal_wait = -1.0;
+  for (const auto& gap : slow.gaps) if (gap.selected) slow_wait = gap.depart_delay;
+  for (const auto& gap : normal.gaps) if (gap.selected) normal_wait = gap.depart_delay;
+  ASSERT_GE(normal_wait, 0.0);
+  EXPECT_GT(slow_wait, normal_wait);
+  // Reusing the same sensor stamp cannot create a stronger slowdown trend.
+  input.now += 0.1;
+  const auto repeated = conservative.update(input);
+  for (const auto& gap : repeated.gaps) {
+    if (gap.selected) {
+      EXPECT_DOUBLE_EQ(gap.depart_delay, slow_wait);
+    }
+  }
+}
+
+TEST(RoundaboutGapSelect, UnconfirmedFrontObjectCannotKeepCommittedGapApproved) {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_use_tracker_velocity = config.gs_require_merge_progress = true;
+  config.gs_confirm_seconds = config.gs_skip_confirm = config.gs_commit_abort_confirm = 0.0;
+  config.yield_point = {10.0, -9.0};
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  input.ego.position = config.yield_point;
+  input.ego.speed = 0.0;
+  input.route = {{10.0, -30.0}, {10.0, -9.0}, {10.0, 0.0}, {9.8, 2.0}};
+  input.objects = {circulatingObject(1, 0.5, 6.0), circulatingObject(2, -2.5, 1.0)};
+  ASSERT_EQ(mission.update(input).state, RoundaboutState::kCommit);
+  auto uncertain = circulatingObject(3, 0.1, 0.0);
+  uncertain.confirmed = uncertain.velocity_valid = uncertain.has_moved = false;
+  uncertain.hit_count = 1;
+  input.objects.push_back(uncertain);
+  input.now = 0.1;
+  const auto out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_FALSE(out.gap_safe);
+  EXPECT_DOUBLE_EQ(out.constraint.max_speed, 0.0);
+  for (const auto& gap : out.gaps) EXPECT_FALSE(gap.go);
+}
+
+TEST(RoundaboutGapSelect, VehicleRoiRejectsInnerIslandSignWithFalseMotionFlag) {
+  auto config = testConfig();
+  config.vehicle_roi_inner_radius = 9.0;
+  config.vehicle_roi_outer_radius = 11.0;
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_confirm_seconds = 0.0;
+  config.gs_require_merge_progress = true;
+  auto input = approachInput(0.0); input.ego.speed = 0.0;
+  auto sign = circulatingObject(10, 0.5, 0.7);
+  sign.position.x *= 0.85; sign.position.y *= 0.85;
+  input.objects = {sign}; // A false has_moved flag must not admit an island object.
+  RoundaboutMission mission(config);
+  const auto out = mission.update(input);
+  EXPECT_EQ(out.state, RoundaboutState::kCommit);
+  EXPECT_TRUE(out.stream.empty());
+  EXPECT_FALSE(out.constraint.lead_vehicle_active);
+}
+
+TEST(RoundaboutGapSelect, ProvenVehicleWithInvalidSpeedIsNotDroppedAsOldInfrastructure) {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_skip_confirm = 0.0;
+  auto input = approachInput(0.0); input.ego.speed = 0.0;
+  auto car = circulatingObject(7, -1.5, 5.0);
+  car.confirmed = car.velocity_valid = false;
+  car.has_moved = true; car.hit_count = 100;
+  input.objects = {car};
+  RoundaboutMission mission(config);
+  const auto out = mission.update(input);
+  ASSERT_EQ(out.stream.size(), 1u);
+  EXPECT_EQ(out.stream.front().id, 7);
+  EXPECT_FALSE(out.gap_safe);
+  EXPECT_TRUE(out.constraint.stop_required);
+}
+
+// ---- 거리 기준 진입(zone 규칙): 차량별 길이, 대기 완화, COMMIT grace, 정지 차량 해제 ----
+
+RoundaboutConfig zoneConfig() {
+  auto config = testConfig();
+  config.gap_select_enabled = config.gs_sequential = true;
+  config.gs_zone_rule_enabled = true;
+  config.gs_zone_confirm_seconds = 0.0;
+  config.gs_commit_abort_enabled = false;
+  config.gs_ego_length = 4.6;
+  config.gs_entry_zone = 1.0;
+  config.gs_standstill_gap = 0.8;
+  config.gs_min_vehicle_length = 4.0;
+  config.gs_zone_front_gap = 2.5;
+  config.gs_zone_rear_gap = 2.0;
+  config.gs_zone_front_time = 0.3;
+  config.gs_zone_vehicle_length = 5.0;
+  config.gs_velocity_hold_min_hits = 20;
+  return config;
+}
+
+RoundaboutInput zoneInput(double now) {
+  RoundaboutInput input = approachInput(now);
+  input.ego.speed = 0.0;
+  input.objects_stamp = now;
+  return input;
+}
+
+// 합류점 상류 arc [m] 에 있는 순환 차량(반지름 10 m 라 각 = -arc / 10).
+TrackedObject upstreamCar(int id, double arc, double speed, double length) {
+  TrackedObject car = circulatingObject(id, -arc / 10.0, speed);
+  car.length = length;
+  car.hit_count = 50;
+  car.confirmed = true;
+  return car;
+}
+
+// 앞차(arc 12.6)와 뒤차(arc 12.6 + spacing)를 3 m/s 로 두고 어느 쪽 틈을 고르는지 본다.
+int zoneChosenLeader(RoundaboutConfig config, double leader_length, double follower_length,
+                     double spacing) {
+  RoundaboutMission mission(config);
+  RoundaboutInput input = zoneInput(0.0);
+  input.objects = {upstreamCar(1, 12.6, 3.0, leader_length),
+                   upstreamCar(2, 12.6 + spacing, 3.0, follower_length)};
+  return mission.update(input).gap_leader_id;
+}
+
+TEST(RoundaboutZoneRule, WindowAndSlotWidthUseEachVehiclesOwnLength) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = true;
+  config.gs_zone_length_min_samples = 1;
+  config.gs_zone_length_max = 7.5;
+  // v=3 m/s: 앞 간격 max(2.5, 0.8+1.0+0.3*3) = 2.7, 뒤 간격 2.0.
+  //   W(4.5, 4.5) = 4.6 + 2.7 + 2.0 + 4.5 = 13.8,  W(7.0, 4.5) = 15.05.
+  EXPECT_EQ(zoneChosenLeader(config, 4.5, 4.5, 14.5), 1);  // 틈 (1, 2) 통과
+  EXPECT_EQ(zoneChosenLeader(config, 7.0, 4.5, 14.5), 2);  // 긴 앞차는 같은 간격이 모자라 건너뜀
+  EXPECT_EQ(zoneChosenLeader(config, 4.5, 7.0, 14.5), 2);  // 긴 뒤차도 마찬가지
+}
+
+TEST(RoundaboutZoneRule, FixedLengthIsUsedWhenEstimationIsOff) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = false;
+  // 관측 길이와 상관없이 기본 5.0 m: W = 4.6 + 2.7 + 2.0 + 5.0 = 14.3
+  EXPECT_EQ(zoneChosenLeader(config, 7.0, 7.0, 14.5), 1);
+  EXPECT_EQ(zoneChosenLeader(config, 4.5, 4.5, 14.0), 2);
+}
+
+TEST(RoundaboutZoneRule, LengthEstimateUsesPercentileAndPriorForPartialViews) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = true;
+  config.gs_zone_length_percentile = 0.8;
+  config.gs_zone_length_min_samples = 10;
+  config.gs_zone_length_max = 7.5;
+  RoundaboutMission mission(config);
+  // 한 차량이 보이는 면에 따라 길이가 흔들린다(부분 관측 2.0~3.0, 정상 4.8~5.2).
+  const double observed[] = {2.0, 3.0, 4.8, 5.0, 5.0, 5.0, 5.2, 5.0, 4.9, 5.1};
+  RoundaboutOutput out;
+  for (int i = 0; i < 10; ++i) {
+    RoundaboutInput input = zoneInput(0.1 * i);
+    input.objects = {upstreamCar(1, 30.0, 3.0, observed[i])};
+    out = mission.update(input);
+  }
+  ASSERT_EQ(out.stream.size(), 1u);
+  EXPECT_NEAR(out.stream.front().length, 5.0, 1e-9);  // 80 백분위수
+
+  // 방금 생긴 차(표본 1 개, 부분 관측 3.2 m)는 스트림 prior(5.0)보다 작게 보지 않는다.
+  RoundaboutInput input = zoneInput(1.0);
+  input.objects = {upstreamCar(1, 27.0, 3.0, 5.0), upstreamCar(2, 20.0, 3.0, 3.2)};
+  out = mission.update(input);
+  double short_view = -1.0;
+  for (const auto& v : out.stream) if (v.id == 2) short_view = v.length;
+  EXPECT_NEAR(short_view, 5.0, 1e-9);
+
+  // 합쳐진 클러스터(12 m)는 상한으로 자른다.
+  for (int i = 0; i < 12; ++i) {
+    RoundaboutInput merged = zoneInput(2.0 + 0.1 * i);
+    merged.objects = {upstreamCar(3, 25.0, 3.0, 12.0)};
+    out = mission.update(merged);
+  }
+  double merged_length = -1.0;
+  for (const auto& v : out.stream) if (v.id == 3) merged_length = v.length;
+  EXPECT_NEAR(merged_length, 7.5, 1e-9);
+}
+
+TEST(RoundaboutZoneRule, LongYieldRelaxesGapsDownToFloors) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = false;
+  config.gs_zone_vehicle_length = 4.5;
+  config.gs_zone_relax_start = 5.0;
+  config.gs_zone_relax_rate = 0.5;       // m/s
+  config.gs_zone_rear_gap_floor = 1.0;
+  config.gs_zone_front_gap_floor = 2.0;
+  // 틈 12.8 m: 기본 W = 13.8 에는 모자라고, 하한까지 줄인 W = 4.6 + 2.0 + 1.0 + 4.5 = 12.1 에는 들어간다.
+  RoundaboutMission mission(config);
+  auto frame = [&](double now) {
+    RoundaboutInput input = zoneInput(now);
+    input.objects = {upstreamCar(1, 12.6, 3.0, 4.5), upstreamCar(2, 12.6 + 12.8, 3.0, 4.5)};
+    return mission.update(input);
+  };
+  RoundaboutOutput out = frame(0.0);
+  ASSERT_EQ(out.state, RoundaboutState::kYield);
+  EXPECT_EQ(out.gap_leader_id, 2);                       // 틈 (1, 2) 는 건너뜀
+  out = frame(5.5);                                       // 완화 0.25 m: 아직 부족
+  EXPECT_EQ(out.gap_leader_id, 2);
+  out = frame(7.5);                                       // 완화 1.25 m >= 1.0 필요
+  EXPECT_EQ(out.gap_leader_id, 1);
+  EXPECT_NE(out.reason.find("relax-"), std::string::npos);
+  out = frame(30.0);                                      // 하한에서 멈춘다(1.7 m)
+  EXPECT_EQ(out.gap_leader_id, 1);
+  EXPECT_NE(out.reason.find("relax-1.7"), std::string::npos);
+}
+
+TEST(RoundaboutZoneRule, CommitGraceBridgesOcclusionGuardButNotMissingMessages) {
+  RoundaboutConfig config = testConfig();
+  config.degraded_speed = 1.5;
+  config.tracker_guard_commit_grace = 1.2;
+  RoundaboutMission mission(config);
+  mission.update(approachInput(0.0));
+  ASSERT_EQ(mission.update(approachInput(0.6)).state, RoundaboutState::kCommit);
+
+  // 메시지는 신선하고 가림 보호만 걸림: grace 안에서는 감속하지 않는다.
+  RoundaboutInput guarded = approachInput(0.7);
+  guarded.tracker_stream_valid = false;
+  guarded.tracker_stream_fresh = true;
+  RoundaboutOutput out = mission.update(guarded);
+  EXPECT_EQ(out.state, RoundaboutState::kCommit);
+  EXPECT_GT(out.constraint.max_speed, 1.5);
+
+  // 메시지가 끊기면(fresh=false) grace 와 상관없이 stale.
+  RoundaboutInput lost = approachInput(0.8);
+  lost.tracker_stream_valid = false;
+  lost.tracker_stream_fresh = false;
+  EXPECT_DOUBLE_EQ(mission.update(lost).constraint.max_speed, 1.5);
+
+  // 가림 보호가 grace 보다 오래 이어지면 stale.
+  RoundaboutInput expired = approachInput(2.0);
+  expired.tracker_stream_valid = false;
+  expired.tracker_stream_fresh = true;
+  EXPECT_DOUBLE_EQ(mission.update(expired).constraint.max_speed, 1.5);
+}
+
+TEST(RoundaboutZoneRule, StationaryYieldingVehicleIsReleasedOnlyAfterWaiting) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = false;
+  config.gs_stationary_yield_enabled = true;
+  config.gs_stationary_yield_start = 5.0;
+  config.gs_stationary_yield_confirm = 3.0;
+  config.gs_stationary_yield_min_distance = 3.0;
+  config.stationary_block_distance = 20.0;
+  auto run = [&](bool car_between) {
+    RoundaboutMission mission(config);
+    RoundaboutOutput out;
+    for (int t = 0; t <= 8; ++t) {
+      RoundaboutInput input = zoneInput(static_cast<double>(t));
+      // 합류점 9 m 상류에 서 있는 차(이동 이력 있음) = 자차를 기다리다 선 NPC.
+      input.objects = {upstreamCar(7, 9.0, 0.0, 4.5)};
+      if (car_between) input.objects.push_back(upstreamCar(8, 4.0, 0.0, 4.5));
+      out = mission.update(input);
+      if (t == 2) {
+        EXPECT_EQ(out.state, RoundaboutState::kYield);
+        EXPECT_NE(out.reason.find("stationary vehicle near conflict"), std::string::npos);
+      }
+    }
+    return out;
+  };
+  RoundaboutOutput released = run(false);
+  EXPECT_EQ(released.state, RoundaboutState::kCommit);
+  // 기능을 끄면 8 초 기다려도 계속 막는다.
+  config.gs_stationary_yield_enabled = false;
+  EXPECT_EQ(run(false).state, RoundaboutState::kYield);
+  config.gs_stationary_yield_enabled = true;
+  // 그 차와 합류점 사이에 다른 차가 있으면 상호 대기가 아니므로 계속 막는다.
+  RoundaboutOutput blocked = run(true);
+  EXPECT_EQ(blocked.state, RoundaboutState::kYield);
+  EXPECT_NE(blocked.reason.find("stationary vehicle near conflict"), std::string::npos);
+}
+
+TEST(RoundaboutZoneRule, ReleasedVehicleThatStartsMovingIsAnIntruder) {
+  auto config = zoneConfig();
+  config.gs_zone_length_estimate = false;
+  config.gs_stationary_yield_enabled = true;
+  config.gs_stationary_yield_start = 5.0;
+  config.gs_stationary_yield_confirm = 3.0;
+  config.gs_stationary_yield_min_distance = 3.0;
+  RoundaboutMission mission(config);
+  RoundaboutOutput out;
+  for (int t = 0; t <= 8; ++t) {
+    RoundaboutInput input = zoneInput(static_cast<double>(t));
+    input.objects = {upstreamCar(7, 9.0, 0.0, 4.5)};
+    out = mission.update(input);
+  }
+  ASSERT_EQ(out.state, RoundaboutState::kCommit);
+  // 진입 중 그 차가 다시 움직이면(속도 3 m/s) 일반 차량으로 돌아가 구간 침범이 된다.
+  RoundaboutInput moving = zoneInput(8.1);
+  moving.ego.speed = 1.0;
+  moving.objects = {upstreamCar(7, 8.7, 3.0, 4.5)};
+  out = mission.update(moving);
+  EXPECT_NE(out.reason.find("zone_intrusion"), std::string::npos);
+}
+
+TEST(RoundaboutMission, ExitFollowsRouteInsteadOfUnrelatedCircularVehicle) {
+  auto config = testConfig();
+  config.safe_confirm_seconds = 0.0;
+  RoundaboutMission mission(config);
+  auto input = approachInput(0.0);
+  ASSERT_EQ(mission.update(input).state, RoundaboutState::kCommit);
+  input.now = 0.2; input.ego.position = {10.0, 0.0};
+  ASSERT_EQ(mission.update(input).state, RoundaboutState::kCirculate);
+  input.now = 1.0; input.ego.position = {0.0, 10.0};
+  input.route = {{10.0, 0.0}, {5.0, 8.0}, {0.0, 10.0}, {0.0, 30.0}};
+  input.objects = {circulatingObject(8, 2.0, 0.0)};
+  const auto leaving = mission.update(input);
+  ASSERT_EQ(leaving.state, RoundaboutState::kExit);
+  EXPECT_FALSE(leaving.constraint.lead_vehicle_active);
+  auto stopped_exit_car = circulatingObject(9, 0.0, 0.0);
+  stopped_exit_car.position = {0.0, 11.5};
+  input.objects.push_back(stopped_exit_car);
+  input.now = 1.1;
+  const auto stopped = mission.update(input);
+  EXPECT_TRUE(stopped.constraint.lead_vehicle_active);
+  EXPECT_EQ(stopped.constraint.lead_vehicle_id, 9);
+  EXPECT_DOUBLE_EQ(stopped.constraint.lead_speed, 0.0);
+  EXPECT_DOUBLE_EQ(stopped.constraint.lead_distance, 0.0);
+}
+
+}  // namespace
+}  // namespace mission_planner
+
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

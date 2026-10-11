@@ -1,0 +1,173 @@
+#include <gtest/gtest.h>
+
+#include "mission_planner/gap_selector.hpp"
+
+namespace mission_planner {
+namespace {
+
+EgoEntryModel standingEgo() {
+  EgoEntryModel ego;
+  ego.distance_to_merge = 7.3;  // K-City 양보선 -> 합류점
+  ego.speed = 0.0;
+  ego.accel = 2.2;
+  ego.max_speed = 8.5;
+  ego.start_delay = 0.2;
+  ego.length = 4.6;
+  return ego;
+}
+
+GapSelectorParams ringParams() {
+  GapSelectorParams p;
+  p.ring_length = 2.0 * 3.14159265358979323846 * 17.955;
+  return p;
+}
+
+StreamVehicle vehicle(int id, double pos, double speed) {
+  StreamVehicle v;
+  v.id = id;
+  v.pos = pos;
+  v.speed = speed;
+  v.length = 4.5;
+  return v;
+}
+
+const GapCandidate* earliest(const std::vector<GapCandidate>& gaps) {
+  const GapCandidate* best = nullptr;
+  for (const GapCandidate& g : gaps)
+    if (g.feasible && (!best || g.depart_delay < best->depart_delay)) best = &g;
+  return best;
+}
+
+TEST(GapSelector, EmptyRingGoesNow) {
+  const auto gaps = GapSelector::evaluate({}, standingEgo(), ringParams());
+  ASSERT_EQ(gaps.size(), 1u);
+  EXPECT_TRUE(gaps[0].feasible);
+  EXPECT_DOUBLE_EQ(gaps[0].depart_delay, 0.0);
+}
+
+TEST(GapSelector, VehicleJustPassedAllowsImmediateGo) {
+  // 합류점을 막 지난 차량(앞차)만 있으면 바로 출발.
+  const auto gaps = GapSelector::evaluate({vehicle(6, 3.2, 6.2)}, standingEgo(),
+                                          ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+  EXPECT_EQ(best->leader_id, 6);
+}
+
+TEST(GapSelector, CloseFastFollowerMakesUsWaitBehindIt) {
+  // 12 m 상류에서 8 m/s 로 오는 차량: 지금은 앞에 못 끼고, 지나간 뒤 출발.
+  const auto gaps = GapSelector::evaluate({vehicle(7, -12.0, 8.0)},
+                                          standingEgo(), ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->leader_id, 7);
+  EXPECT_GE(best->depart_delay, 0.4);
+  EXPECT_LT(best->depart_delay, 4.0);
+}
+
+TEST(GapSelector, FarFollowerLeavesGapNow) {
+  const auto gaps = GapSelector::evaluate({vehicle(8, -55.0, 6.0)},
+                                          standingEgo(), ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->follower_id, 8);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+}
+
+TEST(GapSelector, PicksGapBetweenPlatoonVehicles) {
+  // 차량 A 가 막 지나가는 중, B 는 멀리 뒤: A/B 사이 틈에 바로 들어간다.
+  const auto gaps = GapSelector::evaluate(
+      {vehicle(1, 1.0, 6.0), vehicle(2, -48.0, 6.0)}, standingEgo(),
+      ringParams());
+  const GapCandidate* best = earliest(gaps);
+  ASSERT_NE(best, nullptr);
+  EXPECT_EQ(best->leader_id, 1);
+  EXPECT_EQ(best->follower_id, 2);
+  EXPECT_DOUBLE_EQ(best->depart_delay, 0.0);
+}
+
+TEST(GapSelector, StoppedLeaderAtConflictBlocks) {
+  // 합류점 바로 앞에 선 차량: 앞차 간격이 영영 안 난다.
+  const auto gaps = GapSelector::evaluate({vehicle(3, 4.0, 0.0)},
+                                          standingEgo(), ringParams());
+  EXPECT_EQ(earliest(gaps), nullptr);
+}
+
+TEST(GapSelector, ApproachingLeaderOnlyLimitsFrontSide) {
+  // 상류에서 다가오는 앞차(14 m, 5 m/s)를 먼저 보내고 멀리 있는 뒤차(45 m) 앞으로
+  // 들어가는 틈: 지금 출발하면 앞쪽만 부족하고 뒤쪽은 만족한다.
+  GapSelectorParams p = ringParams();  // K-City 설정값
+  p.front_headway = 0.3;
+  p.rear_headway = 0.5;
+  p.standstill_gap = 0.8;
+  p.check_horizon = 2.0;
+  p.speed_margin = 0.2;
+  const auto gaps = GapSelector::evaluate(
+      {vehicle(1, -14.0, 5.0), vehicle(2, -45.0, 5.0)}, standingEgo(), p);
+  const GapCandidate* g = nullptr;
+  for (const GapCandidate& c : gaps)
+    if (c.leader_id == 1 && c.follower_id == 2) g = &c;
+  ASSERT_NE(g, nullptr);
+  ASSERT_TRUE(g->feasible);
+  EXPECT_GT(g->depart_delay, 0.0);
+  EXPECT_GT(g->front_shortfall_now, 0.0);
+  EXPECT_DOUBLE_EQ(g->rear_shortfall_now, 0.0);
+}
+
+GapSelectorParams kcityParams() {
+  GapSelectorParams p = ringParams();
+  p.front_headway = 0.3;
+  p.rear_headway = 0.5;
+  p.standstill_gap = 0.8;
+  p.check_horizon = 2.0;
+  p.speed_margin = 0.2;
+  return p;
+}
+
+TEST(GapSelectorSequential, FollowsLeaderWhenFollowerIsFar) {
+  // 앞차(10 m 상류, 6 m/s) 뒤, 뒤차(45 m) 앞 틈: 앞차가 빠지는 시각에 맞춰 출발.
+  SequentialParams sp;
+  const auto r = GapSelector::evaluateSequential(
+      {vehicle(1, -10.0, 6.0), vehicle(2, -45.0, 6.0)}, standingEgo(), kcityParams(),
+      sp, 1);
+  ASSERT_TRUE(r.feasible);
+  EXPECT_EQ(r.gap.leader_id, 1);
+  EXPECT_EQ(r.gap.follower_id, 2);
+  EXPECT_TRUE(r.skipped.empty());
+  // 앞차 뒤끝이 합류점을 0.8 m 지나는 시각 - 자차 도착 시간 >= 0
+  EXPECT_GE(r.gap.depart_delay, 0.0);
+}
+
+TEST(GapSelectorSequential, SkipsGapWithCloseFollowerAndTakesNextOne) {
+  // 앞차(10 m) 바로 뒤 뒤차(20 m) - 뒤차 TTC 를 못 지킨다 -> 패스하고
+  // 뒤차 뒤(멀리 60 m 까지 빈) 공간을 목표로.
+  SequentialParams sp;
+  const auto r = GapSelector::evaluateSequential(
+      {vehicle(1, -10.0, 6.0), vehicle(2, -20.0, 6.0), vehicle(3, -60.0, 6.0)},
+      standingEgo(), kcityParams(), sp, 1);
+  ASSERT_TRUE(r.feasible);
+  ASSERT_EQ(r.skipped.size(), 1u);
+  EXPECT_EQ(r.skipped[0], 2);
+  EXPECT_EQ(r.gap.leader_id, 2);
+  EXPECT_EQ(r.gap.follower_id, 3);
+  EXPECT_EQ(r.target_leader, 2);
+}
+
+TEST(GapSelectorSequential, DoesNotGoBackToSkippedGap) {
+  // 목표가 이미 L2 로 넘어갔으면, 앞 틈(L1/F2)이 좋아 보여도 되돌아가지 않는다.
+  SequentialParams sp;
+  const auto r = GapSelector::evaluateSequential(
+      {vehicle(1, -5.0, 6.0), vehicle(2, -40.0, 6.0), vehicle(3, -80.0, 6.0)},
+      standingEgo(), kcityParams(), sp, 2);
+  ASSERT_TRUE(r.feasible);
+  EXPECT_EQ(r.gap.leader_id, 2);
+}
+
+}  // namespace
+}  // namespace mission_planner
+
+int main(int argc, char** argv) {
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

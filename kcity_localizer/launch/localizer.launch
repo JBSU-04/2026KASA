@@ -1,0 +1,36 @@
+<launch>
+  <!-- K-City 2025 mgeo 기반 차량 측위 -->
+  <!-- 입력: MORAI /gps + /imu (기본). ~use_odom:=true 면 /odom 사용 -->
+
+  <arg name="use_odom"    default="false"/>
+  <arg name="use_rviz"    default="true"/>
+  <arg name="rate"        default="50.0"/>
+  <arg name="publish_tf"  default="true"/>
+  <arg name="publish_odom" default="true"/>
+  <arg name="stop_on_unknown" default="false"/>
+  <arg name="unknown_stop_dist" default="40.0"/>
+  <!-- IMU yaw 규약: 현 리그(2026-07-19 실측)는 ENU라 false. NED 리그면 true -->
+  <arg name="imu_ned"     default="false"/>
+
+  <node pkg="kcity_localizer" type="map_localizer.py" name="kcity_map_localizer" output="screen">
+    <param name="use_odom"     value="$(arg use_odom)"/>
+    <param name="imu_ned"      value="$(arg imu_ned)"/>
+    <param name="rate"         value="$(arg rate)"/>
+    <param name="frame_id"     value="map"/>
+    <param name="utm_zone"     value="52"/>
+    <param name="publish_tf"   value="$(arg publish_tf)"/>
+    <param name="publish_odom" value="$(arg publish_odom)"/>
+    <param name="stop_on_unknown" value="$(arg stop_on_unknown)"/>
+    <param name="unknown_stop_dist" value="$(arg unknown_stop_dist)"/>
+    <!-- data_dir 비우면 패키지 내 data/ 사용 -->
+    <param name="data_dir"     value=""/>
+    <!-- MORAI 시뮬레이터는 GPS/IMU 노이즈 옵션을 끈 채로 쓴다 - 실측 오차가
+         거의 없다는 전제로 EKF가 GPS 관측을 훨씬 강하게 신뢰하도록 낮춘다.
+         기존 기본값(0.35/0.6)은 실차 노이즈 대비 여유였다. -->
+    <param name="sigma_gps"    value="0.03"/>
+    <param name="sigma_acc"    value="0.15"/>
+  </node>
+
+  <node if="$(arg use_rviz)" pkg="rviz" type="rviz" name="localizer_rviz"
+        args="-d $(find kcity_localizer)/rviz/localizer.rviz"/>
+</launch>

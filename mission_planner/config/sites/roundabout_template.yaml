@@ -1,0 +1,158 @@
+# 다른 맵에서는 이 파일만 복사해 좌표와 토픽을 수정한다.
+frame_id: map
+update_rate_hz: 20.0
+odom_timeout: 0.4
+
+topics:
+  odom: /odom
+  route: /local_path
+  tracked_objects: /perception/roundabout/tracked_objects
+  localization_valid: /localization/valid
+  constraint: /mission/constraints/roundabout
+  state: /mission/roundabout/state
+  debug: /mission/roundabout/debug
+  markers: /mission/roundabout/markers
+
+tracked_objects:
+  min_confidence: 0.4
+  require_velocity_valid: false
+  require_movement_confirmation: false
+
+roundabout:
+  enabled: false  # 아래 현장 좌표를 입력한 뒤 true로 변경
+  counter_clockwise: true
+  require_tracker_stream: true
+  require_localization: true
+
+  # 모든 좌표는 frame_id 기준[m]
+  center: {x: 0.0, y: 0.0}
+  yield_point: {x: 0.0, y: 0.0}     # 양보선 중앙
+  conflict_point: {x: 0.0, y: 0.0}  # 진입 차로와 순환 차로가 만나는 점
+  exit_point: {x: 0.0, y: 0.0}      # 선택한 출구 시작점
+  entry_heading_deg: 0.0             # 양보선으로 접근하는 차량 진행각[deg]
+  entry_heading_tolerance_deg: 70.0
+  tangent_heading_tolerance_deg: 60.0
+
+  radius:
+    inner: 8.0    # NPC를 순환 차량으로 볼 최소 중심거리[m]
+    outer: 18.0   # NPC를 순환 차량으로 볼 최대 중심거리[m]
+    nominal: 13.0 # TTC 원호 길이를 계산할 대표 반지름[m]
+
+  distance:
+    activation: 35.0
+    decision: 18.0
+    exit_detection: 6.0
+    exit_clear: 12.0
+    route_projection_tolerance: 4.0
+    stop_buffer: 1.0
+    lead_search: 45.0
+
+  speed:  # 모두 m/s
+    approach: 6.0
+    circulation: 7.0
+    exit: 8.0
+    degraded: 2.0  # 진입 후 LiDAR 추적이 끊겼을 때 정지 대신 저속 통과
+    stationary_threshold: 0.3
+
+  gap:
+    ego_merge_time: 2.0             # 양보선에서 합류를 끝낼 때까지 시간[s]
+    rear_time: 4.0                  # 합류 완료 뒤 남길 후방 시간 여유[s]
+    rear_time_is_total_ttc: false   # true면 rear_time 자체를 최종 최소 TTC로 사용
+    relax_start_seconds: 5.0        # YIELD 진입 후 완화를 시작할 시간[s]
+    relax_rate: 0.1                 # 대기 1초당 기준 감소량[s/s], 0이면 비활성
+    rear_ttc_relax_floor: 3.0       # 후방 TTC 절대 하한[s]
+    rear_ttc_relax_max: 0.5         # 후방 TTC 최대 완화량[s]
+    front_time: 2.0                 # 충돌점 통과 차량과 남길 앞 간격[s]
+    front_time_relax_floor: 1.2     # 앞차 시간 간격 절대 하한[s]
+    front_standstill_distance: 5.0
+    front_departure_speed_ratio: 1.0 # 앞 간격 계산에 쓸 approach 속도 비율[0~1]
+    front_check_distance: 35.0
+    stationary_block_distance: 20.0
+    uncertain_object_block_distance: 15.0
+    prediction_uncertainty_time: 0.5
+    safe_confirm_seconds: 0.5       # 안전 판정이 연속 유지돼야 하는 시간[s]
+    safe_confirm_relax_floor: 0.15  # 장기 대기 후 연속 확인 하한[s]
+
+  timing:
+    tracker_timeout: 0.5
+    mandatory_stop_seconds: 0.0           # 0이면 강제 정지시간 기능 비활성[s]
+    mandatory_stop_position_tolerance: 0.5 # 정지 목표 도착 판정 거리[m]
+    mandatory_stop_speed_threshold: 0.25   # 완전정지 판정 자차속도[m/s]
+    minimum_circulate_seconds: 1.0
+    commit_timeout_seconds: 8.0
+    exit_hold_seconds: 1.0
+
+  safety:
+    reset_jump_distance: 5.0
+    comfortable_decel: 2.5
+    emergency_decel: 5.0
+
+# /demo/nonground를 직접 처리하며 new_lane과 MORAI 객체 토픽을 사용하지 않는다.
+lidar_tracker:
+  enabled: false  # center와 반지름을 입력한 뒤 true로 변경
+  topics:
+    cloud: /demo/nonground
+    odom: /odom
+    output: /perception/roundabout/tracked_objects
+    markers: /perception/roundabout/tracker_markers
+    roi_cloud: /perception/roundabout/roi_cloud
+    vehicle_cloud: /perception/roundabout/vehicle_cloud
+    aligned_cloud: /perception/roundabout/aligned_cloud
+  expected_cloud_frame: os_sensor
+  # sensor_nonground | sensor_raw | map_groundgrid
+  input_mode: sensor_nonground
+  max_processing_hz: 12.0
+  processing_radius: 80.0
+  odom_timeout: 0.35
+  cloud_timeout: 0.5
+  reset_jump_distance: 5.0
+
+  # LiDAR 원점의 base_link 기준 위치[m, deg]
+  sensor_extrinsic: {x: 1.10, y: 0.0, z: 1.33, yaw_deg: 0.0}
+
+  roi:
+    min_range: 1.5
+    max_range: 60.0
+    min_z: -0.8
+    max_z: 2.5
+    ring_margin: 3.0
+  voxel_size: 0.2
+  groundgrid:
+    nonground_min_intensity: 90.0
+  raw_ground:
+    percentile: 20.0
+    clearance: 0.25
+
+  cluster:
+    tolerance: 0.8
+    min_points: 5
+    max_points: 1500
+  vehicle_filter:
+    min_length: 0.4
+    max_length: 8.0
+    min_width: 0.15
+    max_width: 6.0
+    min_height: 0.2
+    max_height: 4.0
+    reject_low_linear: true
+    linear_min_length: 2.0
+    linear_max_width: 0.45
+    linear_max_height: 1.3
+    linear_min_aspect_ratio: 6.0
+
+  tracking:
+    association_distance: 3.0
+    position_alpha: 0.75
+    velocity_alpha: 0.4
+    circular_velocity_enabled: true
+    velocity_window_size: 7
+    velocity_min_span: 0.12
+    size_alpha: 0.5
+    stale_seconds: 0.6
+    max_prediction_seconds: 0.3
+    max_object_speed: 30.0
+    min_confirm_hits: 3
+    min_velocity_hits: 4
+    moving_speed_threshold: 0.7
+    moving_distance_threshold: 1.0
+    moving_confirm_hits: 3

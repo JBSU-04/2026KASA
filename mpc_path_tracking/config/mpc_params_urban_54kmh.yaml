@@ -1,0 +1,143 @@
+cost_weight:
+  cte_cost_weight: 3500
+  epsi_cost_weight: 2200
+
+  # cost += v_start_weight * (v[t] - v_target[t])^2
+  # v[t] : 예측된 차량 속도 , v_target : MPC가 정한 목표 속도
+  v_start_weight: 20
+
+  delta_cost_weight: 800
+
+  # cost += delta_start_cost_weight * (delta[0] - previous_delta_cmd)^2
+  # 매 solve 첫 조향이 직전 실제 command와 이어지도록 해서 고속 직선 조향 부호 플리핑을 줄임
+  delta_start_cost_weight: 30000
+
+  # 오차 발생 시 속도를 임의로 깎지 않고 ref_v(15 m/s)를 사수하도록 설정
+  v_target_cost_weight: 300
+  delta_change_cost_weight: 350000
+
+  # 속도 명령 입력 부드럽게
+  v_target_change_cost_weight: 100
+
+urban_control:
+  cte_cost_start_weight: 3500.0
+  cte_cost_urban_weight: 1500.0
+  epsi_cost_weight: 2400.0
+  delta_cost_start_weight: 3500.0
+  delta_cost_high_speed_weight: 38000.0
+  delta_cost_start_mps: 7.0
+  delta_cost_full_mps: 15.0
+  delta_change_cost_start_weight: 450000.0
+  delta_change_cost_urban_weight: 650000.0
+  preview_distance_m: 28.0
+
+highway_control:
+  cte_cost_weight: 1200.0
+  epsi_cost_weight: 9500.0
+  delta_cost_weight: 42000.0
+  delta_change_cost_weight: 600000.0
+  preview_distance_m: 45.0
+
+speed_scheduled_cost:
+  enabled: true
+  delta_cost_start_mps: 7.0
+  delta_cost_full_mps: 15.0
+  delta_cost_start_weight: 3500.0
+  delta_cost_high_speed_weight: 38000.0
+
+k_v: 0.4
+N: 30 # horizon 30*0.05 = 1.50 s. 45 는 IPOPT 가 9.6 Hz 로 처져 슬루가 실효 1.08 rad/s 로 깎였다.
+dt: 0.05
+ref_v: 15.0
+speed:
+  upperBound: 40.0
+  lowerBound: 0.0
+steer:
+  upperBound: 0.6981
+  lowerBound: -0.6981
+  # 모라이 부호 반대
+  command_sign: -1.0
+  # 조향 슬루레이트 (1.8 rad/s = 103 deg/s로 물리 액추에이터 지연 및 위상 오실레이션 억제)
+  command_rate_limit_radps: 1.8
+
+  # 최종 /ctrl_cmd.steering 출력 LPF (EKF 50Hz 환경에서 0.65로 위상 지연 110ms -> 45ms로 단축, 즉각적인 코너 턴인 실현)
+  output_lpf_enabled: true
+  output_lpf_alpha: 0.65
+
+# 규정 2-6-1 아이오닉5 축거 3.000 m.
+# 기존 2.0 은 erp-42(축거 1.04) 시절부터 남은 튜닝값이라 실차 운동학과 어긋났다.
+# Lf 를 키우면 같은 조향각에서 예측 요레이트가 작아진다 -> MPC 가 더 큰 조향을 낸다.
+Lf: 3.0
+
+# MORAI CtrlCmd longitudinal control.  Mode 1 directly controls pedals using
+# /Competition_topic speed feedback; accel and brake are clamped to 0~1.
+longitudinal:
+  command_type: 1
+  throttle_kp: 0.22
+  throttle_ki: 0.02
+  throttle_integral_limit: 2.0
+  throttle_accel_limit: 0.60
+  # M6/M7(고주로) 구간 전용. 도심 0.60은 M2/M3 저속(36km/h) 기준 검증값이라
+  # 그대로면 고주로 목표(25 m/s)까지 가속이 못 따라간다.
+  throttle_accel_limit_exempt: 1.0
+  # 정동적 원본 값(0.60)으로 복원(2026-09-03). 1.00은 이번 병합 과정에서
+  # 들어간 값이었다 - kick_brake_limit(급정지 전용)와 분리돼 있지 않아서
+  # 평소 감속에도 풀 브레이크를 썼다.
+  throttle_brake_limit: 0.60
+  # static_speed_scale(카메라/라이다 감속 킥, /obstacle_avoidance/static_speed_scale)
+  # 걸릴 때만 쓰는 별도 브레이크 세기. 평소 순항속도 변화(커브 등)는
+  # throttle_brake_limit 로 부드럽게, 킥은 더 세게. 2026-09-03 mpc_path_tracking.h
+  # 에 static_speed_scale 구독·kick_brake_limit 분기를 정동적 원본대로 이식.
+  kick_brake_limit: 1.0
+  # 브레이크가 한 사이클 만에 확 튀는(노이즈성) 걸 막는 초당 최대 증가량.
+  # 실제 위험 정지는 obstacle_stop_node가 /ctrl_cmd 를 직접 덮어써서 이 경로를
+  # 안 거치므로 안전엔 무관.
+  brake_rate_limit_per_sec: 1.2
+
+# /local_path가 끝점 근처에서 너무 짧아지면 3차 polyfit에 필요한 점이 부족해
+# MPC 노드가 assert로 죽을 수 있다. 이때는 MPC solve를 건너뛰고 stop command를 낸다.
+path_end_stop:
+  enabled: true
+  min_polyfit_points: 4
+
+# waypoint_system CSV 4번째 컬럼 mission_state 기반 속도 계획.
+# 단위는 모두 m/s. 각 state 목표속도를 먼저 적용하고,
+# 이후 curvature_speed가 필요하면 한 번 더 낮춘다.
+mission_speed:
+  enabled: true
+  rate_limit_up_mps2: 2.2
+  rate_limit_down_mps2: 3.0
+  # 0.csv 도심 구간 전체 기본 순항속도 15.0 m/s (54 km/h) 일괄 적용
+  default_mps: 15.0
+  state_0_mps: 15.0
+  state_1_mps: 15.0
+  state_2_mps: 15.0
+  state_3_mps: 25.0 # 고주로 전용 상태 유지
+  state_4_mps: 18.06 # 고주로 3.csv 속도제한 (65 km/h)
+  state_5_mps: 15.0
+  state_6_mps: 15.0
+  state_7_mps: 15.0
+  state_8_mps: 15.0
+  state_9_mps: 15.0
+  state_10_mps: 15.0
+  state_11_mps: 15.0
+  state_12_mps: 15.0
+
+# Curvature-based speed limit.
+# MPC 추종은 /local_path를 유지하고, 속도 제한은 /final_waypoint.rk를
+# 경로 누적거리 기준으로 preview한다. rk가 없으면 polyfit 곡률로 fallback.
+# 커브에서는 Solve 1회 동안 ref_v/speed.upperBound를 낮춘다.
+curvature_speed:
+  enabled: true
+  use_waypoint_rk: false
+  fallback_to_polyfit: true
+  lateral_accel_limit_mps2: 2.8 # 안정적 그립 횡가속도 (약 0.29 g, 타이어 슬립 없는 최대 선회력)
+  min_speed_mps: 5.5 # 급커브 최소 속도 (19.8 km/h, 14 km/h 대비 40% 빠르면서도 완벽한 그립 확보)
+  max_speed_mps: 0.0 # 0이면 ref_v/speed.upperBound 중 작은 값 사용
+  preview_distance_m: 30.0 # 30m 전방 감지 (54 km/h에서 20 km/h까지 안전 제동거리 21m 완벽 수용)
+  min_lookahead_m: 0.5 # 바로 앞 피팅 노이즈 무시
+  deadband_inv_m: 0.035 # R < 28m 급커브 감속
+  sample_count: 40
+  percentile: 0.80 # 1.0이면 max, 0.90이면 상위 90% 곡률 사용
+  rate_limit_up_mps2: 4.0 # 커브 탈출 후 15 m/s까지 신속 재가속
+  rate_limit_down_mps2: 4.5 # 커브 진입 전 확실한 제동 감속

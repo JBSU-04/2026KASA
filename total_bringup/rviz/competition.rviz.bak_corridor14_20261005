@@ -1,0 +1,439 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /장애물1
+      Splitter Ratio: 0.5
+    Tree Height: 640
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.25
+      Cell Size: 10
+      Class: rviz/Grid
+      Color: 90; 90; 96
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Grid 10m
+      Normal Cell Count: 0
+      Offset: {X: 0, Y: 0, Z: 0}
+      Plane: XY
+      Plane Cell Count: 60
+      Reference Frame: base_link
+      Value: true
+
+    # ===================== LiDAR 원시/클러스터 입력 =====================
+    # 회색: 센서 원시점군. 지면과 실제 장애물이 모두 포함된다.
+    - Alpha: 0.28
+      Autocompute Intensity Bounds: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 175; 175; 175
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: LiDAR RAW (/velodyne_points)
+      Position Transformer: XYZ
+      Queue Size: 2
+      Selectable: false
+      Size (Pixels): 2
+      Size (m): 0.025
+      Style: Points
+      Topic: /velodyne_points
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+
+    # 청록: GroundGrid가 지면을 제거한 뒤 장애물 클러스터링에 넣는 점군.
+    # 아래 미션별 MarkerArray와 겹쳐 보면 어떤 점들이 장애물로 확정됐는지
+    # 바로 비교할 수 있다.
+    - Alpha: 0.90
+      Autocompute Intensity Bounds: false
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 0; 235; 210
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: 클러스터 입력 (/nonground)
+      Position Transformer: XYZ
+      Queue Size: 2
+      Selectable: false
+      Size (Pixels): 4
+      Size (m): 0.04
+      Style: Points
+      Topic: /nonground
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+
+    # ===================== 장애물 (최종 판정된 것만) =====================
+    # 정동적: obstacle_perception 이 코리도·형상·고도 필터를 모두 통과시킨 트랙
+    #         파랑=정적 / 주황=동적 (+동적은 속도 화살표)
+    # 연석/회피 폭 상한: 노랑=실측 우측 연석(밝음 17:26 주행 / 흐림 6주행),
+    # 빨강=우측 상한, 회색=우측 개방(교차로), 초록=좌측 상한, 흰 글자=상한과 근거.
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /occupancy_avoidance/markers
+      Name: 점유 지도 회피 통로와 차량 외곽
+      Namespaces: {}
+      Queue Size: 1
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /perception/reference_corridor
+      Name: 기준경로 인지 코리도 (자홍색)
+      Namespaces: {}
+      Queue Size: 1
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /obstacle_occupancy/markers
+      Name: 장애물 관측(청록) 보존(주황) 외곽
+      Namespaces: {}
+      Queue Size: 2
+      Value: true
+
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /obstacle_avoidance/curb_zone_markers
+      Name: 회피 폭 상한(연석)
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /obstacle_markers
+      Name: 정동적 장애물
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /reverse_escape/debug_markers
+      Name: 후진 회피 8초 타이머
+      Namespaces: {}
+      Queue Size: 10
+      Value: true
+
+    # 주황 반투명: M2 원시점 시간누적으로 먼저 잡은 원거리 제안.
+    # 근거리 GroundGrid 확정 박스와 겹치면 merger가 근거리 결과를 우선한다.
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /obstacle_markers_far
+      Name: 정적 장애물 원거리 선행검출
+      Namespaces: {}
+      Queue Size: 20
+      Value: true
+
+    # 고주로: lidar_ttc_tracker 중 is_vehicle 확정 트랙만
+    #         (차량=파랑, 지속 원거리 후보=주황, 기타 unknown=회색)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /tracked_objects_markers
+      Name: 고주로 차량
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # 고주로 차선 귀속 결과. CURRENT_FRONT=빨강, TARGET_FRONT=초록,
+    # TARGET_REAR=파랑이며 차량 위 텍스트로 역할/ID/거리/속도를 표시한다.
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /smpc/target_markers
+      Name: 고주로 ACC 차선 타겟 (CURRENT/TARGET)
+      Namespaces:
+        smpc_ego_heading: true
+        smpc_ego_label: true
+        smpc_ego_vehicle: true
+        smpc_target_heading: true
+        smpc_target_labels: true
+        smpc_target_vehicles: true
+      Queue Size: 100
+      Value: true
+
+    # 회전교차로: 순환 차량으로 확정된 트랙
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /perception/roundabout/tracker_markers
+      Name: 회전교차로 차량
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /perception/roundabout/roi_markers
+      Name: 회전교차로 차량 ROI
+      Namespaces: {}
+      Queue Size: 10
+      Value: true
+
+    # 회전교차로 미션 상태(양보선·충돌점·상태 텍스트)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /mission/roundabout/markers
+      Name: 회전교차로 미션
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # 터널 벽 검출 원본: 초록=우측 벽, 파랑=좌측 벽, 노랑=목표 중심,
+    # 외곽 사각형=라이다 선감속 검사영역. 실제 직선 벽 피팅이 성공할 때만 보인다.
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /tunnel/wall_markers
+      Name: 터널 라이다 벽 검출(실측)
+      Namespaces: {}
+      Queue Size: 10
+      Value: true
+
+    # 터널 벽 제한영역(노랑 연석선, 빨강/초록 우/좌 한계, 선감속 영역 3~35m)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /obstacle_avoidance/tunnel_zone_markers
+      Name: 터널 벽 제한영역
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # 터널 라이다 배경맵(회색) / 배경에 없는 점(빨강), 확인된 새 물체(주황 원기둥)
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /tunnel/bg_map
+      Name: 터널 배경맵
+      Namespaces: {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /tunnel/bg_markers
+      Name: 터널 배경맵 새 물체
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # Official X-ICP comparison only (no control/TF changes).
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /tunnel/xicp/markers
+      Name: 터널 X-ICP 비교 전용
+      Namespaces: {}
+      Queue Size: 2
+      Value: true
+
+    # 회전교차로 틈 선택(앞/뒤 차량 사이 공간, 선택 틈 초록)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /mission/roundabout/gap_markers
+      Name: 회전교차로 틈 선택
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # 고주로 SMPC 차선변경 안전 영역 (+10m / -15m)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /smpc/yield_zone_markers
+      Name: 고주로 안전구간 (+10m/-15m)
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # 고주로 ACC 추종 타겟 차량 (15m 목표거리 / TTC / 상태 HUD)
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /smpc/acc_target_marker
+      Name: ACC 타겟 추종 (15m/TTC)
+      Namespaces: {}
+      Queue Size: 100
+      Value: true
+
+    # ===================== 경로 =====================
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 255; 200; 0
+      Enabled: true
+      Head Diameter: 0
+      Line Style: Lines
+      Line Width: 0.12
+      Name: local_path
+      Offset: {X: 0, Y: 0, Z: 0}
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.03
+      Shaft Diameter: 0
+      Topic: /local_path
+      Unreliable: false
+      Value: true
+
+    - Alpha: 0.5
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 60; 120; 200
+      Enabled: false
+      Head Diameter: 0
+      Line Style: Lines
+      Line Width: 0.06
+      Name: global_path
+      Offset: {X: 0, Y: 0, Z: 0}
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.03
+      Shaft Diameter: 0
+      Topic: /global_path
+      Unreliable: false
+      Value: false
+
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 0; 255; 160
+      Enabled: true
+      Head Diameter: 0
+      Line Style: Lines
+      Line Width: 0.08
+      Name: MPC 예측경로
+      Offset: {X: 0, Y: 0, Z: 0}
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.03
+      Shaft Diameter: 0
+      Topic: /rviz_predicted_path
+      Unreliable: false
+      Value: true
+
+    # ===================== 자차 =====================
+    - Alpha: 1
+      Class: rviz/Odometry
+      Covariance:
+        Value: false
+      Enabled: true
+      Keep: 1
+      Name: 자차 odom
+      Position Tolerance: 0.1
+      Queue Size: 10
+      Shape:
+        Alpha: 1
+        Color: 255; 255; 255
+        Head Length: 0.5
+        Head Radius: 0.4
+        Shaft Length: 1.5
+        Shaft Radius: 0.15
+        Value: Arrow
+      Topic: /odom
+      Unreliable: false
+      Value: true
+
+    - Class: rviz/TF
+      Enabled: false
+      Name: TF
+      Show Arrows: false
+      Show Axes: true
+      Show Names: true
+      Marker Scale: 2
+      Value: false
+
+    # ===================== 추가 진단용 (기본 off) =====================
+    - Alpha: 0.5
+      Class: rviz/PointCloud2
+      Color: 70; 130; 70
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: false
+      Name: (진단) ground
+      Position Transformer: XYZ
+      Queue Size: 2
+      Selectable: false
+      Size (Pixels): 2
+      Size (m): 0.02
+      Style: Points
+      Topic: /groundgrid/ground
+      Unreliable: false
+      Use Fixed Frame: true
+      Value: false
+
+  Enabled: true
+  Global Options:
+    Background Color: 22; 22; 26
+    Default Light: true
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/Measure
+  Value: true
+  Views:
+    Current:
+      Angle: 0
+      Class: rviz/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Scale: 12
+      Target Frame: base_link
+      X: 0
+      Y: 0
+    Saved:
+      - Angle: 0
+        Class: rviz/TopDownOrtho
+        Name: 자차 추종 TOP
+        Near Clip Distance: 0.01
+        Scale: 12
+        Target Frame: base_link
+        X: 0
+        Y: 0
+      - Angle: 0
+        Class: rviz/TopDownOrtho
+        Name: 넓게 보기
+        Near Clip Distance: 0.01
+        Scale: 5
+        Target Frame: base_link
+        X: 0
+        Y: 0
+      - Class: rviz/ThirdPersonFollower
+        Distance: 28
+        Enable Stereo Rendering: {Value: false}
+        Name: 3인칭 추종
+        Near Clip Distance: 0.01
+        Pitch: 0.55
+        Target Frame: base_link
+        Yaw: 3.14
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: true
+  Width: 1800
+  X: 60
+  Y: 30

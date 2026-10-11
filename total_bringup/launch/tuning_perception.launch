@@ -1,0 +1,103 @@
+<launch>
+  <!-- ===================================================================
+       tuning_perception.launch — 인지(지면제거/장애물검출) 튜닝 전용.
+
+       competition.launch 를 그대로 띄우되 RViz 만 튜닝용 구성으로 바꾼다.
+       주행 로직은 건드리지 않으므로, 이 런치로 본 화면이 곧 실주행 화면이다.
+
+       사용:
+         roslaunch total_bringup tuning_perception.launch
+         roslaunch total_bringup tuning_perception.launch record_heavy:=true
+
+       화면 구성(왼쪽 Displays 에서 체크로 껐다 켠다):
+         1 RAW        원본 점군            (기본 off - 필요할 때만)
+         2 GROUND     지면으로 걸러진 점    초록
+         3 NONGROUND  장애물 후보 점        높이색: 파랑=낮음 -> 빨강=높음
+         4 DETECTION  최종 확정 장애물 박스 (정동적 구간)
+         5 TTC        고주로 트래커 박스    (기본 off)
+         6 local_path 추종 경로
+         7 ROUNDABOUT 회전교차로 트래커 박스
+
+       보는 법:
+         - 노면인데 3 NONGROUND 에 파란 점이 깔린다  -> 지면 제거 부족
+         - 라바콘/박스인데 3 에 안 뜬다              -> 지면 제거 과함
+         - 3 에는 뜨는데 4 박스가 안 생긴다          -> 검출 필터가 기각 중
+       =================================================================== -->
+
+  <arg name="sim_ip"       default="192.168.0.1"/>
+  <!-- 수동 조작이 필요하면 MORAI 자체 키보드를 쓴다(별도 노드 불필요):
+         rosparam set /morai_udp_bridge/control/ctrl_mode 1   # 수동
+         rosparam set /morai_udp_bridge/control/ctrl_mode 2   # 자율 복귀
+       예전에는 teleop_tuning_node 를 게이트로 끼우려고 MPC 출력을
+       /control/mpc_cmd 로 우회시켰는데, 그러면 그 노드를 안 띄웠을 때 차가
+       아예 안 움직이고 대회 런치와 명령 경로가 달라져 거동 비교가 안 됐다.
+       이제 대회 런치와 같은 경로를 쓴다. -->
+
+  <arg name="record"       default="true"/>
+  <arg name="record_heavy" default="false"/>
+  <arg name="bag_dir"      default="$(env HOME)/catkin_ws/bags"/>
+
+  <!-- 미션 노드 on/off.
+       인지 튜닝 전용이라 '점군 -> 검출' 만 남기고 판단/정지 계열은 끈다.
+       그래서 대회 런치와 파라미터가 일부 다르다(obstacle_stop_node,
+       roundabout_lidar_tracker 가 안 뜬다). 인지 파라미터 자체와 MPC 는
+       대회 런치와 동일하다 - 같은 config/tuning_perception.yaml 을 쓴다.
+       ※ 주행 거동을 대회와 같게 놓고 보려면 debug.launch 를 쓴다.
+         여기서 미션까지 켜고 싶으면 인자로 넘기면 된다:
+           roslaunch total_bringup tuning_perception.launch \
+             use_obstacle_stop:=true use_roundabout:=true -->
+  <arg name="use_obstacle_perception" default="true"/>
+  <arg name="use_roundabout"          default="false"/>
+  <arg name="use_obstacle_stop"       default="false"/>
+  <arg name="enable_control"          default="true"/>
+
+  <!-- ★ 튜닝 값 주입.
+       config/tuning_perception.yaml 한 파일만 고치면 세 노드에 모두 반영된다.
+       yaml 의 최상위 키가 곧 노드 이름이라, 전역으로 올리면 각 노드가
+       자기 private param 으로 읽는다. 노드보다 먼저 올라가야 하므로
+       include 앞에 둔다. -->
+  <!-- 라이다 장착 기준값(센서고 등). 여러 노드가 같은 물리량을 각자 갖고
+       있다가 서로 어긋났던 이력이 있어(1.25 / 1.686 / -1.68 / 1.592) 한 곳에
+       모았다. /lidar_extrinsic/* 로 올라가고, 각 노드는 아래 tuning yaml 이
+       자기 이름으로 받아 쓴다. -->
+  <rosparam command="load"
+            file="$(find total_bringup)/config/lidar_extrinsic.yaml" />
+
+  <rosparam command="load"
+            file="$(find total_bringup)/config/tuning_perception.yaml" />
+
+  <include file="$(find total_bringup)/launch/competition.launch">
+    <arg name="sim_ip"                  value="$(arg sim_ip)"/>
+    <arg name="use_obstacle_perception" value="$(arg use_obstacle_perception)"/>
+    <arg name="use_roundabout"          value="$(arg use_roundabout)"/>
+    <arg name="use_obstacle_stop"       value="$(arg use_obstacle_stop)"/>
+    <arg name="enable_control"          value="$(arg enable_control)"/>
+    <arg name="use_rviz"                value="true"/>
+    <arg name="rviz_config"             value="$(find total_bringup)/rviz/perception_tuning.rviz"/>
+  </include>
+
+  <!-- 인지 튜닝에 필요한 토픽만 기록. 점군은 record_heavy 로 따로. -->
+  <node if="$(arg record)" pkg="rosbag" type="record" name="tuning_record"
+        output="screen"
+        args="-o $(arg bag_dir)/tuning --lz4
+              /obstacle_info /obstacle_markers /tracked_objects
+              /odom /gps_state /local_path /final_waypoint /ctrl_cmd
+              /mission/constraints/obstacle_stop
+              /mission/constraints/static_obstacle
+              /mission/constraints/dynamic_obstacle
+              /avoidance_failed
+              /obstacle_avoidance/target_speed_mps
+              /obstacle_avoidance/static_speed_scale
+              /control_feedback/mpc_target_speed_mps
+              /control_feedback/mission_speed_target_mps
+              /control_feedback/curvature_speed_limit_mps
+              /control_feedback/curvature_capacity_speed_mps
+              /imu /tf /tf_static" />
+
+  <!-- 지면제거 튜닝은 점군이 있어야 사후 분석이 된다. -->
+  <node if="$(arg record_heavy)" pkg="rosbag" type="record" name="tuning_record_heavy"
+        output="screen"
+        args="-o $(arg bag_dir)/tuning_heavy --lz4
+              /velodyne_points /perception/points_gravity
+              /groundgrid/segmented_sensor /groundgrid/ground /nonground" />
+</launch>

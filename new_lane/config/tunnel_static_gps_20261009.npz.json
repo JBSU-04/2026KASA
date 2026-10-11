@@ -1,0 +1,74 @@
+{
+  "format_version": 2,
+  "empty_drives": [
+    [
+      "bags/competition_2026-10-09-19-05-14.bag",
+      "bags/competition_heavy_2026-10-09-19-05-13.bag"
+    ],
+    [
+      "bags/competition_2026-10-09-19-06-02.bag",
+      "bags/competition_heavy_2026-10-09-19-06-01.bag"
+    ]
+  ],
+  "gps_required": "normal",
+  "sensor_offset": [
+    1.1,
+    0.0,
+    1.33
+  ],
+  "sensor_height": 1.765,
+  "origin": [
+    302665.26383715635,
+    4123727.0398684195,
+    0.0
+  ],
+  "resolution": 0.05,
+  "minimum_distinct_scans": 3,
+  "support_patch_m": 0.2,
+  "points": 2457589,
+  "floor_points": 445593,
+  "drives": [
+    {
+      "scans": 277,
+      "skipped": 0,
+      "points": 1219906,
+      "floor": 226113
+    },
+    {
+      "scans": 291,
+      "skipped": 0,
+      "points": 1281421,
+      "floor": 240813
+    }
+  ],
+  "cross_drive": [
+    {
+      "drive": 0,
+      "other": 1,
+      "matched": 1182282,
+      "visible_conflicts": 19567
+    },
+    {
+      "drive": 1,
+      "other": 0,
+      "matched": 1219126,
+      "visible_conflicts": 24171
+    }
+  ],
+  "floor_comparison": [
+    {
+      "drive": 0,
+      "other": 1,
+      "matched": 208990,
+      "visible_conflicts": 9639
+    },
+    {
+      "drive": 1,
+      "other": 0,
+      "matched": 213394,
+      "visible_conflicts": 11694
+    }
+  ],
+  "version": "gps_empty_20261009",
+  "notes": "Measured ray visibility only. Cross-drive observed conflicts excluded; absent/unobserved coverage not filled."
+}

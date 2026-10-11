@@ -1,0 +1,8 @@
+<launch>
+  <node pkg="control_pkg" type="control_mux_node" name="control_mux_node" output="screen">
+    <rosparam command="load" file="$(find control_pkg)/config/control.yaml"/>
+  </node>
+  <node pkg="control_pkg" type="vehicle_control_node" name="vehicle_control_node" output="screen">
+    <rosparam command="load" file="$(find control_pkg)/config/control.yaml"/>
+  </node>
+</launch>

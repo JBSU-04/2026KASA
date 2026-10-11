@@ -1,0 +1,574 @@
+enabled: true
+publish_rate_hz: 20.0
+target_timeout_sec: 0.5
+lane_start_extension_m: 80.0
+lane_start_extension_spacing_m: 0.1
+
+active_section_topic: /mission/active_section
+section_gate_enabled: true
+section_gate_timeout_sec: 1.0
+# 합류 전 조기 변경을 인덱스로 막으려 했으나 비활성화한다(-1).
+#   20:25 백의 '너무 이른 변경'은 idx 10831 이었는데, 20:38 백에서 정상적인
+#   변경 기회(feasible=1 confirmed=1, cost keep=60 vs change=0.5)는 idx
+#   10573 부터 열렸다. 두 값이 겹쳐 단일 인덱스 문턱으로는 구분되지 않는다.
+#   11000 을 걸었더니 그 정상 기회가 desire=0 으로 죽고, 문턱을 넘겼을 때는
+#   이미 feasible=0 이 되어 그 주행에서 변경을 아예 못 했다.
+# 조기 변경의 실제 원인은 target_selector 의 distance_to_lane_end 가 CSV
+# 전체 길이 기준이라 합류구간 끝과 다르다는 것이다. 거기서 해결해야 한다.
+lane_change_min_index_csv: 0
+lane_change_min_index: 10800
+
+# Prediction horizon. 40 * 0.2 = 8.0 s covers a preparation phase, the
+# waypoint-blend prediction, and a post-merge safety buffer.  The blend time
+# is a prediction parameter, not a claim about the measured vehicle duration.
+horizon_steps: 40
+prediction_dt_sec: 0.2
+risk_epsilon: 0.04
+urgent_risk_epsilon: 0.15
+
+# A/B test: target_selector continues to publish nearby_vehicles for RViz and
+# diagnostics, but behavior-risk evaluation uses only current_front,
+# target_front, and target_rear unless this is enabled.
+risk_include_nearby_vehicles: true
+
+ego_length_m: 4.8
+ego_width_m: 1.9
+# MPC publishes the CSV mission_state speed target here.  Keep the speed policy
+# in mpc_path_tracking/config/mpc_params.yaml; SMPC only consumes it.
+mission_speed_topic: '/control_feedback/mission_speed_target_mps'
+mission_speed_timeout_sec: 0.5
+# Highway design fallback: 65 km/h. Fresh MPC mission speed still has priority.
+mission_speed_fallback_mps: 18.06
+# Use the lower fresh ACC output in ego trajectory prediction.  This keeps a
+# vehicle waiting at the lane-end stop line from being modelled as instantly
+# accelerating at mission speed.
+ego_prediction_use_acc_target_speed: true
+ego_prediction_acc_target_speed_topic: '/smpc/target_speed_mps'
+ego_prediction_acc_target_speed_timeout_sec: 0.5
+standstill_gap_m: 5.0
+time_headway_sec: 1.0
+
+# Deterministic bbox-edge safety gates for 60~70 km/h operation.
+# 80m gives about 4.1s at 70km/h when approaching a stopped object.
+current_front_trigger_gap_m: 80.0
+current_front_safe_gap_m: 15.0
+# 목표 차로의 별도 고정 앞/뒤 간격(10m/15m)을 차선변경 게이트에서 끈다.
+# 아래 값은 되돌릴 때를 위한 설정값이며, false 동안에는 속도 기반
+# side_vehicle_yield_*_window 가 즉시/미래 점유 검사에 쓰인다.
+# TTC, 실행 경로 충돌 위험, 남은 경로 및 3회 연속 확인은 유지한다.
+fixed_target_gap_gate_enabled: false
+probabilistic_risk_gate_enabled: false # 확률 임계값은 진단/비용만; 실제 궤적 겹침은 계속 차단
+target_front_safe_gap_m: 10.0
+target_rear_safe_gap_m: 15.0
+# In the prepare phase, trajectory risk remains the primary decision gate.
+# These are only immediate bumper-gap guards; closing traffic is protected by
+# the TTC gates below.
+prepare_merge_front_safe_gap_m: 10.0
+prepare_merge_rear_safe_gap_m: 15.0
+# projectedTargetGapTtcSafe 의 미래 예측 창(초).
+#   이전에는 lane_change_duration(3.5s, + post_merge_buffer 1.0)을 그대로
+#   썼는데, 그 값은 MPC 블렌딩 시간이라 곡률/승차감 기준으로 정해진다.
+#   경로를 완만하게 하려고 3.25 -> 3.50 으로 올리면 위험 예측 창도 같이
+#   길어져 변경이 더 보수적으로 바뀌는 결합이 있었다. 두 값은 목적이
+#   다르므로 분리해 여기서 직접 정한다.
+#   0 이하로 두면 기존처럼 lane_change_duration 을 따라간다.
+projected_gap_ttc_horizon_sec: 2.0
+# 커밋 히스테리시스 (2026-09-16, src_최적 kcity2026 _score 에서 가져옴).
+#   한 번 변경을 확정한 뒤에는 같은 목표 차로 후보 비용을 이만큼 깎아,
+#   관측이 조금 흔들렸다고 판단이 뒤집혀 차로 사이에서 멈추는 것을 막는다.
+#   src_최적은 committed 후보에 -7.0 / 다른 후보에 +9.0 을 준다.
+#   안전 게이트(change_confirmed)는 그대로라 위험해지면 실행되지 않는다.
+commit_hysteresis_enabled: true
+commit_bias_cost: 7.0
+commit_hold_sec: 2.0
+# 목표 차로 차량 속도 추정 신뢰도 게이트 (2026-09-16 실측).
+#   중앙차분 기준 오차(n=523): std 0~1.0 RMS 1.05 / 1.0~2.0 RMS 1.45 /
+#   2.0+ RMS 1.8. 1.0 을 넘으면 급격히 나빠진다.
+# (1) 양보 목표속도(commanded = side_veh_speed + 0.5*gap_err)의 기준점을
+#     신뢰 불가 시 자차 속도로 대체해, 틀린 추정이 목표속도를 통째로
+#     흔드는 것을 막는다.
+# (2) 폐쇄속도에 얹는 안전 마진 배수. 기존엔 무조건 2*std 였는데, 신뢰
+#     구간에서는 1*std 로 낮춘다 - 없는 위험을 만들어 차선변경을 막던
+#     원인이었다(20:38 백: 간격이 벌어지는 중인데 projected_gap_ttc=0).
+#     신뢰 구간 밖은 기존 2 배를 그대로 쓴다.
+trusted_speed_gate_enabled: true
+trusted_speed_max_std_mps: 1.0
+trusted_speed_std_margin_scale: 1.0
+untrusted_speed_std_margin_scale: 2.0
+target_front_min_ttc_sec: 1.5 #1.5 #3.0
+target_rear_min_ttc_sec: 1.8 #1.8 #3.5
+# TTC alone cannot reject a same-speed rear vehicle. Keep at least this much
+# rear time-headway while entering its lane (1.2 s = 20~23.3m at 60~70km/h).
+target_rear_min_headway_sec: 1.2
+# 자차 속도로 확장되는 즉시 점유영역이 비어 있으면, 라이다 속도 미분에
+# 민감한 TTC/headway는 보조 조건으로만 쓴다. 실행 가능한 경로, 범퍼 간격,
+# 예측 궤적 겹침 검사는 계속 유지한다. 점유영역에 차량이 들어오면 위의
+# 일반 TTC/headway 기준으로 즉시 복귀한다.
+clear_zone_ttc_relax_enabled: true
+clear_zone_front_min_ttc_sec: 1.0 #0.8
+clear_zone_rear_min_ttc_sec: 1.2 #0.8
+clear_zone_rear_min_headway_sec: 0.2
+# 가속 합류 중 일시적으로 후방 간격이 줄어도 허용하는 물리 하한.
+clear_zone_projected_rear_min_gap_m: 8.0
+# 저속 TTC 완화는 CHANGE_NOW 궤적이 실제로 가속할 때만 허용한다.
+clear_zone_merge_accel_min_gain_mps: 0.5
+# 점유영역이 비었을 때의 시간지표 risk 문턱. TTC/headway 만 풀고 이걸 그대로
+# 두면 간격이 넉넉해도 "앞차가 급제동할 수 있다"는 시나리오 확률만으로 막힌다.
+#   실측 2026-09-15(16:49 백) t=23.0: 양보 완료 후 앞차 10.2 m, 뒤 비어 있음,
+#   ttc_ok 1/1, zone_ttc_relaxed=1 인데 legacy_change=0.295 > 0.150 으로 거부.
+# 궤적 겹침(clearance)과 최소 범퍼 간격은 그대로라 실제 충돌 궤적은 계속 막힌다.
+clear_zone_risk_epsilon: 0.35
+urgent_merge_front_safe_gap_m: 10.0
+urgent_merge_rear_safe_gap_m: 18.0
+emergency_merge_front_safe_gap_m: 6.5
+emergency_merge_rear_safe_gap_m: 4.5
+emergency_merge_risk_epsilon: 0.25
+
+# Remaining-lane pressure. From 120 m to 30 m, reduce only the conservative
+# merge margins continuously. Collision overlap remains forbidden, invalid or
+# stale velocity still fails closed, and the low-speed rear launch guard stays.
+deadline_relax_enabled: true
+deadline_relax_start_distance_m: 120.0
+deadline_relax_full_distance_m: 30.0
+deadline_relax_front_gap_floor_m: 7.0
+deadline_relax_rear_gap_floor_m: 10.0
+deadline_relax_front_ttc_floor_sec: 1.0 #1.2
+deadline_relax_rear_ttc_floor_sec: 1.2 #1.5
+deadline_relax_rear_headway_floor_sec: 0.8
+
+# 대기시간 기반 완화. 차선변경을 원하는데(desire_change) 확정을 못 받은
+# 상태가 이어지면, 위 deadline_relax_*_floor 값까지 요구치를 낮춘다.
+# 거리 기반 완화와 같은 0~1 스케일이고 둘 중 큰 값을 쓴다 - 차선 끝이
+# 아직 멀어 거리 완화가 0 인 구간에서도 동작한다.
+#   실측 2026-09-14(13:00 백): 2->3 변경이 20초간 wait_for_gap 에 머물렀다.
+#   그 사이 target_rear 는 계속 무효(뒤차 없음)였고 target_front 만 25 m
+#   앞에 있었다.
+# grace 3초 동안은 완화 없음 -> 이후 3초에 걸쳐 floor 까지 선형 완화.
+# 완화는 gap/TTC/headway 요구치만 낮춘다. 궤적 충돌 검사(clearance)와
+# 시간지표 risk 게이트는 그대로라, 실제로 겹치는 변경은 계속 거부된다.
+wait_relax_enabled: true
+wait_relax_grace_sec: 2.0
+wait_relax_ramp_sec: 3.0
+
+# Do not relax target-lane rear safety at highway speed. A previous merge
+# priority could reduce the rear requirement while ego was moving laterally.
+merge_priority_enabled: false
+merge_priority_rear_safe_gap_m: 4.5
+merge_priority_rear_min_gap_m: 4.0
+merge_priority_rear_max_closing_mps: 3.5
+merge_priority_rear_min_ttc_sec: 1.5 #1.8
+merge_priority_rear_risk_scale: 0.10
+merge_priority_nearby_rear_risk_scale: 0.05
+
+# 8 m/s 이하에서는 동적 안전영역이 비고 CHANGE_NOW 궤적이 실제로
+# 가속할 때만 TTC를 완화한다. 가속할 수 없거나 영역 안에 차량이 있으면
+# 기존 저속 후방 보호를 유지한다.
+low_speed_rear_safety_enabled: true
+low_speed_rear_ego_speed_mps: 8.0
+low_speed_rear_safe_gap_m: 15.0
+low_speed_rear_min_ttc_sec: 1.5 #2.0
+
+# Ego current-lane ownership priority: in multi-lane merge zones, side-lane
+# vehicles that are trying to enter ego's current lane should not make ego yield
+# too early. They still become hard hazards once they are very close in front.
+ego_lane_priority_enabled: true
+ego_lane_priority_current_max_abs_d_m: 1.25
+ego_lane_priority_front_hard_gap_m: 8.0
+ego_lane_priority_side_risk_scale: 0.08
+
+# V2 trajectory rollout.
+lane_width_m: 3.5
+lane_change_duration_sec: 4.0 # fallback when use_waypoint_linear_blend=false
+use_waypoint_linear_blend: true # legacy fallback only; normal path uses /path_switch_preview
+waypoint_blend_steps: 120 # legacy fallback matching waypoint_system/config/base.yaml
+waypoint_blend_rate_hz: 30.0 # legacy fallback
+# waypoint_system/config/base.yaml 의 path_switch_blend_duration_sec_ 과
+# 반드시 같아야 한다. 평상시에는 PathSwitchPreview 가 실제 값을 실어
+# 오므로 이건 preview 가 없을 때의 폴백이다. 3.5 -> 2.75 (실측 안착 2.7s).
+waypoint_blend_duration_sec: 4.00 # matches waypoint_system spatial blend
+lane_center_decay_tau_sec: 1000000.0 # Hold target-vehicle d; no lane-centering drift.
+
+# SMPC must evaluate the reference that waypoint_system will actually pass to
+# the MPC.  A stale/missing preview fails closed for CHANGE_LEFT rather than
+# falling back to an independent CSV centre-line blend.
+ego_reference_preview_enabled: true
+ego_reference_preview_required_for_change: true
+ego_reference_preview_allow_fallback: false # require the executable path geometry
+ego_reference_preview_topic: /path_switch_preview
+ego_reference_preview_timeout_sec: 1.00
+# Must match waypoint_system/config/base.yaml.  A stopped ego does not consume
+# a time blend until it has actually started moving.
+ego_reference_preview_motion_start_speed_mps: 0.20
+ego_reference_preview_motion_start_distance_m: 0.30
+# Must match ACC's endpoint_connector_speed_cap_mps/max_accel contract.  This
+# models a stopped endpoint handoff as a spatial connector with 0 -> 5.0 m/s
+# launch, never as a lateral-only zero-speed transition.
+stopped_launch_connector_speed_cap_mps: 5.0
+stopped_launch_connector_max_accel_mps2: 3.0
+stopped_launch_connector_max_preswitch_distance_m: 0.50
+# Do not approve a normal 4 s BLEND if the ego prediction remains on the
+# source lane (for example, stationary with no motion-clock start). A stopped
+# lane-end change must use waypoint_system's CONNECTOR preview and reach the
+# target lane plus post-merge buffer within the horizon.
+ego_reference_preview_require_target_completion: true
+ego_reference_preview_target_completion_max_abs_d_m: 0.75
+
+# Receding-horizon behavior candidates.  t_LC means the predicted start of
+# the path transition, not a future lane-change reservation: the supervisor
+# still receives CHANGE_LEFT only after a fresh CHANGE_NOW check.
+behavior_planner_enabled: true
+# Enable validated YIELD/HOLD preparation execution.  ACC retains all
+# lead/TTC/lane-end hard safety authority and rechecks this request every cycle.
+behavior_execute_decel_hold: true
+# Keep positive-acceleration candidates in shadow mode until MORAI logs show
+# that they never defeat normal ACC/front-vehicle protection.
+# false -> true (2026-09-16). 양보 해제 후 가속 합류를 허용한다.
+#   후보가 생성되더라도 feasible 게이트(risk/clearance/gap/TTC)를 그대로
+#   통과해야 선택되므로, 새 뒤차가 후방 안전영역에 들어오면 자동으로
+#   탈락하고 YIELD/WAIT 로 돌아간다 - '가속으로 억지 진입'은 생기지 않는다.
+#   ACC 쪽 실행은 accel_after_yield_release_window(1.5 s) 안에서만 열린다.
+behavior_execute_accel: true
+# Keep the legacy mode-max scalar only for telemetry/comparison.  Feasibility
+# is decided by the time-indexed risk gate and deterministic safety gates.
+behavior_require_legacy_risk_gate: false
+behavior_min_signed_clearance_m: 0.0
+# Includes supervisor confirmation/path-switch latency in the candidate model.
+behavior_execution_delay_sec: 0.20
+# At 70km/h this reserves another 19.4m after the 3.5s spatial merge.
+behavior_post_merge_buffer_sec: 1.0
+# Legacy fallback if no candidate list is supplied.  Normal operation tests
+# the lightest comfortable YIELD first; ACC rate-limits the selected request.
+behavior_decel_accel_mps2: -1.5
+# 후보는 comfort 상한(-3.0)으로 clamp 된다. 상한을 올린 만큼 마지막 단계도
+# 넓혀, 양보 감속 탐색이 -2.4 에서 멈추지 않게 한다.
+behavior_yield_decel_candidates_mps2: [-0.8, -1.2, -1.8, -2.4, -3.0]
+# This applies only to SMPC's non-emergency YIELD request.  ACC lead/TTC and
+# lane-end emergency braking retain their independent, stronger limits.
+# 2.50 -> 3.00 (2026-09-15). adaptive_front_decel 이 남은 거리로 계산한
+# 필요 감속도가 2.5 에서 잘리면, 간격이 좁을수록 오히려 부족해진다.
+behavior_yield_comfort_max_decel_mps2: 3.00
+# A continuously re-evaluated YIELD may not ratchet below this episode's
+# entry speed minus the following amount. 2026-09-16 16:19 주행에서는
+# 14.2 m/s 에 시작한 양보가 8.2 m/s 바닥에 걸려 옆 차량을 보내는 동안
+# 남은 변경 경로를 소모했다. 최대 감속 폭을 8 m/s 로 넓혀 같은 조건에서
+# 약 6.2 m/s 까지 양보할 수 있게 한다.
+behavior_yield_max_speed_drop_mps: 8.0
+# 상대차 속도 추정은 사용하지 않는다(원거리 라이다 속도가 가장 부정확하다).
+# 2026-09-18 방향 반전: 고속일수록 영역을 넓힌다.
+#   ego_speed_wide_mps(5.0)   이하 -> 최소 영역 (front 5.5 / rear 9.0)
+#   ego_speed_narrow_mps(13.0) 이상 -> 최대 영역 (front 5.5 / rear 11.0)
+#   그 사이는 선형 보간.
+# 근거: 고속에서 같은 시간에 더 많이 좁혀지고 제동거리도 길어지므로 영역이
+# 커져야 한다. 저속에서는 여유가 있어 영역을 줄여야 합류가 막히지 않는다.
+# 파라미터 이름은 호환을 위해 유지한다(wide=좁아지는 하한, narrow=넓어지는 상한).
+# TTC/headway/risk 판정은 이 영역과 별도로 계속 적용된다.
+side_vehicle_yield_use_safe_gaps: false
+side_vehicle_yield_front_window_m: 4.2
+side_vehicle_yield_rear_window_m: 7.0
+side_vehicle_yield_dynamic_window_enabled: true
+side_vehicle_yield_front_window_max_m: 4.2
+# 앞 안전영역의 속도 비례 하한: max(위 영역, 이 시간 x 자차속도). 15 m/s -> 7.5 m, 20 m/s -> 10 m.
+#   17:15 백: 고정 4.2 m 라 4.4 m/s 느린 앞차 5.6 m 앞을 비었다고 보고 변경 -> 충돌.
+side_vehicle_yield_front_min_headway_sec: 0.4
+side_vehicle_yield_rear_window_max_m: 11.0
+side_vehicle_yield_ego_speed_wide_mps: 5.0
+side_vehicle_yield_ego_speed_narrow_mps: 13.0
+# 옆/앞에서 양보를 시작한 차량이 투영상 뒤차로 바뀌어도 동일 차량이
+# 영역을 벗어날 때까지 양보를 유지한다. 느린 뒤차를 새로 만나면 commit하지 않는다.
+side_vehicle_yield_commit_enabled: true
+side_vehicle_yield_commit_max_duration_sec: 15.0
+side_vehicle_yield_window_m: 10.0
+side_vehicle_yield_min_speed_mps: 6.0
+# -1.8 -> -2.2 (2026-09-15). 안전영역에 차량이 있을 때 감속 시작이 느렸다.
+#   16 m/s 에서 2.5 m/s 를 줄이는 데 1.39 s -> 1.14 s.
+# 상한은 behavior_yield_comfort_max_decel_mps2(3.0) 이고, 앞차가 가까우면
+# adaptive_front_decel 이 필요 감속도를 계산해 그 상한까지 알아서 올린다.
+side_vehicle_yield_prep_accel_mps2: -2.2
+# 동적 점유영역 밖에 있어도 목표 차로의 느린 앞차로 미래 궤적이 막히는
+# 경우에는 30m부터 별도의 조기 soft-yield를 적용한다.
+target_front_early_yield_enabled: true
+target_front_early_yield_window_m: 30.0
+target_front_early_yield_min_closing_mps: 1.0
+target_front_early_yield_max_velocity_std_mps: 3.0
+target_front_early_yield_max_observation_age_sec: 0.5
+target_front_early_yield_time_headway_sec: 1.0
+target_front_early_yield_gap_gain: 0.4
+target_front_early_yield_prep_accel_mps2: -1.8
+target_front_early_yield_min_speed_drop_mps: 0.3
+# 현재 동적 전방 점유영역 안이면 상대속도와 남은 거리에 필요한 감속도를 계산한다.
+# 일반 양보 감속(-1.8)보다 크게 필요하면 comfort 상한(2.5m/s^2)까지 올린다.
+side_vehicle_yield_adaptive_front_decel_enabled: true
+side_vehicle_yield_adaptive_front_stop_margin_m: 2.0
+# 뒤차 양보를 거는 최소 접근속도(m/s). 목표 차로 뒤차가 자차보다 이만큼
+# 빠를 때만 양보한다. 나보다 느린 차에 양보하면 가만히 있어도 벌어질
+# 간격을 만들려고 감속하게 되고, 그 차는 오지 않아 교착에 빠진다.
+#   실측 2026-09-14(19:26 백): 뒤차 id2 가 11.0 m/s 로 자차 15.4 m/s 보다
+#   4.1 m/s 느린데 yield_rear_vehicle_pass 가 걸려 자차가 0 m/s 까지
+#   완전 정지했다. 간격은 이미 -6.7 -> -21.7 m 로 벌어지던 중이었다.
+side_vehicle_rear_yield_min_closing_mps: 0.5
+# 느린 뒤차 앞서가기 (2026-09-16).
+#   목표 차로 양보영역을 점유한 차량이 자차보다 뒤에 있고(delta_s<0)
+#   자차보다 느리면, 감속해서 보내주려 해도 그 차는 오지 않는다.
+#   가만히 있어도 간격이 벌어지는데 감속하면 교착에 빠진다.
+#     실측 2026-09-14(19:26 백): 뒤차가 4.1 m/s 느린데 양보가 걸려
+#     자차가 15.4 -> 0 m/s 로 완전 정지했다.
+#   이 경우 감속 요청 없이 현재 속도를 유지(HOLD)하고 그 차 앞으로
+#   합류한다. 가속까지 요청하지는 않는다 - ACC 가 스스로 올리게 둔다.
+# 전제 조건: 앞쪽 양보영역(side_vehicle_yield_front_window_m)만큼
+#   비어 있어야 한다. 앞 차량이 그 안에 있으면 앞서갈 공간이 없으므로
+#   기존 양보 경로를 그대로 탄다.
+# 접근하는 뒤차는 이 분기보다 앞선 조건에서 먼저 잡히므로 영향 없다.
+slow_rear_overtake_enabled: true
+# 느린 뒤차 앞지르기/양보 결정 고정 (2026-09-26, 13:48 백).
+#   옆 차로 느린 뒤차가 안전영역에 있을 때 처음 한 번, 앞질러 뒤 영역을 비운 뒤에도
+#   차선변경(실행지연+블렌드+합류 여유+차 길이)이 차로 끝 전에 끝나는지 추정한다.
+#   가속 앞지르기 -> 속도 유지 앞지르기 -> 양보(먼저 보내고 ACC 로 따라가기) 순.
+#   결정은 그 차량 id 에 고정해 프레임마다 앞지르기/HOLD/양보가 바뀌지 않게 한다.
+#   앞지르기 중 가능성이 사라지면(여유 0 기준) 양보로 한 번만 바꾼다.
+slow_rear_latch_enabled: true
+slow_rear_deadline_check_enabled: true
+slow_rear_overtake_deadline_margin_m: 5.0
+slow_rear_overtake_accel_mps2: 1.0
+slow_rear_overtake_speed_gain_mps: 3.0
+slow_rear_overtake_max_sim_sec: 10.0
+slow_rear_latch_timeout_sec: 12.0
+slow_rear_latch_lost_sec: 1.0
+# 목표 차로 틈 선택 (2026-09-26).
+#   목표 차로 차량을 위치순으로 늘어놓고 연속한 두 차 사이(와 맨 앞/뒤 열린 틈)에
+#   안전영역(앞 side_vehicle_yield_front_window, 뒤 rear_window) + slot_margin 을 지키는
+#   자차 자리를 만든다. 각 자리에 맞추는 속도 제어를 시뮬레이션해 차로 끝(중간 기준)
+#   전에 맞출 수 있는 자리 중 cost(맞추는 시간 + effort_weight x 속도 변화량)가 가장
+#   작은 곳을 고르고, 앞/뒤 차량 id 로 고정한다(새 후보가 switch_cost 이상 좋아야 교체).
+#   명령 속도: 이미 자리 안이면 현재 위치 유지(열린 틈은 속도 제한 없음), 밖이면
+#   가장 가까운 안쪽 지점으로 틈 속도 + position_gain x 위치오차(+-max_catchup).
+#   감속이 필요하면 YIELD(decel_mps2), 아니면 HOLD 상한(ACC 가 그 속도까지 가속).
+#   실제 변경 허가는 기존 게이트(안전영역/TTC/궤적/차로 끝)가 그대로 한다.
+#   맞출 수 있는 틈이 없으면 기존 로직(느린 뒤차 판단/양보/정지 합류)으로 돌아간다.
+gap_select_enabled: true
+# 틈 선택 모드일 때 /smpc/yield_zone_markers 에 기존 안전영역 대신 틈 시각화를 낸다.
+gap_select_publish_markers: true
+gap_select_current_lanes: [0, 1, 2]
+gap_select_open_gap_extra_m: 4.5 # 맨 앞/뒤 열린 틈에서 안전영역 경계보다 더 둘 거리
+gap_select_inner_margin_m: 3.0 # 두 차 사이 틈: 자리 밖이면 경계 안쪽 이만큼 지점을 목표
+gap_select_position_gain: 0.3 # 1/s
+gap_select_max_catchup_mps: 6.0 # 4.0 -> 6.0: 목표 지점 속도 기준 상대속도 한도(앞지르기/뒤로 빠지기)
+gap_select_min_speed_mps: 5.0
+gap_select_align_margin_m: 1.0 # 자리 경계 안쪽으로 이만큼 들어와야 '맞춤'
+gap_select_align_speed_tol_mps: 2.0 # 틈 속도와 이 이내면 '맞춤'
+gap_select_slot_margin_m: 1.0 # 안전영역 바깥에 더하는 여유(앞/뒤 각각)
+gap_select_min_slot_m: 1.0
+gap_select_max_time_sec: 12.0
+gap_select_accel_mps2: 1.2 # 시뮬레이션 가속 한계(ACC max_accel 1.6 보다 보수적)
+gap_select_decel_mps2: 1.5 # 시뮬레이션/YIELD 감속률
+gap_select_effort_weight: 0.2
+gap_select_switch_cost_sec: 1.5
+gap_select_match_dist_m: 6.0 # id 가 바뀌어도 예측 자리 위치 이내면 같은 틈으로 이어감
+gap_select_hold_sec: 0.6 # 틈을 잠깐 못 찾으면 직전 명령 유지
+gap_select_switch_confirm_frames: 3 # 틈 교체는 이 프레임 수 연속 더 좋아야 함(처음 선택은 즉시)
+# 가능한 틈이 없으면 차로 끝 초과가 가장 작은 틈을 계속 추구(best effort). 다른 best effort
+# 틈이 이만큼 이상 덜 초과할 때만 교체. 목표 차로에 차량이 있으면 기존 양보 로직으로 넘어가지 않는다.
+gap_select_effort_switch_m: 10.0
+# 틈 명령 속도 변화율 제한(m/s per s). ACC 가감속 한계보다 크게 두어 반응은 거의 안 늦추고
+# 같은 자리의 명령이 먼 차량 가시성에 따라 오가는 것만 흡수한다.
+gap_select_cmd_rate_mps2: 3.0
+# 틈 방향 규칙. 목표 차로에서 자차에 가장 가까운 차량(기준 차량) 기준:
+#   speed: 나보다 deadband 이상 느리면 그 차 앞 틈(추월), 빠르면 그 차 뒤 틈(보내기),
+#          비슷하면 시간 비용으로 선택.
+#   yield: 항상 그 차 뒤 틈(보수적). 보낸 뒤 그 차와 그 뒤 차량 사이 틈을 다시 본다.
+#   cost : 규칙 없이 시간 비용만.
+# 고른 쪽이 차로 끝 안에 불가능하고 반대쪽이 가능하면 반대쪽으로 간다.
+gap_select_side_policy: speed
+gap_select_side_speed_deadband_mps: 1.0
+# 같은 차로 앞차 반영(2026-09-26, 17:59 백). 틈 시뮬레이션에서 자차 속도를
+#   앞차속도 + gain x (간격 - (standstill + time_gap x 자차속도)) 이하로 제한하고(ACC 추종 모양),
+#   방향 규칙은 앞차속도 + overtake_margin 을 앞지르기 가능 최고속도로 본다.
+#   17:59 백: 목표 차로 차를 앞지르는 틈을 25 m/s 가속 가정으로 골랐는데 16 m/s 앞차 때문에
+#   가속을 못 해 8 초를 잃고 차로 끝에서 정지.
+gap_select_own_lead_enabled: true
+gap_select_own_lead_max_gap_m: 80.0
+gap_select_own_lead_standstill_m: 6.0
+gap_select_own_lead_time_gap_sec: 0.6
+gap_select_own_lead_gain: 0.3
+gap_select_own_lead_overtake_margin_mps: 2.0
+# 자차 뒤에 이 속도 미만으로 서 있는 물체는 틈 구성에서 뺀다(뒤에서 다가올 수 없음).
+gap_select_ignore_stationary_behind_mps: 2.0
+# 차로 끝 거리 검사 기준 (2026-09-26).
+#   true : 실행지연 + 블렌드 x lane_deadline_blend_fraction 지점에서 lane_deadline_margin_m
+#          이상 남으면 통과(블렌드 절반 = 자차 중심이 차선을 넘는 시점).
+#   false: 이전 기준(블렌드 전체 + 합류 후 여유 1 s + 차 길이).
+#   margin 은 0번 차로 CSV 끝(= current_lane_length - ego_s) 기준 거리.
+#   slow_rear 앞지르기 추정도 같은 식을 쓰고 slow_rear_overtake_deadline_margin_m 을 더한다.
+lane_deadline_midpoint_enabled: true
+lane_deadline_blend_fraction: 0.5
+lane_deadline_margin_m: 5.0
+# 차로 끝에서 정지(emergency_stop_required + 이 속도 이하)하면 차로 끝 거리 검사를
+# 건너뛴다. 합류는 endpoint connector 가 맡고 간격/TTC/궤적 검사는 그대로 적용.
+#   13:48 백: 남은 0.9 m 에서 정지 후 간격이 비어도 이 검사로 영구 교착.
+lane_end_standstill_merge_enabled: true
+lane_end_standstill_merge_max_speed_mps: 1.0
+# 정지 합류 전용 목표 차로 뒤차 기준(안전영역/완화 TTC 대신 추가로 적용).
+#   2.5 s @ 10.8 m/s = 27 m. 13:48 백의 차량 흐름(약 45 m 간격)에서 앞차가 빠진 직후
+#   한 번씩 열리는 틈만 통과한다.
+lane_end_standstill_rear_min_gap_m: 20.0
+lane_end_standstill_rear_min_ttc_sec: 2.5
+# 차선변경 예측 속도의 앞차 추종 상한 (2026-09-16).
+#   양보 cap 을 풀 때 미션속도(21 m/s)로 바로 올리면, 실제로는 앞차 때문에
+#   낼 수 없는 속도로 전진한다고 예측해 목표 차로 앞차를 따라잡는 것으로
+#   보이고 clearance 가 음수로 떨어진다(20:17 백 패턴).
+#   현재/목표 차로 앞차를 실제 추종 가능한 속도로 상한을 둔다.
+#     cap = lead_v + gap_gain * (현재간격 - (standstill + headway*v))
+#   ACC 의 gap_gain(0.4)과 같은 형태다. 앞차가 없으면 무제한.
+lead_follow_gap_gain: 0.4
+lead_follow_min_cap_mps: 5.0
+# 속도를 신뢰할 수 없을 때의 간격 기반 폴백 (2026-09-16).
+#   projectedTargetGapTtcSafe 는 velocity_valid=false 면 즉시 거부했다.
+#   그런데 LiDAR 트래커의 velocity_valid 는 프레임마다 뒤집힌다 -
+#   실측(15:59 백, t>=14): target_front 91% / target_rear 85% /
+#   둘 다 78% 통과. 즉 22% 프레임에서 강제로 0 이 되고,
+#   confirmation_count(3 연속)를 못 채워 확정이 사실상 불가능했다.
+#   그 구간 실제 간격은 요구치의 2 배 이상이었고 양보영역도 비어 있었다.
+#   (차선변경이 28 초 주행 내내 한 번도 실행되지 않음)
+# 이제 속도를 모르면 '최악의 상대속도'를 가정해 검사하고, 그래도 요구
+# 간격을 지키면 통과시킨다. 빠듯하면 종전처럼 거부된다.
+#   실측 재현: 진입 통과율 78% -> 95%. 거부된 5 회는 모두 rear 간격이
+#   최악 가정에서 요구치(13 m)를 밑도는 실제로 빠듯한 경우였다.
+unknown_velocity_gap_fallback_enabled: true
+# 예측 창 동안 상대속도가 최대 이만큼 벌어질 수 있다고 가정한다.
+# 4.0 m/s x 2.0 s(projected_gap_ttc_horizon_sec) = 간격 8 m 소진 가정.
+unknown_velocity_worst_closing_mps: 4.0
+# 목표 차선 후방차가 안전 영역 안에 들어오면 앞지르기용 HOLD/ACCEL 후보를
+# 제외하고, 이 값만큼 자차 속도 상한을 낮춰 차량을 먼저 보낸 뒤 합류한다.
+# 연속 양보의 총 감속 폭은 behavior_yield_max_speed_drop_mps가 제한한다.
+side_vehicle_rear_yield_speed_drop_mps: 2.5
+change_feasible_confirm_count: 3
+# 확인 프레임은 새 목표 차량 데이터가 들어온 프레임만 센다(같은 관측 중복 방지).
+streak_count_new_targets_only: true
+# 속도를 신뢰할 수 없어도 범퍼 간격 이 거리 이내 차량은 원시 속도로 TTC/예측 간격 검사.
+untrusted_near_gap_m: 20.0
+# 속도 오차 여유 상한(불신 트랙 std 폭주 방지, 신뢰 트랙은 영향 없음).
+untrusted_std_margin_cap_mps: 2.0
+debug_yield_zone_publish_markers: true
+behavior_hold_accel_mps2: 0.0
+behavior_accel_accel_mps2: 1.0
+# 목표 차선 후방차가 양보 영역 안에 있으면 YIELD 후보만 허용한다.
+# 그 외 상황에서는 실행 가능한 후보 중 비용이 가장 낮은 행동을 선택한다.
+behavior_lc_start_times_sec: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+behavior_delay_cost_weight: 1.0
+behavior_accel_cost_weight: 0.25
+# ACC acknowledges whether its lower target is this exact behavior cap or an
+# independent safety restriction.  Required before behavior execution is on.
+behavior_status_topic: '/smpc/behavior_longitudinal_status'
+behavior_status_timeout_sec: 0.35
+
+# Multimodal TV prediction modes.
+# Front vehicles: {nominal, braking}; rear vehicle: {nominal, accelerating}.
+# The two base probabilities below are now only priors.  The decision node
+# increases/decreases them using gap, TTC, relative speed, and observed v_long
+# trend from LiDAR tracking history.
+front_brake_probability: 0.25
+rear_accel_probability: 0.25
+min_front_brake_probability: 0.05
+max_front_brake_probability: 0.65
+min_rear_accel_probability: 0.05
+max_rear_accel_probability: 0.65
+# 목표 차로 앞차의 '급제동 가정' 감속률. 예측 창(변경 3.5s + 버퍼 1.0s)
+# 전체에 이 감속이 지속된다고 보므로 값이 클수록 매우 보수적이다.
+#   실측 2026-09-15(16:49 백) t=23.0: 자차 8.74, 앞차 10.1 m/s, 간격 10.2 m
+#   (앞차가 더 빨라 실제로는 간격이 벌어지는 중)
+#     -2.0 -> 4.5초 창 최소 간격 -3.92 m (충돌 예측) -> 차선변경 거부
+#     -1.5 -> +1.14 m
+#     -1.2 -> +4.18 m
+#   고주로 정속 주행 차량에 -2.0 은 과도하다. 실제 급제동이면 TTC 게이트와
+#   ACC 가 별도로 잡는다.
+# NPC 종방향 이벤트 모드(앞차 급제동 / 뒤차 급가속) 사용 여부.
+# 대회 NPC 는 급제동·급가속을 하지 않으므로 끈다(false).
+#   켜져 있으면 등속 주행 중인 차량도 '3.5초 내내 -1.2 m/s^2 로 감속한다'는
+#   시나리오로 함께 평가된다. projectedTargetGapTtcSafe 는 확률과 무관하게
+#   모든 모드의 통과를 요구하므로, 이 한 가지 최악 가정만으로 변경이
+#   영구 차단됐다.
+#   실측(2026-09-15 20:38 백): 옆 차로 점유영역이 전 구간 비었고
+#   (zone_ttc_relaxed=1) risk/clearance/TTC 가 모두 통과인데
+#   projected_gap_ttc 만 0 이라 28초 내내 변경을 못 했다. 그 앞차는 등속
+#   10.4 m/s 로 간격이 14.2 -> 20.1 m 로 오히려 벌어지는 중이었다.
+# 끄면 nominal(등속) 모드만 남고 확률 1.0 이 된다. 아래 두 값은 이 스위치를
+# 다시 켤 때만 쓰인다. 횡방향 모드(관측된 차선변경)는 영향 없이 유지된다.
+npc_longitudinal_event_modes_enabled: false
+front_brake_accel_mps2: -1.2
+rear_accel_mps2: 1.5
+nominal_target_accel_mps2: 0.0
+ego_assumed_accel_mps2: 0.0
+probability_ttc_safe_sec: 5.0
+probability_ttc_critical_sec: 1.5
+probability_rel_speed_scale_mps: 8.0
+probability_accel_scale_mps2: 3.0
+# 속도 추정이 불확실한 프레임은 관측 가속도 계산에서 제외한다.
+#   실측 2026-09-15(16:49 백) id0: 0.52초에 10.94 -> 6.95 (std 1.0~1.9)
+#   -> 관측 가속도 -7.7 m/s^2 (노이즈). alpha 0.35 EMA 가 그 한 번을
+#   5프레임 넘게 끌고 가며 front_brake 확률을 계속 밀어올렸다.
+observed_accel_max_velocity_std: 0.8
+observed_accel_alpha: 0.35
+max_observed_accel_mps2: 6.0
+
+# Ego prediction rollout for KEEP/CHANGE evaluation only.
+# 실제 /ctrl_cmd를 바꾸는 값이 아니라, SMPC가 "내 차가 앞으로 어떻게 움직일 것인가"를
+# 평가할 때 쓰는 가정이다. true이면 현재 속도가 0이어도 mission_state 속도까지
+# 아래 가속 한계로 회복한다고 보고, 제자리 lateral-only 차선변경 예측을 피한다.
+ego_prediction_use_mission_speed_rollout: true
+ego_prediction_max_accel_mps2: 2.5
+ego_prediction_max_decel_mps2: 2.0
+
+# Optional lateral/cut-in mode.  For this fitting pass, target vehicles are
+# assumed to never change lanes: no observed_lateral mode is generated and
+# their current Frenet d offset is kept almost constant over the horizon.
+lateral_mode_enabled: false
+lateral_mode_probability: 0.0
+max_lateral_mode_probability: 0.0
+lateral_mode_v_threshold_mps: 0.90
+yaw_lateral_threshold_rad: 0.28
+yaw_lateral_probability_gain: 0.04
+max_lateral_prediction_mps: 0.0
+lateral_mode_allow_nearby: false
+lateral_mode_allow_rear: false
+lateral_mode_allow_yaw_only: false
+lateral_mode_min_abs_d_m: 1.40
+lateral_mode_require_yaw_agreement: true
+lateral_mode_require_away_from_center: true
+tv_yaw_rate_weight: 0.05
+tv_csv_yaw_weight: 0.40
+tv_no_lateral_probability_floor: 1.00
+tv_yaw_rate_horizon_sec: 0.8
+max_abs_tv_yaw_rate: 0.6
+
+# Gaussian prediction uncertainty used for chance-risk estimates.
+prediction_sigma_base_m: 0.5
+prediction_sigma_growth_mps: 0.35
+prediction_lateral_sigma_base_m: 0.25
+prediction_lateral_sigma_growth_mps: 0.0
+collision_margin_m: 0.45
+
+# Cost shaping for KEEP vs CHANGE_LEFT.
+lane_change_base_cost: 0.5
+risk_cost_weight: 80.0
+gap_cost_weight: 2.5
+blocked_cost_weight: 35.0
+lane_end_prepare_cost: 60.0
+lane_end_urgent_cost: 180.0
+lane_end_emergency_cost: 500.0
+decision_hysteresis_cost: 0.1
+
+# RViz debug text marker near ego.
+debug_publish_marker: true
+debug_marker_lifetime_sec: 0.5
+debug_marker_height_m: 4.0
+
+# RViz ego/target future prediction markers.
+debug_prediction_publish_markers: true
+debug_prediction_marker_lifetime_sec: 0.5
+debug_prediction_line_width_m: 0.25
+debug_prediction_z_m: 0.35
+debug_prediction_footprint_height_m: 0.15
+debug_prediction_ego_footprint_stride: 5
+debug_prediction_target_footprint_stride: 5
+debug_prediction_target_max_vehicles: 20
+debug_prediction_show_target_modes: true
+debug_prediction_show_labels: true

@@ -1,0 +1,9 @@
+int8 control_mode
+bool e_stop
+uint8 gear
+int32 speed
+int32 steer
+uint8 brake
+int32 encoder
+uint16 battery
+uint8 alive

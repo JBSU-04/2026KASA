@@ -1,0 +1,8 @@
+# tracked_object_adapter — 정본 트랙 타입 변환
+# 회전교차로는 전용 트래커를 그대로 쓰는 것이 검증된 구성이라 기본 off.
+tracked_object_adapter:
+  enable_roundabout: false
+  enable_shadow: false
+  min_confidence: 0.0
+  moved_min_hits: 3
+  static_speed_threshold: 1.5

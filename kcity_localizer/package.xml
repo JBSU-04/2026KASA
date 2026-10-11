@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>kcity_localizer</name>
+  <version>0.1.0</version>
+  <description>
+    MORAI K-City 2025 mgeo 기반 차량 측위 패키지.
+    런처 Unity 번들에서 추출한 node_set/link_set 로 /gps(+/imu) 입력을
+    맵 로컬좌표에 정합하여 현재 주행 링크/노드/가로오프셋을 인식한다.
+  </description>
+  <maintainer email="dladmsrbs12350@gmail.com">kuuve</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf</exec_depend>
+  <exec_depend>morai_msgs</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-pyproj</exec_depend>
+
+  <export>
+  </export>
+</package>

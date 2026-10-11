@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Early M2 static-obstacle proposals from gravity-aligned raw LiDAR.
+
+GroundGrid remains the authoritative near-field detector.  This node only
+recovers sparse, above-ground returns at 12--40 m by accumulating them in the
+map frame for a short time.  A proposal needs evidence from multiple scans and
+must overlap the reference-path corridor, so a single road return cannot start
+an avoidance manoeuvre.
+"""
+
+import json
+import math
+from collections import deque
+
+import numpy as np
+import rospy
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
+from waypoint_maker.msg import Lane
+from mission_supervisor.msg import SectionState
+
+try:
+    from scipy.spatial import cKDTree
+except ImportError:
+    cKDTree = None
+
+
+def _yaw(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def _xyz(msg):
+    """Zero-copy xyz extraction for ordinary PointCloud2 layouts."""
+    fields = {f.name: f for f in msg.fields}
+    if not all(k in fields for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), np.float32)
+    endian = '>' if msg.is_bigendian else '<'
+    names, formats, offsets = [], [], []
+    for k in ('x', 'y', 'z'):
+        f = fields[k]
+        if f.datatype != 7:  # sensor_msgs/PointField.FLOAT32
+            return np.empty((0, 3), np.float32)
+        names.append(k); formats.append(endian + 'f4'); offsets.append(f.offset)
+    dtype = np.dtype({'names': names, 'formats': formats,
+                      'offsets': offsets, 'itemsize': msg.point_step})
+    count = msg.width * msg.height
+    arr = np.frombuffer(msg.data, dtype=dtype, count=count)
+    out = np.column_stack((arr['x'], arr['y'], arr['z'])).astype(np.float32, copy=False)
+    return out[np.isfinite(out).all(axis=1)]
+
+
+class FarStaticDetector:
+    def __init__(self):
+        self.active_sections = set(rospy.get_param('~active_sections', ['M2']))
+        # 구간별 자차 기준 좌우 창 [y_min, y_max] (좌 +). 터널(M8)은 벽을 이 느슨한
+        # 희소 점 검출기에 절대 넣지 않도록 벽 안쪽만 모은다(obstacle_stop 의
+        # tunnel_wall_roi: y < -2.4 또는 y > 5.5 가 벽).
+        self.section_y_limits = rospy.get_param('~section_y_limits', {'M8': [-2.0, 5.0]})
+        # 구간별 mission_mode 태그(병합 노드가 근거리 없을 때 이 값을 쓴다).
+        self.section_modes = rospy.get_param('~section_mission_modes', {'M8': 'tunnel'})
+        # 구간별 지면 평면 추정(고정 평면 대신). 터널 바닥은 좌로 ~3% 횡경사 +
+        # 종경사가 있어 고정 평면 기준으로 0.1~0.35 m 짜리 가짜 물체가 계속 생겼다
+        # (17:09/20:27 백). 매 스캔 z = a + b x + c y 를 반복 최소제곱으로 맞춘다.
+        self.plane_sections = set(rospy.get_param('~plane_ground_sections', ['M8']))
+        self.plane_fit_x = rospy.get_param('~plane_fit_x_range_m', [5.0, 40.0])
+        self.plane_fit_band = float(rospy.get_param('~plane_fit_band_m', 0.6))
+        self.plane_fit_min_points = int(rospy.get_param('~plane_fit_min_points', 60))
+        # 구간별 최대 높이(터널 천장/조명 잔여 점 제거).
+        self.section_h_max = rospy.get_param('~section_max_height_m', {'M8': 2.0})
+        self.x_min = float(rospy.get_param('~x_min_m', 12.0))
+        self.x_max = float(rospy.get_param('~x_max_m', 40.0))
+        self.y_max = float(rospy.get_param('~y_half_m', 4.5))
+        self.ground_z = float(rospy.get_param('~ground_z', -1.765))
+        self.sensor_x = float(rospy.get_param('~sensor_x_m', 1.1))
+        self.sensor_y = float(rospy.get_param('~sensor_y_m', 0.0))
+        self.h_min = float(rospy.get_param('~min_height_m', 0.10))
+        self.h_max = float(rospy.get_param('~max_height_m', 2.8))
+        # ★ 2단계 코리도 (근거리 obstacle_perception 과 같은 구조).
+        #   gather_half_width_m : 점을 모으는 폭. 물체 모양을 온전히 잡는다.
+        #   path_corridor_half_width_m : 만들어진 물체의 '안쪽 끝'이 이 안이면 제안.
+        #   예전에는 1.9 m 하나로 누적 전에 점을 잘라서, 경로에서 1.9 m 밖으로
+        #   나간 물체의 바깥 끝이 잘린 채 폭을 쟀다.
+        #     실측(09-23 16개 주행): 원거리 바깥 끝 p50 1.89 / p90 1.92,
+        #     근거리 p50 2.05 / p90 2.26. 1.9 m 초과 비율 6.9% vs 64.7%.
+        #     카고박스·우측 저상물 모두 바깥 0.15~0.35 m 가 잘렸다.
+        # 근거리 obstacle_perception 의 path_corridor_half_width(1.7)와 같은 값.
+        self.path_half = float(rospy.get_param('~path_corridor_half_width_m', 1.7))
+        self.gather_half = max(self.path_half, float(rospy.get_param('~gather_half_width_m', 7.0)))
+        # 넓게 모으면 우측 연석점도 들어와 연석 옆 장애물이 연석과 한 덩어리로
+        # 묶여(max_cluster_extent 초과) 통째 버려질 수 있다. 회피 노드의 연석
+        # 기반 폭 곡선(road_width_profile)으로 연석선 = 우측한계 + 반폭 + 여유
+        # 를 구해, 그 선에서 curb_exclude_margin_m 안쪽부터 바깥 점은 뺀다.
+        self.profile_param = rospy.get_param('~road_width_profile_param',
+                                             '/obstacle_avoidance_node/road_width_profile')
+        self.curb_offset = float(rospy.get_param('~curb_line_offset_m', 1.10))   # 0.95 + 0.15
+        self.curb_margin = float(rospy.get_param('~curb_exclude_margin_m', 0.10))
+        self.right_open = float(rospy.get_param('~right_open_limit_m', 3.5))
+        self.profile = None
+        self.profile_t = 0.0
+        self.window = float(rospy.get_param('~accumulation_sec', 0.55))
+        self.voxel = float(rospy.get_param('~voxel_m', 0.16))
+        self.eps = float(rospy.get_param('~cluster_eps_m', 0.65))
+        self.min_points = int(rospy.get_param('~min_accumulated_points', 5))
+        self.min_scans = int(rospy.get_param('~min_distinct_scans', 2))
+        self.max_extent = float(rospy.get_param('~max_cluster_extent_m', 7.0))
+        self.extent_trim = float(rospy.get_param('~extent_trim_pct', 5.0))
+        # ★ 제안 ID 승계. 예전에는 id 를 중심좌표 해시로 만들었다:
+        #       oid = 900000 + abs(hash((round(cx,1), round(cy,1)))) % 90000
+        #   중심 추정이 몇 cm 만 움직여도 round 가 다른 값에 떨어져 해시가
+        #   무관한 숫자로 튄다. 실측 2026-09-22(17:49:26 백): 같은 물체가
+        #   1초에 ID 를 7번 갈아탔다(985323 -> 973612 -> 959612 -> ...,
+        #   연속 world 거리는 0.08~0.34 m 뿐).
+        #   obstacle_avoidance_node 는 primary 장애물이 바뀌면 회피 방향
+        #   락(committed_avoid_side_)을 푼다. ID 가 매 스캔 바뀌니 락이
+        #   걸릴 새가 없었고, 4주행에서 d_end 부호가 14/16/6/4회 뒤집혔다.
+        #   그래서 이전 주기 제안과 최근접 매칭으로 ID 를 물려준다.
+        self.match_dist = float(rospy.get_param('~id_match_distance_m', 1.6))
+        self.id_timeout = float(rospy.get_param('~id_timeout_sec', 1.4))
+        self.hold_sec = float(rospy.get_param('~proposal_hold_sec', 1.25))
+        self.tracked = []      # [{'id', 'xy', 'stamp', 'proposal'}]
+        self.next_id = 900001
+        self.section = ''
+        self.pose = None
+        self.route = np.empty((0, 2), np.float64)
+        self.route_idx = np.empty((0,), np.int64)
+        self.route_tan = np.empty((0, 2), np.float64)
+        self.route_tree = None
+        self.route_pack = (self.route, self.route_idx, self.route_tan, None)
+        self.frames = deque()
+        self.scan_seq = 0
+        self.pub = rospy.Publisher('/obstacle_info_far', String, queue_size=2)
+        self.marker_pub = rospy.Publisher('/obstacle_markers_far', MarkerArray, queue_size=1)
+        rospy.Subscriber('/mission/active_section', SectionState, self._section, queue_size=1)
+        rospy.Subscriber('/odom', Odometry, self._odom, queue_size=1)
+        rospy.Subscriber('/final_waypoint', Lane, self._route, queue_size=1)
+        rospy.Subscriber('/perception/points_gravity', PointCloud2, self._cloud,
+                         queue_size=1, buff_size=8 * 1024 * 1024)
+
+    def _section(self, msg):
+        if msg.section_id != self.section and msg.section_id not in self.active_sections:
+            self.frames.clear()
+            self.tracked = []   # 구간을 벗어나면 ID 승계도 끊는다
+        self.section = msg.section_id
+
+    def _odom(self, msg):
+        self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y,
+                     _yaw(msg.pose.pose.orientation))
+
+    def _route(self, msg):
+        # 경로 배열들은 다른 스레드(점군 콜백)가 읽는다. 하나씩 교체하면 길이가
+        # 다른 배열을 섞어 읽어 IndexError 가 난다 -> 다 만든 뒤 한 번에 교체.
+        pts = [(w.pose.pose.position.x, w.pose.pose.position.y) for w in msg.waypoints]
+        route = np.asarray(pts, dtype=np.float64) if pts else np.empty((0, 2))
+        idx = np.asarray([w.waypoint_index for w in msg.waypoints], dtype=np.int64)
+        if len(route) >= 2:
+            tan = np.gradient(route, axis=0)
+            tan = tan / np.maximum(1e-9, np.hypot(tan[:, 0], tan[:, 1]))[:, None]
+        else:
+            tan = np.empty((0, 2))
+        tree = cKDTree(route) if cKDTree is not None and len(route) else None
+        self.route_pack = (route, idx, tan, tree)
+        self.route, self.route_idx, self.route_tan, self.route_tree = route, idx, tan, tree
+
+    def _curb_line(self, idx):
+        """각 점의 CSV idx 에서 우측 연석선 횡거리(양수, m). 연석 없음 = inf."""
+        now = rospy.Time.now().to_sec()
+        if self.profile is None or now - self.profile_t > 5.0:
+            raw = rospy.get_param(self.profile_param, [])
+            self.profile = np.asarray(raw, dtype=np.float64).reshape(-1, 3) if len(raw) >= 6 else np.empty((0, 3))
+            self.profile_t = now
+        out = np.full(len(idx), np.inf)
+        if len(self.profile) < 2:
+            return out
+        inside = (idx >= self.profile[0, 0]) & (idx <= self.profile[-1, 0])
+        r = np.interp(idx[inside], self.profile[:, 0], self.profile[:, 1])
+        line = np.where(r < self.right_open - 1e-3, r + self.curb_offset, np.inf)
+        out[inside] = line
+        return out
+
+    def _plane_height(self, p):
+        """중력정렬 점군에서 바닥 평면 z = a + b x + c y 를 맞춰 점별 높이를 돌려준다."""
+        lim = self.section_y_limits.get(self.section, [-self.y_max, self.y_max])
+        cand = p[(p[:, 0] >= float(self.plane_fit_x[0])) & (p[:, 0] <= float(self.plane_fit_x[1])) &
+                 (p[:, 1] >= float(lim[0])) & (p[:, 1] <= float(lim[1])) &
+                 (np.abs(p[:, 2] - self.ground_z) <= self.plane_fit_band)]
+        if len(cand) < self.plane_fit_min_points:
+            return None
+        A = np.column_stack((np.ones(len(cand)), cand[:, 0], cand[:, 1])).astype(np.float64)
+        z = cand[:, 2].astype(np.float64)
+        keep = np.ones(len(cand), bool)
+        coef = None
+        for tol in (0.20, 0.10, 0.06):
+            if keep.sum() < self.plane_fit_min_points:
+                return None
+            coef, *_ = np.linalg.lstsq(A[keep], z[keep], rcond=None)
+            res = z - A.dot(coef)
+            # 물체 점은 평면 위로만 튄다 -> 아래쪽은 넉넉히, 위쪽만 좁힌다.
+            keep = (res <= tol) & (res >= -2.0 * tol)
+        ground = coef[0] + coef[1] * p[:, 0] + coef[2] * p[:, 1]
+        return p[:, 2] - ground
+
+    def _mode(self):
+        return str(self.section_modes.get(self.section, 'static'))
+
+    def _empty(self, stamp):
+        self.pub.publish(String(data=json.dumps({
+            'stamp': stamp, 'mission_mode': self._mode(), 'obstacles': [],
+            'collision_objects': [], 'source': 'raw_temporal_far'})))
+        clear = Marker(); clear.action = Marker.DELETEALL
+        self.marker_pub.publish(MarkerArray(markers=[clear]))
+
+    def _cloud(self, msg):
+        stamp = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
+        if self.section not in self.active_sections or self.pose is None or len(self.route) < 2:
+            self._empty(stamp); return
+        p = _xyz(msg)
+        height = p[:, 2] - self.ground_z
+        h_max = float(self.section_h_max.get(self.section, self.h_max))
+        if self.section in self.plane_sections:
+            plane_h = self._plane_height(p)
+            if plane_h is None:
+                self._empty(stamp); return      # 지면을 못 잡으면 제안하지 않는다
+            height = plane_h
+        keep = ((p[:, 0] >= self.x_min) & (p[:, 0] <= self.x_max) &
+                (np.abs(p[:, 1]) <= self.y_max) &
+                (height >= self.h_min) & (height <= h_max))
+        lim = self.section_y_limits.get(self.section)
+        if lim is not None and len(lim) >= 2:
+            keep &= (p[:, 1] >= float(lim[0])) & (p[:, 1] <= float(lim[1]))
+        p = p[keep]
+        if len(p):
+            # One sample per voxel per scan prevents a dense scan from satisfying
+            # the temporal confirmation rule by itself.
+            key = np.floor(p / self.voxel).astype(np.int32)
+            _, take = np.unique(key, axis=0, return_index=True)
+            p = p[take]
+        x0, y0, yaw = self.pose
+        c, s = math.cos(yaw), math.sin(yaw)
+        route, route_idx, route_tan, route_tree = self.route_pack
+        # points_gravity keeps the LiDAR origin. Convert to base_link before
+        # map compensation and before reporting position_ego.
+        if len(p):
+            p[:, 0] += self.sensor_x
+            p[:, 1] += self.sensor_y
+        world = np.empty_like(p, dtype=np.float64)
+        if len(p):
+            world[:, 0] = x0 + c * p[:, 0] - s * p[:, 1]
+            world[:, 1] = y0 + s * p[:, 0] + c * p[:, 1]
+            world[:, 2] = p[:, 2]
+            if route_tree is not None:
+                d, j = route_tree.query(world[:, :2], k=1)
+            else:
+                dd = np.sqrt(((world[:, None, :2] - route[None, :, :]) ** 2).sum(2))
+                j = dd.argmin(1); d = dd.min(1)
+            keep = d <= self.gather_half
+            # 부호 있는 기준경로 횡거리(좌 +). 없으면 부호 없는 거리로 대신한다.
+            lat = d.copy()
+            if len(route_tan) == len(route):
+                tx, ty = route_tan[j, 0], route_tan[j, 1]
+                lat = -ty * (world[:, 0] - route[j, 0]) + tx * (world[:, 1] - route[j, 1])
+                # 우측 연석 제외: 횡거리가 연석선 - margin 보다 바깥이면 뺀다.
+                if len(route_idx) == len(route):
+                    line = self._curb_line(route_idx[j])
+                    keep &= ~(lat < -(line - self.curb_margin))
+            world = world[keep]
+            d = lat[keep]
+        self.scan_seq += 1
+        if len(world):
+            scans = np.full((len(world), 1), self.scan_seq, dtype=np.float64)
+            stamps = np.full((len(world), 1), stamp, dtype=np.float64)
+            # 6번째 열 = 부호 있는 기준경로 횡거리(좌 +). 안쪽 끝·폭 계산용
+            self.frames.append((stamp, np.hstack((world, scans, stamps, d[:, None]))))
+        while self.frames and stamp - self.frames[0][0] > self.window:
+            self.frames.popleft()
+        proposals = self._cluster(stamp, x0, y0, yaw, route_tan, route_tree, len(route))
+        payload = {'stamp': stamp, 'mission_mode': self._mode(), 'obstacles': proposals,
+                   'collision_objects': list(proposals), 'source': 'raw_temporal_far'}
+        self.pub.publish(String(data=json.dumps(payload, separators=(',', ':'))))
+        self._markers(msg.header, proposals)
+
+    def _cluster(self, stamp, x0, y0, yaw, route_tan=None, route_tree=None, n_route=0):
+        if cKDTree is None or not self.frames:
+            return self._with_hold([], stamp, x0, y0, yaw)
+        a = np.vstack([v for _, v in self.frames])
+        if len(a) < self.min_points:
+            return self._with_hold([], stamp, x0, y0, yaw)
+        tree = cKDTree(a[:, :2])
+        pairs = tree.query_pairs(self.eps)
+        parent = np.arange(len(a))
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]; i = parent[i]
+            return i
+        for i, j in pairs:
+            ri, rj = root(i), root(j)
+            if ri != rj: parent[rj] = ri
+        groups = {}
+        for i in range(len(a)): groups.setdefault(root(i), []).append(i)
+        out = []
+        c, s = math.cos(yaw), math.sin(yaw)
+        for ids in groups.values():
+            q = a[ids]
+            if len(q) < self.min_points or len(np.unique(q[:, 3])) < self.min_scans:
+                continue
+            # 안쪽 끝(기준경로에 가장 가까운 점)이 코리도 밖이면 경로와 무관
+            latp = q[:, 5]
+            if float(np.min(np.abs(latp))) > self.path_half:
+                continue
+            xy = q[:, :2]
+            span = np.ptp(xy, axis=0)
+            if float(np.hypot(span[0], span[1])) > self.max_extent:
+                continue
+            center = np.median(xy, axis=0)
+            dx, dy = center[0] - x0, center[1] - y0
+            ex, ey = c * dx + s * dy, -s * dx + c * dy
+            if ex < self.x_min - 1.0 or ex > self.x_max + 1.0:
+                continue
+            # Express dimensions in the ego/path axes. Sparse distant returns
+            # get conservative minimum dimensions until GroundGrid takes over.
+            relx = c * (xy[:, 0] - center[0]) + s * (xy[:, 1] - center[1])
+            rely = -s * (xy[:, 0] - center[0]) + c * (xy[:, 1] - center[1])
+            # Sparse far returns expose only part of the object. A conservative
+            # 0.8 m minimum avoids beginning an under-sized manoeuvre that has
+            # to jump outward when the near detector later sees the full box.
+            # ★ 횡 범위는 기준경로 방향으로, 안쪽/바깥쪽을 다르게 잰다.
+            #   넓게 모으면 누적(0.55 s) 중 자세 오차로 번진 점 몇 개가 끝을 정해
+            #   바깥으로 0.3~0.4 m 과대 추정됐다(09-23 17:26/17:46 리플레이:
+            #   카고박스 바깥 끝 +2.39 / +2.29 vs 근거리 +2.02 / +1.96).
+            #   - 안쪽 끝(경로 쪽): 버리지 않는다. 그쪽으로 지나갈 때 필요한
+            #     이동량을 정하는 끝이라 작게 보면 위험하다(10% 를 양쪽에 버리면
+            #     희소 클러스터에서 안쪽 끝을 0.17 m 멀게 봤다).
+            #   - 바깥 끝: extent_trim_pct 만큼 버린 백분위로 번짐을 거른다.
+            #   - 경로를 가로지르는 물체: 양쪽 다 통과 판단에 쓰이므로 버리지 않는다.
+            lo_p, hi_p = self.extent_trim, 100.0 - self.extent_trim
+            span_x = float(np.percentile(relx, hi_p) - np.percentile(relx, lo_p))
+            length = max(0.8, min(6.0, span_x + self.voxel))
+            if latp.min() < 0.0 < latp.max():
+                lat_lo, lat_hi = float(latp.min()), float(latp.max())
+            else:
+                side = 1.0 if np.median(latp) > 0.0 else -1.0
+                alat = np.abs(latp)   # 'a'(누적 점 배열) 이름과 겹치지 않게
+                inner, outer = float(alat.min()), float(np.percentile(alat, hi_p))
+                lat_lo, lat_hi = sorted((side * inner, side * outer))
+            width = max(0.8, min(2.6, (lat_hi - lat_lo) + self.voxel))
+            # 중심을 새 횡 범위의 가운데로 옮긴다(기준경로 법선 방향).
+            if route_tree is not None and route_tan is not None and len(route_tan) == n_route:
+                _, jc = route_tree.query(center)
+                nx, ny = -route_tan[jc, 1], route_tan[jc, 0]
+                shift = 0.5 * (lat_lo + lat_hi) - float(np.median(latp))
+                center = center + shift * np.array([nx, ny])
+                dx, dy = center[0] - x0, center[1] - y0
+                ex, ey = c * dx + s * dy, -s * dx + c * dy
+            top = float(np.max(q[:, 2]) - self.ground_z)
+            out.append({
+                'id': -1, 'class_name': 'obstacle',
+                'position_ego': [round(ex, 3), round(ey, 3), round(float(np.median(q[:, 2])), 3)],
+                'position_world': [round(float(center[0]), 3), round(float(center[1]), 3)],
+                'length': round(length, 3), 'width': round(width, 3),
+                'radius': round(0.5 * math.hypot(length, width), 3),
+                'speed': 0.0, 'velocity': [0.0, 0.0], 'motion_state': 'static',
+                'velocity_valid': False, 'confirmed': True, 'passed': False,
+                'in_trigger_corridor': True, 'top_elevation': round(top, 3),
+                'last_seen': float(np.max(q[:, 4])), 'source': 'raw_temporal_far',
+                'evidence_scans': int(len(np.unique(q[:, 3]))),
+                'evidence_points': int(len(q))})
+        self._assign_ids(out, stamp)
+        return self._with_hold(out, stamp, x0, y0, yaw)
+
+    def _with_hold(self, out, stamp, x0, y0, yaw):
+        fresh_ids = {p['id'] for p in out}
+        c, s = math.cos(yaw), math.sin(yaw)
+        for track in self.tracked:
+            if track['id'] in fresh_ids or stamp - track['stamp'] > self.hold_sec:
+                continue
+            held = dict(track['proposal'])
+            held['held_prediction'] = True
+            held['observation_age'] = round(max(0.0, stamp - track['stamp']), 3)
+            dx, dy = held['position_world'][0] - x0, held['position_world'][1] - y0
+            ex, ey = c * dx + s * dy, -s * dx + c * dy
+            # Hand over to the authoritative near detector once the old
+            # proposal has passed the far field; never preserve a passed box.
+            if ex < self.x_min - 1.0 or ex > self.x_max + 1.0:
+                continue
+            held['position_ego'] = [round(ex, 3), round(ey, 3), held['position_ego'][2]]
+            out.append(held)
+        for p in out:
+            p.setdefault('held_prediction', stamp - p['last_seen'] > 0.15)
+            p.setdefault('observation_age', round(max(0.0, stamp - p['last_seen']), 3))
+        return sorted(out, key=lambda z: z['position_ego'][0])
+
+    def _assign_ids(self, proposals, stamp):
+        """이전 주기 제안과 최근접 매칭으로 ID 를 물려준다.
+
+        정적 물체만 다루므로 world 좌표가 거의 고정이다. 가까운 쌍부터
+        greedy 로 1:1 매칭하고(한 트랙이 두 제안에 붙지 않게), 남은 제안은
+        새 ID 를 받는다. 매칭 거리 상한은 클러스터 중심 흔들림(실측 0.08~
+        0.34 m)보다 넉넉하되 이웃 물체를 흡수하지 않을 값으로 둔다.
+        """
+        alive = [t for t in self.tracked if stamp - t['stamp'] <= self.id_timeout]
+        pairs = []
+        for pi, p in enumerate(proposals):
+            px, py = p['position_world']
+            for ti, t in enumerate(alive):
+                dist = math.hypot(px - t['xy'][0], py - t['xy'][1])
+                if dist <= self.match_dist:
+                    pairs.append((dist, pi, ti))
+        pairs.sort()
+        used_p, used_t = set(), set()
+        for dist, pi, ti in pairs:
+            if pi in used_p or ti in used_t:
+                continue
+            proposals[pi]['id'] = alive[ti]['id']
+            used_p.add(pi); used_t.add(ti)
+        for pi, p in enumerate(proposals):
+            if pi not in used_p:
+                p['id'] = self.next_id
+                self.next_id += 1
+        # 이번 주기에 안 보인 트랙도 id_timeout 까지는 보관한다. 그러지
+        # 않으면 점군이 한 스캔만 비어도(원거리에서는 흔하다 - 실측 17~20%
+        # 프레임) 기억이 통째로 날아가 다음 검출이 새 ID 를 받는다.
+        keep = [t for ti, t in enumerate(alive)
+                if ti not in used_t and stamp - t['stamp'] <= self.id_timeout]
+        self.tracked = keep + [{'id': p['id'], 'xy': tuple(p['position_world']),
+                                'stamp': p['last_seen'], 'proposal': dict(p)}
+                               for p in proposals]
+
+    def _markers(self, header, obstacles):
+        ma = MarkerArray()
+        clear = Marker(); clear.action = Marker.DELETEALL; ma.markers.append(clear)
+        for i, o in enumerate(obstacles):
+            m = Marker(); m.header = header; m.header.frame_id = 'map'
+            m.ns = 'far_static_proposal'; m.id = i; m.type = Marker.CUBE; m.action = Marker.ADD
+            m.pose.position.x, m.pose.position.y = o['position_world']
+            m.pose.position.z = self.ground_z + max(0.2, o['top_elevation']) * 0.5
+            m.pose.orientation.w = 1.0
+            m.scale.x, m.scale.y, m.scale.z = o['length'], o['width'], max(0.2, o['top_elevation'])
+            m.color.r, m.color.g, m.color.b = 1.0, 0.45, 0.0
+            m.color.a = 0.35 if o.get('held_prediction', False) else 0.8
+            m.lifetime = rospy.Duration(0.35); ma.markers.append(m)
+        self.marker_pub.publish(ma)
+
+
+if __name__ == '__main__':
+    rospy.init_node('far_static_obstacle_detector')
+    FarStaticDetector()
+    rospy.spin()

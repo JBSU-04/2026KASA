@@ -1,0 +1,525 @@
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <geometry_msgs/Point.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <ros/ros.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/ColorRGBA.h>
+#include <tf2/utils.h>
+#include <visualization_msgs/MarkerArray.h>
+
+#include <mission_planner_msgs/BehaviorConstraint.h>
+#include <mission_planner_msgs/MissionDebug.h>
+#include <mission_planner_msgs/MissionState.h>
+#include <mission_planner_msgs/TrackedObjectArray.h>
+
+#include "mission_planner/geometry.hpp"
+#include "mission_planner/roundabout_mission.hpp"
+
+namespace mission_planner {
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kTwoPi = 2.0 * kPi;
+
+geometry_msgs::Point toRosPoint(const Point2& point, double z = 0.0) {
+  geometry_msgs::Point result;
+  result.x = point.x;
+  result.y = point.y;
+  result.z = z;
+  return result;
+}
+
+std_msgs::ColorRGBA color(float red, float green, float blue, float alpha) {
+  std_msgs::ColorRGBA result;
+  result.r = red;
+  result.g = green;
+  result.b = blue;
+  result.a = alpha;
+  return result;
+}
+
+}  // namespace
+
+class RoundaboutMissionNode {
+ public:
+  RoundaboutMissionNode()
+      : nh_(),
+        pnh_("~"),
+        mission_(RoundaboutConfig()) {
+    loadParameters();
+    mission_.setConfig(config_);
+
+    odom_sub_ = nh_.subscribe(odom_topic_, 5,
+                              &RoundaboutMissionNode::odomCallback, this);
+    route_sub_ = nh_.subscribe(route_topic_, 2,
+                               &RoundaboutMissionNode::routeCallback, this);
+    tracked_objects_sub_ = nh_.subscribe(
+        tracked_objects_topic_, 5,
+        &RoundaboutMissionNode::trackedObjectsCallback, this);
+    localization_sub_ = nh_.subscribe(
+        localization_topic_, 2,
+        &RoundaboutMissionNode::localizationCallback, this);
+
+    constraint_pub_ = nh_.advertise<mission_planner_msgs::BehaviorConstraint>(
+        constraint_topic_, 2);
+    state_pub_ =
+        nh_.advertise<mission_planner_msgs::MissionState>(state_topic_, 2);
+    debug_pub_ =
+        nh_.advertise<mission_planner_msgs::MissionDebug>(debug_topic_, 2);
+    marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
+        marker_topic_, 1, true);
+
+    timer_ = nh_.createTimer(ros::Duration(1.0 / update_rate_hz_),
+                             &RoundaboutMissionNode::timerCallback, this);
+
+    ROS_INFO_STREAM("[roundabout_mission] ready enabled=" << config_.enabled
+                    << " odom=" << odom_topic_ << " route=" << route_topic_
+                    << " tracked_objects=" << tracked_objects_topic_
+                    << " constraint=" << constraint_topic_);
+    if (!config_.enabled) {
+      ROS_WARN("[roundabout_mission] disabled: set roundabout/enabled=true "
+               "after entering site coordinates");
+    }
+  }
+
+ private:
+  void loadPoint(const std::string& name, Point2* point) {
+    pnh_.param<double>(name + "/x", point->x, 0.0);
+    pnh_.param<double>(name + "/y", point->y, 0.0);
+  }
+
+  void loadParameters() {
+    pnh_.param<std::string>("topics/odom", odom_topic_, "/odom");
+    pnh_.param<std::string>("topics/route", route_topic_, "/local_path");
+    pnh_.param<std::string>("topics/tracked_objects", tracked_objects_topic_,
+                            "/perception/roundabout/tracked_objects");
+    pnh_.param<std::string>("topics/localization_valid", localization_topic_,
+                            "/localization/valid");
+    pnh_.param<std::string>("topics/constraint", constraint_topic_,
+                            "/mission/constraints/roundabout");
+    pnh_.param<std::string>("topics/state", state_topic_,
+                            "/mission/roundabout/state");
+    pnh_.param<std::string>("topics/debug", debug_topic_,
+                            "/mission/roundabout/debug");
+    pnh_.param<std::string>("topics/markers", marker_topic_,
+                            "/mission/roundabout/markers");
+    pnh_.param<std::string>("frame_id", frame_id_, "map");
+    pnh_.param<double>("update_rate_hz", update_rate_hz_, 20.0);
+    pnh_.param<double>("odom_timeout", odom_timeout_, 0.4);
+    pnh_.param<double>("tracked_objects/min_confidence", min_confidence_, 0.4);
+    pnh_.param<bool>("tracked_objects/require_velocity_valid",
+                     require_velocity_valid_, false);
+    pnh_.param<bool>("tracked_objects/require_movement_confirmation",
+                     require_movement_confirmation_, false);
+    update_rate_hz_ = std::max(1.0, update_rate_hz_);
+    odom_timeout_ = std::max(0.05, odom_timeout_);
+
+    pnh_.param<bool>("roundabout/enabled", config_.enabled, false);
+    pnh_.param<bool>("roundabout/counter_clockwise",
+                     config_.counter_clockwise, true);
+    pnh_.param<bool>("roundabout/require_tracker_stream",
+                     config_.require_tracker_stream, true);
+    pnh_.param<bool>("roundabout/require_localization",
+                     config_.require_localization, true);
+    loadPoint("roundabout/center", &config_.center);
+    loadPoint("roundabout/yield_point", &config_.yield_point);
+    loadPoint("roundabout/conflict_point", &config_.conflict_point);
+    loadPoint("roundabout/exit_point", &config_.exit_point);
+
+    double entry_heading_deg = 0.0;
+    double entry_heading_tolerance_deg = 70.0;
+    double tangent_heading_tolerance_deg = 60.0;
+    pnh_.param<double>("roundabout/entry_heading_deg", entry_heading_deg, 0.0);
+    pnh_.param<double>("roundabout/entry_heading_tolerance_deg",
+                       entry_heading_tolerance_deg, 70.0);
+    pnh_.param<double>("roundabout/tangent_heading_tolerance_deg",
+                       tangent_heading_tolerance_deg, 60.0);
+    config_.entry_heading = entry_heading_deg * kPi / 180.0;
+    config_.entry_heading_tolerance =
+        entry_heading_tolerance_deg * kPi / 180.0;
+    config_.tangent_heading_tolerance =
+        tangent_heading_tolerance_deg * kPi / 180.0;
+
+    pnh_.param<double>("roundabout/radius/inner", config_.inner_radius, 8.0);
+    pnh_.param<double>("roundabout/radius/outer", config_.outer_radius, 18.0);
+    pnh_.param<double>("roundabout/radius/nominal", config_.nominal_radius,
+                       13.0);
+    pnh_.param<double>("roundabout/distance/activation",
+                       config_.activation_distance, 35.0);
+    pnh_.param<double>("roundabout/distance/decision",
+                       config_.decision_distance, 18.0);
+    pnh_.param<double>("roundabout/distance/exit_detection",
+                       config_.exit_detection_radius, 6.0);
+    pnh_.param<double>("roundabout/distance/exit_clear",
+                       config_.exit_clear_distance, 12.0);
+    pnh_.param<double>("roundabout/distance/route_projection_tolerance",
+                       config_.route_projection_tolerance, 4.0);
+    pnh_.param<double>("roundabout/distance/stop_buffer", config_.stop_buffer,
+                       1.0);
+    pnh_.param<double>("roundabout/distance/creep_buffer",
+                       config_.creep_buffer, config_.stop_buffer);
+    pnh_.param<double>("roundabout/distance/lead_search",
+                       config_.lead_search_distance, 45.0);
+
+    pnh_.param<double>("roundabout/speed/approach", config_.approach_speed,
+                       6.0);
+    pnh_.param<double>("roundabout/speed/circulation",
+                       config_.circulation_speed, 7.0);
+    pnh_.param<double>("roundabout/speed/exit", config_.exit_speed, 8.0);
+    pnh_.param<double>("roundabout/speed/degraded", config_.degraded_speed,
+                       2.0);
+    pnh_.param<double>("roundabout/speed/stationary_threshold",
+                       config_.stationary_speed, 0.3);
+
+    pnh_.param<double>("roundabout/gap/ego_merge_time",
+                       config_.ego_merge_time, 2.0);
+    pnh_.param<double>("roundabout/gap/rear_time", config_.rear_time_gap, 4.0);
+    pnh_.param<double>("roundabout/gap/rear_ttc_relax_floor",
+                       config_.rear_ttc_relax_floor, 3.0);
+    pnh_.param<double>("roundabout/gap/rear_ttc_relax_max",
+                       config_.rear_ttc_relax_max, 0.5);
+    pnh_.param<double>("roundabout/gap/relax_start_seconds",
+                       config_.gap_relax_start_seconds, 5.0);
+    pnh_.param<double>("roundabout/gap/relax_rate",
+                       config_.gap_relax_rate, 0.1);
+    pnh_.param<bool>("roundabout/gap/rear_time_is_total_ttc",
+                     config_.rear_time_is_total_ttc, false);
+    pnh_.param<double>("roundabout/gap/front_time", config_.front_time_gap,
+                       2.0);
+    pnh_.param<double>("roundabout/gap/front_time_relax_floor",
+                       config_.front_time_relax_floor, 1.2);
+    pnh_.param<double>("roundabout/gap/front_standstill_distance",
+                       config_.front_standstill_distance, 5.0);
+    pnh_.param<double>("roundabout/gap/front_departure_speed_ratio",
+                       config_.front_departure_speed_ratio, 1.0);
+    pnh_.param<double>("roundabout/gap/front_check_distance",
+                       config_.front_check_distance, 35.0);
+    pnh_.param<double>("roundabout/gap/stationary_block_distance",
+                       config_.stationary_block_distance, 20.0);
+    pnh_.param<double>("roundabout/gap/uncertain_object_block_distance",
+                       config_.uncertain_object_block_distance, 15.0);
+    pnh_.param<double>("roundabout/gap/prediction_uncertainty_time",
+                       config_.prediction_uncertainty_time, 0.5);
+    pnh_.param<double>("roundabout/gap/safe_confirm_seconds",
+                       config_.safe_confirm_seconds, 0.5);
+    pnh_.param<double>("roundabout/gap/safe_confirm_relax_floor",
+                       config_.safe_confirm_relax_floor, 0.15);
+
+    pnh_.param<double>("roundabout/timing/tracker_timeout",
+                       config_.tracker_timeout, 0.5);
+    pnh_.param<double>("roundabout/timing/mandatory_stop_seconds",
+                       config_.mandatory_stop_seconds, 0.0);
+    pnh_.param<double>("roundabout/timing/mandatory_stop_position_tolerance",
+                       config_.mandatory_stop_position_tolerance, 0.5);
+    pnh_.param<double>("roundabout/timing/mandatory_stop_speed_threshold",
+                       config_.mandatory_stop_speed_threshold, 0.25);
+    pnh_.param<double>("roundabout/timing/minimum_circulate_seconds",
+                       config_.minimum_circulate_seconds, 1.0);
+    pnh_.param<double>("roundabout/timing/commit_timeout_seconds",
+                       config_.commit_timeout_seconds, 8.0);
+    pnh_.param<double>("roundabout/timing/exit_hold_seconds",
+                       config_.exit_hold_seconds, 1.0);
+    pnh_.param<double>("roundabout/safety/reset_jump_distance",
+                       config_.reset_jump_distance, 5.0);
+    pnh_.param<double>("roundabout/safety/comfortable_decel",
+                       config_.comfortable_decel, 2.5);
+    pnh_.param<double>("roundabout/safety/emergency_decel",
+                       config_.emergency_decel, 5.0);
+  }
+
+  void odomCallback(const nav_msgs::Odometry::ConstPtr& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ego_.position.x = message->pose.pose.position.x;
+    ego_.position.y = message->pose.pose.position.y;
+    ego_.yaw = tf2::getYaw(message->pose.pose.orientation);
+    ego_.speed = std::hypot(message->twist.twist.linear.x,
+                            message->twist.twist.linear.y);
+    ego_.valid = std::isfinite(ego_.position.x) &&
+                 std::isfinite(ego_.position.y) && std::isfinite(ego_.yaw) &&
+                 std::isfinite(ego_.speed);
+    last_odom_time_ = ros::Time::now();
+  }
+
+  void routeCallback(const nav_msgs::Path::ConstPtr& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    route_.clear();
+    route_.reserve(message->poses.size());
+    for (const geometry_msgs::PoseStamped& pose : message->poses) {
+      route_.push_back({pose.pose.position.x, pose.pose.position.y});
+    }
+  }
+
+  void trackedObjectsCallback(
+      const mission_planner_msgs::TrackedObjectArray::ConstPtr& message) {
+    if (!message->header.frame_id.empty() &&
+        message->header.frame_id != frame_id_) {
+      ROS_WARN_THROTTLE(2.0,
+                        "[roundabout_mission] tracked object frame '%s' must "
+                        "match '%s'",
+                        message->header.frame_id.c_str(), frame_id_.c_str());
+      return;
+    }
+
+    std::vector<TrackedObject> tracks;
+    tracks.reserve(message->objects.size());
+    for (const mission_planner_msgs::TrackedObject& object : message->objects) {
+      if (object.confidence < min_confidence_ ||
+          (require_velocity_valid_ && !object.velocity_valid) ||
+          (require_movement_confirmation_ && !object.has_moved) ||
+          !std::isfinite(object.position.x) ||
+          !std::isfinite(object.position.y)) {
+        continue;
+      }
+      TrackedObject track;
+      track.id = object.id;
+      track.position = {object.position.x, object.position.y};
+      track.velocity_x = object.velocity.x;
+      track.velocity_y = object.velocity.y;
+      track.length = std::max(0.1, std::max(object.size.x, object.size.y));
+      track.velocity_valid = object.velocity_valid;
+      track.has_moved = object.has_moved;
+      tracks.push_back(track);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked_objects_ = std::move(tracks);
+    tracker_reported_valid_ = message->valid;
+    last_tracker_time_ = ros::Time::now();
+  }
+
+  void localizationCallback(const std_msgs::Bool::ConstPtr& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    localization_valid_ = message->data;
+    have_localization_status_ = true;
+  }
+
+  void timerCallback(const ros::TimerEvent&) {
+    const ros::Time stamp = ros::Time::now();
+
+    // 런타임 핫 리로드: 1초 주기로 파라미터 동기화하여 rosparam 갱신 시 실시간 반영
+    if ((stamp - last_param_sync_).toSec() >= 1.0) {
+      loadParameters();
+      mission_.setConfig(config_);
+      last_param_sync_ = stamp;
+    }
+
+    RoundaboutInput input;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      input.now = stamp.toSec();
+      input.ego = ego_;
+      input.ego.valid = input.ego.valid && !last_odom_time_.isZero() &&
+                        (stamp - last_odom_time_).toSec() <= odom_timeout_;
+      input.localization_valid =
+          !config_.require_localization ||
+          (have_localization_status_ && localization_valid_);
+      input.tracker_stream_valid =
+          !last_tracker_time_.isZero() &&
+          (stamp - last_tracker_time_).toSec() <= config_.tracker_timeout &&
+          tracker_reported_valid_;
+      input.route = route_;
+      input.objects = tracked_objects_;
+    }
+
+    const RoundaboutState previous_state = mission_.state();
+    const RoundaboutOutput output = mission_.update(input);
+    if (previous_state != output.state) {
+      ROS_INFO_STREAM("[roundabout_mission] "
+                      << RoundaboutMission::stateName(previous_state) << " -> "
+                      << RoundaboutMission::stateName(output.state)
+                      << " reason=" << output.reason);
+    }
+    publish(output, input.localization_valid, input.tracker_stream_valid,
+            stamp);
+  }
+
+  void publish(const RoundaboutOutput& output, bool localization_valid,
+               bool tracker_stream_valid,
+               const ros::Time& stamp) {
+    mission_planner_msgs::BehaviorConstraint constraint;
+    constraint.header.stamp = stamp;
+    constraint.header.frame_id = frame_id_;
+    constraint.source = mission_planner_msgs::BehaviorConstraint::SOURCE_ROUNDABOUT;
+    constraint.priority = output.constraint.priority;
+    constraint.active = output.constraint.active;
+    constraint.max_speed = output.constraint.max_speed;
+    constraint.stop_required = output.constraint.stop_required;
+    constraint.stop_distance = output.constraint.stop_distance;
+    constraint.lead_vehicle_active = output.constraint.lead_vehicle_active;
+    constraint.lead_vehicle_id = output.constraint.lead_vehicle_id;
+    constraint.lead_distance = output.constraint.lead_distance;
+    constraint.lead_speed = output.constraint.lead_speed;
+    constraint.comfortable_decel = output.constraint.comfortable_decel;
+    constraint.emergency_decel = output.constraint.emergency_decel;
+    constraint.reason = output.constraint.reason;
+    constraint_pub_.publish(constraint);
+
+    mission_planner_msgs::MissionState state;
+    state.header = constraint.header;
+    state.state = static_cast<std::uint8_t>(output.state);
+    state.active = output.state != RoundaboutState::kIdle;
+    state.gap_safe = output.gap_safe;
+    state.localization_valid = localization_valid;
+    state.tracker_stream_valid = tracker_stream_valid;
+    state.blocking_object_id = output.blocking_object_id;
+    state.tracked_object_count = output.tracked_object_count;
+    state.distance_to_yield = output.distance_to_yield;
+    state.next_npc_ttc = output.next_npc_ttc;
+    state.front_gap = output.front_gap;
+    state.reason = output.reason;
+    state_pub_.publish(state);
+
+    mission_planner_msgs::MissionDebug debug;
+    debug.header = constraint.header;
+    debug.center = toRosPoint(config_.center);
+    debug.yield_point = toRosPoint(config_.yield_point);
+    debug.conflict_point = toRosPoint(config_.conflict_point);
+    debug.exit_point = toRosPoint(config_.exit_point);
+    debug.inner_radius = config_.inner_radius;
+    debug.outer_radius = config_.outer_radius;
+    debug.ego_radius = output.ego_radius;
+    debug.ego_angle = output.ego_angle;
+    debug.safe_speed = output.constraint.max_speed;
+    debug.blocking_object_id = output.blocking_object_id;
+    debug_pub_.publish(debug);
+
+    marker_pub_.publish(makeMarkers(output, stamp));
+  }
+
+  visualization_msgs::Marker baseMarker(const ros::Time& stamp, int id,
+                                         int type) const {
+    visualization_msgs::Marker marker;
+    marker.header.stamp = stamp;
+    marker.header.frame_id = frame_id_;
+    marker.ns = "roundabout_mission";
+    marker.id = id;
+    marker.type = type;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.lifetime = ros::Duration(0.25);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeCircle(const ros::Time& stamp, int id,
+                                         double radius,
+                                         const std_msgs::ColorRGBA& marker_color) const {
+    visualization_msgs::Marker marker =
+        baseMarker(stamp, id, visualization_msgs::Marker::LINE_STRIP);
+    marker.scale.x = 0.18;
+    marker.color = marker_color;
+    for (int index = 0; index <= 72; ++index) {
+      const double angle = kTwoPi * static_cast<double>(index) / 72.0;
+      marker.points.push_back(toRosPoint(
+          {config_.center.x + radius * std::cos(angle),
+           config_.center.y + radius * std::sin(angle)},
+          0.25));
+    }
+    return marker;
+  }
+
+  visualization_msgs::MarkerArray makeMarkers(const RoundaboutOutput& output,
+                                                const ros::Time& stamp) const {
+    visualization_msgs::MarkerArray markers;
+    markers.markers.push_back(
+        makeCircle(stamp, 0, config_.inner_radius, color(0.2F, 0.7F, 1.0F, 0.8F)));
+    markers.markers.push_back(
+        makeCircle(stamp, 1, config_.outer_radius, color(0.2F, 0.7F, 1.0F, 0.8F)));
+
+    visualization_msgs::Marker yield_line =
+        baseMarker(stamp, 2, visualization_msgs::Marker::LINE_LIST);
+    yield_line.scale.x = 0.35;
+    yield_line.color = color(1.0F, 0.2F, 0.2F, 1.0F);
+    const double normal_x = -std::sin(config_.entry_heading);
+    const double normal_y = std::cos(config_.entry_heading);
+    yield_line.points.push_back(toRosPoint(
+        {config_.yield_point.x - 3.0 * normal_x,
+         config_.yield_point.y - 3.0 * normal_y},
+        0.35));
+    yield_line.points.push_back(toRosPoint(
+        {config_.yield_point.x + 3.0 * normal_x,
+         config_.yield_point.y + 3.0 * normal_y},
+        0.35));
+    markers.markers.push_back(yield_line);
+
+    visualization_msgs::Marker conflict =
+        baseMarker(stamp, 3, visualization_msgs::Marker::SPHERE);
+    conflict.pose.position = toRosPoint(config_.conflict_point, 0.4);
+    conflict.scale.x = conflict.scale.y = conflict.scale.z = 0.8;
+    conflict.color = color(1.0F, 0.55F, 0.0F, 1.0F);
+    markers.markers.push_back(conflict);
+
+    visualization_msgs::Marker exit =
+        baseMarker(stamp, 4, visualization_msgs::Marker::SPHERE);
+    exit.pose.position = toRosPoint(config_.exit_point, 0.4);
+    exit.scale.x = exit.scale.y = exit.scale.z = 0.8;
+    exit.color = color(0.2F, 1.0F, 0.3F, 1.0F);
+    markers.markers.push_back(exit);
+
+    visualization_msgs::Marker label =
+        baseMarker(stamp, 5, visualization_msgs::Marker::TEXT_VIEW_FACING);
+    label.pose.position = toRosPoint(config_.center, 2.0);
+    label.scale.z = 1.2;
+    label.color = color(1.0F, 1.0F, 1.0F, 1.0F);
+    label.text = std::string("Roundabout: ") +
+                 RoundaboutMission::stateName(output.state) + "\n" +
+                 output.reason;
+    markers.markers.push_back(label);
+    return markers;
+  }
+
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+  ros::Subscriber odom_sub_;
+  ros::Subscriber route_sub_;
+  ros::Subscriber tracked_objects_sub_;
+  ros::Subscriber localization_sub_;
+  ros::Publisher constraint_pub_;
+  ros::Publisher state_pub_;
+  ros::Publisher debug_pub_;
+  ros::Publisher marker_pub_;
+  ros::Timer timer_;
+
+  std::mutex mutex_;
+  EgoState ego_;
+  std::vector<Point2> route_;
+  std::vector<TrackedObject> tracked_objects_;
+  RoundaboutMission mission_;
+  RoundaboutConfig config_;
+  ros::Time last_odom_time_;
+  ros::Time last_tracker_time_;
+  ros::Time last_param_sync_;
+  bool localization_valid_ = false;
+  bool have_localization_status_ = false;
+  bool tracker_reported_valid_ = false;
+
+  std::string odom_topic_;
+  std::string route_topic_;
+  std::string tracked_objects_topic_;
+  std::string localization_topic_;
+  std::string constraint_topic_;
+  std::string state_topic_;
+  std::string debug_topic_;
+  std::string marker_topic_;
+  std::string frame_id_;
+  double update_rate_hz_ = 20.0;
+  double odom_timeout_ = 0.4;
+  double min_confidence_ = 0.4;
+  bool require_velocity_valid_ = false;
+  bool require_movement_confirmation_ = false;
+};
+
+}  // namespace mission_planner
+
+int main(int argc, char** argv) {
+  ros::init(argc, argv, "roundabout_mission");
+  mission_planner::RoundaboutMissionNode node;
+  ros::spin();
+  return 0;
+}

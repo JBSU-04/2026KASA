@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Tunnel Wall Detector Node.
+
+Subscribes to LiDAR /nonground point cloud and estimates distance to the right
+and left tunnel walls. Computes the lateral shift required to keep the vehicle
+centered in lane 3 during GPS outages in the tunnel. Decouples intentional
+Frenet avoidance swerving from true dead-reckoning drift.
+"""
+
+import math
+import numpy as np
+import rospy
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Float64, String
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+def pointcloud2_to_xyz_array(msg):
+    """Fast unpacking of PointCloud2 into an (N, 3) float32 numpy array."""
+    field_offset = {f.name: f.offset for f in msg.fields}
+    if not all(k in field_offset for k in ('x', 'y', 'z')):
+        return np.empty((0, 3), dtype=np.float32)
+
+    names = ['x', 'y', 'z']
+    dtype = np.dtype({
+        'names': names,
+        'formats': [np.float32] * 3,
+        'offsets': [field_offset[name] for name in names],
+        'itemsize': msg.point_step,
+    })
+    n = len(msg.data) // msg.point_step
+    arr = np.frombuffer(msg.data, dtype=dtype, count=n)
+    pts = np.stack([arr[name] for name in names], axis=-1)
+    return pts[~np.isnan(pts).any(axis=1)]
+
+
+def fit_wall_line_ransac(points_xy, max_iter=25, dist_thresh=0.08, max_slope=0.30):
+    """Fit a line y = m*x + b to wall points using RANSAC.
+
+    Returns (m, b, inlier_ratio) or (None, None, 0.0) if fit fails.
+    """
+    n = len(points_xy)
+    if n < 20:
+        return None, None, 0.0
+
+    best_inliers = 0
+    best_m = 0.0
+    best_b = 0.0
+
+    x = points_xy[:, 0]
+    y = points_xy[:, 1]
+
+    # Pre-filter by slope bounds using randomized pairs
+    for _ in range(max_iter):
+        idx = np.random.choice(n, 2, replace=False)
+        dx = x[idx[1]] - x[idx[0]]
+        if abs(dx) < 1.0:
+            continue
+        dy = y[idx[1]] - y[idx[0]]
+        m = dy / dx
+        if abs(m) > max_slope:
+            continue
+        b = y[idx[0]] - m * x[idx[0]]
+
+        # Distance from line: |m*x - y + b| / sqrt(m^2 + 1)
+        dists = np.abs(m * x - y + b) / math.sqrt(m * m + 1.0)
+        inliers = np.count_nonzero(dists < dist_thresh)
+
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_m = m
+            best_b = b
+
+    if best_inliers < max(15, int(n * 0.25)):
+        # Fallback: simple median of y if points are concentrated
+        if n >= 20:
+            med_y = float(np.median(y))
+            return 0.0, med_y, float(n) / max(n, 1)
+        return None, None, 0.0
+
+    # Refine with least squares on inliers
+    dists = np.abs(best_m * x - y + best_b) / math.sqrt(best_m * best_m + 1.0)
+    inlier_mask = dists < dist_thresh
+    if np.count_nonzero(inlier_mask) >= 10:
+        poly = np.polyfit(x[inlier_mask], y[inlier_mask], 1)
+        return float(poly[0]), float(poly[1]), float(best_inliers) / n
+
+    return best_m, best_b, float(best_inliers) / n
+
+
+class TunnelWallDetector:
+    def __init__(self):
+        # Parameters
+        self.target_wall_dist = float(rospy.get_param('~target_wall_dist', 2.45))
+        self.nominal_tunnel_width = float(rospy.get_param('~nominal_tunnel_width', 8.40))
+        self.max_shift = float(rospy.get_param('~max_shift', 1.80))
+        self.shift_rate_limit = float(rospy.get_param('~shift_rate_limit', 0.50))
+        self.ema_alpha = float(rospy.get_param('~ema_alpha', 0.20))
+        self.deadband_m = float(rospy.get_param('~deadband_m', 0.03))
+
+        # State
+        self.gps_mode = 'normal'
+        self.active_section = ''
+        self.current_frenet_d = 0.0
+        self.last_frenet_d_stamp = rospy.Time(0)
+
+        self.filtered_shift = 0.0
+        self.last_update_time = rospy.Time.now()
+        self.tunnel_active = False
+
+        # Publishers
+        self.offset_pub = rospy.Publisher('/tunnel/wall_offset', Float64, queue_size=1)
+        self.marker_pub = rospy.Publisher('/tunnel/wall_markers', MarkerArray, queue_size=1)
+
+        # Subscribers
+        rospy.Subscriber('/localization/gps_mode', String, self.gps_mode_cb, queue_size=1)
+        try:
+            from mission_supervisor.msg import SectionState
+            rospy.Subscriber('/mission/active_section', SectionState, self.section_cb, queue_size=1)
+        except Exception:
+            pass
+        rospy.Subscriber('/obstacle_avoidance/frenet_d', Float64, self.frenet_d_cb, queue_size=1)
+        rospy.Subscriber('/nonground', PointCloud2, self.lidar_cb, queue_size=1)
+
+        rospy.loginfo('[tunnel_wall_detector] Initialized. target_wall_dist=%.2f, nominal_width=%.2f',
+                      self.target_wall_dist, self.nominal_tunnel_width)
+
+    def gps_mode_cb(self, msg):
+        self.gps_mode = msg.data
+
+    def section_cb(self, msg):
+        self.active_section = getattr(msg, 'section_id', '')
+
+    def frenet_d_cb(self, msg):
+        self.current_frenet_d = msg.data
+        self.last_frenet_d_stamp = rospy.Time.now()
+
+    def is_tunnel_zone(self):
+        return (self.gps_mode == 'frozen' or
+                self.active_section == 'M8' or
+                self.active_section == 'tunnel_approach' or
+                self.active_section == 'gps_shadow')
+
+    def lidar_cb(self, msg):
+        now = rospy.Time.now()
+        dt = max(0.001, (now - self.last_update_time).to_sec())
+        self.last_update_time = now
+
+        in_tunnel = self.is_tunnel_zone()
+
+        if not in_tunnel:
+            # Smoothly decay shift to 0 when exiting tunnel
+            if abs(self.filtered_shift) > 0.01:
+                decay = max(0.0, abs(self.filtered_shift) - self.shift_rate_limit * dt)
+                self.filtered_shift = math.copysign(decay, self.filtered_shift)
+            else:
+                self.filtered_shift = 0.0
+            self.offset_pub.publish(Float64(data=self.filtered_shift))
+            return
+
+        # Parse points
+        pts = pointcloud2_to_xyz_array(msg)
+        if len(pts) == 0:
+            self.offset_pub.publish(Float64(data=self.filtered_shift))
+            return
+
+        # Filter forward & height ROI (vehicle base_link / velodyne frame)
+        # x: forward [1.0, 15.0] m
+        # z: height [0.2, 2.0] m (clear ground and ceiling)
+        mask_forward = (pts[:, 0] >= 1.0) & (pts[:, 0] <= 15.0)
+        mask_z = (pts[:, 2] >= 0.20) & (pts[:, 2] <= 2.0)
+        roi_pts = pts[mask_forward & mask_z]
+
+        if len(roi_pts) < 30:
+            self.offset_pub.publish(Float64(data=self.filtered_shift))
+            return
+
+        # Right wall region: y in [-4.5, -1.0]
+        right_mask = (roi_pts[:, 1] >= -4.5) & (roi_pts[:, 1] <= -1.0)
+        right_pts = roi_pts[right_mask][:, :2]
+
+        # Left wall region: y in [1.5, 6.5]
+        left_mask = (roi_pts[:, 1] >= 1.5) & (roi_pts[:, 1] <= 6.5)
+        left_pts = roi_pts[left_mask][:, :2]
+
+        m_r, b_r, ratio_r = fit_wall_line_ransac(right_pts)
+        m_l, b_l, ratio_l = fit_wall_line_ransac(left_pts)
+
+        d_right = -b_r if b_r is not None else None
+        d_left = b_l if b_l is not None else None
+
+        d_fused = None
+        # Dual wall validation
+        if d_right is not None and d_left is not None:
+            width = d_right + d_left
+            if 7.2 <= width <= 9.6:
+                # Both walls consistent with tunnel geometry
+                d_fused = 0.5 * d_right + 0.5 * (self.nominal_tunnel_width - d_left)
+            elif 1.0 <= d_right <= 4.0:
+                d_fused = d_right
+            elif 3.5 <= d_left <= 7.5:
+                d_fused = self.nominal_tunnel_width - d_left
+        elif d_right is not None and 1.0 <= d_right <= 4.0:
+            d_fused = d_right
+        elif d_left is not None and 3.5 <= d_left <= 7.5:
+            d_fused = self.nominal_tunnel_width - d_left
+
+        if d_fused is not None:
+            # Account for intentional Frenet swerving (frenet_d)
+            frenet_d = 0.0
+            if (now - self.last_frenet_d_stamp).to_sec() < 0.5:
+                frenet_d = self.current_frenet_d
+
+            # Expected wall distance: if swerving left by frenet_d, wall is further away
+            expected_wall_dist = self.target_wall_dist + frenet_d
+
+            # Raw lateral drift: positive when vehicle is too far right (wall closer than expected)
+            raw_drift = expected_wall_dist - d_fused
+
+            # Apply deadband
+            if abs(raw_drift) < self.deadband_m:
+                raw_drift = 0.0
+
+            # Clamp raw drift
+            raw_drift = max(-self.max_shift, min(self.max_shift, raw_drift))
+
+            # Rate limit and EMA filter
+            target_shift = raw_drift
+            max_change = self.shift_rate_limit * dt
+            step = target_shift - self.filtered_shift
+            step = max(-max_change, min(max_change, step))
+            self.filtered_shift += step
+            self.filtered_shift = (1.0 - self.ema_alpha) * self.filtered_shift + self.ema_alpha * target_shift
+
+            rospy.loginfo_throttle(1.0,
+                '[tunnel_wall] d_right=%.2f, d_left=%.2f, fused=%.2f, frenet_d=%.2f -> shift=%.2f m',
+                d_right if d_right is not None else -1.0,
+                d_left if d_left is not None else -1.0,
+                d_fused, frenet_d, self.filtered_shift)
+        else:
+            rospy.logwarn_throttle(2.0, '[tunnel_wall] No valid wall line detected in ROI')
+
+        self.offset_pub.publish(Float64(data=self.filtered_shift))
+        self.publish_markers(msg.header.frame_id, m_r, b_r, m_l, b_l)
+
+    def publish_markers(self, frame_id, m_r, b_r, m_l, b_l):
+        if self.marker_pub.get_num_connections() == 0:
+            return
+
+        ma = MarkerArray()
+
+        del_m = Marker()
+        del_m.action = Marker.DELETEALL
+        ma.markers.append(del_m)
+
+        header_stamp = rospy.Time.now()
+
+        # Right wall marker (Green line)
+        if b_r is not None:
+            mr = Marker()
+            mr.header.frame_id = frame_id
+            mr.header.stamp = header_stamp
+            mr.ns = "tunnel_walls"
+            mr.id = 1
+            mr.type = Marker.LINE_STRIP
+            mr.action = Marker.ADD
+            mr.scale.x = 0.12
+            mr.color.r = 0.1
+            mr.color.g = 1.0
+            mr.color.b = 0.1
+            mr.color.a = 0.9
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                mr.points.append(Point(x_val, m_r * x_val + b_r, 0.5))
+            ma.markers.append(mr)
+
+        # Left wall marker (Blue line)
+        if b_l is not None:
+            ml = Marker()
+            ml.header.frame_id = frame_id
+            ml.header.stamp = header_stamp
+            ml.ns = "tunnel_walls"
+            ml.id = 2
+            ml.type = Marker.LINE_STRIP
+            ml.action = Marker.ADD
+            ml.scale.x = 0.12
+            ml.color.r = 0.1
+            ml.color.g = 0.3
+            ml.color.b = 1.0
+            ml.color.a = 0.9
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                ml.points.append(Point(x_val, m_l * x_val + b_l, 0.5))
+            ma.markers.append(ml)
+
+        # Target lane center line (Yellow line)
+        if b_r is not None:
+            mc = Marker()
+            mc.header.frame_id = frame_id
+            mc.header.stamp = header_stamp
+            mc.ns = "tunnel_walls"
+            mc.id = 3
+            mc.type = Marker.LINE_STRIP
+            mc.action = Marker.ADD
+            mc.scale.x = 0.08
+            mc.color.r = 1.0
+            mc.color.g = 0.9
+            mc.color.b = 0.1
+            mc.color.a = 0.8
+            for x_val in [0.0, 5.0, 10.0, 15.0]:
+                from geometry_msgs.msg import Point
+                mc.points.append(Point(x_val, m_r * x_val + b_r + self.target_wall_dist, 0.2))
+            ma.markers.append(mc)
+
+        self.marker_pub.publish(ma)
+
+
+if __name__ == '__main__':
+    try:
+        rospy.init_node('tunnel_wall_detector', anonymous=False)
+        node = TunnelWallDetector()
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        pass

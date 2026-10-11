@@ -1,0 +1,16 @@
+<launch>
+  <!-- 고주로 차선변경. M6/M7 구간에서만 의미가 있다(속도상한 전달권은
+       constraint_to_speed_cap 이 구간별로 판단 - mission.launch 참고).
+
+       use_lidar_tracker:=false : perception.launch 가 use_ttc_tracker(기본 true)
+       로 이미 lidar_ttc_tracker 를 name="lidar_ttc_tracker" 로 띄워 놓는데,
+       smpc_integration.launch 도 기본값으로 자기 lidar_ttc_tracker 를 같은
+       이름으로 또 띄워서 "multiple nodes named [/lidar_ttc_tracker]" 로
+       roslaunch 자체가 안 뜨는 문제가 있었다(enable_behavior:=true 가 한
+       번도 끝까지 실행된 적이 없었다는 뜻). /tracked_objects 는 이미 다른
+       곳에서 나오고 있으니 여기서는 새로 안 띄운다. -->
+  <include file="$(find smpc_lane_change)/launch/smpc_integration.launch">
+    <arg name="use_rviz" value="false"/>
+    <arg name="use_lidar_tracker" value="false"/>
+  </include>
+</launch>

@@ -1,0 +1,120 @@
+<launch>
+  <!-- ===================================================================
+       debug.launch — 미션 전체 상태를 눈과 로그로 동시에 보는 구성.
+
+       competition.launch 를 그대로 띄우고 두 가지를 얹는다.
+         1) 통합 RViz  : 경로 · LiDAR · TTC 추적 · 회전교차로를 한 화면에
+         2) mission_debug : 사슬 순서대로 한 화면 로그
+              구간 -> 미션 -> 제약 -> 속도캡 -> MPC -> /ctrl_cmd
+            각 줄 앞 OK 또는 빗금 표시로 어디서 끊겼는지 바로 보인다.
+
+       사용:
+         roslaunch total_bringup debug.launch                    # 기본 주행
+         roslaunch total_bringup debug.launch use_roundabout:=true  # M5 포함
+       =================================================================== -->
+
+  <arg name="sim_ip"          default="127.0.0.1"/>
+  <!-- 대회 런치와 같은 구성으로 둔다(거동 비교가 되려면 미션 조합이 같아야 한다). -->
+  <arg name="use_roundabout"  default="true"/>
+  <arg name="use_traffic_light" default="false"/>
+  <arg name="use_traffic_light_detector" default="false"/>
+  <arg name="use_dynamic_obstacle"      default="false"/>
+  <arg name="use_static_obstacle"       default="false"/>
+  <arg name="use_obstacle_perception"   default="true"/>
+  <arg name="use_camera_speed_kick"     default="true"/>
+  <arg name="use_obstacle_stop"         default="true"/>
+  <arg name="static_dynamic_split_idx"  default="3700"/>
+  <arg name="obstacle_avoid_start_idx"  default="2400"/>
+  <arg name="obstacle_stop_end_idx"     default="4900"/>
+  <!-- 명령 전달 방식. 기본은 원본(직접 발행). 여기서 안 받아두면 명령줄에
+       넘겨도 조용히 무시된다. -->
+  <arg name="use_stop_adapter"          default="false"/>
+  <arg name="use_arbiter"               default="false"/>
+  <arg name="enable_mission"  default="true"/>
+  <arg name="enable_behavior" default="true"/>
+  <arg name="enable_control"  default="true"/>
+  <arg name="use_ekf"         default="true"/>
+  <arg name="mpc_N"           default="30"/>
+  <arg name="external_acc_enabled" default="true"/>
+  <arg name="debug_period"    default="1.0"/>
+  <arg name="path_number"     default="0"/>
+  <arg name="dry_run"         default="false"/>
+
+  <!-- 주행 기록. 제어 사슬 분석에 필요한 토픽만 담는다.
+       점군·영상은 뺐다(용량). 필요하면 record_heavy:=true. -->
+  <arg name="record"       default="true"/>
+  <arg name="record_heavy" default="false"/>
+  <arg name="bag_dir"      default="$(env HOME)/catkin_ws/bags"/>
+
+  <include file="$(find total_bringup)/launch/competition.launch">
+    <arg name="sim_ip"          value="$(arg sim_ip)"/>
+    <arg name="dry_run"         value="$(arg dry_run)"/>
+    <arg name="use_roundabout"  value="$(arg use_roundabout)"/>
+    <arg name="use_traffic_light" value="$(arg use_traffic_light)"/>
+    <arg name="use_traffic_light_detector" value="$(arg use_traffic_light_detector)"/>
+    <arg name="use_dynamic_obstacle"    value="$(arg use_dynamic_obstacle)"/>
+    <arg name="use_static_obstacle"     value="$(arg use_static_obstacle)"/>
+    <arg name="use_obstacle_perception" value="$(arg use_obstacle_perception)"/>
+    <arg name="use_camera_speed_kick"   value="$(arg use_camera_speed_kick)"/>
+    <arg name="use_obstacle_stop"       value="$(arg use_obstacle_stop)"/>
+    <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+    <arg name="obstacle_avoid_start_idx" value="$(arg obstacle_avoid_start_idx)"/>
+    <arg name="obstacle_stop_end_idx"    value="$(arg obstacle_stop_end_idx)"/>
+    <arg name="use_stop_adapter"        value="$(arg use_stop_adapter)"/>
+    <arg name="use_arbiter"             value="$(arg use_arbiter)"/>
+    <arg name="enable_mission"  value="$(arg enable_mission)"/>
+    <arg name="enable_behavior" value="$(arg enable_behavior)"/>
+    <arg name="enable_control"  value="$(arg enable_control)"/>
+    <arg name="use_ekf"         value="$(arg use_ekf)"/>
+    <arg name="mpc_N"           value="$(arg mpc_N)"/>
+    <arg name="external_acc_enabled" value="$(arg external_acc_enabled)"/>
+    <arg name="path_number"     value="$(arg path_number)"/>
+    <arg name="use_rviz"        value="true"/>
+    <arg name="rviz_config"     value="$(find total_bringup)/rviz/debug.rviz"/>
+  </include>
+
+  <node if="$(arg record)" pkg="rosbag" type="record" name="drive_record"
+        output="screen"
+        args="-o $(arg bag_dir)/drive --lz4
+              /ctrl_cmd /ctrl_cmd_raw /control/raw_cmd /control/m8_cmd /aeb/command
+              /local_path /planning/local_path/waypoint /planning/local_path/avoidance
+              /final_waypoint /gps_state /path_number /global_path
+              /odom /odom_fused /Competition_topic /CollisionData /imu /gps
+              /mission/active_section /mission/behavior_constraint
+              /mission/speed_cap_mps /mission/sequence_state
+              /mission/constraints/roundabout /mission/roundabout/state
+              /smpc/target_speed_mps /smpc/target_speed_mps_gated
+              /smpc/targets /smpc/decision /smpc/lane_change_status
+              /smpc/lane_change_supervisor_debug /smpc/smpc_decision_debug
+              /smpc/behavior_plan /smpc/behavior_longitudinal_request
+              /smpc/behavior_longitudinal_status
+              /localization/valid /localization/state
+              /mpc/controller_time_ms /rviz_predicted_path /trajectory_path
+              /control_feedback/mpc_target_speed_mps
+              /control_feedback/is_highway_mode
+              /control_feedback/mission_speed_target_mps
+              /control_feedback/curvature_speed_limit_mps
+              /tracked_objects /tf /tf_static
+              /obstacle_info /obstacle_avoidance/target_speed_mps
+              /camera_detection/obstacle_present /obstacle_avoidance/static_speed_scale
+              /control/obstacle_stop_cmd /avoidance_failed
+              /mission/constraints/obstacle_stop
+              /mission/constraints/static_obstacle
+              /mission/constraints/dynamic_obstacle
+              /mission/constraints/traffic_light" />
+
+  <node if="$(arg record_heavy)" pkg="rosbag" type="record" name="drive_record_heavy"
+        output="screen"
+        args="-o $(arg bag_dir)/heavy --lz4 /velodyne_points /image_jpeg/compressed" />
+
+  <node pkg="mission_supervisor" type="mission_debug.py" name="mission_debug"
+        output="screen">
+    <param name="period" value="$(arg debug_period)"/>
+  </node>
+
+  <!-- 3D 네비게이션 스타일 통합 시각화 노드 (3D 자차, 라이트 콘, 주행 유도로 카펫, 홀로그램 HUD) -->
+  <node pkg="total_bringup" type="navigation_3d_visualizer_node.py" name="navigation_3d_visualizer" output="screen">
+    <param name="carpet_width" value="2.2"/>
+    <param name="carpet_max_len" value="35.0"/>
+  </node>
+</launch>

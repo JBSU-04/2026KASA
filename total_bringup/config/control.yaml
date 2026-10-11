@@ -1,0 +1,20 @@
+# control_arbiter — /ctrl_cmd 의 유일한 publisher
+#
+# 기존 튜닝값은 건드리지 않는다. 여기 값은 전부 이 노드가 새로 쓰는 것이다.
+control_arbiter:
+  rate: 50.0
+  cmd_timeout: 0.5
+  source_timeout: 0.5
+  full_brake: 1.0
+  # 제어 소스 전환(MPC <-> M8 차선주행) 시 조향 램프 시간
+  source_blend_sec: 1.5
+  lane_following_executor: lane_following
+
+  # 규정: 60kph 초과 즉시 15초, 3초 지속마다 15초 추가.
+  # MPC 의 state_0 목표(15.0 m/s = 54 kph)보다 위에 두어 오버슈트에서만 작동한다.
+  # 기본 주행 튜닝에는 개입하지 않는다. 끄려면 enabled: false.
+  speed_limit:
+    enabled: true
+    hard_limit_mps: 16.2          # 58.3 kph
+    brake: 0.25
+    release_margin_mps: 0.4
