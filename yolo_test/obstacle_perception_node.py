@@ -1113,6 +1113,9 @@ class ObstaclePerceptionNode:
         self.m8_detection_queue_pub=rospy.Publisher('/tunnel/detection_queue_ms',Float64,queue_size=1)
         self.m8_worker_enabled=bool(rospy.get_param('/tunnel_recovery/detection_worker_enabled',True))
         self.m8_entry_surface_policy=bool(rospy.get_param('/tunnel_recovery/entry_surface_policy_enabled',True))
+        self.m8_unified_input=bool(rospy.get_param('/tunnel_recovery/unified_detection_input_enabled',True))
+        self.m8_far_temporal=bool(rospy.get_param('/tunnel_recovery/far_temporal_input_enabled',True))
+        self.m8_surface_id_association=bool(rospy.get_param('/tunnel_recovery/surface_id_association_enabled',True))
         self.filtered_scan_stamp=-1e9
         self.native_tunnel_enabled=bool(rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True))
         self.native_sequence=0;self.native_debug_stamp=-1e9;self.native_coordinate_version=0;self.native_frame_offset=(0.,0.);self.native_frame_stamp=-1.;self.m8_frame_lock=threading.RLock()
@@ -1439,7 +1442,7 @@ class ObstaclePerceptionNode:
             self.path_xy = np.array([world_to_ego(p, self.scan_pose) for p in self.path_world])
         arr = pointcloud2_to_xyz_array_fast(msg, self.ground_relative_field)
         if zone=='tunnel' and filtered_background:
-            if rospy.get_param('/tunnel_recovery/unified_detection_input_enabled',True):
+            if getattr(self,'m8_unified_input',True):
                 # Same-stamp Raw residuals are bundled by the C++ producer.
                 # No cross-topic arrival-order dependency, no second scan processing.
                 self.min_points_for_confirm=min(self.min_points_for_confirm,3)
@@ -1523,7 +1526,7 @@ class ObstaclePerceptionNode:
             (arr[:, 1] >= self.self_y_min) & (arr[:, 1] <= self.self_y_max)
         )
         local_height_input=(zone=='tunnel' and filtered_background and
-                            rospy.get_param('/tunnel_recovery/unified_detection_input_enabled',True) and
+                            getattr(self,'m8_unified_input',True) and
                             arr.shape[1]>3)
         low_height_keep=(arr[:,3]>=.08) if local_height_input else (arr[:,2]>=self.roi_z_min)
         roi_filter = (
@@ -1574,7 +1577,7 @@ class ObstaclePerceptionNode:
                                          max_span_x=self.cluster_max_span_x,
                                          tall_keep_top=self.cluster_tall_keep_top,
                                          native_connectivity=(zone=="tunnel"))
-        if zone=='tunnel' and filtered_background and rospy.get_param('/tunnel_recovery/far_temporal_input_enabled',True):
+        if zone=='tunnel' and filtered_background and getattr(self,'m8_far_temporal',True):
             # Same sparse connectivity as M2, but only current returns reach
             # the tracker. Historical points never fake a fresh surface.
             groups=self.m8_far_input.groups(filtered,self.scan_pose,now,self.native_coordinate_version)
@@ -2036,7 +2039,7 @@ class ObstaclePerceptionNode:
                 shape = abs(length-track.length) + abs(width-track.width)
                 dh = abs(top-track.top_elevation) if track.top_elevation is not None else 0.0
                 surface_match=False
-                if self.mission_zone=='tunnel' and g and self.m8_entry_surface_policy:
+                if self.mission_zone=='tunnel' and g and self.m8_entry_surface_policy and getattr(self,'m8_surface_id_association',True):
                     old=np.asarray(getattr(track,'support_points_world',[]),float)
                     current=np.asarray(g.get('support_points_world',[]),float)
                     if old.ndim==2 and current.ndim==2 and min(len(old),len(current))>=3:

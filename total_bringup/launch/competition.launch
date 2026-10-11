@@ -1,5 +1,4 @@
 <launch>
-  <param name="/tunnel_recovery/approach_route_csv" value="$(find waypoint_system)/data/default/3.csv"/>
   <arg name="tunnel_common_scene_enabled" default="true"/>
   <arg name="tunnel_native_scene_enabled" default="true"/>
   <arg name="tunnel_wall_profile_file" default="$(find new_lane)/config/tunnel_wall_profile.yaml"/>

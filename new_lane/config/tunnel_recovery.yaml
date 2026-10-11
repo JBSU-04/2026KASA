@@ -19,6 +19,7 @@ tunnel_recovery:
   unified_detection_input_enabled: true
   far_temporal_input_enabled: true
   surface_certificate_hold_enabled: true
+  surface_id_association_enabled: true
   common_scene_enabled: true
   continuous_transition_enabled: true
 

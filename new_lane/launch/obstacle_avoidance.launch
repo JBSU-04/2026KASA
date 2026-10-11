@@ -962,6 +962,7 @@
   </node>
 
   <rosparam command="load" file="$(find new_lane)/config/tunnel_recovery.yaml"/>
+  <param name="/tunnel_recovery/approach_route_csv" value="$(find waypoint_system)/data/default/3.csv"/>
   <param name="/tunnel_recovery/common_scene_enabled" value="$(arg tunnel_common_scene_enabled)"/>
   <param name="/tunnel_recovery/continuous_transition_enabled" value="$(arg tunnel_continuous_transition_enabled)"/>
   <param name="/tunnel_recovery/native_scene_enabled" value="$(arg tunnel_native_scene_enabled)"/>

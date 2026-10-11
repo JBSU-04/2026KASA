@@ -176,7 +176,7 @@ class StaticOccupancy:
             p=self.parents[pid]
             # SurfaceMotion already requires three independent surfaces over
             # 0.2 s. Do not add another three-frame admission delay in M8.
-            if (mode=='tunnel' and fresh and eligible and o.get('motion_state')=='static'
+            if (mode=='tunnel' and getattr(self,'preserve_surface_certificate',True) and fresh and eligible and o.get('motion_state')=='static'
                     and o.get('m8_surface_reason') in ('repeated_stationary_surface','stationary_certificate_partial_view')
                     and len(o.get('support_points_world',[]))>=3):
                 p['certified']=True
@@ -373,6 +373,7 @@ class Merger:
         rospy.Subscriber('/obstacle_info_far', String, self.cb_far, queue_size=1, buff_size=2 ** 24)
         rospy.Subscriber('/odom', Odometry, self.cb_odom, queue_size=1)
         rospy.Subscriber('/final_waypoint', Lane, self.cb_route, queue_size=1)
+        self.occupancy.preserve_surface_certificate=bool(rospy.get_param('/tunnel_recovery/surface_certificate_hold_enabled',True))
         self.tunnel_region=read_region(rospy.get_param)
         self.tunnel_shadow_first=next((int(s['idx'][0])for s in rospy.get_param('/section_router/sections',[])if s.get('id')=='M8'),self.tunnel_region[1])
         self.random_active=False;self.random_active_stamp=-1e9
