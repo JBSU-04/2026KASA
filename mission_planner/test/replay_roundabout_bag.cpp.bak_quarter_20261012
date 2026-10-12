@@ -1,0 +1,467 @@
+// Offline core replay: reads recorded inputs; never publishes control commands.
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <memory>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <map>
+#include <string>
+#include <rosbag/bag.h>
+#include <rosbag/view.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
+#include <mission_planner_msgs/MissionState.h>
+#include <mission_planner_msgs/BehaviorConstraint.h>
+#include <mission_planner_msgs/TrackedObjectArray.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <yaml-cpp/yaml.h>
+#include "mission_planner/roundabout_mission.hpp"
+#include "mission_planner/geometry.hpp"
+#include "mission_planner/roundabout_cloud_adapter.hpp"
+
+using namespace mission_planner;
+
+template <typename T>
+void read(const YAML::Node& node, const char* key, T& value) {
+  if (node[key]) value = node[key].as<T>();
+}
+
+RoundaboutConfig loadConfig(const YAML::Node& site) {
+  RoundaboutConfig c;
+  const auto r = site["roundabout"];
+#define ROOT(key, field) read(r, key, c.field)
+  ROOT("enabled", enabled); ROOT("counter_clockwise", counter_clockwise);
+  ROOT("require_tracker_stream", require_tracker_stream);
+  ROOT("require_localization", require_localization);
+  for (auto pair : {std::make_pair("center", &c.center),
+                    std::make_pair("yield_point", &c.yield_point),
+                    std::make_pair("conflict_point", &c.conflict_point),
+                    std::make_pair("exit_point", &c.exit_point)}) {
+    read(r[pair.first], "x", pair.second->x);
+    read(r[pair.first], "y", pair.second->y);
+  }
+  double degrees = 0.0;
+  read(r, "entry_heading_deg", degrees); c.entry_heading = degrees * M_PI / 180.0;
+  read(r, "entry_heading_tolerance_deg", degrees); c.entry_heading_tolerance = degrees * M_PI / 180.0;
+  read(r, "tangent_heading_tolerance_deg", degrees); c.tangent_heading_tolerance = degrees * M_PI / 180.0;
+#define GROUP(group, key, field) if (r[group]) read(r[group], key, c.field)
+  GROUP("radius", "inner", inner_radius); GROUP("radius", "outer", outer_radius);
+  GROUP("radius", "nominal", nominal_radius);
+  if(r["distance_entry"]){
+    const auto d=r["distance_entry"];std::string model="constant_accel";read(d,"ego_motion_model",model);
+    if(model!="constant_accel"&&model!="measured_profile")throw std::runtime_error("Unknown ego_motion_model");
+    c.distance_measured_profile=model=="measured_profile";
+    std::string mode="trajectory";read(d,"approval_mode",mode);
+    if(mode!="trajectory"&&mode!="clearance")throw std::runtime_error("Unknown approval_mode");
+    c.distance_clearance_only=mode=="clearance";
+    if(d["measured_profile"]){read(d["measured_profile"],"times_s",c.distance_profile_times);read(d["measured_profile"],"speeds_mps",c.distance_profile_speeds);}
+  }
+  GROUP("distance_entry","commit_rear_yield_lock",distance_commit_rear_yield_lock);
+  GROUP("distance_entry","front_response_s",distance_front_response);GROUP("distance_entry","project_leader",distance_project_leader);
+  GROUP("distance_entry","front_max_decel_mps2",distance_front_max_decel);
+  GROUP("distance_entry","front_gap_m",distance_front_gap);GROUP("distance_entry","rear_gap_m",distance_rear_gap);
+  GROUP("distance_entry","post_clear_horizon_s",distance_horizon);GROUP("distance_entry","rear_yield_assumption",distance_rear_yield);
+  GROUP("distance_entry","rear_reaction_s",distance_reaction);GROUP("distance_entry","rear_max_decel_mps2",distance_rear_decel);
+  GROUP("distance_entry","confirm_s",distance_confirm);GROUP("distance_entry","pair_invalid_s",distance_pair_invalid);GROUP("distance_entry","unknown_observe_s",distance_unknown_hold);
+  GROUP("vehicle_roi", "inner_radius", vehicle_roi_inner_radius);
+  GROUP("vehicle_roi", "outer_radius", vehicle_roi_outer_radius);
+  GROUP("vehicle_roi", "exit_lead_lateral_tolerance", exit_lead_lateral_tolerance);
+  GROUP("distance", "activation", activation_distance); GROUP("distance", "decision", decision_distance);
+  GROUP("distance", "exit_detection", exit_detection_radius); GROUP("distance", "exit_clear", exit_clear_distance);
+  GROUP("distance", "route_projection_tolerance", route_projection_tolerance);
+  GROUP("distance", "stop_buffer", stop_buffer); GROUP("distance", "creep_buffer", creep_buffer);
+  GROUP("distance", "lead_search", lead_search_distance);
+  GROUP("speed", "approach", approach_speed); GROUP("speed", "yield_roll", yield_roll_speed); GROUP("distance", "yield_go", yield_go_distance); GROUP("speed", "circulation", circulation_speed);
+  GROUP("speed", "exit", exit_speed); GROUP("speed", "degraded", degraded_speed);
+  GROUP("speed", "stationary_threshold", stationary_speed);
+  GROUP("timing", "mandatory_stop_seconds", mandatory_stop_seconds);
+  GROUP("timing", "mandatory_stop_position_tolerance", mandatory_stop_position_tolerance);
+  GROUP("timing", "mandatory_stop_speed_threshold", mandatory_stop_speed_threshold);
+  GROUP("timing", "minimum_circulate_seconds", minimum_circulate_seconds);
+  GROUP("timing", "commit_timeout_seconds", commit_timeout_seconds);
+  GROUP("timing", "exit_hold_seconds", exit_hold_seconds);
+  GROUP("timing", "tracker_guard_commit_grace_s", tracker_guard_commit_grace);
+  GROUP("timing", "tracker_stale_grace_s", tracker_stale_grace);
+  GROUP("safety", "reset_jump_distance", reset_jump_distance);
+  GROUP("safety", "comfortable_decel", comfortable_decel); GROUP("safety", "emergency_decel", emergency_decel);
+  GROUP("gap", "uncertain_object_block_distance", uncertain_object_block_distance);
+  GROUP("gap", "stationary_block_distance", stationary_block_distance);
+  GROUP("auto", "conflict_point", auto_conflict_point); GROUP("auto", "exit", auto_exit);
+  GROUP("auto", "conflict_radius_margin", auto_conflict_radius_margin);
+  GROUP("auto", "exit_radius_margin", auto_exit_radius_margin);
+#define GS(key, field) GROUP("gap_select", key, field)
+  GS("commit_rear_yield_lock", gs_commit_rear_yield_lock);
+  GS("use_route_body_projection", gs_route_body_projection); GS("ego_width", gs_ego_width);
+  GS("prediction_npc_width", gs_prediction_npc_width);
+  GS("timed_entry_approach", gs_timed_entry_approach);
+  GS("rear_ttc_at_entry", gs_rear_ttc_at_entry);
+  GS("use_measured_entry_profile", gs_measured_entry_profile);
+  GS("enabled", gap_select_enabled); GS("sequential", gs_sequential);
+  GS("use_mpc_prediction", gs_use_mpc_prediction); GS("use_tracker_velocity", gs_use_tracker_velocity);
+  GS("require_merge_progress", gs_require_merge_progress);
+  GS("opportunity_enabled", gs_opportunity_enabled);
+  GS("preparation_enabled",gs_preparation_enabled);
+  GS("preparation_wait_distance_m",gs_preparation_wait_distance);
+  GS("preparation_max_speed_mps",gs_preparation_max_speed);
+  GS("preparation_margin_m",gs_preparation_margin);
+  GS("preparation_horizon_s",gs_preparation_horizon);
+  GS("observed_entry_enabled",gs_observed_entry_enabled);GS("spatial_only_admission",gs_spatial_only_admission);
+  GS("observation_timeout_s",gs_observation_timeout);GS("observation_radial_half_m",gs_observation_radial_half);
+  GS("unknown_speed_upper_mps",gs_unknown_speed_upper);GS("post_clear_horizon_s",gs_post_clear_horizon);
+  GS("opportunity_rear_yield", gs_opportunity_rear_yield);
+  GS("commit_acc_only", gs_commit_acc_only);
+  GS("entry_commit_distance_m", gs_entry_commit_distance);
+  GS("entry_commit_max_speed_mps", gs_entry_commit_max_speed);
+  GS("opportunity_horizon_s", gs_opportunity_horizon);
+  GS("opportunity_step_s", gs_opportunity_step);
+  GS("opportunity_expire_confirm_s", gs_opportunity_expire_confirm);
+  GS("duplicate_distance_m", gs_duplicate_distance);
+  GS("duplicate_coverage", gs_duplicate_coverage);
+  GS("duplicate_max_hits", gs_duplicate_max_hits);
+  GS("duplicate_parent_min_hits", gs_duplicate_parent_min_hits);
+  GS("spatial_gap_enabled", gs_spatial_gap_enabled);
+  GS("spatial_arrival_check", gs_spatial_arrival_check);GS("adaptive_approach", gs_adaptive_approach);
+  GS("body_collision_guard", gs_body_collision_guard);GS("approach_response_s", gs_approach_response);
+  GS("collision_horizon_s", gs_collision_horizon);GS("collision_margin_m", gs_collision_margin);
+  GS("spatial_front_gap_m", gs_spatial_front_gap);GS("spatial_rear_gap_m", gs_spatial_rear_gap);
+  GS("approach_decel_mps2", gs_approach_decel);
+  GS("approach_slow_distance_m", gs_approach_slow_distance);
+  GS("approach_time_buffer_s", gs_approach_time_buffer);
+  GS("approach_accel_compensation", gs_approach_accel_compensation);
+  GS("approach_accel_upper_mps2", gs_approach_accel_upper);
+  GS("ego_accel", gs_ego_accel); GS("ego_start_delay", gs_ego_start_delay);
+  GS("ego_max_speed", gs_ego_max_speed); GS("ego_length", gs_ego_length);
+  GS("min_vehicle_length", gs_min_vehicle_length); GS("front_headway", gs_front_headway);
+  GS("rear_headway", gs_rear_headway); GS("standstill_gap", gs_standstill_gap);
+  GS("check_horizon", gs_check_horizon); GS("speed_margin", gs_speed_margin);
+  GS("entry_zone", gs_entry_zone); GS("max_wait", gs_max_wait);
+  GS("ttc_rear", gs_ttc_rear); GS("late_margin", gs_late_margin);
+  GS("seq_rear_headway", gs_seq_rear_headway); GS("adaptive_leader_start", gs_adaptive_leader_start);
+  GS("leader_start_max_distance", gs_leader_start_max_distance);
+  GS("leader_start_distance", gs_leader_start_distance);
+  GS("leader_decel_horizon", gs_leader_decel_horizon); GS("leader_decel_limit", gs_leader_decel_limit);
+  GS("prediction_follow_standstill_gap", gs_prediction_follow_standstill_gap);
+  GS("prediction_follow_time_gap", gs_prediction_follow_time_gap);
+  GS("skip_confirm", gs_skip_confirm); GS("confirm_seconds", gs_confirm_seconds);
+  GS("circle_stop_margin", gs_circle_stop_margin);
+  GS("unconfirmed_enabled", gs_unconfirmed_enabled); GS("unconfirmed_range", gs_unconfirmed_range);
+  GS("unconfirmed_speed", gs_unconfirmed_speed); GS("unconfirmed_max_hits", gs_unconfirmed_max_hits);
+  GS("commit_abort_enabled", gs_commit_abort_enabled); GS("commit_abort_confirm", gs_commit_abort_confirm);
+  GS("abort_margin", gs_abort_margin); GS("stop_reaction_time", gs_stop_reaction_time);
+  GS("stop_margin", gs_stop_margin); GS("leader_release_margin_s", gs_leader_release_margin); GS("leader_release_accel", gs_leader_release_accel); GS("leader_release_min_speed", gs_leader_release_min_speed); GS("go_after_leader_passed", gs_go_after_leader_passed); GS("phantom_enabled", gs_phantom_enabled);
+  GS("zone_rule_enabled", gs_zone_rule_enabled); GS("zone_front_gap_m", gs_zone_front_gap);
+  GS("zone_rear_gap_m", gs_zone_rear_gap); GS("zone_vehicle_length_m", gs_zone_vehicle_length);
+  GS("zone_confirm_seconds", gs_zone_confirm_seconds);
+  GS("zone_preconfirm", gs_zone_preconfirm); GS("zone_pair_tolerance_m", gs_zone_pair_tolerance);
+  GS("zone_commit_tolerance_m", gs_zone_commit_tolerance);
+  GS("stream_speed_min_travel_m", gs_stream_speed_min_travel);
+  GS("stream_speed_memory_sec", gs_stream_speed_memory);
+  GS("velocity_hold_min_hits", gs_velocity_hold_min_hits);
+  GS("zone_position_bias", gs_zone_position_bias); GS("zone_front_time_s", gs_zone_front_time);
+  GS("zone_length_estimate", gs_zone_length_estimate); GS("zone_length_percentile", gs_zone_length_percentile);
+  GS("zone_length_window_s", gs_zone_length_window); GS("zone_length_min_samples", gs_zone_length_min_samples);
+  GS("zone_length_max_m", gs_zone_length_max); GS("zone_length_prior_memory_s", gs_zone_length_prior_memory);
+  GS("zone_relax_start_s", gs_zone_relax_start); GS("zone_relax_from_stop", gs_zone_relax_from_stop); GS("zone_relax_rate_mps", gs_zone_relax_rate);
+  GS("zone_rear_gap_floor_m", gs_zone_rear_gap_floor); GS("zone_front_gap_floor_m", gs_zone_front_gap_floor);
+  GS("stationary_yield_release_enabled", gs_stationary_yield_enabled);
+  GS("stationary_yield_release_start_s", gs_stationary_yield_start);
+  GS("stationary_yield_confirm_s", gs_stationary_yield_confirm);
+  GS("stationary_yield_min_distance_m", gs_stationary_yield_min_distance);
+  { std::string em; read(r, "entry_model", em); c.tw_enabled = em == "time_window"; c.distance_enabled=em=="distance"||em=="window"; c.window_enabled=em=="window"; }
+#define TW(key, field) GROUP("time_window", key, field)
+  TW("m_front", tw_m_front); TW("m_rear", tw_m_rear); TW("commit_m_front", tw_commit_m_front);
+  TW("commit_m_rear", tw_commit_m_rear); TW("sigma_v", tw_sigma_v); TW("young_age", tw_young_age);
+  TW("near_upstream", tw_near_upstream); TW("assumed_speed", tw_assumed_speed);
+  TW("restart_accel", tw_restart_accel); TW("restart_delay", tw_restart_delay);
+  TW("ghost_age", tw_ghost_age); TW("min_observe", tw_min_observe);
+  TW("leader_headway", tw_leader_headway); TW("confirm", tw_confirm);
+  TW("stopped_wait", tw_stopped_wait); TW("stopped_min_gap", tw_stopped_min_gap);
+  TW("front_space", tw_front_space); TW("rear_space", tw_rear_space); TW("moving_speed", tw_moving_speed); TW("rear_decel", tw_rear_decel);
+#undef TW
+#undef GS
+#undef GROUP
+#undef ROOT
+  if(r["window"]){const auto w=r["window"];read(w,"s0_m",c.window_s0);read(w,"headway_s",c.window_headway);read(w,"length_margin_m",c.window_length_margin);
+    read(w,"lag_decel_mps2",c.window_lag_decel);read(w,"ego_accel_mps2",c.window_ego_accel);read(w,"start_delay_s",c.window_start_delay);
+    read(w,"merge_margin_m",c.window_merge_margin);read(w,"commit_tolerance_s",c.window_commit_tolerance);read(w,"confirm_frames",c.window_confirm_frames);read(w,"miss_frames",c.window_miss_frames);read(w,"lag_yield_decel_mps2",c.window_lag_yield_decel);read(w,"lag_reaction_s",c.window_lag_reaction);}
+  if(c.window_enabled){c.gap_select_enabled=true;c.gs_observed_entry_enabled=c.gs_preparation_enabled=c.gs_spatial_gap_enabled=false;
+    c.gs_spatial_arrival_check=c.gs_timed_entry_approach=c.gs_route_body_projection=false;c.gs_opportunity_enabled=c.gs_commit_acc_only=c.gs_zone_rule_enabled=false;
+    c.distance_rear_yield=false;c.distance_commit_rear_yield_lock=false;c.gs_commit_rear_yield_lock=false;c.gs_commit_abort_enabled=true;c.distance_confirm=0.;}
+  return c;
+}
+
+int main(int argc, char** argv) {
+  if (argc < 3) { std::cerr << "usage: replay_roundabout_bag BAG SITE_YAML [--sensor-bag HEAVY_BAG] [--route CSV] [--velocity-hold] [--diagnostics]\n"; return 1; }
+  bool simulate_ego=false;
+  bool velocity_hold = false, diagnostics = false;std::string tracks_file, route_file, sensor_file;
+  for (int i = 3; i < argc; ++i) {
+    const std::string option(argv[i]);
+    if(option=="--sensor-bag"&&i+1<argc)sensor_file=argv[++i];
+    else if(option=="--tracks"&&i+1<argc)tracks_file=argv[++i];
+    else if(option=="--route"&&i+1<argc)route_file=argv[++i];
+    else if(option=="--simulate-ego")simulate_ego=true;
+    else if (option == "--velocity-hold") velocity_hold = true;
+    else if (option == "--diagnostics") diagnostics = true;
+    else { std::cerr << "unknown option " << option << '\n'; return 1; }
+  }
+  ros::Time::init();
+  const auto site = YAML::LoadFile(argv[2]);
+  auto config = loadConfig(site);
+  ObservationTransform observation_tf;double observation_resolution=.5,observation_height=1.765;
+  if(site["lidar_tracker"] && site["lidar_tracker"]["sensor_extrinsic"]) {
+    const auto ex=site["lidar_tracker"]["sensor_extrinsic"];
+    read(ex,"x",observation_tf.sensor_x);read(ex,"y",observation_tf.sensor_y);read(ex,"z",observation_tf.sensor_z);
+    double yaw=0;read(ex,"yaw_deg",yaw);observation_tf.sensor_yaw=yaw*M_PI/180;
+  }
+  if(site["roundabout"]["observation"]) {
+    const auto o=site["roundabout"]["observation"];read(o,"resolution_m",observation_resolution);
+    read(o,"ground_height_below_sensor_m",observation_height);
+  }
+  std::deque<std::pair<double,ObservationTransform>> observation_poses;
+  std::deque<sensor_msgs::PointCloud2::ConstPtr> raw_scans,ng_scans;
+  double observation_ms=0.;size_t observation_count=0;
+  RoundaboutMission mission(config);
+  RoundaboutInput input;
+  std::vector<Point2> reference_route;
+  if (!route_file.empty()) {
+    std::ifstream file(route_file);std::string row;
+    if(!file)throw std::runtime_error("Cannot read offline reference route");
+    while(std::getline(file,row)) {
+      std::istringstream line(row);std::string index,x,y;
+      if(std::getline(line,index,',')&&std::getline(line,x,',')&&std::getline(line,y,','))
+        reference_route.push_back({std::stod(x),std::stod(y)});
+    }
+    if(reference_route.size()<2)throw std::runtime_error("Offline reference route too short");
+    input.route=reference_route;
+  }
+  input.prediction_accel_limit = 2.2; // Recorded MPC ramp; no controller runs here.
+  input.prediction_speed_limit = config.circulation_speed;
+  double recorded_mission_speed=config.circulation_speed;
+  input.localization_valid = true;
+  double last_tracker = -1.0, last_odom = -1.0;
+  bool tracker_valid = false;
+  double first_old = -1.0, first_new = -1.0;
+  int old_roi_leads = 0, new_roi_leads = 0, previous = -1, aborted = 0;
+  int preparation_frames=0,candidate_frames=0,approved_stop_frames=0;
+  std::map<std::string,int> rejection_counts;
+  double min_confidence = 0.4;
+  if (site["tracked_objects"]) read(site["tracked_objects"], "min_confidence", min_confidence);
+  std::map<int, TrackedObject> objects;
+  std::map<int, double> last_valid_velocity;
+  double last_diagnostic = -1.0;
+  std::vector<double> decision_ms;
+  bool sim_ready=false;double sim_s=0.0,sim_v=0.0,sim_last=-1.0,sim_brake_since=-1.0;
+  double sim_min_separation=1e9,sim_front_separation=1e9,sim_clear=-1.0;
+  std::vector<Point2> sim_path;std::vector<double> sim_arc;
+  auto set_sim_pose=[&]() {
+    auto it=std::upper_bound(sim_arc.begin(),sim_arc.end(),sim_s);
+    const size_t i=std::min(sim_path.size()-1,std::max<size_t>(1,it-sim_arc.begin()));
+    const double f=std::max(0.0,std::min(1.0,(sim_s-sim_arc[i-1])/std::max(1e-6,sim_arc[i]-sim_arc[i-1])));
+    input.ego.position={sim_path[i-1].x+f*(sim_path[i].x-sim_path[i-1].x),sim_path[i-1].y+f*(sim_path[i].y-sim_path[i-1].y)};
+    input.ego.yaw=std::atan2(sim_path[i].y-sim_path[i-1].y,sim_path[i].x-sim_path[i-1].x);input.ego.speed=sim_v;
+  };
+
+  rosbag::Bag bag(argv[1], rosbag::bagmode::Read);
+  std::vector<std::string> topics{
+    "/odom", "/local_path", "/localization/valid", "/perception/roundabout/tracked_objects",
+    "/mission/roundabout/state", "/mission/constraints/roundabout", "/mission/roundabout/gap_markers",
+    "/control_feedback/curvature_capacity_speed_mps", "/control_feedback/mission_speed_target_mps"};
+  if(!tracks_file.empty())topics.erase(std::remove(topics.begin(),topics.end(),"/perception/roundabout/tracked_objects"),topics.end());
+  if(sensor_file.empty() && config.gs_observed_entry_enabled) {
+    topics.push_back("/perception/points_gravity");topics.push_back("/nonground");
+  }
+  rosbag::View view(bag, rosbag::TopicQuery(topics));
+  std::unique_ptr<rosbag::Bag> sensor_bag;
+  if(!sensor_file.empty()) {
+    sensor_bag.reset(new rosbag::Bag(sensor_file,rosbag::bagmode::Read));
+    view.addQuery(*sensor_bag,rosbag::TopicQuery(std::vector<std::string>{"/perception/points_gravity","/nonground"}));
+  }
+  std::unique_ptr<rosbag::Bag> replay_tracks;
+  if(!tracks_file.empty()){replay_tracks.reset(new rosbag::Bag(tracks_file,rosbag::bagmode::Read));view.addQuery(*replay_tracks,rosbag::TopicQuery(std::vector<std::string>{"/replay/tracked_objects"}));}
+  const double start = view.getBeginTime().toSec();
+  auto inRoi = [&](const TrackedObject& o) {
+    const double radius = std::hypot(o.position.x - config.center.x, o.position.y - config.center.y);
+    return (config.vehicle_roi_inner_radius < 0.0 || radius >= config.vehicle_roi_inner_radius) &&
+           (config.vehicle_roi_outer_radius < 0.0 || radius <= config.vehicle_roi_outer_radius);
+  };
+  for (const auto& message : view) {
+    if (auto m = message.instantiate<nav_msgs::Odometry>()) {
+      if (!sim_ready) {input.ego.position = {m->pose.pose.position.x, m->pose.pose.position.y};
+      const auto q = m->pose.pose.orientation;
+      input.ego.yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y*q.y + q.z*q.z));
+      input.ego.speed = std::hypot(m->twist.twist.linear.x, m->twist.twist.linear.y);
+      }
+      last_odom = message.getTime().toSec();
+      auto pose=observation_tf;pose.x=m->pose.pose.position.x;pose.y=m->pose.pose.position.y;
+      pose.z=m->pose.pose.position.z;
+      const auto oq=m->pose.pose.orientation;
+      pose.yaw=std::atan2(2*(oq.w*oq.z+oq.x*oq.y),1-2*(oq.y*oq.y+oq.z*oq.z));
+      observation_poses.push_back({m->header.stamp.isZero()?last_odom:m->header.stamp.toSec(),pose});
+      while(observation_poses.size()>60)observation_poses.pop_front();
+    } else if (auto m = message.instantiate<sensor_msgs::PointCloud2>()) {
+      auto& queue=message.getTopic()=="/perception/points_gravity"?raw_scans:ng_scans;
+      queue.push_back(m);while(queue.size()>4)queue.pop_front();
+      if(!config.gs_observed_entry_enabled || observation_poses.empty())continue;
+      for(const auto& raw:raw_scans) {
+        const double stamp=raw->header.stamp.toSec();
+        if(stamp<=0 || raw->header.frame_id!="velodyne_ground" ||
+            (!input.observation.frames.empty() && stamp<=input.observation.frames.back()->stamp) ||
+            std::abs(message.getTime().toSec()-stamp)>config.gs_observation_timeout)continue;
+        sensor_msgs::PointCloud2::ConstPtr ng;double best=.031;
+        for(const auto& cloud:ng_scans) {
+          const double dt=std::abs(cloud->header.stamp.toSec()-stamp);
+          if(cloud->header.frame_id=="velodyne_ground" && dt<best){ng=cloud;best=dt;}
+        }
+        if(!ng)continue;
+        const auto pose=std::min_element(observation_poses.begin(),observation_poses.end(),
+            [stamp](const auto& a,const auto& b){return std::abs(a.first-stamp)<std::abs(b.first-stamp);});
+        if(std::abs(pose->first-stamp)>.15 || std::hypot(pose->second.x-config.center.x,pose->second.y-config.center.y)>80.)continue;
+        std::vector<ObservationPoint> rays,occupied;
+        if(!observationPoints(*raw,pose->second,&rays) || !observationPoints(*ng,pose->second,&occupied) || rays.size()<100)continue;
+        const auto origin=pose->second.origin();const auto clock=std::chrono::steady_clock::now();
+        input.observation.add(buildRoundaboutObservation(config.center.x,config.center.y,config.outer_radius+(config.gs_preparation_enabled?config.gs_entry_commit_distance+5.:3.),
+            observation_resolution,stamp,origin,origin.z-observation_height,rays,occupied));
+        observation_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-clock).count();++observation_count;
+      }
+    } else if (auto m = message.instantiate<nav_msgs::Path>()) {
+      if (!sim_ready && reference_route.empty()) {input.route.clear();
+      for (const auto& pose : m->poses) input.route.push_back({pose.pose.position.x, pose.pose.position.y});}
+    } else if (auto m = message.instantiate<std_msgs::Bool>()) {
+      input.localization_valid = m->data;
+    } else if (auto m = message.instantiate<std_msgs::Float64>()) {
+      if(message.getTopic()=="/control_feedback/mission_speed_target_mps")recorded_mission_speed=m->data;
+      else input.prediction_speed_limit = m->data;
+    } else if (auto m = message.instantiate<mission_planner_msgs::TrackedObjectArray>()) {
+      input.objects.clear(); objects.clear();
+      for (const auto& o : m->objects) {
+        if (o.confidence < min_confidence) continue;
+        TrackedObject track;
+        track.id = o.id; track.position = {o.position.x, o.position.y};
+        track.velocity_x = o.velocity.x; track.velocity_y = o.velocity.y;
+        track.length = std::max(0.1, std::max(o.size.x, o.size.y));
+        track.aabb_x=o.size.x;track.aabb_y=o.size.y;
+        track.height=o.size.z;track.width=std::min(o.size.x,o.size.y);track.confidence=o.confidence;
+        track.has_moved = o.has_moved; track.velocity_valid = o.velocity_valid;
+        const double stamp = m->header.stamp.toSec();
+        if (o.velocity_valid) last_valid_velocity[o.id] = stamp;
+        // Approximation only: old bags lack the tracker's last real-evidence
+        // timestamp. Never change the recorded position or stored velocity.
+        if (velocity_hold && o.has_moved && last_valid_velocity.count(o.id) &&
+            stamp - last_valid_velocity.at(o.id) <= 0.6)
+          track.velocity_valid = true;
+        track.confirmed = o.has_moved && track.velocity_valid; track.hit_count = o.hit_count;
+        input.objects.push_back(track); objects[track.id] = track;
+      }
+      last_tracker = message.getTime().toSec();
+      input.objects_stamp = m->header.stamp.toSec(); tracker_valid = m->valid;
+    } else if (auto m = message.instantiate<mission_planner_msgs::BehaviorConstraint>()) {
+      if (m->lead_vehicle_active && objects.count(m->lead_vehicle_id) &&
+          !inRoi(objects.at(m->lead_vehicle_id))) ++old_roi_leads;
+    } else if (auto m = message.instantiate<mission_planner_msgs::MissionState>()) {
+      input.now = message.getTime().toSec();
+      input.ego.valid = last_odom >= 0.0 && input.now - last_odom <= 0.4;
+      input.tracker_stream_fresh = last_tracker >= 0.0 && input.now - last_tracker <= 0.5;
+      input.tracker_stream_valid = tracker_valid && input.tracker_stream_fresh;
+      const auto decision_start=std::chrono::steady_clock::now();
+      const auto out = mission.update(input);
+      if(out.entry_phase=="preparing")++preparation_frames;
+      if(out.acceleration_start_delay>=0 && !out.approval_latched)++candidate_frames;
+      if(out.approval_latched && out.constraint.stop_required)++approved_stop_frames;
+      for(const auto& gap:out.gaps)if(gap.selected && !out.approval_latched && !gap.feasible)
+        ++rejection_counts[gap.failure_reason.substr(0,gap.failure_reason.find('@'))];
+      const int state = static_cast<int>(out.state);
+      if(state==2 || state==3)decision_ms.push_back(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decision_start).count());
+      if (m->state == 3 && first_old < 0.0) first_old = input.now - start;
+      if (state == 3 && first_new < 0.0) first_new = input.now - start;
+      if (out.constraint.lead_vehicle_active && objects.count(out.constraint.lead_vehicle_id) &&
+          !inRoi(objects.at(out.constraint.lead_vehicle_id))) ++new_roi_leads;
+      if(simulate_ego && !sim_ready && input.route.size()>=2 &&
+          (config.gs_spatial_gap_enabled
+              ? ((state==1||state==2) && out.distance_to_yield<=config.activation_distance)
+              : (state==2 && input.ego.speed<.1 && out.distance_to_yield<1))) {
+        sim_path=input.route;sim_arc.assign(sim_path.size(),0.0);
+        for(size_t i=1;i<sim_path.size();++i)sim_arc[i]=sim_arc[i-1]+distance(sim_path[i-1],sim_path[i]);
+        sim_s=projectToPolyline(sim_path,input.ego.position).s;sim_v=input.ego.speed;sim_last=input.now;sim_ready=true;
+      }
+      if(sim_ready) {
+        if(state==5 && sim_clear<0)sim_clear=input.now-start;
+        double cap=out.constraint.max_speed<0?recorded_mission_speed:out.constraint.max_speed;
+        if(input.prediction_speed_limit>0)cap=std::min(cap,input.prediction_speed_limit);
+        if(out.constraint.stop_required)cap=std::min(cap,std::sqrt(4*std::max(0.0,out.constraint.stop_distance)));
+        if(out.constraint.lead_vehicle_active) {
+          const double usable=std::max(0.0,out.constraint.lead_distance-config.gs_prediction_follow_standstill_gap);
+          const double headway=std::max(.1,config.gs_prediction_follow_time_gap);
+          cap=std::min(cap,std::max(0.0,out.constraint.lead_speed+(usable-headway*sim_v)/headway));
+        }
+        if(cap<sim_v && sim_brake_since<0)sim_brake_since=input.now;
+        if(cap>=sim_v)sim_brake_since=-1.0;
+        const double dt=std::max(0.0,std::min(.1,input.now-sim_last));
+        const bool delay=(first_new>=0 && input.now-start-first_new<config.gs_ego_start_delay) ||
+          (sim_brake_since>=0 && input.now-sim_brake_since<.3);
+        const double next=delay?sim_v:(sim_v<cap?std::min(cap,sim_v+3.2*dt):std::max(cap,sim_v-2*dt));
+        sim_s=std::min(sim_arc.back(),sim_s+.5*(sim_v+next)*dt);sim_v=next;sim_last=input.now;set_sim_pose();
+        if(first_new>=0)for(const auto& o:input.objects) {
+          if(!o.has_moved || distance(input.ego.position,o.position)>15)continue;
+          const bool world=o.aabb_x>0 && o.aabb_y>0;
+          const double yaw=world?0.0:std::atan2(o.velocity_y,o.velocity_x);
+          const double separation=boxSeparation(input.ego.position,input.ego.yaw,
+              config.gs_ego_length,config.gs_ego_width,o.position,yaw,
+              world?o.aabb_x:std::max(4.0,o.length),world?o.aabb_y:std::max(1.9,o.width));
+          if(separation<sim_min_separation) {
+            sim_min_separation=separation;
+            if(diagnostics)std::cout<<"SIM_MIN t="<<input.now-start<<" id="<<o.id<<" sep="<<separation<<" ego_v="<<sim_v<<" npc_v="<<std::hypot(o.velocity_x,o.velocity_y)<<" size="<<o.length<<","<<o.width<<" radial="<<radiusFrom(config.center,o.position)<<" state="<<state<<'\n';
+          }
+          const double forward=(config.counter_clockwise?1.0:-1.0)*normalizeAngle(angleFrom(config.center,o.position)-angleFrom(config.center,input.ego.position))*config.nominal_radius;
+          if(forward>=0 && separation<sim_front_separation) {
+            sim_front_separation=separation;
+            if(diagnostics)std::cout<<"SIM_FRONT t="<<input.now-start<<" id="<<o.id<<" sep="<<separation<<" ahead="<<forward<<" state="<<state<<'\n';
+          }
+        }
+      }
+      if (state != previous) {
+        if (previous == 3 && state == 2) ++aborted;
+        std::cout << input.now - start << " state=" << state << ' ' << out.reason << '\n';
+        previous = state;
+      }
+      if (diagnostics && (state == 2 || state == 3) && input.now - last_diagnostic >= 0.2) {
+        std::cout << input.now - start << " wait=" << out.gap_depart_delay << " cap="
+                  << out.ego_prediction_speed << " " << out.reason
+                  << " future_departure="<<out.future_departure<<" switch="<<out.gap_switch_reason
+                  << " duplicates="<<out.duplicate_track_ids.size()
+                  << " physical_gap="<<out.physical_gap_length<<" phase="<<out.entry_phase<<" trajectory_observation="<<out.trajectory_observation<<" creep="<<out.preparation_speed<<" boundary="<<out.preparation_stop_distance
+                  << " observed_free="<<out.observed_free_length<<" observation="<<out.observation_state<<" fixed="<<out.approval_latched
+                  << " command_cap="<<out.constraint.max_speed
+                  << " predicted_entry="<<out.ego_zone_time<<" predicted_reference="<<out.ego_reference_time<<" predicted_clear="<<out.ego_clear_time
+                  << " delay="<<out.ego_delay_remaining<<" leader_limited="<<out.ego_leader_limited<<" curve_limited="<<out.ego_curve_limited;
+        for(const auto& gap:out.gaps)if(gap.selected)
+          std::cout<<" candidate="<<(gap.preview?"PREVIEW":(gap.feasible?"CONFIRM":"BLOCKED"));
+        for (const auto& vehicle : out.stream)
+          std::cout << " [" << vehicle.id << " p=" << vehicle.pos << " v=" << vehicle.speed
+                    << " confirmed=" << vehicle.confirmed << ']';
+        std::cout << '\n';
+        last_diagnostic = input.now;
+      }
+    }
+  }
+  std::cout << "first_commit recorded=" << first_old << " replay=" << first_new
+            << " ROI_rejected_lead_frames recorded=" << old_roi_leads << " replay=" << new_roi_leads
+            << " replay_aborts=" << aborted << '\n';
+  std::cout<<"preparation_frames="<<preparation_frames<<" candidate_frames="<<candidate_frames
+           <<" approved_stop_frames="<<approved_stop_frames<<'\n';
+  for(const auto& reason:rejection_counts)std::cout<<"rejected "<<reason.first<<" frames="<<reason.second<<'\n';
+  if(!decision_ms.empty()) {
+    std::sort(decision_ms.begin(),decision_ms.end());
+    const auto quantile=[&](double q){return decision_ms[static_cast<size_t>(q*(decision_ms.size()-1))];};
+    std::cout<<"decision_ms frames="<<decision_ms.size()<<" p50="<<quantile(.5)<<" p95="<<quantile(.95)<<" p99="<<quantile(.99)<<" max="<<decision_ms.back()<<'\n';
+  }
+  if(simulate_ego)std::cout<<"sim_exit="<<sim_clear<<" sim_observed_box_min_sep="<<sim_min_separation<<" sim_front_box_min_sep="<<sim_front_separation<<" Assumed ego acceleration3.2/decel2/response0.3; raw world AABB proxies; recorded mission/curvature limits; NPCs follow recorded trajectories; not MORAI closed loop.\n";
+  if(!simulate_ego)std::cout << "Fixed recorded trajectories; does not reproduce changed ego motion or NPC reactions.\n";
+  if(!tracks_file.empty())std::cout<<"Uses raw-cloud replay tracks, recorded ego trajectory unchanged.\n";
+  if (velocity_hold) std::cout << "Velocity-valid hold approximated from old validity flags, not raw LiDAR replay.\n";
+  std::cout<<"observation_frames="<<observation_count<<" mean_observation_ms="<<(observation_count?observation_ms/observation_count:0)<<"\n";
+  return 0;
+}

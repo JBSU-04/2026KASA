@@ -4,6 +4,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 
 #include "mission_planner/types.hpp"
 #include <string>
@@ -66,6 +67,11 @@ class RoundaboutMission {
     double predicted_front = std::numeric_limits<double>::infinity(), predicted_rear = std::numeric_limits<double>::infinity();
     double current_rear = std::numeric_limits<double>::infinity(), rear_decel = 0.0, clear_time = 0.0;
     bool front_wait_ok = false;
+    double window_t_open = std::numeric_limits<double>::infinity(), window_t_close = std::numeric_limits<double>::infinity(), window_t_ego = std::numeric_limits<double>::infinity();
+    int window_ok_frames = 0, window_missed = 0;
+    double quarter_P = std::numeric_limits<double>::quiet_NaN(), quarter_gap = std::numeric_limits<double>::quiet_NaN();
+    double quarter_s_front = std::numeric_limits<double>::quiet_NaN(), quarter_s_trig = std::numeric_limits<double>::quiet_NaN(), quarter_x = std::numeric_limits<double>::quiet_NaN();
+    std::string quarter_case;
   };
 
   struct LeadResult {
@@ -125,6 +131,7 @@ class RoundaboutMission {
   bool mandatory_stop_completed_ = false;
   double commit_unsafe_since_ = -1.0;
   bool commit_aborted_ = false;  // COMMIT 중 양보 복귀했음(합류 구역 앞 정지)
+  bool abort_stopped_ = false;  // 진입 취소 뒤 한 번 멈췄는지(움찔거림 방지)
   bool have_previous_ego_ = false;
   Point2 previous_ego_position_;
   std::string failsafe_reason_ = "localization invalid";
@@ -179,6 +186,13 @@ class RoundaboutMission {
   int committed_leader_ = -2;
   int committed_follower_ = -2;
   int committed_wrap_ = 0;
+  // 갭 시간 창 모델: 놓친 갭 (leader, follower, wrap), 타깃 갭, 연속 OK 프레임 수.
+  std::set<std::tuple<int,int,int>> window_missed_;
+  std::map<std::tuple<int,int,int>,int> window_miss_count_;
+  int quarter_ok_frames_ = 0;
+  std::set<std::pair<int,int>> quarter_missed_;  // 이번 접근에서 놓친 갭 (leader, follower)
+  double quarter_yield_conflict_ = 0.0;  // 커밋 직전(양보선 대기) 합류점까지 거리
+  int window_target_leader_ = -2, window_target_follower_ = -2, window_target_wrap_ = 0, window_ok_frames_ = 0;
   // 진입 중 승인 앞차의 마지막 확인 뒤끝 위치(합류점 기준 원호)/속도/시각.
   double committed_leader_rear_ = -1e9, committed_leader_speed_ = 0.0, committed_leader_seen_ = -1.0;
   bool commitGapOk(const GapResult& gap) const {

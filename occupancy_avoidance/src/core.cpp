@@ -186,8 +186,8 @@ std::pair<double,double> Engine::bounds(int idx) const {
       // M8: a transient wall fit must not widen the measured physical tunnel.
       // The half-width + curb margin is applied by the caller exactly once.
       if(strict_scene_margins_)for(const auto&e:edges_)if(idx>=e.first&&idx<=e.last){
-        if(e.right>0)result.first=std::max(result.first,-e.right);
-        if(e.left>0)result.second=std::min(result.second,e.left);
+        if(e.right>0)result.first=std::max(result.first,-e.right+profile_offset_);
+        if(e.left>0)result.second=std::min(result.second,e.left+profile_offset_);
         break;
       }
       return result;
@@ -195,7 +195,7 @@ std::pair<double,double> Engine::bounds(int idx) const {
   }
   double inset=cfg_.half_width+cfg_.curb_margin;
   for(const auto&e:edges_)if(idx>=e.first && idx<=e.last)
-    return {e.right>0?-e.right:-cfg_.open_right-inset,e.left>0?e.left:cfg_.open_left+inset};
+    return {e.right>0?-e.right+profile_offset_:-cfg_.open_right-inset,e.left>0?e.left+profile_offset_:cfg_.open_left+inset};
   return {-cfg_.open_right-inset,cfg_.open_left+inset};
 }
 bool Engine::boundaryKnown(int idx,bool left)const {
@@ -569,7 +569,7 @@ void Engine::selectTrigger(const Pose& pose,const std::vector<Reference>& ref,Re
   double pad=cfg_.resolution*.7072,nearest=INF;
   std::vector<Point> current;int outside=0,far=0,unconfirmed=0,passed=0;
   double seen=trigger_seen_;
-  for(const auto& kv:evidence_){const auto&e=kv.second;auto l=location(e.p);
+  for(const auto& kv:evidence_){if(certified_admission_only_)break;const auto&e=kv.second;auto l=location(e.p);
     if(l.first+pad < -cfg_.rear-cfg_.obstacle_margin){++passed;continue;}
     if(l.second-pad>cfg_.trigger_half_width){++outside;continue;}
     if(l.first-pad>cfg_.trigger_distance){++far;continue;}
@@ -583,7 +583,18 @@ void Engine::selectTrigger(const Pose& pose,const std::vector<Reference>& ref,Re
   // the original object's independent temporal verification for admission; do
   // not paint its box/hull into the collision map or alter any measured point.
   for(const auto& object:certified_triggers_){
-    if(object.footprint.size()<3||pose.stamp<object.stamp-.05||pose.stamp-object.stamp>cfg_.trigger_hold)continue;
+    if(object.footprint.size()<(object.measured_cells?1u:3u)||pose.stamp<object.stamp-.05||pose.stamp-object.stamp>cfg_.trigger_hold)continue;
+    if(object.measured_cells){
+      // No enclosing hull: separated side surfaces cannot bridge an empty
+      // reference corridor merely because their combined min/max spans it.
+      for(const auto&p:object.footprint){auto l=location(p);
+        if(!roadInside(p.x,p.y,0)||l.first+pad<-cfg_.rear-cfg_.obstacle_margin||
+           l.first-pad>cfg_.trigger_distance||l.second-pad>cfg_.trigger_half_width)continue;
+        current.push_back(p);nearest=std::min(nearest,l.first-pad);
+        seen=std::max(seen,object.stamp);certified=true;
+      }
+      continue;
+    }
     double smin=INF,smax=-INF,dmin=INF,dmax=-INF;bool inside=false;
     for(const auto& p:object.footprint){double d;auto l=location(p,&d);
       smin=std::min(smin,l.first);smax=std::max(smax,l.first);
@@ -643,7 +654,7 @@ std::unique_ptr<Engine> Engine::planningSnapshot() const {
   trial->last_path_=last_path_;trial->measured_curvature_=measured_curvature_;
   trial->aligned_since_=aligned_since_;trial->avoidance_session_=avoidance_session_;
   trial->spatial_return_active_=spatial_return_active_;trial->traffic_=traffic_;
-  trial->held_trigger_=held_trigger_;trial->trigger_seen_=trigger_seen_;trial->certified_triggers_=certified_triggers_;
+  trial->certified_admission_only_=certified_admission_only_;trial->held_trigger_=held_trigger_;trial->trigger_seen_=trigger_seen_;trial->certified_triggers_=certified_triggers_;
   return trial;
 }
 void Engine::adoptPlanning(const Engine& p) {

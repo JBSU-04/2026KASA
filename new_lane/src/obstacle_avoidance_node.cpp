@@ -49,9 +49,11 @@ public:
 	{
 		loadParams();
         nh_.param("/tunnel_recovery/common_scene_enabled",common_scene_enabled_,true);
+        nh_.param("/tunnel_recovery/independent_preslow_enabled",independent_preslow_,false);
         if(common_scene_enabled_)tunnel_region_=occupancy_avoidance::TunnelRegion::load(nh_);
         pnh_.param<std::string>("avoidance_backend",avoidance_backend_,"occupancy");
         pnh_.param("tunnel_verified_hold_only",tunnel_verified_hold_only_,true);
+        pnh_.param("tunnel_transient_grace_sec",tunnel_transient_grace_sec_,0.5);
         // 2026-10-07(21:09:45 백): 터널 입구 첫 장애물 접근 중 점이 늘며 직전 경로가 0.6 s 연속 무효 -> 0.5 s 유예를
         //   넘겨 AEB(5.7 -> 2.8 m/s 덜컹). 유예 중에도 상한은 매 주기 줄어든다. 0.8 s 로.
         pnh_.param("embedded_fail_grace_sec",embedded_fail_grace_sec_,.8);
@@ -111,7 +113,9 @@ public:
 
 		tunnel_offset_sub_ = nh_.subscribe("/tunnel/wall_offset", 1, &ObstacleAvoidanceNode::tunnelOffsetCallback, this);
 		tunnel_limits_sub_ = nh_.subscribe("/tunnel/wall_limits", 1, &ObstacleAvoidanceNode::tunnelLimitsCallback, this);
-		tunnel_lidar_kick_sub_ = nh_.subscribe("/tunnel/lidar_obstacle_ahead", 1, &ObstacleAvoidanceNode::tunnelLidarKickCallback, this);
+		tunnel_preslow_cap_sub_=nh_.subscribe<std_msgs::Float64>("/tunnel/preslow_speed_cap_mps",1,
+            [this](const std_msgs::Float64::ConstPtr&m){std::lock_guard<std::mutex>lock(speed_kick_mutex_);tunnel_preslow_cap_=m->data;tunnel_preslow_stamp_=ros::Time::now();updateSpeedKickLocked();});
+        tunnel_lidar_kick_sub_ = nh_.subscribe("/tunnel/lidar_obstacle_ahead", 1, &ObstacleAvoidanceNode::tunnelLidarKickCallback, this);
 		tunnel_lidar_dist_sub_ = nh_.subscribe<std_msgs::Float64>("/tunnel/lidar_obstacle_inpath_distance", 1,
 			[this](const std_msgs::Float64::ConstPtr& m){ tunnel_lidar_dist_ = m->data; tunnel_lidar_dist_time_ = ros::Time::now(); });
 		dyn_state_sub_ = nh_.subscribe("/obstacle_stop/dynamic_state", 1, &ObstacleAvoidanceNode::dynStateCallback, this);
@@ -741,7 +745,7 @@ private:
 	//   있으면 그것으로, 없으면 기준경로 횡 -3.2 ~ +6.2).
 	void evaluateTunnelObstacleKick(const Json::Value &root)
 	{
-        if(common_scene_enabled_ && tunnel_mode_)return;
+        if((common_scene_enabled_||independent_preslow_) && tunnel_mode_)return;
 		const Json::Value &list = root.isMember("collision_objects")
 			? root["collision_objects"] : root["obstacles"];
 		const bool limits_ok = tunnel_limits_active_;
@@ -760,7 +764,7 @@ private:
 				obs.get("static_occupancy", false).asBool() || obs.get("static_certified", false).asBool()))
 				continue;
 			// 회피 경로가 이미 피해 가는 물체도 선감속하지 않는다.
-			if (handledByAvoidance(obs)) continue;
+			if (handledByAvoidance(obs) || avoidanceTarget(obs)) continue;
 			const double half_len = 0.5 * obs.get("length", 0.0).asDouble();
 			const double fwd = obs["position_ego"][0].asDouble() - half_len;
 			if (fwd < 3.0 || fwd > tunnel_kick_range_m_) continue;
@@ -1255,6 +1259,13 @@ private:
 	// updateSpeedKick() 내부에서만 사용)
 	void updateSpeedKickLocked()
 	{
+        // 2026-10-12 선서행은 미션(경로 소유·mission_mode)과 분리: 3.csv 에서는 엔진이 경로를 맡아도 상한을 낸다.
+        //   (전에는 소유 검사로 먼저 return 해 터널에서 선서행 상한이 한 번도 나가지 않았다.)
+        if(independent_preslow_&&current_lane_number_==3){
+            std_msgs::Float64 cap;const double age=(ros::Time::now()-tunnel_preslow_stamp_).toSec();
+            cap.data=!tunnel_preslow_stamp_.isZero()&&age>=0&&age<=.35&&std::isfinite(tunnel_preslow_cap_)?std::max(4.,tunnel_preslow_cap_):9999.;
+            static_speed_scale_pub_.publish(cap);return; // preslow never owns mission stop or path
+        }
 		if (externalOccupancyOwnsPath()) return;
 		// 고주로 차선(1/2/3.csv) 및 도심 기본경로 외 구간에서는 카메라 감속 절대 비활성화.
 		// 고주로 갓길 라바콘 등을 카메라가 인지하여 고속 주행 중 20km/h로 급감속하는 문제를 차단한다.
@@ -2853,7 +2864,13 @@ private:
             const ros::Time now=ros::Time::now();
             if(embedded_invalid_since_.isZero())embedded_invalid_since_=now;
             const double invalid_for=(now-embedded_invalid_since_).toSec();
-            const bool can_hold=(!tunnel_mode_||!tunnel_verified_hold_only_) && out.rejection!="dynamic_hold" && invalid_for<embedded_fail_grace_sec_ &&
+            // 2026-10-12: 터널도 공간 실패가 아닌 일시 무효(입력 지연·좌표 갱신 등)는 tunnel_transient_grace_sec 유예한다.
+            //   점유·통로 없음 같은 공간 실패와 동적 대기는 즉시 실패(정지)한다.
+            static const std::set<std::string> spatial_rejections={"occupancy","collision","no_connected_corridor",
+                "corridor_dynamics_infeasible","no_valid_connector","curvature","final_owner_occupancy"};
+            const bool grace_kind=!tunnel_mode_||!tunnel_verified_hold_only_||!spatial_rejections.count(out.rejection);
+            const double grace_sec=(tunnel_mode_&&tunnel_verified_hold_only_)?std::min(embedded_fail_grace_sec_,tunnel_transient_grace_sec_):embedded_fail_grace_sec_;
+            const bool can_hold=grace_kind && out.rejection!="dynamic_hold" && invalid_for<grace_sec &&
                 !last_embedded_stamp_.isZero() && (now-last_embedded_stamp_).toSec()<=embedded_fail_grace_sec_+.5 &&
                 !last_embedded_path_.poses.empty();
             state["grace_hold"]=can_hold;state["invalid_for_s"]=invalid_for;
@@ -2873,7 +2890,7 @@ private:
             }
             // 직전 embedded 경로가 없을 때(기준경로 통과 중 회피 시작 첫 프레임 무효, 16:27:55 백 6.80 s)도
             //   grace 동안은 실패로 보지 않는다. 새 경로는 내지 않고(직전 /local_path 유지) 상한만 조금 줄인다.
-            if((!tunnel_mode_||!tunnel_verified_hold_only_) && out.rejection!="dynamic_hold" && invalid_for<embedded_fail_grace_sec_){
+            if(grace_kind && out.rejection!="dynamic_hold" && invalid_for<grace_sec){
                 publishAvoidanceFailed(false);
                 std_msgs::Float64 cap;cap.data=std::max(0.,std::min(embeddedPreCap(c_d),bot_speed_-0.5));
                 embedded_cap_out_=cap.data;embedded_cap_stamp_=now;avoidance_speed_pub_.publish(cap);
@@ -4273,10 +4290,24 @@ private:
     double tunnel_obstacle_kick_dist_=-1.0;
     ros::Time tunnel_obstacle_inpath_time_;
     // 2026-10-08: 회피 경로가 피해 가는 물체(경로에서 kick_avoid_clear_m 초과)는 선감속하지 않는다.
+    // 2026-10-11 M8 최종: 회피 대상으로 잡은 정적 장애물(정적 점유/인증, 동적 아님)은 엔진이 최근 유효 경로를 냈고
+    //   그 경로가 물체에서 kick_avoid_clear_m 넘게 떨어져 지나가면 선감속하지 않는다(회피 시작 전 계획 단계 포함).
+    bool avoidanceTarget(const Json::Value& obs) const {
+        const std::string ms=obs.get("motion_state","").asString(),occ=obs.get("occupancy_state","").asString();
+        if(ms=="dynamic")return false;
+        if(!(ms=="static"||occ=="retained"||occ=="candidate"||obs.get("static_occupancy",false).asBool()||
+             obs.get("static_certified",false).asBool()||obs.get("m8_restatic",false).asBool()))return false;
+        const ros::Time now=ros::Time::now();
+        if(last_embedded_stamp_.isZero()||(now-last_embedded_stamp_).toSec()>.5||last_embedded_path_.poses.size()<2)return false;
+        return pathClearance(obs)>kick_avoid_clear_m_;
+    }
     bool handledByAvoidance(const Json::Value& obs) const {
         const ros::Time now=ros::Time::now();
         if(embedded_avoiding_stamp_.isZero()||(now-embedded_avoiding_stamp_).toSec()>.5||
            last_embedded_stamp_.isZero()||(now-last_embedded_stamp_).toSec()>.5||last_embedded_path_.poses.size()<2)return false;
+        return pathClearance(obs)>kick_avoid_clear_m_;
+    }
+    double pathClearance(const Json::Value& obs) const {
         std::vector<std::pair<double,double>> pts;
         const Json::Value& fp=obs.isMember("observed_footprint_world")&&obs["observed_footprint_world"].size()>=3?obs["observed_footprint_world"]:obs["footprint_world"];
         for(const auto& q:fp)if(q.size()>=2)pts.push_back({q[0].asDouble(),q[1].asDouble()});
@@ -4286,7 +4317,7 @@ private:
             const double ax=P[i].pose.position.x,ay=P[i].pose.position.y,ex=P[i+1].pose.position.x-ax,ey=P[i+1].pose.position.y-ay;
             const double l2=std::max(1e-9,ex*ex+ey*ey),u=std::max(0.,std::min(1.,((q.first-ax)*ex+(q.second-ay)*ey)/l2));
             best=std::min(best,std::hypot(q.first-ax-u*ex,q.second-ay-u*ey));}
-        return best>kick_avoid_clear_m_;
+        return best;
     }
     double kick_avoid_clear_m_=1.0;
     bool tunnel_kick_static_exclude_=false;
@@ -4308,6 +4339,7 @@ private:
 	int occ_side_ = 0;
 	bool occupancy_path_primary_ = true;
     bool tunnel_verified_hold_only_ = true;
+    double tunnel_transient_grace_sec_ = 0.5;
 	double occupancy_primary_switch_sec_ = 0.5, occupancy_primary_hold_sec_ = 0.5;
 	bool engine_primary_active_ = false;
 	ros::Time engine_good_since_, engine_bad_since_, engine_primary_eval_stamp_;
@@ -4484,7 +4516,8 @@ private:
 	std::set<int> dyn_ids_, restatic_ids_, bg_ids_;
 	ros::Time dyn_state_stamp_, bg_ids_stamp_;
 	ros::Subscriber tunnel_limits_sub_;
-	ros::Subscriber tunnel_lidar_kick_sub_;
+	ros::Subscriber tunnel_lidar_kick_sub_,tunnel_preslow_cap_sub_;
+    bool independent_preslow_=false;double tunnel_preslow_cap_=9999.;ros::Time tunnel_preslow_stamp_;
 	ros::Publisher tunnel_zone_marker_pub_;
 	bool tunnel_wall_limits_enabled_ = true;
 	double tunnel_wall_clearance_ = 1.10;      // 연석선 - 차 중심 (반폭 0.95 + 0.15)

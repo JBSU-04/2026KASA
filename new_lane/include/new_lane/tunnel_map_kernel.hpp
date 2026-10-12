@@ -31,12 +31,21 @@ inline bool extrapolatePose(const Pose&p,double stamp,Pose&out){
 struct Row{V sensor,world;double height=NAN,ground=NAN;int label=0;bool valid=false,bg=false,inside=false,candidate=false;};
 // Exact sensor-coordinate union. Raw candidates remain observations, not a
 // forced static certificate. Unknown floor and verified background stay out.
-inline std::vector<Row> mergeDetectionRows(const std::vector<Row>& nonground,const std::vector<Row>& raw){
+inline std::vector<Row> mergeDetectionRows(const std::vector<Row>& nonground,const std::vector<Row>& raw,bool legacy_raw=false){
   std::vector<Row> out;out.reserve(nonground.size()+raw.size());
-  std::set<std::array<double,3>> seen;
-  auto add=[&](const Row&r){if(r.sensor.allFinite()&&seen.insert({r.sensor.x(),r.sensor.y(),r.sensor.z()}).second)out.push_back(r);};
-  for(const auto&r:nonground)add(r);
-  for(const auto&r:raw)if(r.valid&&!r.bg&&!r.inside&&r.candidate&&(r.label==2||r.label==3))add(r);
+  std::map<std::array<double,3>,size_t> seen;
+  auto add=[&](const Row&r,bool map_height){
+    if(!r.sensor.allFinite())return;
+    const std::array<double,3> key{{r.sensor.x(),r.sensor.y(),r.sensor.z()}};
+    auto found=seen.find(key);
+    if(found==seen.end()){seen[key]=out.size();out.push_back(r);}
+    else if(map_height&&legacy_raw)out[found->second]=r;
+  };
+  for(const auto&r:nonground)add(r,false);
+  // Map mismatch is not proof of being above ground. The shared GroundGrid
+  // height and selection remain authoritative for the detector. Raw remains
+  // available as map evidence, never reintroducing rejected terrain by default.
+  if(legacy_raw)for(const auto&r:raw)if(r.valid&&!r.bg&&!r.inside&&r.candidate&&(r.label==2||r.label==3))add(r,true);
   return out;
 }
 

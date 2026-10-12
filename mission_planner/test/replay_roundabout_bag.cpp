@@ -171,7 +171,7 @@ RoundaboutConfig loadConfig(const YAML::Node& site) {
   GS("stationary_yield_release_start_s", gs_stationary_yield_start);
   GS("stationary_yield_confirm_s", gs_stationary_yield_confirm);
   GS("stationary_yield_min_distance_m", gs_stationary_yield_min_distance);
-  { std::string em; read(r, "entry_model", em); c.tw_enabled = em == "time_window"; c.distance_enabled=em=="distance"; }
+  { std::string em; read(r, "entry_model", em); c.tw_enabled = em == "time_window"; c.distance_enabled=em=="distance"||em=="window"||em=="quarter"; c.window_enabled=em=="window"; c.quarter_enabled=em=="quarter"; }
 #define TW(key, field) GROUP("time_window", key, field)
   TW("m_front", tw_m_front); TW("m_rear", tw_m_rear); TW("commit_m_front", tw_commit_m_front);
   TW("commit_m_rear", tw_commit_m_rear); TW("sigma_v", tw_sigma_v); TW("young_age", tw_young_age);
@@ -185,6 +185,16 @@ RoundaboutConfig loadConfig(const YAML::Node& site) {
 #undef GS
 #undef GROUP
 #undef ROOT
+  if(r["window"]){const auto w=r["window"];read(w,"s0_m",c.window_s0);read(w,"headway_s",c.window_headway);read(w,"length_margin_m",c.window_length_margin);
+    read(w,"lag_decel_mps2",c.window_lag_decel);read(w,"ego_accel_mps2",c.window_ego_accel);read(w,"start_delay_s",c.window_start_delay);
+    read(w,"merge_margin_m",c.window_merge_margin);read(w,"commit_tolerance_s",c.window_commit_tolerance);read(w,"confirm_frames",c.window_confirm_frames);read(w,"miss_frames",c.window_miss_frames);read(w,"lag_yield_decel_mps2",c.window_lag_yield_decel);read(w,"lag_reaction_s",c.window_lag_reaction);}
+  if(r["gap_select"]){const auto gs=r["gap_select"];read(gs,"ego_center_offset_m",c.gs_ego_center_offset);read(gs,"ego_rear_overhang_m",c.gs_ego_rear_overhang);read(gs,"rear_follower_lateral_m",c.gs_rear_follower_lateral);}
+  if(r["quarter"]){const auto q=r["quarter"];read(q,"fraction",c.quarter_fraction);read(q,"band_m",c.quarter_band);read(q,"min_gap_m",c.quarter_min_gap);
+    read(q,"open_rear_tail_m",c.quarter_open_rear_tail);read(q,"open_rear_view_m",c.quarter_open_rear_view);read(q,"open_front_time_s",c.quarter_open_front_time);
+    read(q,"front_margin_m",c.quarter_front_margin);read(q,"abort_rear_m",c.quarter_abort_rear);read(q,"abort_yield_m",c.quarter_abort_yield);read(q,"confirm_frames",c.quarter_confirm_frames);read(q,"activate_distance_m",c.quarter_activate_distance);read(q,"lead_time_s",c.quarter_lead_time);read(q,"front_fallback_m",c.quarter_front_fallback);}
+  if(c.window_enabled||c.quarter_enabled){c.gap_select_enabled=true;c.gs_observed_entry_enabled=c.gs_preparation_enabled=c.gs_spatial_gap_enabled=false;
+    c.gs_spatial_arrival_check=c.gs_timed_entry_approach=c.gs_route_body_projection=false;c.gs_opportunity_enabled=c.gs_commit_acc_only=c.gs_zone_rule_enabled=false;
+    c.distance_rear_yield=false;c.distance_commit_rear_yield_lock=false;c.gs_commit_rear_yield_lock=false;c.gs_commit_abort_enabled=true;c.distance_confirm=0.;}
   return c;
 }
 

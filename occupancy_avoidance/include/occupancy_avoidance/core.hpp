@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <grid_map_core/grid_map_core.hpp>
 #include <octomap/OcTree.h>
 #include <array>
@@ -13,7 +14,7 @@ struct Pose { double stamp=0,x=0,y=0,z=0,yaw=0,speed=0; };
 struct Reference { double x=0,y=0,yaw=0; int idx=0; };
 struct Edge { int first=0,last=0; double right=-1,left=-1; };
 struct DynamicRegion { double x=0,y=0,yaw=0,length=0,width=0,vx=0,vy=0,uncertainty=0; };
-struct CertifiedTrigger { std::vector<Point> footprint; double stamp=-1; };
+struct CertifiedTrigger { std::vector<Point> footprint; double stamp=-1; bool measured_cells=false; };
 struct LiveEdges { Pose pose; double right=0,left=0,right_slope=0,left_slope=0; bool valid=false; };
 struct Config {
   double resolution=.1, length=80, width=30;
@@ -112,6 +113,8 @@ class Engine {
   void setReacquiring(bool active){if(reacquiring_&&!active&&tunnel_connected_hold_&&continuous_transition_){spatial_return_active_=false;aligned_since_=-1;}reacquiring_=active;}
   void setRoad(std::vector<Reference> road, std::vector<Edge> edges);
   void setLiveEdges(const LiveEdges& edges){live_=edges;}
+  // 2026-10-12: 추측항법 횡 드리프트(/tunnel/wall_offset, + 면 실제 차가 오른쪽). 경로 기준 벽 프로파일 경계에만 반영.
+  void setProfileOffset(double offset){profile_offset_=std::isfinite(offset)?offset:0.;}
   // Full, gravity-aligned sensor returns: preserve 3D beam heights for clearing.
   bool integrate(const Pose&,const std::vector<Point>& returns,
                  const std::vector<Point>& ground={},const std::vector<DynamicRegion>& dynamic={});
@@ -141,6 +144,7 @@ class Engine {
   void setWallSurfaceBand(double band){cfg_.wall_surface_band=band;}
   void setCorridorTargetExtra(double m){cfg_.corridor_target_extra=m;}
   // Existing verified static geometry is an admission hint only, never collision occupancy.
+  void setCertifiedAdmissionOnly(bool enabled){certified_admission_only_=enabled;}
   void setCertifiedTriggers(std::vector<CertifiedTrigger> objects){certified_triggers_=std::move(objects);}
   bool nearCertified(double x,double y,double stamp) const;
   void addCertifiedProxies(double now);
@@ -162,6 +166,7 @@ class Engine {
  private:
   bool tunnel_connected_hold_=false;
   bool reacquiring_=false,continuous_transition_=true,strict_scene_margins_=false;
+  double profile_offset_=0.;
   double visibility_shift_x_=0,visibility_shift_y_=0;
   std::map<uint64_t,std::pair<Point,double>> ray_clear_receipts_;
   mutable std::array<double,2> collision_location_{{NAN,NAN}};
@@ -197,6 +202,7 @@ class Engine {
   Pose scan_pose_;
   double measured_curvature_=0;
   double aligned_since_=-1;
+  bool certified_admission_only_=false;
   bool avoidance_session_=false;
   bool spatial_return_active_=false;
   bool approach_fallback_in_progress_=false;

@@ -13,6 +13,7 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
+#include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Float64.h>
 #include <std_msgs/ColorRGBA.h>
 #include <tf2/utils.h>
@@ -81,6 +82,7 @@ class RoundaboutMissionNode {
     state_pub_ =
         nh_.advertise<mission_planner_msgs::MissionState>(state_topic_, 2);
     distance_debug_pub_=nh_.advertise<std_msgs::String>("/mission/roundabout/distance_debug",2);
+    acc_pub_=nh_.advertise<std_msgs::Float64MultiArray>("/mission/roundabout/acc",2);
     debug_pub_ =
         nh_.advertise<mission_planner_msgs::MissionDebug>(debug_topic_, 2);
     marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
@@ -126,6 +128,9 @@ class RoundaboutMissionNode {
     pnh_.param<double>("roundabout/gap_select/approach_response_s", config_.gs_approach_response, .3);
     pnh_.param<double>("roundabout/gap_select/collision_horizon_s", config_.gs_collision_horizon, 1.0);
     pnh_.param<double>("roundabout/gap_select/collision_margin_m", config_.gs_collision_margin, .2);
+    pnh_.param<double>("roundabout/gap_select/ego_center_offset_m", config_.gs_ego_center_offset, 1.53);
+    pnh_.param<double>("roundabout/gap_select/ego_rear_overhang_m", config_.gs_ego_rear_overhang, 0.79);
+    pnh_.param<double>("roundabout/gap_select/rear_follower_lateral_m", config_.gs_rear_follower_lateral, 2.5);
     pnh_.param<double>("roundabout/gap_select/spatial_front_gap_m", config_.gs_spatial_front_gap, 2.5);
     pnh_.param<double>("roundabout/gap_select/spatial_rear_gap_m", config_.gs_spatial_rear_gap, 2.0);
     pnh_.param<double>("roundabout/gap_select/approach_decel_mps2", config_.gs_approach_decel, 1.0);
@@ -379,8 +384,16 @@ class RoundaboutMissionNode {
     {
       std::string entry_model;
       pnh_.param<std::string>("roundabout/entry_model", entry_model, "legacy");
+      if(entry_model!="legacy"&&entry_model!="distance"&&entry_model!="time_window"&&entry_model!="observed_follow"&&entry_model!="window"&&entry_model!="quarter")
+        throw std::runtime_error("Unknown roundabout entry_model: "+entry_model);
+      if(entry_model=="observed_follow") {
+        config_.gap_select_enabled=true;
+        config_.gs_observed_entry_enabled=true;
+      }
       config_.tw_enabled = entry_model == "time_window";
-      config_.distance_enabled = entry_model == "distance";
+      config_.distance_enabled = entry_model == "distance" || entry_model == "window" || entry_model == "quarter";
+      config_.window_enabled = entry_model == "window";
+      config_.quarter_enabled = entry_model == "quarter";
       if(config_.distance_enabled)config_.gap_select_enabled=true;
       std::string motion_model;
       pnh_.param<std::string>("roundabout/distance_entry/ego_motion_model",motion_model,"constant_accel");
@@ -405,6 +418,38 @@ class RoundaboutMissionNode {
       pnh_.param("roundabout/distance_entry/confirm_s",config_.distance_confirm,.2);
       pnh_.param("roundabout/distance_entry/pair_invalid_s",config_.distance_pair_invalid,.3);
       pnh_.param("roundabout/distance_entry/unknown_observe_s",config_.distance_unknown_hold,.6);
+      pnh_.param("roundabout/window/s0_m",config_.window_s0,4.0);
+      pnh_.param("roundabout/quarter/fraction",config_.quarter_fraction,0.25);
+      pnh_.param("roundabout/quarter/band_m",config_.quarter_band,1.0);
+      pnh_.param("roundabout/quarter/min_gap_m",config_.quarter_min_gap,9.0);
+      pnh_.param("roundabout/quarter/open_rear_tail_m",config_.quarter_open_rear_tail,2.0);
+      pnh_.param("roundabout/quarter/open_rear_view_m",config_.quarter_open_rear_view,20.0);
+      pnh_.param("roundabout/quarter/open_front_time_s",config_.quarter_open_front_time,3.0);
+      pnh_.param("roundabout/quarter/front_margin_m",config_.quarter_front_margin,2.0);
+      pnh_.param("roundabout/quarter/abort_rear_m",config_.quarter_abort_rear,2.0);
+      pnh_.param("roundabout/quarter/abort_yield_m",config_.quarter_abort_yield,1.0);
+      pnh_.param("roundabout/quarter/confirm_frames",config_.quarter_confirm_frames,2);
+      pnh_.param("roundabout/quarter/activate_distance_m",config_.quarter_activate_distance,5.0);
+      pnh_.param("roundabout/quarter/lead_time_s",config_.quarter_lead_time,1.6);
+      pnh_.param("roundabout/quarter/front_fallback_m",config_.quarter_front_fallback,3.8);
+      pnh_.param("roundabout/acc/enabled",config_.acc_enabled,false);
+      pnh_.param("roundabout/acc/target_gap_m",config_.acc_target_gap,2.0);
+      pnh_.param("roundabout/acc/time_gap_s",config_.acc_time_gap,0.2);
+      pnh_.param("roundabout/acc/gain",config_.acc_gain,0.8);
+      pnh_.param("roundabout/acc/accel_gain",config_.acc_accel_gain,1.0);
+      pnh_.param("roundabout/acc/max_accel_mps2",config_.acc_max_accel,2.5);
+      pnh_.param("roundabout/acc/max_brake_mps2",config_.acc_max_brake,3.0);
+      pnh_.param("roundabout/window/headway_s",config_.window_headway,1.2);
+      pnh_.param("roundabout/window/length_margin_m",config_.window_length_margin,0.5);
+      pnh_.param("roundabout/window/lag_decel_mps2",config_.window_lag_decel,1.5);
+      pnh_.param("roundabout/window/ego_accel_mps2",config_.window_ego_accel,1.5);
+      pnh_.param("roundabout/window/start_delay_s",config_.window_start_delay,0.24);
+      pnh_.param("roundabout/window/merge_margin_m",config_.window_merge_margin,1.0);
+      pnh_.param("roundabout/window/commit_tolerance_s",config_.window_commit_tolerance,0.5);
+      pnh_.param("roundabout/window/confirm_frames",config_.window_confirm_frames,4);
+      pnh_.param("roundabout/window/miss_frames",config_.window_miss_frames,6);
+      pnh_.param("roundabout/window/lag_yield_decel_mps2",config_.window_lag_yield_decel,2.0);
+      pnh_.param("roundabout/window/lag_reaction_s",config_.window_lag_reaction,0.5);
       pnh_.param<double>("roundabout/time_window/m_front", config_.tw_m_front, 0.5);
       pnh_.param<double>("roundabout/time_window/m_rear", config_.tw_m_rear, 1.2);
       pnh_.param<double>("roundabout/time_window/commit_m_front", config_.tw_commit_m_front, 0.0);
@@ -550,6 +595,14 @@ class RoundaboutMissionNode {
                        config_.comfortable_decel, 2.5);
     pnh_.param<double>("roundabout/safety/emergency_decel",
                        config_.emergency_decel, 5.0);
+    if(config_.window_enabled||config_.quarter_enabled){
+      // 2026-10-12: 시간 창/1/4 지점 모델은 거리 모델 상태기계만 쓰고, 다른 진입 모델 전용 정책은 끈다.
+      config_.gs_observed_entry_enabled=config_.gs_preparation_enabled=config_.gs_spatial_gap_enabled=false;
+      config_.gs_spatial_arrival_check=config_.gs_timed_entry_approach=config_.gs_route_body_projection=false;
+      config_.gs_opportunity_enabled=config_.gs_commit_acc_only=config_.gs_zone_rule_enabled=false;
+      config_.distance_rear_yield=false;config_.distance_commit_rear_yield_lock=false;config_.gs_commit_rear_yield_lock=false;
+      config_.gs_commit_abort_enabled=true;config_.distance_confirm=0.;
+    }
   }
 
   void odomCallback(const nav_msgs::Odometry::ConstPtr& message) {
@@ -792,7 +845,7 @@ class RoundaboutMissionNode {
       else if(output.state==RoundaboutState::kCirculate||output.state==RoundaboutState::kExit)phase="circulating";
       else if(output.state==RoundaboutState::kFailsafe)phase="failsafe";
       else if(output.state==RoundaboutState::kIdle)phase="inactive";
-      std::ostringstream d;d<<"{\"model\":\""<<(config_.gs_spatial_arrival_check?"spatial":"distance")<<"\",\"stamp\":"<<num(stamp.toSec())
+      std::ostringstream d;d<<"{\"model\":\""<<(config_.quarter_enabled?"quarter":config_.window_enabled?"window":config_.gs_spatial_arrival_check?"spatial":"distance")<<"\",\"stamp\":"<<num(stamp.toSec())
        <<",\"ego_motion_model\":\""<<(config_.distance_measured_profile?"measured_profile":"constant_accel")<<"\""
        <<",\"approval_mode\":\""<<(config_.gs_spatial_only_admission?"spatial_space":config_.gs_spatial_arrival_check?"spatial_trajectory":(config_.distance_clearance_only?"clearance":"trajectory"))<<"\""
        <<",\"approval_latched\":"<<((config_.gs_observed_entry_enabled?output.approval_latched:(output.state==RoundaboutState::kCommit&&(config_.gs_spatial_arrival_check?config_.gs_commit_rear_yield_lock:(config_.distance_clearance_only&&config_.distance_rear_yield&&config_.distance_commit_rear_yield_lock))))?"true":"false")
@@ -832,11 +885,21 @@ class RoundaboutMissionNode {
           <<",\"approval_fixed\":"<<(output.approval_latched?"true":"false")
           <<",\"acc_target_id\":"<<output.constraint.lead_vehicle_id
           <<",\"acc_distance_m\":"<<num(output.constraint.lead_distance)
-          <<",\"acc_speed_mps\":"<<num(output.constraint.lead_speed)<<"}";
+          <<",\"acc_speed_mps\":"<<num(output.constraint.lead_speed)
+          <<",\"window_t_open_s\":"<<num(output.window_t_open)<<",\"window_t_ego_s\":"<<num(output.window_t_ego)
+          <<",\"window_t_close_s\":"<<num(output.window_t_close)<<",\"window_ok_frames\":"<<output.window_ok_frames
+          <<",\"window_missed\":"<<output.window_missed
+          <<",\"quarter_P_m\":"<<num(output.quarter_P)<<",\"quarter_gap_m\":"<<num(output.quarter_gap)
+          <<",\"quarter_s_front_m\":"<<num(output.quarter_s_front)<<",\"quarter_s_trig_m\":"<<num(output.quarter_s_trig)
+          <<",\"quarter_case\":\""<<output.quarter_case<<"\"}";
       std_msgs::String message;message.data=payload+extra.str();distance_debug_pub_.publish(message);
     }
 
     state_pub_.publish(state);
+    {  // 2026-10-12 ACC: [active, id, gap, gap_ref, lead_speed, v_des, a_des] (roundabout_launch_assist 가 a_des 로 페달 보조)
+      std_msgs::Float64MultiArray acc;acc.data={output.acc_active?1.:0.,double(output.acc_id),output.acc_gap,output.acc_gap_ref,
+        output.acc_lead_speed,output.acc_v_des,output.acc_a_des};acc_pub_.publish(acc);
+    }
 
     mission_planner_msgs::MissionDebug debug;
     debug.header = constraint.header;
@@ -864,6 +927,66 @@ class RoundaboutMissionNode {
     if (yaw) *yaw = tangentYaw(ang, config_.counter_clockwise);
     return {config_.center.x + radius * std::cos(ang),
             config_.center.y + radius * std::sin(ang)};
+  }
+
+  // 2026-10-12 1/4 지점 진입 디버그 시각화.
+  //   노랑/초록 구: 대상 갭의 판단 지점(일반 갭 = 1/4 지점, 뒤 개방 = 앞차 꼬리-2 m, 앞 개방 = 뒷차 앞범퍼). 초록 = 출발 허용
+  //   하늘색 굵은 호: 판단 지점이 지나야 출발이 허용되는 구간(출발 기준점 +-band)
+  //   흰 기둥: '우리 차 앞' 교점,  분홍 고리: ACC 대상 차(대기 중 미리 잡음 = 점선색, 추종 중 = 진한 분홍)
+  void appendQuarterMarkers(visualization_msgs::MarkerArray& arr,const RoundaboutOutput& output,const ros::Time& stamp){
+    if(!config_.quarter_enabled)return;
+    const double R=config_.nominal_radius;const ros::Duration life(0.3);
+    auto base=[&](const std::string& ns,int id,int type){visualization_msgs::Marker m;m.header.frame_id=frame_id_;m.header.stamp=stamp;m.ns=ns;m.id=id;
+      m.type=type;m.action=visualization_msgs::Marker::ADD;m.pose.orientation.w=1.;m.lifetime=life;return m;};
+    std::ostringstream fmt;fmt.setf(std::ios::fixed);fmt.precision(1);
+    const bool entering=output.state==RoundaboutState::kApproach||output.state==RoundaboutState::kYield;
+    if(entering&&std::isfinite(output.quarter_s_trig)){
+      visualization_msgs::Marker arc=base("quarter_trigger",0,visualization_msgs::Marker::LINE_STRIP);arc.scale.x=.6;
+      arc.color=output.gap_safe?color(.1F,1.F,.3F,.9F):color(.2F,.85F,1.F,.9F);
+      for(int i=0;i<=10;++i){const double s=output.quarter_s_trig-config_.quarter_band+2.*config_.quarter_band*i/10.;
+        arc.points.push_back(toRosPoint(ringPoint(output.conflict_angle,s,R,nullptr),.15));}
+      arr.markers.push_back(arc);
+      visualization_msgs::Marker t=base("quarter_trigger_text",0,visualization_msgs::Marker::TEXT_VIEW_FACING);
+      t.pose.position=toRosPoint(ringPoint(output.conflict_angle,output.quarter_s_trig,R+2.5,nullptr),1.5);t.scale.z=.6;t.color=color(.2F,.85F,1.F,1.F);
+      std::ostringstream ts;ts.setf(std::ios::fixed);ts.precision(1);ts<<"출발 구간 "<<output.quarter_s_trig<<"+-"<<config_.quarter_band<<"m";t.text=ts.str();arr.markers.push_back(t);
+    }
+    if(entering&&std::isfinite(output.quarter_s_front)){
+      visualization_msgs::Marker f=base("quarter_front",0,visualization_msgs::Marker::CYLINDER);
+      f.pose.position=toRosPoint(ringPoint(output.conflict_angle,output.quarter_s_front,R,nullptr),.6);f.scale.x=f.scale.y=.5;f.scale.z=1.2;f.color=color(1.F,1.F,1.F,.9F);
+      arr.markers.push_back(f);
+      visualization_msgs::Marker t=base("quarter_front_text",0,visualization_msgs::Marker::TEXT_VIEW_FACING);
+      t.pose.position=f.pose.position;t.pose.position.z=1.8;t.scale.z=.5;t.color=color(1.F,1.F,1.F,1.F);t.text="우리 차 앞";arr.markers.push_back(t);
+    }
+    if(entering&&std::isfinite(output.quarter_x)){
+      visualization_msgs::Marker q=base("quarter_point",0,visualization_msgs::Marker::SPHERE);
+      q.pose.position=toRosPoint(ringPoint(output.conflict_angle,output.quarter_x,R,nullptr),.8);q.scale.x=q.scale.y=q.scale.z=1.2;
+      q.color=output.gap_safe?color(.1F,1.F,.3F,.95F):color(1.F,.85F,.1F,.95F);arr.markers.push_back(q);
+      visualization_msgs::Marker t=base("quarter_point_text",0,visualization_msgs::Marker::TEXT_VIEW_FACING);
+      t.pose.position=q.pose.position;t.pose.position.z=2.2;t.scale.z=.55;t.color=q.color;t.color.a=1.F;
+      std::ostringstream ts;ts.setf(std::ios::fixed);ts.precision(1);
+      ts<<(output.quarter_case=="normal"||output.quarter_case=="virtual_rear"?"1/4 지점":output.quarter_case=="open_rear"?"앞차꼬리-2m":"뒷차 앞범퍼")
+        <<" "<<output.quarter_x<<"m";
+      if(std::isfinite(output.quarter_gap))ts<<" 갭 "<<output.quarter_gap<<"m";
+      ts<<"\n["<<output.quarter_case<<"] "<<(output.gap_safe?"출발 허용":"대기");t.text=ts.str();arr.markers.push_back(t);
+    }
+    if(output.acc_id>=0){
+      // 갭 평가 목록(진입 단계)에 없으면(순환/이탈) 최신 추적 목록에서 위치를 찾는다.
+      std::vector<RoundaboutVehicleViz> candidates=output.stream;
+      bool found=false;for(const auto& v:candidates)if(v.id==output.acc_id)found=true;
+      if(!found)for(const auto& o:tracked_objects_)if(o.id==output.acc_id){RoundaboutVehicleViz v;v.id=o.id;v.length=o.length;
+        v.measured_position=o.position;v.measured_position_valid=true;candidates.push_back(v);}
+      for(const RoundaboutVehicleViz& v:candidates){if(v.id!=output.acc_id)continue;
+        const Point2 c=v.measured_position_valid?v.measured_position:ringPoint(output.conflict_angle,v.pos,R,nullptr);
+        visualization_msgs::Marker ring=base("acc_target",0,visualization_msgs::Marker::CYLINDER);
+        ring.pose.position=toRosPoint(c,1.8);ring.scale.x=ring.scale.y=std::max(3.,v.length+1.);ring.scale.z=.15;
+        ring.color=output.acc_active?color(1.F,.1F,.7F,.9F):color(1.F,.6F,.9F,.6F);arr.markers.push_back(ring);
+        visualization_msgs::Marker t=base("acc_target_text",0,visualization_msgs::Marker::TEXT_VIEW_FACING);
+        t.pose.position=toRosPoint(c,3.3);t.scale.z=.6;t.color=ring.color;t.color.a=1.F;
+        std::ostringstream ts;ts.setf(std::ios::fixed);ts.precision(1);
+        ts<<"ACC "<<(output.acc_active?"추종":"대기(미리 잡음)")<<" id"<<v.id<<"\n간격 "<<output.acc_gap<<"m / 유지 "<<output.acc_gap_ref<<"m";
+        if(output.acc_active)ts<<"\nv_des "<<output.acc_v_des<<" a_des "<<output.acc_a_des;
+        t.text=ts.str();arr.markers.push_back(t);break;}
+    }
   }
 
   // ★ 틈 선택 시각화(고주로 gap select 마커와 같은 색 규칙).
@@ -932,6 +1055,7 @@ class RoundaboutMissionNode {
         (output.state != RoundaboutState::kApproach &&
          output.state != RoundaboutState::kYield &&
          output.state != RoundaboutState::kCommit)) {
+      appendQuarterMarkers(arr, output, stamp);
       gap_marker_pub_.publish(arr);
       return;
     }
@@ -1131,6 +1255,7 @@ class RoundaboutMissionNode {
     }
     st.text = ss.str();
     arr.markers.push_back(st);
+    appendQuarterMarkers(arr, output, stamp);
     gap_marker_pub_.publish(arr);
   }
 
@@ -1238,7 +1363,7 @@ class RoundaboutMissionNode {
   ros::Subscriber localization_sub_;
   ros::Publisher constraint_pub_;
   ros::Publisher state_pub_;
-  ros::Publisher debug_pub_,distance_debug_pub_;
+  ros::Publisher debug_pub_,distance_debug_pub_,acc_pub_;
   ros::Publisher marker_pub_;
   ros::Publisher gap_marker_pub_;
   std::string gap_marker_topic_;

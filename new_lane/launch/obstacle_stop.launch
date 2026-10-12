@@ -203,6 +203,8 @@
     <param name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)" />
     <param name="dynamic_zone_max_idx" value="$(arg dynamic_zone_max_idx)" />
     <param name="trigger_stop_sec" value="8.0" />
+    <!-- 2026-10-12 터널: 회피 반경 부족(엔진 공간 실패) 3 s 연속이면 후진 탐색(정지 8 s 대체) -->
+    <param name="tunnel_trigger_stop_sec" value="3.0" />
     <param name="trigger_gap_m" value="5.0" />
     <param name="reverse_min_m" value="5.0" />
     <param name="reverse_max_m" value="10.0" />

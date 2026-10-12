@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""World footprints shared by occupancy and collision consumers (metres)."""
+import math
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def hull(points):
+    pts=sorted(set((float(x),float(y)) for x,y in points))
+    if len(pts)<3:return pts
+    def cross(a,b,c):return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+    sides=[]
+    for seq in (pts,list(reversed(pts))):
+        out=[]
+        for p in seq:
+            while len(out)>1 and cross(out[-2],out[-1],p)<=0:out.pop()
+            out.append(p)
+        sides.append(out[:-1])
+    return sides[0]+sides[1]
+
+
+def rectangle(x,y,yaw,length,width):
+    c,s=math.cos(yaw),math.sin(yaw)
+    return [[x+c*a-s*b,y+s*a+c*b] for a,b in
+            [(-length/2,-width/2),(length/2,-width/2),(length/2,width/2),(-length/2,width/2)]]
+
+
+def footprint(obs):
+    p=obs.get('footprint_world')
+    if p and len(p)>=3 and all(len(q)>=2 and all(math.isfinite(float(v)) for v in q[:2]) for q in p):
+        result=hull([q[:2] for q in p])
+        if len(result)>=3:return result
+    x,y=obs['position_world'][:2]
+    return rectangle(x,y,float(obs.get('footprint_yaw',obs.get('ego_yaw',0.))),
+                     max(.35,float(obs.get('length',.35))),max(.35,float(obs.get('width',.35))))
+
+
+def overlap(a,b):
+    for poly in (a,b):
+        for i,p in enumerate(poly):
+            q=poly[(i+1)%len(poly)];ax,ay=-(q[1]-p[1]),q[0]-p[0]
+            if math.hypot(ax,ay)<1e-9:continue
+            pa=[x*ax+y*ay for x,y in a];pb=[x*ax+y*ay for x,y in b]
+            if max(pa)<min(pb)-1e-9 or max(pb)<min(pa)-1e-9:return False
+    return True
+
+
+def body_overlap(obs,ego,yaw,front=3.85,rear=.79,half_width=.95,margin=.20):
+    center=.5*(front-rear)
+    body=rectangle(ego[0]+center*math.cos(yaw),ego[1]+center*math.sin(yaw),yaw,
+                   front+rear+2*margin,2*(half_width+margin))
+    return overlap(footprint(obs),body)
+
+
+def projection(obs,yaw):
+    c,s=math.cos(yaw),math.sin(yaw);p=footprint(obs)
+    a=[c*x+s*y for x,y in p];b=[-s*x+c*y for x,y in p]
+    return [min(a),max(a),min(b),max(b)]
+
+
+def measured_geometry(points, yaw, min_extent=.35):
+    """One contract for both detectors. No shifted origin, size cap or range padding.
+
+    A polygon encloses actual returns. Only degenerate/single-ring geometry
+    receives the same minimum extent in both detectors.
+    """
+    points=np.asarray(points,dtype=float)
+    if points.ndim!=2 or len(points)==0 or points.shape[1]<2:
+        raise ValueError('geometry needs world points')
+    xy=points[:,:2];xy=xy[np.isfinite(xy).all(axis=1)]
+    if not len(xy):raise ValueError('no finite world points')
+    c,s=math.cos(yaw),math.sin(yaw)
+    # Work relative to a local origin to preserve precision at UTM coordinates.
+    origin=xy.mean(axis=0);axes=np.array([[c,-s],[s,c]])
+    local=(xy-origin)@axes;lo=local.min(axis=0);hi=local.max(axis=0)
+    middle=(lo+hi)/2;half=np.maximum((hi-lo)/2,min_extent/2)
+    poly=hull(xy.tolist())
+    if len(poly)<3 or np.any(hi-lo<min_extent):
+        poly=[list(origin+axes@np.array([a,b])) for a,b in
+              [(middle[0]-half[0],middle[1]-half[1]),(middle[0]+half[0],middle[1]-half[1]),
+               (middle[0]+half[0],middle[1]+half[1]),(middle[0]-half[0],middle[1]+half[1])]]
+    center=origin+axes@middle
+    return dict(footprint_world=poly,footprint_yaw=float(yaw),
+                position_world=center.tolist(),length=float(2*half[0]),width=float(2*half[1]),
+                radius=float(np.linalg.norm(half)))
+
+
+def sensor_to_base_xy(points,frame,offset):
+    """Horizontal conversion; keep sensor z for existing height thresholds."""
+    if frame.lstrip('/')=='base_link':return points
+    if frame.lstrip('/') not in ('velodyne_ground','velodyne'):
+        raise ValueError('unsupported LiDAR frame '+frame)
+    result=np.asarray(points).copy();result[:,0]+=offset[0];result[:,1]+=offset[1]
+    return result
+
+
+def clip_footprint(poly,box,yaw):
+    """Clip an actual convex outline to accepted fixed-axis boundaries.
+
+    Do not fill the empty corners of a path-aligned bounding rectangle for a
+    diagonal truck; those corners are dimensions, not occupied measurements.
+    """
+    c,s=math.cos(yaw),math.sin(yaw)
+    points=[[c*x+s*y,-s*x+c*y] for x,y in poly]
+    for axis,bound,lower in ((0,box[0],True),(0,box[1],False),(1,box[2],True),(1,box[3],False)):
+        result=[]
+        if not points:return []
+        for a,b in zip(points,points[1:]+points[:1]):
+            ai=a[axis]>=bound if lower else a[axis]<=bound
+            bi=b[axis]>=bound if lower else b[axis]<=bound
+            if ai:result.append(a)
+            if ai!=bi:
+                u=(bound-a[axis])/(b[axis]-a[axis])
+                result.append([a[0]+u*(b[0]-a[0]),a[1]+u*(b[1]-a[1])])
+        points=result
+    return hull([[c*a-s*b,s*a+c*b] for a,b in points])
+
+
+def pose_at(samples,stamp,max_age=.15):
+    """Interpolate yaw through wrap-around; optional fourth coordinate is height."""
+    if not samples:return None
+    if stamp<=samples[0][0]:return samples[0][1] if samples[0][0]-stamp<=max_age else None
+    for (ta,a),(tb,b) in zip(samples,samples[1:]):
+        if ta<=stamp<=tb:
+            if tb-ta>2*max_age:return None
+            u=(stamp-ta)/(tb-ta)
+            out=[x+u*(y-x) for x,y in zip(a,b)]
+            out[2]=a[2]+u*math.atan2(math.sin(b[2]-a[2]),math.cos(b[2]-a[2]))
+            return tuple(out)
+    return samples[-1][1] if stamp-samples[-1][0]<=max_age else None
+
+
+class RayEvidence:
+    """Only returned beams passing THROUGH an old occupied cell prove it empty.
+
+    A stopped/occluded beam, a different-height beam, or no beam is unknown.
+    Points and origins use the same map xyz frame at the scan timestamp.
+    """
+    def __init__(self,scan,now):
+        self.stamp=float(scan.get('stamp',-1e9));self.valid=False
+        if scan.get('frame')!='map' or not 0<=now-self.stamp<=.35:return
+        origin=np.asarray(scan.get('origin',[]),float)
+        ends=np.asarray(scan.get('endpoints',[]),float)
+        if origin.shape!=(3,) or ends.ndim!=2 or ends.shape[1]!=3 or not np.isfinite(origin).all():return
+        ends=ends[np.isfinite(ends).all(axis=1)]
+        delta=ends-origin;distance=np.linalg.norm(delta,axis=1);good=distance>.2
+        if not good.any():return
+        self.origin=origin;self.range=distance[good];self.direction=delta[good]/self.range[:,None]
+        self.native=None
+        if scan.get('native_geometry',False):
+            from m8_geometry_native import available,Rays
+            if available():
+                self.native=Rays(origin,ends[good]);self.valid=True;return
+        self.tree=cKDTree(self.direction);self.valid=True
+
+    def clear(self,points):
+        if not self.valid:return False
+        points=np.asarray(points,float)
+        if points.ndim!=2 or points.shape[1]!=3 or not len(points) or not np.isfinite(points).all():return False
+        if getattr(self,'native',None) is not None:return self.native.clear(points)
+        delta=points-self.origin;r=np.linalg.norm(delta,axis=1)
+        if np.any(r<.2):return False
+        _,idx=self.tree.query(delta/r[:,None],k=min(4,len(self.range)))
+        if idx.ndim==1:idx=idx[:,None]
+        dirs=self.direction[idx];along=np.einsum('ni,nki->nk',delta,dirs)
+        transverse=np.linalg.norm(delta[:,None,:]-along[:,:,None]*dirs,axis=2)
+        # 8 cm cell radius, including vertical distance; endpoint must extend
+        # 20 cm beyond the cell. Never infer a complete angular cone is free.
+        free=(transverse<=.08)&(along>0)&(self.range[idx]>along+.20)
+        return bool(np.all(np.any(free,axis=1)))
+
+
+def regional_plane_heights(p, ground_z):
+    """중력정렬 점군의 점별 '국소 노면 평면' 위 높이. 평면을 못 잡은 칸은 NaN.
+
+    6 x 4 m 칸마다 주변(±9 x ±6 m) 1 m 칸 낮은 점(하위 30 %) 중앙값으로 평면을 맞춘다.
+    한 평면으로 앞 5~40 m 를 맞추면 종단 경사가 바뀌는 터널 구간에서 노면이 0.2 m 위로
+    떠 물체로 제안됐다(2026-10-09 14:56:06 백, 윗면 0.17 m 노면 -> 정지). 국소 평면은 경사 변화를 따라간다.
+    tunnel_wall_detector.regional_ground_points 와 같은 계산(그 함수도 이것을 쓴다).
+    반환: (height[N], valid[N] bool, keys[N,2] 칸 번호)
+    """
+    p = np.asarray(p, dtype=float)
+    keys = np.floor(p[:, :2]/[6., 4.]).astype(int)
+    height = np.full(len(p), np.nan)
+    valid = np.zeros(len(p), bool)
+    low = p[(p[:, 2] > ground_z-1.) & (p[:, 2] < ground_z+.8)]
+    if not len(low):
+        return height, valid, keys
+    cells = np.floor(low[:, :2]).astype(int)
+    _, groups, counts = np.unique(cells, axis=0, return_inverse=True, return_counts=True)
+    ordered = low[np.argsort(groups, kind='stable')]
+    bounds = np.r_[0, np.cumsum(counts)]
+    seeds = []
+    for i in np.flatnonzero(counts >= 3):
+        cell_points = ordered[bounds[i]:bounds[i+1]]
+        seeds.append(np.median(cell_points[cell_points[:, 2] <=
+                     np.percentile(cell_points[:, 2], 30)], axis=0))
+    seeds = np.asarray(seeds)
+    if not len(seeds):
+        return height, valid, keys
+    for cell in np.unique(keys, axis=0):
+        center = (cell+.5)*[6., 4.]
+        near = seeds[(np.abs(seeds[:, 0]-center[0]) <= 9) &
+                     (np.abs(seeds[:, 1]-center[1]) <= 6)]
+        if len(near) < 12:
+            continue
+        A = np.column_stack([near[:, :2]-center, np.ones(len(near))])
+        keep = np.ones(len(near), bool)
+        for _ in range(4):
+            if keep.sum() < 12:
+                break
+            coef = np.linalg.lstsq(A[keep], near[keep, 2], rcond=None)[0]
+            keep = np.abs(near[:, 2]-A@coef) <= .12
+        if (keep.sum() < 12 or np.linalg.norm(coef[:2]) > .12 or
+                np.ptp(near[keep, 0]) < 2 or np.ptp(near[keep, 1]) < 1 or
+                np.sqrt(np.mean((near[keep, 2]-A[keep]@coef)**2)) > .07):
+            continue
+        target = np.all(keys == cell, axis=1)
+        z = (p[target, :2]-center)@coef[:2]+coef[2]
+        height[target] = (p[target, 2]-z)/np.sqrt(1+np.sum(coef[:2]**2))
+        valid[target] = True
+    return height, valid, keys

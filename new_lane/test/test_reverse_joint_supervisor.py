@@ -124,3 +124,24 @@ def test_post_stop_failure_restarts_longer_reverse_search(node):
     assert node.post_stop_retry(9.)
     assert node.state == r.IDLE and node.retry_min_reverse == 5.
     assert node.target is None and node.stopped_since == 1.
+
+
+def test_tunnel_reverse_after_three_seconds_of_spatial_failure(node):
+    # 2026-10-12(21:51:17 백): 정지 8 s 타이머가 조금만 움직여도 리셋돼 후진이 안 나왔다.
+    node.tunnel_trigger_stop_sec = 3.
+    node.forward_failure_reason, node.forward_failure_stamp = 'no_connected_corridor', 10.
+    node.forward_mission_blocked = True
+    node.spatial_fail_since = 8.
+    assert not node.tunnel_trigger_ready(10.)
+    node.spatial_fail_since = 7.
+    assert node.tunnel_trigger_ready(10.)
+    node.forward_failure_reason = 'stale_lidar'
+    assert not node.tunnel_trigger_ready(10.)
+
+
+def test_tunnel_solver_failure_without_mission_object_never_triggers_reverse(node):
+    node.forward_failure_reason='no_connected_corridor';node.forward_failure_stamp=10.
+    node.forward_mission_blocked=False
+    assert not node.m8_escape_allowed(10.)
+    node.forward_mission_blocked=True;node.forward_failure_reason='curvature'
+    assert not node.m8_escape_allowed(10.)

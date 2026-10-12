@@ -97,6 +97,8 @@ class ObstacleStopNode:
             '~tunnel_wall_min_vertical_thickness', 2.0))
         self.tunnel_wall_min_top_elevation = float(rospy.get_param(
             '~tunnel_wall_min_top_elevation', 2.2))
+        self.tunnel_dynamic_min_top = float(rospy.get_param('~tunnel_dynamic_min_top', 0.25))
+        self.tunnel_dynamic_min_size = float(rospy.get_param('~tunnel_dynamic_min_size', 0.6))
         self.tunnel_wall_min_length = float(rospy.get_param(
             '~tunnel_wall_min_length', 1.5))
         self.tunnel_wall_max_width = float(rospy.get_param(
@@ -169,7 +171,7 @@ class ObstacleStopNode:
         #   보고 움직이기 시작한 순간(12~13 m)을 잡는다. 코리도 안이면 즉시 정지, 밖이면
         #   경로 쪽으로 tunnel_bg_moving_min_toward 이상 다가올 때 정지(느린 물체 포함).
         #   근처(tunnel_bg_moving_match_m) 트래커 물체는 바로 동적으로 올린다.
-        self.tunnel_bg_moving_enabled = bool(rospy.get_param('~tunnel_bg_moving_enabled', True))
+        self.tunnel_bg_moving_enabled = bool(rospy.get_param('~tunnel_bg_moving_enabled', True)) and not bool(rospy.get_param('/tunnel_recovery/independent_preslow_enabled',False))
         self.tunnel_bg_moving_timeout = float(rospy.get_param('~tunnel_bg_moving_timeout', 0.3))
         self.tunnel_bg_moving_min_toward = float(rospy.get_param('~tunnel_bg_moving_min_toward', 0.3))
         self.tunnel_bg_moving_half_width = float(rospy.get_param('~tunnel_bg_moving_half_width', 0.3))
@@ -347,6 +349,7 @@ class ObstacleStopNode:
         self.current_waypoint_idx = None
         self.tunnel_cells_authoritative_enabled=bool(rospy.get_param('~tunnel_cells_authoritative_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
         self.tunnel_motion_evidence_enabled=bool(rospy.get_param('~tunnel_motion_evidence_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self.shared_detector_policy=bool(rospy.get_param('/tunnel_recovery/shared_detector_policy_enabled',True))
         self._body_sweep_cache={}
         self.tunnel_swept_stop_enabled=bool(rospy.get_param("~tunnel_swept_stop_enabled",True)) and bool(rospy.get_param("/tunnel_recovery/enabled",True))
         self.current_lane_number = 0
@@ -796,6 +799,17 @@ class ObstacleStopNode:
         mid=len(h)//2
         a=np.array(h[mid][1:])-np.array(h[0][1:]);b=np.array(h[-1][1:])-np.array(h[mid][1:])
         return float(a@b)>0 and np.linalg.norm(a+b)>=.15
+
+    def tunnel_dynamic_too_small(self, obs):
+        """동적 경로 예측 정지 최소 조건: 꼭대기 >= 0.25 m 이고 길이+폭 >= 0.6 m. 사용자 저상 장애물은 0.45 m."""
+        top = obs.get('top_elevation')
+        try:
+            top = float(top) if top is not None else None
+            size = float(obs.get('length', 0.)) + float(obs.get('width', 0.))
+        except (TypeError, ValueError):
+            return False
+        return ((top is not None and top < getattr(self, 'tunnel_dynamic_min_top', .25)) or
+                size < getattr(self, 'tunnel_dynamic_min_size', .6))
 
     def _driven_predictive_conflict(self, obs, vector, allow_prefix=False):
         """None means incomplete/stale horizon: use the conservative legacy model."""
@@ -1726,7 +1740,7 @@ class ObstacleStopNode:
             (signed_lat >= float(self.predictive_risk.get('slow_lateral_min', 0.50)) or speed >= 1.2))
         tracker_dynamic = ((obs.get('motion_state') == 'dynamic' or (velocity_valid and dynamic_streak >= 2)) and
                            speed >= 0.8)
-        if tunnel and obs.get('static_certified', False) and not self._coherent_measured_motion(oid):
+        if tunnel and not getattr(self,'shared_detector_policy',False) and obs.get('static_certified', False) and not self._coherent_measured_motion(oid):
             tracker_dynamic = coherent_motion = False
         evidence = fresh and (tracker_dynamic or coherent_motion)
 
@@ -1762,11 +1776,15 @@ class ObstacleStopNode:
 
         world_fast = None
         m8_evidence=True
-        if tunnel and getattr(self,'tunnel_motion_evidence_enabled',False):
+        shared_m8=tunnel and getattr(self,'shared_detector_policy',False)
+        # Shared M8 uses the same scan-based motion evidence as M3. The
+        # legacy tunnel centroid/world-fast classifier cannot override it.
+        det_dynamic_now,det_dynamic_confirmed=dynamic_now,dynamic_confirmed
+        if tunnel and not shared_m8 and getattr(self,'tunnel_motion_evidence_enabled',False):
             m8_evidence,self._m8_motion_reason=self.m8_motion_evidence(obs,now)
             if not hasattr(self,'_m8_motion_reasons'):self._m8_motion_reasons={}
             self._m8_motion_reasons[oid]=self._m8_motion_reason
-        if tunnel:
+        if tunnel and not shared_m8:
             st = self._dyn_hyst.setdefault(oid, {'on': False, 'hits': 0, 'low_since': None,
                                                  'on_since': None})
             parent_static = bool(obs.get('static_certified', False)) and (not m8_evidence if getattr(self,'tunnel_motion_evidence_enabled',False) else not self._coherent_measured_motion(oid))
@@ -1819,15 +1837,15 @@ class ObstacleStopNode:
                         st['on_since'] = None
                 else:
                     st['low_since'] = None
-            dynamic_now = st['on']
-            dynamic_confirmed = st['on']
+            dynamic_now = st['on'] or (shared_m8 and det_dynamic_now)
+            dynamic_confirmed = st['on'] or (shared_m8 and det_dynamic_confirmed)
             if dynamic_now:
                 self._dynamic_seen[oid] = now
             else:
                 self._dynamic_seen.pop(oid, None)
 
         # 원거리 정적 자리 + 실제로 안 움직임 -> 동적이 아니다(클러스터 흔들림).
-        if tunnel and (dynamic_now or dynamic_confirmed) and self._far_static_match(obs):
+        if tunnel and not shared_m8 and (dynamic_now or dynamic_confirmed) and self._far_static_match(obs):
             moved = self._moved_m(oid)
             if moved is None or moved < self.tunnel_far_static_move_m:
                 dynamic_now = False
@@ -1853,6 +1871,9 @@ class ObstacleStopNode:
         verified_static = (tunnel and not dynamic_confirmed and
                            (self.tunnel_measured_static(obs, now) or '_static_parent_id' in obs or
                             (obs.get('static_certified', False) and not self._coherent_measured_motion(oid))))
+        if shared_m8:
+            verified_static=bool(not dynamic_confirmed and obs.get('confirmed_obstacle',obs.get('confirmed',False))
+                                 and (obs.get('motion_state')=='static' or obs.get('m8_restatic',False)))
         if tunnel and dynamic_confirmed:
             getattr(self, '_measured_static', {}).pop(oid, None)
         # Classification must not depend on whether the avoidance path is clear.
@@ -1860,6 +1881,14 @@ class ObstacleStopNode:
                         (verified_static or (speed < self.tunnel_dyn_on_speed and
                          (stationary_sec >= self.tunnel_static_confirm_sec or
                           obs.get('motion_state') == 'static'))))
+        if shared_m8:
+            static_ready=verified_static and not dynamic_confirmed
+            if static_ready:
+                recent=False
+                self._tunnel_dynamic_seen.pop(oid,None)
+                self._dyn_hyst.pop(oid,None)
+                self._frame_static.add(oid)
+                self._frame_dyn.discard(oid)
         if static_ready and oid in self._ever_dyn:
             self._frame_static.add(oid)
             self._frame_dyn.discard(oid)
@@ -1883,6 +1912,10 @@ class ObstacleStopNode:
                 #   관측 나이와 무관하게 주행 경로에 걸리면 정지한다(놓아서 두 번 충돌).
                 if obs.get('blind_hold', False) and driven_conflict:
                     return True, 'tunnel_blind_hold'
+                # 2026-10-12(19:09:58 백): 입구·출구의 높이 0.12 m, 0.3 m 크기 연석·지면 조각이 동적 경로 예측 정지를 걸었다.
+                #   작은 저상 물체는 동적 예측 정지 대상에서 빼고 아래 정적 판단(주행 경로 점유)만 받는다.
+                if (dynamic_confirmed or recent) and self.tunnel_dynamic_too_small(obs):
+                    dynamic_confirmed=recent=False
                 if dynamic_confirmed or recent:
                     vector=obs.get('velocity') if velocity_valid else obs.get('observed_velocity')
                     if fresh and vector and len(vector)>=2 and all(math.isfinite(float(v)) for v in vector[:2]):
@@ -1932,7 +1965,7 @@ class ObstacleStopNode:
                     fx_far = float(obs.get('position_ego', [0.0])[0])
                     st_f = self._dyn_hyst.get(oid) or {}
                     on_since = st_f.get('on_since')
-                    if (fx_far > self.stop_zone_max_forward and dynamic_confirmed and
+                    if (not shared_m8 and fx_far > self.stop_zone_max_forward and dynamic_confirmed and
                             (on_since is None or now - on_since < self.tunnel_far_dyn_confirm_sec)):
                         return False, 'tunnel_far_dynamic_unconfirmed'
                     return True, 'tunnel_in_path_dynamic'
@@ -1945,7 +1978,7 @@ class ObstacleStopNode:
                 # 속도 조건은 두지 않는다: 낮은 정적 물체의 속도 추정이 1.98 m/s 로
                 # 튀어(19:49 백) 이어받기가 막혔다. 실제로 움직이는 물체는 위의
                 # dynamic_confirmed / recent_dynamic 분기가 먼저 정지시킨다.
-                if (getattr(self, 'tunnel_far_static_inherit', False) and
+                if (not shared_m8 and getattr(self, 'tunnel_far_static_inherit', False) and
                         len(obs.get('position_world', [])) >= 2):
                     wx, wy = float(obs['position_world'][0]), float(obs['position_world'][1])
                     m2 = self.tunnel_far_static_match_m ** 2
@@ -1955,6 +1988,7 @@ class ObstacleStopNode:
                 static_ok = verified_static or (speed < self.tunnel_dyn_on_speed and (
                     stationary_sec >= self.tunnel_static_confirm_sec or
                     obs.get('motion_state') == 'static'))
+                if shared_m8:static_ok=verified_static
                 if static_ok:
                     if oid in self._ever_dyn:
                         # 동적이었다가 경로 위에 멈춤 -> 정적 전환(플래너가 회피)
@@ -2102,19 +2136,19 @@ class ObstacleStopNode:
                     if now_s - f[2] <= self.tunnel_far_static_memory_sec][-200:]
             elif not tunnel:
                 self._tunnel_far_static = []
-            if tunnel:
+            if tunnel and not getattr(self,'shared_detector_policy',False):
                 self._associate_fragments(obs_list, t_now)
             for obs in obs_list:
                 if obs.get('infrastructure_candidate', False):
                     continue  # retained by the path planner as collision geometry
-                if tunnel and self._is_tunnel_wall_piece(obs):
+                if tunnel and not getattr(self,'shared_detector_policy',False) and self._is_tunnel_wall_piece(obs):
                     stop_decisions.append({'id': int(obs.get('id',-1)), 'stop': False,
                         'reason': 'tunnel_wall_excluded', 'wall_reason': self._wall_reason})
                     rospy.loginfo_throttle(
                         1.0, "[obstacle_stop] 터널 벽/턱 조각 제외(프로파일): id=%s pos_ego=%s",
                         obs.get('id', -1), obs.get('position_ego'))
                     continue
-                if tunnel and self._wall_reason != 'inward_motion_protected' and self._is_tunnel_wall_like(obs):
+                if tunnel and not getattr(self,'shared_detector_policy',False) and self._wall_reason != 'inward_motion_protected' and self._is_tunnel_wall_like(obs):
                     rospy.loginfo_throttle(
                         1.0,
                         "[obstacle_stop] 터널 벽 조각 제외: id=%s pos_ego=%s "

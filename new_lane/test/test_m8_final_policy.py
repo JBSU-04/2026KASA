@@ -88,7 +88,7 @@ def test_reverse_requires_fresh_spatial_failure_not_dynamic_or_timeout():
     method=next(n for c in tree.body if isinstance(c,ast.ClassDef) for n in c.body
                 if isinstance(n,ast.FunctionDef) and n.name=='m8_escape_allowed')
     env={};exec(compile(ast.Module(body=[method],type_ignores=[]),str(file),'exec'),env)
-    node=SimpleNamespace(forward_failure_stamp=10.,forward_failure_reason='no_connected_corridor')
+    node=SimpleNamespace(forward_failure_stamp=10.,forward_failure_reason='no_connected_corridor',forward_mission_blocked=True)
     assert env['m8_escape_allowed'](node,10.1)
     for reason in ['stale_lidar','stale_pose_reference_or_geometry','search_timeout','dynamic_hold']:
         node.forward_failure_reason=reason;assert not env['m8_escape_allowed'](node,10.1)

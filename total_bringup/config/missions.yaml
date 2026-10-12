@@ -121,7 +121,7 @@ section_router:
       speed_limit_exempt: true
       executors: [smpc]
     - id: M7B
-      name: tunnel_approach # M8 앞 60m 인지 준비, 40m 정동적 제어 (실제 CSV 거리)
+      name: tunnel_approach # 실측 터널 입구 앞 60m 인지 준비, 25m 정동적 제어
       csv: 3
       # M7 끝(6197)과 M8 시작(7000) 사이 약 80 m 공백을 메운다. 공백이면
       # section_id 가 '' 로 나가고, 그때 obstacle_perception 의 폴백
@@ -158,8 +158,8 @@ section_router:
 sequence_monitor:
   rate: 2.0
   time_limit_sec: 900.0 # 규정: 15분
-  # M7B(터널 접근)는 감속만 하고 미션을 무장하지 않으므로 여기에 넣지
-  # 않는다. 넣으면 제약을 안 냈다고 계속 SKIPPED 로 찍힌다. 관측기는
+  # M7B는 접근 단계이므로 별도 완수 미션에 넣지 않는다. 접근 경계 안에서는
+  # 정동적 제어를 무장하지만 M8의 GPS 음영 구간 정의는 유지한다. 관측기는
   # 기록만 하고 아무것도 차단하지 않으므로 빠져 있어도 문제없다.
   expected_order: [M1, M2, M3, M4, M5, M6, M7, M8]
 

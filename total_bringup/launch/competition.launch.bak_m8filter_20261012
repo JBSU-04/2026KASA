@@ -1,0 +1,337 @@
+<launch>
+  <arg name="tunnel_cpp_prefilter" default="true"/>
+  <arg name="tunnel_common_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
+  <arg name="tunnel_native_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
+  <arg name="tunnel_wall_profile_file" default="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+  <arg name="tunnel_physical_boundary_policy" default="true"/>
+  <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_gps_20261009.bin"/>
+  <arg name="tunnel_verified_background_filter_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
+  <arg name="tunnel_continuous_transition_enabled" default="true"/>
+  <!-- M8: DR plus validated X-ICP yaw; dr/ufld remain explicit rollback modes. -->
+  <arg name="tunnel_heading_mode" default="xicp"/>
+  <param name="/tunnel_recovery/heading_mode" value="$(arg tunnel_heading_mode)"/>
+  <arg name="tunnel_map_backend" default="cpp"/>
+  <arg name="tunnel_recovery_enabled" default="true"/>
+  <param name="/tunnel_recovery/enabled" value="$(arg tunnel_recovery_enabled)"/>
+  <!-- 라이다 장착 기준값(센서고 등). 여러 인지 노드가 같은 물리량을 각자
+       갖고 있다가 서로 어긋났던 이력이 있어(1.25 / 1.686 / -1.68 / 1.592,
+       9cm 오차가 방치되어 12~20cm 저상 장애물이 통째로 탈락했었다) 한 곳에
+       모았다. 각 노드는 시작할 때 자기 값과 이것을 비교해 어긋나면 경고한다.
+       노드보다 먼저 올라가야 하므로 최상단에 둔다. -->
+  <rosparam command="load"
+            file="$(find total_bringup)/config/lidar_extrinsic.yaml" />
+  <rosparam command="load"
+            file="$(find total_bringup)/config/tuning_perception.yaml" />
+
+  <!-- ===================================================================
+       competition.launch — K-City 통합 주행 단일 진입점
+
+       레이어별로 켜고 끌 수 있게 나눴다. 단계 검증 순서는 다음과 같다.
+
+         Phase 2  transport + localization + planning + control
+         Phase 3  + mission (미션은 아직 무장 안 됨, 라우터만 확인)
+         Phase 4  missions.yaml 의 executors 를 하나씩 채워가며 미션 추가
+         Phase 5  + behavior (고주로 차선변경)
+
+       주의: /ctrl_cmd 의 유일한 publisher 는 control_arbiter 다.
+             어떤 노드도 /ctrl_cmd 를 직접 발행하면 안 된다.
+       =================================================================== -->
+
+  <arg name="sim_ip"        default="192.168.0.1"/>
+  <arg name="use_rviz"      default="true"/>   <!-- rviz_config 기본 = rviz/competition.rviz -->
+
+  <!-- 음영구간 단독 시험용. true 면 그 구간에서 쓰지 않는 YOLO/신호등/회전교차로/
+       고주로 SMPC/상향 카메라를 띄우지 않는다. 터널은 3.csv idx 7201~8850 이므로
+         roslaunch total_bringup competition.launch tunnel_only:=true path_number:=3
+       처럼 경로도 같이 넘긴다. 기본(false)은 전체 코스 구성 그대로다. -->
+  <arg name="tunnel_only" default="false"/>
+  <arg name="enable_camera2" default="$(eval not arg('tunnel_only'))"/>
+
+  <arg name="enable_transport"    default="true"/>
+  <arg name="enable_localization" default="true"/>
+  <arg name="use_ekf"             default="true"/>
+  <!-- 신호등 정지선/신호 ID는 kcity_map_localizer가 만든다. EKF 사용 시에도
+       제어용 odom은 재발행하지 않고 지도 매칭 출력만 사용한다. -->
+  <arg name="use_map_localizer"   default="true"/>
+  <!-- 신호색이 아직 미정이어도 정지선 40m 안에서는 보수적으로 정지. -->
+  <arg name="traffic_light_stop_on_unknown" default="true"/>
+  <arg name="traffic_light_unknown_stop_dist" default="40.0"/>
+  <arg name="enable_perception"   default="true"/>
+  <arg name="enable_planning"     default="true"/>
+  <arg name="enable_mission"      default="true"/>
+  <!-- M6/M7 고주로 SMPC 차선변경 + ACC. 대회 코스에 포함되므로 기본 on. -->
+  <arg name="enable_behavior"     default="$(eval not arg('tunnel_only'))"/>
+  <arg name="enable_control"      default="true"/>
+  <arg name="path_number"         default="0"/>
+
+  <!-- 전 노드 준비 전에는 차량을 움직이지 않는다. 규정상 출발 1분 내
+       경로 5%(114 m) 미통과는 패널티가 아니라 주행 실패다. -->
+  <arg name="dry_run" default="false"/>
+
+  <!-- 수동 주행 모드: CtrlMode=1 을 계속 보내 MORAI 를 키보드 조작으로 돌린다.
+       차량을 출발 위치로 옮길 때 쓰고, 제어 레이어는 자동으로 꺼진다. -->
+  <arg name="manual_drive" default="false"/>
+
+  <!-- MPC horizon. 실측으로 30 을 채택했다(2026-09-02).
+       N=45: CPU 91%, 명령 9.6 Hz  -> 설계 20 Hz 미달, 조향 슬루 실효 1.08 rad/s
+       N=30: CPU 74%, 명령 19.3 Hz -> 슬루 실효 1.93 rad/s (의도값 2.0 회복)
+       도심 15 m/s 기준 예측거리 22.5 m 로 /local_path(20 m)와도 맞는다.
+       mpc_params.yaml 도 N: 30 으로 맞췄다. 되돌리려면 mpc_N:=45. -->
+  <arg name="mpc_N" default="30"/>
+  <!-- false 면 MPC 가 SMPC ACC 목표속도를 무시한다(차선변경 판단은 유지). -->
+  <arg name="external_acc_enabled" default="true"/>
+
+  <!-- 대회 기본 구성: M1~M4 신호등, M2/M3 정동적 장애물, M5 회전교차로,
+       M6/M7 고주로, M8 음영구간 랜덤 장애물을 모두 준비한다. -->
+  <!-- M5 회전교차로. 대회 코스에 포함되므로 기본 on. -->
+  <arg name="use_roundabout" default="$(eval not arg('tunnel_only'))"/>
+  <arg name="use_traffic_light" default="$(eval not arg('tunnel_only'))"/>
+  <arg name="use_traffic_light_detector" default="$(eval not arg('tunnel_only'))"/>
+  <!-- 아래 둘은 mission_pkg의 구형 별도 실행기 스위치다. 실제 M2/M3와 M8은
+       공통 obstacle_perception + new_lane 회피/정지 파이프라인을 사용한다. -->
+  <arg name="use_dynamic_obstacle"      default="false"/>
+  <arg name="use_static_obstacle"       default="false"/>
+  <arg name="use_obstacle_perception"   default="true"/>   <!-- 정동적 장애물 인지 -->
+  <arg name="use_tunnel_xicp" default="true"/> <!-- 품질·시각 검증을 통과한 M8 yaw 보정 포함 -->
+  <arg name="use_camera_speed_kick"     default="$(eval not arg('tunnel_only'))"/>   <!-- 정동적 카메라 사전 감속 -->
+  <arg name="tunnel_camera_kick_enabled" default="false"/>  <!-- 터널 구간 카메라 사전 감속 (2026-09-28 끔) -->
+  <arg name="use_obstacle_stop"         default="true"/>   <!-- 동적 구간 정지 -->
+  <arg name="static_dynamic_split_idx"  default="3700"/>
+  <!-- 정적 회피 구간의 시작 idx. missions.yaml 의 M2 시작(2400)과 맞춘다.
+       이 앞은 일반 주행 구간이라 노변 구조물에 회피/감속이 걸리면 안 된다. -->
+  <arg name="obstacle_avoid_start_idx"  default="2400"/>
+  <!-- 명령 전달 방식. 기본은 원본(직접 발행). true 면 mux/arbiter 중재 방식. -->
+  <arg name="use_path_mux"   default="false"/>
+  <arg name="avoidance_backend" default="occupancy"/>
+  <arg name="use_arbiter"    default="false"/>
+  <arg name="use_stop_adapter" default="false"/>   <!-- M2 정적 / M3 동적 경계 -->
+
+  <!-- 동적 정지 구간의 끝(CSV idx). obstacle_stop_node 는 split 이후를 전부
+       동적 미션 구간으로 보고 confirmed 장애물이면 즉시 정지한다. 정동적 원본
+       코스는 split 뒤가 곧 코스 끝이라 상한이 필요 없었지만, K-City 전체 랩은
+       split(3700) 뒤로 중앙분리대와 회전교차로가 이어져서 상한이 없으면
+       그 구조물에도 급정지가 걸린다. missions.yaml 의 M3 끝 == 4900. -->
+  <arg name="obstacle_stop_end_idx" default="4900"/>
+
+  <!-- MPC 출력 토픽 선택.
+       obstacle_stop_node 를 최종단으로 쓰면(정동적 원본 사슬) MPC 는
+       /ctrl_cmd_raw 로 내보내고 정지 노드가 /ctrl_cmd 를 발행한다.
+       그 노드는 /ctrl_cmd_raw 콜백 안에서만 발행하므로, 이 배선이 없으면
+       정지 노드는 감지만 하고 아무것도 내보내지 못한다.
+       use_stop_adapter 나 use_arbiter 를 쓰면 최종 발행자가 따로 있으므로
+       MPC 는 원래대로 둔다. -->
+  <!-- 회전교차로 출발 페달 보조(layers/control.launch 참고). -->
+  <arg name="use_roundabout_launch_assist" default="true"/>
+  <arg name="mpc_cmd_topic"
+       default="$(eval '/ctrl_cmd_raw' if (arg('use_obstacle_stop') and not arg('use_stop_adapter') and not arg('use_arbiter')) else '/ctrl_cmd')"/>
+
+  <!-- 주행 기록(기본 off). 대회 당일엔 끈 채로 두고, 검증 주행에서만 켠다:
+         roslaunch total_bringup competition.launch record:=true
+         roslaunch total_bringup competition.launch record:=true record_heavy:=true
+       record_heavy 는 점군까지 받는다(지면제거 사후분석용, 용량 큼).
+       예전에 tuning_perception.launch 에만 record 가 있어서, 대회 런치로
+       검증 주행을 하고 나면 분석할 bag 이 없었다. -->
+  <arg name="record"       default="false"/>
+  <arg name="record_heavy" default="false"/>
+  <arg name="bag_dir"      default="$(env HOME)/catkin_ws/bags"/>
+  <!-- 대회장처럼 MORAI 가 다른 PC 에 있을 때, UDP 지연과 토픽 Hz 를 남긴다.
+       평소에도 켜 두면 현장 수치를 집 수치와 바로 비교할 수 있다. -->
+  <arg name="comm_monitor"  default="true"/>
+
+  <!-- 공통 설정 -->
+  <rosparam command="load" file="$(find total_bringup)/config/total_params.yaml"/>
+  <rosparam command="load" file="$(find total_bringup)/config/missions.yaml"/>
+  <rosparam command="load" file="$(find total_bringup)/config/control.yaml"/>
+  <rosparam command="load" file="$(find total_bringup)/config/planning.yaml"/>
+  <rosparam command="load" file="$(find total_bringup)/config/perception.yaml"/>
+  <rosparam command="load" file="$(find mpc_path_tracking)/config/mpc_params.yaml"/>
+
+  <!-- LiDAR 장착 TF: MORAI SensorInfo x=1.10 / z=1.33과 동일.
+       lidar_extrinsic.yaml 과 반드시 일치한다. -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="base_link_to_velodyne"
+        args="1.10 0 1.33 0 0 0 base_link velodyne"/>
+
+  <group if="$(arg enable_transport)">
+    <include file="$(find total_bringup)/launch/layers/transport.launch">
+      <arg name="sim_ip"       value="$(arg sim_ip)"/>
+      <arg name="manual_drive" value="$(arg manual_drive)"/>
+      <arg name="enable_camera2" value="$(arg enable_camera2)"/>
+    </include>
+  </group>
+
+  <group if="$(arg enable_localization)">
+    <include file="$(find total_bringup)/launch/layers/localization.launch">
+      <arg name="tunnel_heading_mode" value="$(arg tunnel_heading_mode)"/>
+      <arg name="use_ekf" value="$(arg use_ekf)"/>
+      <arg name="use_map_localizer" value="$(arg use_map_localizer)"/>
+      <arg name="stop_on_unknown" value="$(arg traffic_light_stop_on_unknown)"/>
+      <arg name="unknown_stop_dist" value="$(arg traffic_light_unknown_stop_dist)"/>
+    </include>
+  </group>
+
+  <group if="$(arg enable_perception)">
+    <include file="$(find total_bringup)/launch/layers/perception.launch">
+      <!-- Only the yaw observer is disabled; wall/map perception remains active. -->
+      <arg name="use_traffic_light_detector" value="$(arg use_traffic_light_detector)"/>
+      <arg name="use_obstacle_perception"    value="$(arg use_obstacle_perception)"/>
+      <arg name="use_tunnel_xicp" value="$(eval arg('use_tunnel_xicp') and arg('tunnel_heading_mode') in ['existing', 'xicp'])"/>
+      <arg name="use_camera_speed_kick"      value="$(arg use_camera_speed_kick)"/>
+    </include>
+  </group>
+
+  <group if="$(arg enable_planning)">
+    <include file="$(find total_bringup)/launch/layers/planning.launch">
+      <arg name="tunnel_cpp_prefilter" value="$(arg tunnel_cpp_prefilter)"/>
+      <arg name="tunnel_common_scene_enabled" value="$(arg tunnel_common_scene_enabled)"/>
+      <arg name="tunnel_native_scene_enabled" value="$(arg tunnel_native_scene_enabled)"/>
+      <arg name="tunnel_wall_profile_file" value="$(arg tunnel_wall_profile_file)"/>
+      <arg name="tunnel_physical_boundary_policy" value="$(arg tunnel_physical_boundary_policy)"/>
+      <arg name="tunnel_static_map_binary" value="$(arg tunnel_static_map_binary)"/>
+      <arg name="tunnel_verified_background_filter_enabled" value="$(arg tunnel_verified_background_filter_enabled)"/>
+      <arg name="tunnel_continuous_transition_enabled" value="$(arg tunnel_continuous_transition_enabled)"/>
+      <arg name="tunnel_map_backend" value="$(arg tunnel_map_backend)"/>
+      <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+      <arg name="static_zone_min_idx"      value="$(arg obstacle_avoid_start_idx)"/>
+      <arg name="dynamic_zone_max_idx"     value="$(arg obstacle_stop_end_idx)"/>
+      <arg name="use_path_mux" value="$(arg use_path_mux)"/>
+      <arg name="avoidance_backend" value="$(arg avoidance_backend)"/>
+      <arg name="path_number"  value="$(arg path_number)"/>
+      <arg name="tunnel_camera_kick_enabled" value="$(arg tunnel_camera_kick_enabled)"/>
+      <!-- 신호등 미션을 끄면(use_traffic_light:=false) 플래너 신호 가드도 끈다.
+           YOLO 신호 인지는 따로 돌아 빨간불이면 회피만 보류되고 정지는 안 했다. -->
+      <arg name="tl_guard_enabled" value="$(arg use_traffic_light)"/>
+    </include>
+  </group>
+
+  <group if="$(arg enable_mission)">
+    <include file="$(find total_bringup)/launch/layers/mission.launch">
+      <arg name="use_roundabout" value="$(arg use_roundabout)"/>
+      <arg name="use_traffic_light"     value="$(arg use_traffic_light)"/>
+      <arg name="use_dynamic_obstacle"  value="$(arg use_dynamic_obstacle)"/>
+      <arg name="use_static_obstacle"   value="$(arg use_static_obstacle)"/>
+      <arg name="use_obstacle_stop"     value="$(arg use_obstacle_stop)"/>
+      <arg name="use_stop_adapter"      value="$(arg use_stop_adapter)"/>
+      <arg name="use_arbiter"           value="$(arg use_arbiter)"/>
+      <arg name="obstacle_stop_end_idx" value="$(arg obstacle_stop_end_idx)"/>
+      <arg name="static_dynamic_split_idx" value="$(arg static_dynamic_split_idx)"/>
+    </include>
+  </group>
+
+  <!-- SMPC(ACC/차선변경). enable_behavior 는 이 레이어를 띄울지만 결정한다.
+       MPC 가 실제로 듣는 /smpc/target_speed_mps_gated 의 매 순간 유일한
+       발행자가 누구인지(우리 미션 캡 vs ACC 중계)는 constraint_to_speed_cap
+       이 구간별로(M6/M7=speed_limit_exempt 인 동안만 ACC) 스스로 판단한다 -
+       그래서 cap_direct_topic 을 여기서 비울 필요가 없다. smpc_lane_change
+       원본 이름(/smpc/target_speed_mps)은 그 패키지 내부 배선 때문에 안
+       건드리고 그대로 둔다(자세한 내용은 constraint_to_speed_cap.py 참고).
+       이전에는 enable_behavior 하나로 랩 전체에서 껐다 켜서, ACC 를 켜면
+       M2/M3 구간 속도상한이 끊기는 문제가 있었다. -->
+  <group if="$(arg enable_behavior)">
+    <include file="$(find total_bringup)/launch/layers/behavior.launch"/>
+  </group>
+
+  <group if="$(eval arg('enable_control') and not arg('manual_drive'))">
+    <include file="$(find total_bringup)/launch/layers/control.launch">
+      <arg name="dry_run" value="$(arg dry_run)"/>
+      <arg name="mpc_N"       value="$(arg mpc_N)"/>
+      <arg name="external_acc_enabled" value="$(arg external_acc_enabled)"/>
+      <arg name="use_arbiter" value="$(arg use_arbiter)"/>
+      <arg name="mpc_cmd_topic" value="$(arg mpc_cmd_topic)"/>
+      <arg name="use_roundabout_launch_assist" value="$(arg use_roundabout_launch_assist)"/>
+    </include>
+  </group>
+
+  <!-- 설정 파일 없이 띄우면 빈 화면이라 아무것도 안 보인다.
+       waypoint_system 의 경로 시각화 설정을 기본으로 쓴다.
+       다른 설정: kcity_localizer/rviz/localizer.rviz,
+                 lidar_perception_pkg/rviz/lidar_perception.rviz,
+                 smpc_lane_change/rviz/smpc_debug.rviz -->
+  <!-- 대회 화면. 원시 /velodyne_points(회색), GroundGrid 비지면 입력
+       /nonground(청록), 정동적/고주로/회전교차로 판정 마커를 겹쳐 그린다.
+       지면점 등 추가 중간 산출물은 기본 off이며 진단용 전체 화면은 debug.rviz. -->
+  <arg name="rviz_config"
+       default="$(find total_bringup)/rviz/competition.rviz"/>
+  <node if="$(arg use_rviz)" pkg="rviz" type="rviz" name="rviz"
+        args="-d $(arg rviz_config)"/>
+
+  <!-- UDP 지연/Hz 감시. 지연은 '수신시각 - MORAI header.stamp' 인데, PC 가
+       둘이면 시계 offset 이 섞이므로 노드가 offset 과 jitter 를 갈라서 낸다.
+       자세한 근거는 comm_monitor.py 주석 참조. -->
+  <node if="$(arg comm_monitor)" pkg="total_bringup" type="comm_monitor.py"
+        name="comm_monitor" output="screen" respawn="true">
+    <param name="window_sec" value="5.0"/>
+    <param name="rate" value="2.0"/>
+  </node>
+
+  <!-- 검증용 기록. 토픽은 tuning_perception.launch 와 같게 맞춰서 기존 분석
+       스크립트가 그대로 돌아가게 한다. /ctrl_cmd_raw 도 같이 받는다 -
+       use_obstacle_stop 이 켜지면 MPC 출력이 그쪽으로 나가서, /ctrl_cmd 만
+       기록하면 정지 노드가 덮기 전의 원본 명령을 못 본다. -->
+  <node if="$(arg record)" pkg="rosbag" type="record" name="competition_record"
+        output="screen"
+        args="-o $(arg bag_dir)/competition --lz4
+              /obstacle_info /obstacle_info_near /obstacle_info_far
+              /obstacle_markers /obstacle_markers_far /tracked_objects
+              /odom /odom_fused /gps /gps_state /Competition_topic /cur_speed
+              /in_pose_with_covariance /in_twist_with_covariance
+              /ekf_pose_with_covariance /ekf_twist_with_covariance
+              /localization/sensors_valid /localization/valid
+              /localization/gps_frozen /localization/gps_reacquiring
+              /localization/gps_mode /localization/dr_pose
+              /localization/course_bias_deg /localization/reacquire_error_m
+              /tunnel/camera_yaw_error /tunnel/camera_yaw_valid
+              /tunnel/camera_global_yaw
+              /comm/latency_ms /comm/summary
+              /local_path /final_waypoint
+              /ctrl_cmd /ctrl_cmd_raw /ctrl_cmd_mpc /mission/roundabout/launch_assist
+              /mission/constraints/obstacle_stop
+              /mission/constraints/static_obstacle
+              /mission/constraints/dynamic_obstacle
+              /mission/constraints/traffic_light
+              /mission/active_section
+              /traffic_light_color
+              /diagnostics
+              /localization/stop_ahead /localization/stop_tl
+              /localization/stop_required
+              /aeb/command
+              /obstacle_stop/visualization
+              /avoidance_failed
+              /obstacle_avoidance/target_speed_mps
+              /obstacle_avoidance/static_speed_scale
+              /camera_detection/obstacle_present
+              /control_feedback/mpc_target_speed_mps
+              /control_feedback/mission_speed_target_mps
+              /control_feedback/curvature_speed_limit_mps
+              /control_feedback/curvature_capacity_speed_mps
+              /imu /tf /tf_static
+              /path_number
+              /smpc/targets /smpc/decision /smpc/lane_change_status
+              /smpc/smpc_decision_debug /smpc/lane_change_supervisor_debug
+              /smpc/behavior_plan /smpc/behavior_longitudinal_request
+              /mission/speed_cap_mps
+              /smpc/target_speed_mps /smpc/target_speed_mps_gated
+              /smpc/acc_active_lead /smpc/acc_raw_target_speed_mps
+              /smpc/behavior_longitudinal_status
+              /mission/constraints/roundabout /mission/roundabout/state
+              /mission/roundabout/debug /mission/roundabout/distance_debug /mission/roundabout/gap_markers
+              /tunnel/wall_offset /tunnel/wall_limits /tunnel/lidar_obstacle_ahead
+              /tunnel/xicp/status /tunnel/xicp/comparison_pose
+              /tunnel/lidar_obstacle_distance /obstacle_avoidance/frenet_d
+              /tunnel/wall_yaw_error /tunnel/bg_markers /localization/dr_pose
+              /obstacle_stop/dynamic_state /obstacle_avoidance/validation_debug /tunnel/background_ids /tunnel/bg_moving /tunnel/bg_candidates_debug /tunnel/map_state /tunnel/nonground_filter_state /tunnel/map_total_processing_ms /tunnel/map_input_age_ms /tunnel/merger_processing_ms /tunnel/merger_queue_ms /tunnel/scene_processing_ms /tunnel/scene_input_age_ms /tunnel/planning_input_age_ms /tunnel/perception_scene /tunnel/preslow_speed_cap_mps /tunnel/preslow_state /localization/frame_update /tunnel/heading/state /localization/speed_valid /localization/speed_state /tunnel/detection_processing_ms /tunnel/detection_queue_ms /tunnel/preprocess_state /tunnel/preprocess_compute_ms /tunnel/preprocess_queue_ms /tunnel/preprocess_output_age_ms /tunnel/engine_integrate_ms /tunnel/lane_heading/state /tunnel/lane_yaw_measurement /tunnel/xicp/yaw_measurement /perception/divider_boundary /occupancy_avoidance/obstacles /occupancy_avoidance/candidate_state /occupancy_avoidance/candidate_path /occupancy_avoidance/validation_debug /occupancy_avoidance/markers /obstacle_avoidance/selection_state /obstacle_avoidance/boundary_profile /obstacle_avoidance/planning_obstacles /reverse_escape/joint_plan /reverse_escape/handoff /occupancy_avoidance/escape_handoff_state /reverse_escape/reverse_path /reverse_escape/forward_path /reverse_escape/state /control/gear /morai/gear /control/reverse_cmd
+              /perception/roundabout/tracked_objects
+              /path_switch_preview" />
+
+  <!-- 카메라-라이다 퓨전 검증용으로 전방 카메라(cam0, 1280x720)를 함께 남긴다.
+       투영 외부/내부 파라미터가 맞는지 확인하려면 같은 백에 점군과 이미지가
+       모두 있어야 한다. compressed JPEG 이라 30 Hz 기준 약 4.4 MB/s 로,
+       기존 heavy(약 8 MB/s) 대비 증가폭이 크지 않다. -->
+  <node if="$(arg record_heavy)" pkg="rosbag" type="record" name="competition_record_heavy"
+        output="screen"
+        args="-o $(arg bag_dir)/competition_heavy --lz4
+              /velodyne_points /perception/points_gravity
+              /groundgrid/segmented_sensor /groundgrid/ground /nonground
+              /tunnel/xicp/markers /tunnel/scene_markers /tunnel/preslow_markers
+              /tunnel/filtered_background_input /tunnel/filtered_near /tunnel/filtered_far /tunnel/filtered_points /tunnel/map_classified /tunnel/map_foreground /tunnel/map_background /tunnel/nonground_filtered /tunnel/detections_native /tunnel/detector_native /tunnel/perception_scene_native
+              /image_jpeg/compressed" />
+</launch>

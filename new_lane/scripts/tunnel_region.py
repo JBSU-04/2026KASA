@@ -34,7 +34,7 @@ def read_region(get_param):
             first, last = map(int, section['idx'])
             if first > last: raise ValueError('invalid M8 bounds')
             if get_param('/tunnel_recovery/approach_control_enabled', False):
-                control, prepare = approach_bounds(get_param('/tunnel_recovery/approach_route_csv', ''), first,
+                control, prepare = approach_bounds(get_param('/tunnel_recovery/approach_route_csv', ''), int(get_param('/tunnel_recovery/approach_anchor_idx',first)),
                     float(get_param('/tunnel_recovery/control_prepare_distance_m',40.)),
                     float(get_param('/tunnel_recovery/perception_prepare_distance_m',60.)))
                 # Never arm during highway: clamp to the configured M7B boundary.

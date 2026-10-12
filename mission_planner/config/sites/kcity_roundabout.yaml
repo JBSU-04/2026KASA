@@ -23,7 +23,7 @@ tracked_objects:
   require_movement_confirmation: true # 실제 이동이 확인된 트랙만 사용 [bool]
 
 roundabout:
-  entry_model: legacy # TTC-based sequential gap selection
+  entry_model: observed_follow # observed slot + preparation + fixed front ACC
   distance_entry:
     approval_mode: clearance # front space at first entry + rear space at full clearance; trajectory restores prior checks
     commit_rear_yield_lock: true # cooperative NPCs yield after GO; keep live front braking and sensor protections
@@ -31,10 +31,10 @@ roundabout:
     measured_profile:
       times_s: [0.0, 0.3, 0.8, 1.3, 1.8, 2.3, 2.8, 3.3] # after start delay
       speeds_mps: [0.0, 0.95, 2.5, 3.7, 4.6, 5.2, 5.55, 5.8]
-    front_gap_m: 3.0 # 18:23 run: 4m delayed approval; 3m starts 0.05s later than 2.5m [m]
+    front_gap_m: 2.0
     front_response_s: 0.5 # LiDAR/update + measured brake buildup reserve [s]
     front_max_decel_mps2: 3.0 # bounded leader braking scenario [m/s^2]
-    rear_gap_m: 1.5 # first entry-spacing fit [m]
+    rear_gap_m: 1.5
     post_clear_horizon_s: 1.5 # trajectory mode only
     rear_yield_assumption: true # MORAI NPC cooperative braking only
     rear_reaction_s: 0.5
@@ -79,7 +79,7 @@ roundabout:
 
   speed:
     approach: 8.0 # 접근 구간 속도 [m/s] (28.8 km/h)
-    yield_roll: 0.0 # 양보선에서 정지한 상태로 진입 판단 [m/s]
+    yield_roll: 1.5
     circulation: 8.5 # 원형 차로 순환 및 진입 속도 [m/s] (30.6 km/h, 진입 탄력 상향)
     exit: 15.0 # 출구 구간 최대속도 [m/s] (54 km/h)
     degraded: 2.0 # 진입 후 LiDAR가 끊겼을 때 제한속도 [m/s]
@@ -131,9 +131,9 @@ roundabout:
   #   더 낮추면(앞 0.2 / 뒤 0.4 / 0.7 m) 12:50 에서 지나가는 차 바로 뒤로 1.7 m 붙어 들어간다.
   gap_select:
     enabled: true
-    commit_rear_yield_lock: true # 승인 후 뒤차 재판정 취소 금지; 실제 앞차 제동 유지
-    use_measured_entry_profile: true # distance_entry.measured_profile의 실측 출발 곡선 재사용
-    use_mpc_prediction: true # MPC 곡률 허용 속도와 기존 가속 램프를 예측에만 반영
+    commit_rear_yield_lock: true
+    use_measured_entry_profile: true
+    use_mpc_prediction: true
     mpc_feedback_timeout: 0.5 # 피드백 끊김 시 진입 대기 [s]
     require_merge_progress: true # 반경 진입만으로 순환 상태가 되지 않음
     use_tracker_velocity: true # 실제 검출 기반 트래커 추정 하나만 사용, 미션 재회귀 제외
@@ -141,10 +141,10 @@ roundabout:
     speed_disagreement_limit: 1.0 # 기존 미션 회귀에서만 사용하는 차이 상한 [m/s]
     stop_reaction_time: 0.3 # 승인 취소 제동 반응 여유 [s]
     stop_margin: 0.5 # 승인 취소 제동 여유 [m]
-    ego_accel: 2.2 # 정지 출발 가속 [m/s^2]
-    ego_start_delay: 0.2 # 출발 반응 지연 [s]
+    ego_accel: 3.0
+    ego_start_delay: 0.24
     ego_max_speed: 0.0 # 합류 속도 상한 [m/s] (0 = speed.circulation)
-    ego_length: 4.6 # 자차 길이 [m]
+    ego_length: 4.6
     min_vehicle_length: 4.0 # 순환 차량 길이 하한 [m] (부분 관측 보정)
     front_headway: 0.3 # 앞차 시간 간격 [s] (합류 뒤 자차 ACC 가 앞차를 따른다)
     rear_headway: 0.5 # 뒤차 시간 간격 [s] (MORAI NPC 는 자차에 반응해 감속)
@@ -246,8 +246,8 @@ roundabout:
     leader_start_distance: 9.0 # 앞차가 합류점 이 거리 안에 와야 출발 [m]
     leader_decel_horizon: 2.0 # 최근 속도 감소 추세를 앞차 예측에 반영할 시간 [s]
     leader_decel_limit: 1.5 # 예측에 반영할 감속도 상한 [m/s^2]
-    prediction_follow_standstill_gap: 2.5 # roundabout-only lead standstill distance [m]
-    prediction_follow_time_gap: 0.5 # roundabout-only lead time gap [s]
+    prediction_follow_standstill_gap: 2.0
+    prediction_follow_time_gap: 0.35
     speed_window: 1.5 # use_tracker_velocity=false인 기존 미션 회귀 창 [s]
     skip_confirm: 0.3 # 목표 틈이 이 시간 연속으로 안 될 때만 패스 [s] (새 트랙 첫 프레임 속도 노이즈)
     skip_confirm_after_safe: 0.8 # (sequential 전용, zone rule 에서는 안 씀) 2026-10-05 직전까지 가능하던 틈은 이 시간 연속 불가일 때만 패스 [s]
@@ -256,7 +256,7 @@ roundabout:
     leader_release_min_speed: 2.0 # 앞차 최소 속도 [m/s]
     seq_go_tolerance: 0.3 # 이전 설정 호환용. 순차 GO는 실제 출발 지연 0일 때만 승인
     circle_stop_margin: 0.5 # 앞차 대기/중단 정지점을 원 판정 반경(outer+이 값) 밖에 [m]
-    confirm_seconds: 0.1 # 출발 판단 연속 유지 [s]
+    confirm_seconds: 0.1
     switch_margin: 0.5 # 고른 틈을 바꾸는 최소 이득 [s]
     # 가림 대비: 상류 관측 끝(중앙분리대 가림)에 안 보이는 차량을 가정. 기본 끔.
     #   09-18 16:27 백: COMMIT 직후 상류 -21.9 m 에서 id7 이 처음 잡혔다.
@@ -272,11 +272,35 @@ roundabout:
     unconfirmed_max_hits: 45 # 이보다 오래된 미확정 트랙은 시설물로 보고 무시 (15 Hz ~3 s)
     # ★ COMMIT 중 틈이 무너지면(늦게 잡힌 뒤차) 합류 구역 앞에서 편하게 설 수 있을
     #   때 다시 양보. 서는 곳 = 합류점 - 자차 반길이 - entry_zone - abort_margin.
-    commit_abort_enabled: true
+    commit_abort_enabled: false
     commit_abort_confirm: 0.2 # 무너짐 연속 유지 [s]
     abort_margin: 0.5 # [m]
     viz_range: 35.0 # 틈 시각화 범위(합류점 기준 +-) [m]
 
+    observed_entry_enabled: true
+    preparation_enabled: true
+    spatial_gap_enabled: true
+    spatial_arrival_check: true
+    spatial_only_admission: false
+    opportunity_enabled: true
+    opportunity_rear_yield: true
+    commit_acc_only: true
+    body_collision_guard: true
+    use_route_body_projection: true
+    timed_entry_approach: true
+    entry_commit_distance_m: 8.0
+    ego_width: 1.9
+    spatial_front_gap_m: 2.0
+    spatial_rear_gap_m: 1.5
+    preparation_wait_distance_m: 3.0
+    preparation_max_speed_mps: 1.5
+    preparation_margin_m: 0.5
+    preparation_horizon_s: 4.0
+    observation_timeout_s: 0.35
+    post_clear_horizon_s: 0.5
+    unknown_speed_upper_mps: 8.0
+    approach_decel_mps2: 2.5
+    approach_response_s: 0.24
   # 합류점/출구 자동 판정(좌표 하드코딩 대체). 못 구하면 위 좌표를 쓴다.
   auto:
     conflict_point: false # 실측 NPC 궤적과 기준경로 교점을 사용
@@ -290,7 +314,7 @@ roundabout:
     #   stale 로 보지 않는다. 16:24:06 백: 15.7 s 1 초 valid=false -> 감속 -> 뒤차 침범 -> 취소.
     tracker_guard_commit_grace_s: 1.2
     tracker_stale_grace_s: 0.8 # 2026-10-05 접근/양보 중 트래커 순간 끊김 유예 [s] (16:13 백 194.0 s, 20:38 백 13.0~13.7 s valid=false 0.72 s)
-    mandatory_stop_seconds: 1.0 # 양보선에서 완전정지 후 반드시 유지할 시간 [s] (0.5 -> 1.0s)
+    mandatory_stop_seconds: 0.0 # preparation is not a mandatory stop
     mandatory_stop_position_tolerance: 0.8 # 실측 판단점 주변 정지 허용오차 [m]
     mandatory_stop_speed_threshold: 0.1 # 정지로 판정할 최대 자차속도 [m/s]
     minimum_circulate_seconds: 1.0 # 출구 판정 전 최소 순환 시간 [s]
@@ -305,6 +329,7 @@ roundabout:
 # 회전교차로 트래커는 공통 GroundGrid 비지면 점군을 사용하고 차량용
 # 클러스터 크기·형상·추적 파라미터는 이 미션에서 독립적으로 적용한다.
 lidar_tracker:
+  section_gating_enabled: false # prewarm inside existing 80m processing ROI only
   enabled: true # LiDAR 차량 추적 노드 활성화 [bool]
   topics:
     cloud: /nonground # GroundGrid 비지면 PointCloud2 입력

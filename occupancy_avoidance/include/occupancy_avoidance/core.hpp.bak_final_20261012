@@ -1,0 +1,219 @@
+#pragma once
+#include <grid_map_core/grid_map_core.hpp>
+#include <octomap/OcTree.h>
+#include <array>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace occupancy_avoidance {
+struct Point { double x=0,y=0,z=0; double map_ground=0,map_label=-1; };
+struct Pose { double stamp=0,x=0,y=0,z=0,yaw=0,speed=0; };
+struct Reference { double x=0,y=0,yaw=0; int idx=0; };
+struct Edge { int first=0,last=0; double right=-1,left=-1; };
+struct DynamicRegion { double x=0,y=0,yaw=0,length=0,width=0,vx=0,vy=0,uncertainty=0; };
+struct CertifiedTrigger { std::vector<Point> footprint; double stamp=-1; bool measured_cells=false; };
+struct LiveEdges { Pose pose; double right=0,left=0,right_slope=0,left_slope=0; bool valid=false; };
+struct Config {
+  double resolution=.1, length=80, width=30;
+  double sensor_x=1.1,sensor_y=0,sensor_z=1.33,sensor_height=1.765;
+  double half_width=.95,front=3.85,rear=.79,curb_margin=.1,obstacle_margin=.2;
+  double rear_observation_distance=5.;
+  double min_height=.06,max_height=2.8,transient_sec=.35,scan_timeout=.35,near_memory_sec=0;
+  // 2026-10-06: 인지가 확정한 정적 물체(footprint + certified_margin) 안의 실측 점은 이 낮은 높이부터 점유로 본다.
+  //   min_height 를 올려 노면 잡음을 거르면서도 저상 장애물(0.2~0.5 m)을 멀리서 잡기 위해서다. 0 이하면 끔.
+  double certified_min_height=-1,certified_margin=.3;
+  // 2026-10-06(16:41:24 백): 저상 장애물은 28~20 m 에서 스캔당 점이 0~3 개라 엔진 격자가 17 m 에서야 생겼다.
+  //   인지가 확정한 물체 외곽 안에 실측 점이 certified_far_min_cells 미만이면 그 외곽(+certified_margin)을
+  //   계획/충돌 검사용 임시 장애물로 쓴다(격자·증거에는 남기지 않음). 실측이 생기면 실측만 쓴다.
+  bool certified_far_proxy=false;int certified_far_min_cells=3;
+  double knot_ds=1.0,lateral_step=.2,horizon=40,max_curvature=.18;
+  double approach_horizon=50;
+  double approach_obstacle_margin=.2;
+  bool tunnel_recovery_enabled=true;
+  bool trigger_enabled=true;
+  double trigger_half_width=1.5,trigger_distance=30,trigger_hold=3;
+  double traffic_range=80,traffic_timeout=.7,traffic_gap_min=10,traffic_gap_max=20;
+  double traffic_decel=1.5;
+  int static_planning_start_idx=2100,static_zone_min_idx=2400;
+  double max_lateral_accel=2.5,max_slope=.45,max_lateral_jerk=.035;
+  double target_speed=8.333,braking=2.5,reaction=.3,open_right=4.5,open_left=7.0;
+  double return_min_distance=12,return_min_time=2,return_tolerance=.2;
+  double return_center_weight=2;
+  // 2026-10-06(16:41:24 백): 장애물 직후 목표가 바로 0 이 돼 12 m 만에 복귀(곡률 0.06~0.14, MPC 오버슈트 +0.3 m).
+  //   복귀 구간 앞부분 return_ramp_time*v(최소 return_ramp_min_m) 동안 목표·중앙 가중을 서서히 0 쪽으로 옮긴다. 0 이면 끔.
+  double return_ramp_time=0,return_ramp_min_m=10;
+  // 2026-10-06: 회피 중 속도 상한(경로 모양용 target_speed 와 분리). >0 이면 속도 상한에만 이 값을 쓴다.
+  //   랩타임: 고정 8.33 대신 곡률(max_lateral_accel)과 MPC 회피 곡률 상한에 맡긴다.
+  double avoid_speed_ceiling=-1;
+  // 2026-10-06(17:09:45 백): corridor 경로의 장애물 뒤 복귀를 5차 곡선(기존 spatial_return 과 같은 횡가속/저크 한계)으로
+  //   바꿔 잇는다. 곡선 전체가 validate(차체+여유 코리도, 연석, 곡률)를 통과할 때만 쓴다.
+  bool return_quintic=false;double return_quintic_accel=1.5;
+  // 2026-10-06: 경로 모양(QP 첫 시도 곡률 한계 = path_lateral_accel / target_speed^2)용 횡가속. 속도 상한용
+  //   max_lateral_accel(3.0)과 분리한다. <=0 이면 max_lateral_accel 을 쓴다(이전 동작).
+  double path_lateral_accel=-1;
+  // 2026-10-07 터널(21:05~21:08 백): 천장/벽 점이 누적·광선추적에 들어가 integrate 가 프레임당 44~272 ms,
+  //   엔진 잠금을 잡아 자세/라이다가 stale -> 회피 실패 -> 긴급제동으로 멈췄다.
+  //   ceiling_skip_height: 지면 위 이 높이 넘는 점은 누적·광선추적에서 뺀다(<=0 끔).
+  //   wall_surface_band: 벽 경계 이 거리 안쪽 점은 벽면으로 보고 장애물에서 뺀다(setWallSurfaceBand 로 터널만).
+  double ceiling_skip_height=3.2;
+  double wall_surface_band=0.0;
+  // 통로 안 목표를 '허용 경계 + corridor_target_extra' 로 장애물에서 더 띄운다(최소 간격과 별개).
+  //   2026-10-09(14:57:05 백): 0.4 m 라 회피 경로가 장애물 크기에 비해 넓었다. 터널은 0.15 m.
+  double corridor_target_extra=0.4;
+  // QP 곡률(ddx)/곡률변화(dddx) 가중치 배율. 1 = 기존(150/300).
+  double path_smooth_scale=1.0;
+  // 연결 경로: true 면 2~10 m 후보 중 최대 곡률이 작은 순서로 검증(기존: 가장 짧은 통과 후보).
+  bool connector_smooth=true;
+  double speedCeiling() const { return avoid_speed_ceiling>0?avoid_speed_ceiling:target_speed; }
+  double return_overshoot=.1,cruise_offset=.15,cruise_heading=.05235987756;
+  double cruise_path_offset=.2,cruise_preview=8,cruise_hold=.5;
+  double live_boundary_distance=6,live_boundary_heading=.08726646260;
+  // Same transition-length rule as legacy new_lane spatial center return.
+  double spatial_return_accel=1.5,spatial_return_jerk=8,spatial_return_min_speed=4.5;
+  double spatial_return_min_length=6,spatial_return_max_length=32;
+  int confirm_scans=3,clear_scans=3;
+};
+struct TrafficState {
+  bool enabled=false,seen=false,required=false;
+  double distance=-1,stop_target=-1,distance_stamp=-1,required_stamp=-1;
+};
+struct Result {
+  std::vector<Reference> path;
+  std::vector<std::array<double,4>> corridor; // x,y,lower d,upper d
+  bool clear=false,held=false,avoiding=false,returning=false;
+  std::string reason;
+  std::string motion_state="STOP",speed_limit_reason="no_valid_path",boundary_source="open";
+  std::string return_rejection_reason="not_requested";
+  double failure_distance=-1;
+  double planning_horizon=0;
+  double approach_blockage_distance=-1;
+  int trigger_count=0;bool trigger_held=false,traffic_held=false;
+  std::string trigger_reason="disabled";
+  double trigger_nearest=-1,return_complete_distance=-1,traffic_stop_target=-1;
+  double speed_cap=0,max_curvature=0,minimum_curb_clearance=1e9,compute_ms=0;
+  size_t static_voxels=0,transient_voxels=0;
+};
+struct SceneVoxel { Point point; bool fixed=false; double seen=0; };
+struct SceneSnapshot { Pose pose; double curvature=0; std::vector<SceneVoxel> voxels; std::vector<std::array<double,3>> visibility; std::vector<Point> cleared; };
+struct EscapePlan;
+class Engine {
+ public:
+  explicit Engine(Config config=Config());
+  void reset();
+  SceneSnapshot exportScene() const;
+  bool importScene(const SceneSnapshot&);
+  void rebasePlanning(double dx,double dy);
+  void rebaseEvidence(double dx,double dy);
+  void setNearMemory(double seconds){cfg_.near_memory_sec=seconds;}
+  void setStrictSceneMargins(bool enabled){strict_scene_margins_=enabled;}
+  void setContinuousTransition(bool enabled){continuous_transition_=enabled;}
+  void setReacquiring(bool active){if(reacquiring_&&!active&&tunnel_connected_hold_&&continuous_transition_){spatial_return_active_=false;aligned_since_=-1;}reacquiring_=active;}
+  void setRoad(std::vector<Reference> road, std::vector<Edge> edges);
+  void setLiveEdges(const LiveEdges& edges){live_=edges;}
+  // Full, gravity-aligned sensor returns: preserve 3D beam heights for clearing.
+  bool integrate(const Pose&,const std::vector<Point>& returns,
+                 const std::vector<Point>& ground={},const std::vector<DynamicRegion>& dynamic={});
+  Result plan(const Pose&,const std::vector<Reference>& route);
+  // Hypothetical recovery never changes live planning history or map evidence.
+  std::unique_ptr<Engine> recoverySnapshot() const;
+  // Planning copies keep continuity; hypothetical recovery copies deliberately do not.
+  std::unique_ptr<Engine> planningSnapshot() const;
+  void adoptPlanning(const Engine& planned);
+  // Build and validate a curved connection from the actual pose, including its entire tail.
+  bool connect(const Pose&,const std::vector<Reference>&,double,
+               std::vector<Reference>&,std::string* reason=nullptr) const;
+  EscapePlan jointEscapePlan(const Pose&,double blocker_x,double blocker_y,double blocker_length,
+      const std::vector<Point>& memory,double wheelbase,double steer,double reverse_max,double budget,bool forward_only=false,const std::vector<DynamicRegion>& dynamic={}) const;
+  bool escapeBodyClear(const Reference&,double now,bool reverse) const;
+  Result evaluateEscape(const Pose&,const std::vector<Reference>& route) const;
+  bool validateReverse(const std::vector<Reference>&,double,std::string* reason=nullptr) const;
+  bool locate(double x,double y,Reference& out) const;
+  void setTunnelConnectedHold(bool enabled){tunnel_connected_hold_=enabled;}
+  void invalidateHeldPath(){last_path_.clear();spatial_return_active_=false;}
+  void adoptEscape(const std::vector<Reference>& path){last_path_=path;avoidance_session_=true;aligned_since_=-1;}
+  void setConditionalDividers(std::vector<Edge> candidates);
+  std::vector<Edge> conditionalDividers(double now) const;
+  double dividerObservationStamp() const {return divider_seen_;}
+  void updateEdges(std::vector<Edge> edges){edges_=std::move(edges);}
+  void setRearObservation(double distance){cfg_.rear_observation_distance=distance;}
+  void setWallSurfaceBand(double band){cfg_.wall_surface_band=band;}
+  void setCorridorTargetExtra(double m){cfg_.corridor_target_extra=m;}
+  // Existing verified static geometry is an admission hint only, never collision occupancy.
+  void setCertifiedTriggers(std::vector<CertifiedTrigger> objects){certified_triggers_=std::move(objects);}
+  bool nearCertified(double x,double y,double stamp) const;
+  void addCertifiedProxies(double now);
+  void setTraffic(const TrafficState& state){traffic_=state;}
+  bool validate(const std::vector<Reference>& path,double now,std::string* reason=nullptr,double* failure_distance=nullptr) const;
+  std::pair<double,double> bounds(int idx) const;
+  bool boundaryKnown(int idx,bool left) const;
+  std::string boundarySource(int idx) const;
+  const grid_map::GridMap& grid() const { return grid_; }
+  const Config& config() const { return cfg_; }
+  double lastScan() const { return last_scan_; }
+  std::vector<Point> measuredRayCleared() const {
+    std::vector<Point> out;for(const auto& q:ray_clear_receipts_)if(last_scan_-q.second.second<=.35)out.push_back(q.second.first);return out;
+  }
+  std::array<double,2> collisionLocation() const{return collision_location_;}
+  size_t staticCount() const;
+  uint64_t geometryDigest() const;
+  size_t count() const { return evidence_.size(); }
+ private:
+  bool tunnel_connected_hold_=false;
+  bool reacquiring_=false,continuous_transition_=true,strict_scene_margins_=false;
+  double visibility_shift_x_=0,visibility_shift_y_=0;
+  std::map<uint64_t,std::pair<Point,double>> ray_clear_receipts_;
+  mutable std::array<double,2> collision_location_{{NAN,NAN}};
+  struct Evidence { Point p; int hits=0,misses=0; double first=0,last=0,last_clear=0; bool fixed=false; };
+  Config cfg_;
+  std::unique_ptr<octomap::OcTree> tree_;
+  std::map<uint64_t,Evidence> evidence_;
+  grid_map::GridMap grid_;
+  std::vector<Reference> road_,last_path_;
+  std::vector<Edge> edges_,base_edges_,divider_candidates_;
+  double divider_seen_=-1;int divider_hits_=0,divider_first_=-1,divider_last_=-1;
+  void observeDividers(const Pose&,const std::vector<Point>&);
+  void applyConditionalEdges(double now);
+  struct RoadNode { size_t point=0; int left=-1,right=-1; unsigned axis=0; };
+  std::vector<RoadNode> road_tree_;
+  int buildRoad(std::vector<size_t>&,size_t,size_t,unsigned);
+  void queryRoad(int,double,double,double&,const Reference*&) const;
+  std::map<std::pair<int,int>,std::vector<Point>> obstacle_bins_;
+  std::map<std::pair<int,int>,double> ground_visibility_;
+  // 자차가 마지막으로 움직인 시각. 서 있는 동안 흐른 시간은 바닥 관측 나이에 넣지 않는다(후진 확인용).
+  double last_moving_stamp_=-1;
+  // 이미 장애물 여유(obstacle_margin) 안에 들어와 서 있을 때, 그 사이클만 여유를 '지금 간격보다 조금 작게' 낮춘다.
+  mutable double margin_override_=-1;
+  double bodyObstacleDistance(const Pose& pose) const;
+  double effectiveMargin() const {return margin_override_>=0?margin_override_:cfg_.obstacle_margin;}
+  void relaxMarginForStart(const Pose& pose) const;
+  // 20:29:27 백: 정지-이동(3 m)-정지 사이에 '서 있던 시간' 보정이 초기화돼 차 뒤 5~10 m 바닥(33 s 전 관측)이
+  //   만료 -> reverse_unobserved. 근거리 사각은 서 있는 동안 다시 볼 수 없으므로 관측 인정 120 s 로 둔다.
+  //   후진 경로의 점유(장애물) 검사와 후진 노드의 실시간 뒤쪽 점 검사는 그대로다.
+  double visibilityHorizon(double now) const {(void)now;return 120.;}
+  double origin_x_=0,origin_y_=0,origin_z_=0,last_scan_=-1,last_pose_stamp_=-1;
+  double ground_plane_[3]={0,0,0};
+  Pose scan_pose_;
+  double measured_curvature_=0;
+  double aligned_since_=-1;
+  bool avoidance_session_=false;
+  bool spatial_return_active_=false;
+  bool approach_fallback_in_progress_=false;
+  LiveEdges live_;
+  TrafficState traffic_;
+  std::vector<CertifiedTrigger> certified_triggers_;
+  std::vector<Point> held_trigger_;double trigger_seen_=-1;
+  void selectTrigger(const Pose&,const std::vector<Reference>&,Result&);
+  bool approvalPath(Result&,const Pose&,const std::vector<Reference>&,double,const std::string&);
+  bool initialized_=false;
+  uint64_t key(const octomap::OcTreeKey&) const;
+  const Reference* nearestRoad(double x,double y) const;
+  bool roadInside(double x,double y,double inset,double* clearance=nullptr) const;
+  bool bodyClear(const Reference&,double now,std::string* reason=nullptr) const;
+  bool liveBoundaryApplies(int idx) const;
+  void updateMotion(Result&,const Pose&,const std::vector<Reference>&);
+  void rebuild(double now);
+  std::vector<Reference> resample(const std::vector<Reference>&,double ds) const;
+};
+} // namespace occupancy_avoidance

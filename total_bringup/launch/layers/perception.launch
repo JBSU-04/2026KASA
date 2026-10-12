@@ -107,7 +107,7 @@
       <rosparam param="section_profile_sections">[M8]</rosparam>
       <param name="profile_margin_m" value="0.5"/>
       <!-- 터널 최소 높이 0.20 m: 종단 경사 변화 노면이 0.075~0.19 m 로 떠 오제안(16:23 백). -->
-      <rosparam param="section_min_height_m">{M8: 0.20}</rosparam>
+      <rosparam param="section_min_height_m">{M8: 0.10}</rosparam>
       <param name="x_min_m" value="12.0"/>
       <param name="x_max_m" value="40.0"/>
       <!-- 4.5 -> 7.5 (2026-09-23): 아래 gather_half_width_m(7.0)만큼 점을 모으려면

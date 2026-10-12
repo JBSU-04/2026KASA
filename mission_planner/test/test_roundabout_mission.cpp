@@ -2578,3 +2578,233 @@ TEST(RoundaboutPreparation, LocalizationLossRestartsPreparationConfirmationBefor
  EXPECT_EQ(mission.update(in).entry_phase,"preparing");
 }
 }
+
+namespace mission_planner {
+
+// 2026-10-11: 앞차가 합류점을 지나기 전부터 가상 앞차로 추종(project_leader). 수동 시연처럼 앞차가
+//   상류(-7/-12 m)에 있을 때 승인하고 앞차 뒤에 맞춰 출발해도 앞 간격 1.5 m 이상, 정상 흐름이면 진입 완료.
+TEST(DistanceEntry,ProjectedLeaderTimedEntryKeepsFrontClearance){
+ for(int clearance:{0,1})for(int scenario:{0,1})for(double npc_speed:{3.5,4.5,5.5})
+ for(double leader0:{-7.,-12.})for(double leader_decel:{1.5,3.}){
+  SCOPED_TRACE(::testing::Message()<<"clearance="<<clearance<<" scenario="<<scenario<<" npc="<<npc_speed<<" leader0="<<leader0<<" decel="<<leader_decel);
+  auto c=testConfig();c.distance_enabled=true;c.gap_select_enabled=true;c.gs_require_merge_progress=true;
+  c.distance_clearance_only=clearance;c.distance_measured_profile=true;auto model=measuredTestEgo();
+  c.distance_profile_times=model.profile_times;c.distance_profile_speeds=model.profile_speeds;c.distance_project_leader=true;
+  c.gs_speed_margin=.2;c.comfortable_decel=2.;c.distance_front_response=.5;c.distance_front_max_decel=3.;c.distance_front_gap=2.5;
+  c.distance_rear_gap=2.;c.distance_confirm=.15;c.distance_rear_yield=true;
+  c.gs_prediction_follow_standstill_gap=3.;c.gs_prediction_follow_time_gap=.8;c.gs_standstill_gap=.8;
+  c.mandatory_stop_seconds=1;c.yield_point={10,-10};c.gs_commit_abort_enabled=true;
+  RoundaboutMission mission(c);auto input=approachInput(0);input.route={{10,-30},{10,0}};
+  input.prediction_speed_limit=8.5;input.prediction_accel_limit=3.2;
+  for(int j=1;j<=40;++j)input.route.push_back({10*std::cos(j*.025),10*std::sin(j*.025)});
+  double s=-10,v=0,leader=leader0,leader_v=npc_speed,rear=leader0-20,rear_v=npc_speed,commit=-1,min_gap=1e9,brake_since=-1;bool cleared=false;
+  for(int i=0;i<600;++i){double now=i*.05;input.now=now;input.ego.position=s<0?Point2{10,s}:Point2{10*std::cos(s/10),10*std::sin(s/10)};
+   input.ego.yaw=kPi/2+std::max(0.,s)/10;input.ego.speed=v;
+   auto l=circulatingObject(1,leader/10,leader_v),r=circulatingObject(2,rear/10,rear_v);l.hit_count=r.hit_count=i/2+10;
+   input.objects={l,r};auto out=mission.update(input);
+   if(out.state==RoundaboutState::kCommit&&commit<0)commit=now;
+   double cap=out.constraint.max_speed<0?8.5:out.constraint.max_speed;
+   if(out.constraint.stop_required)cap=std::min(cap,std::sqrt(2*c.comfortable_decel*std::max(0.,out.constraint.stop_distance)));
+   if(out.constraint.lead_vehicle_active){double gap=std::max(0.,out.constraint.lead_distance-c.gs_prediction_follow_standstill_gap);
+    cap=std::min(cap,std::min(std::sqrt(out.constraint.lead_speed*out.constraint.lead_speed+2*c.comfortable_decel*gap),
+      std::max(0.,out.constraint.lead_speed+(gap-.8*v)/.8)));}
+   if(cap<v&&brake_since<0)brake_since=now;
+   if(cap>=v)brake_since=-1;
+   const bool brake_delay=brake_since>=0&&now-brake_since<.3;
+   const double next=(commit>=0&&now-commit<.23)||brake_delay?v:(v<cap?std::min(cap,v+3.2*.05):std::max(cap,v-2.5*.05));
+   s+=.5*(v+next)*.05;v=next;
+   if(scenario==1&&commit>=0&&now-commit>.5)leader_v=std::max(0.,leader_v-leader_decel*.05);
+   leader+=leader_v*.05;
+   const double rear_gap=std::max(0.,leader-rear-6.);
+   const double rear_cap=std::min(npc_speed,std::min(std::sqrt(leader_v*leader_v+4*rear_gap),
+     std::max(0.,leader_v+(rear_gap-.5*rear_v)/.5)));
+   const double rear_next=rear_v<rear_cap?std::min(rear_cap,rear_v+.1):std::max(rear_cap,rear_v-.15);
+   rear+=.5*(rear_v+rear_next)*.05;rear_v=rear_next;
+   if(s+2.3>=0)min_gap=std::min(min_gap,leader-2.-s-2.3);
+   if(s>=2.3){cleared=true;break;}
+  }
+  EXPECT_GE(min_gap,1.5);
+  if(scenario==0){EXPECT_TRUE(cleared);EXPECT_GE(commit,0.);}
+ }
+}
+}
+
+namespace mission_planner {
+TEST(RoundaboutPreparation, ApprovedFrontOwnsAccBeforeMergeInsteadOfAnotherRingCar) {
+ auto c=preparationConfig();RoundaboutMission mission(c);auto in=observedEntryInput(c);
+ in.objects={observedCar(c,7,16,4),observedCar(c,11,-26,4)};
+ for(double t:{.8,.9,1.})preparationScan(in,t);
+ mission.update(in);in.now=1.11;in.objects_stamp=in.now;preparationScan(in,in.now);
+ auto out=mission.update(in);ASSERT_EQ(out.state,RoundaboutState::kCommit)<<out.reason;
+ ASSERT_EQ(out.gap_leader_id,7);
+ in.now=1.2;in.objects_stamp=in.now;in.objects.push_back(observedCar(c,5,5,4));
+ in.observation.frames.clear();out=mission.update(in);
+ EXPECT_TRUE(out.approval_latched);EXPECT_EQ(out.gap_leader_id,7);
+ EXPECT_EQ(out.constraint.lead_vehicle_id,7)<<out.reason;
+ EXPECT_FALSE(out.constraint.stop_required);
+ EXPECT_DOUBLE_EQ(out.constraint.lead_standstill_distance,2.);
+ EXPECT_DOUBLE_EQ(out.constraint.lead_time_gap,.35);
+}
+TEST(RoundaboutPreparation, ApprovedPairDoesNotChangeWhenRearClosesDuringLaunch) {
+ auto c=preparationConfig();RoundaboutMission mission(c);auto in=observedEntryInput(c);
+ in.objects={observedCar(c,7,16,4),observedCar(c,11,-26,4)};
+ for(double t:{.8,.9,1.})preparationScan(in,t);
+ mission.update(in);in.now=1.11;in.objects_stamp=in.now;preparationScan(in,in.now);
+ ASSERT_EQ(mission.update(in).state,RoundaboutState::kCommit);
+ in.now=1.2;in.objects_stamp=in.now;in.objects[1]=observedCar(c,11,-1,8);
+ in.observation.frames.clear();auto out=mission.update(in);
+ EXPECT_EQ(out.state,RoundaboutState::kCommit);EXPECT_EQ(out.gap_leader_id,7);
+ EXPECT_EQ(out.gap_follower_id,11);EXPECT_TRUE(out.approval_latched);
+ EXPECT_FALSE(out.constraint.stop_required)<<out.reason;
+}
+}
+namespace mission_planner {
+TEST(RoundaboutPreparation, MeasuredPedalCurveCannotIgnorePredictionAccelerationLimit) {
+ auto c=preparationConfig();c.gs_measured_entry_profile=true;
+ c.distance_profile_times={0.,.3,.8,1.3,1.8,2.3,2.8};
+ c.distance_profile_speeds={0.,.8,2.8,4.6,6.,7.,7.6};
+ auto in=observedEntryInput(c);in.objects={observedCar(c,7,30,4),observedCar(c,11,-55,4)};
+ for(double t:{.8,.9,1.})preparationScan(in,t);
+ RoundaboutMission fast(c);in.prediction_accel_limit=3.;auto f=fast.update(in);
+ RoundaboutMission slow(c);in.prediction_accel_limit=1.5;auto s=slow.update(in);
+ ASSERT_TRUE(f.gap_safe)<<f.reason;ASSERT_TRUE(s.gap_safe)<<s.reason;
+ EXPECT_GT(s.ego_zone_time,f.ego_zone_time);
+ EXPECT_GT(s.ego_clear_time,f.ego_clear_time);
+}
+}
+
+namespace mission_planner {
+// 2026-10-12 갭 시간 창 진입(entry_model: window)과 ACC 2 m 거리 유지.
+RoundaboutConfig windowConfig(){
+  auto c=testConfig();c.distance_enabled=true;c.window_enabled=true;c.gap_select_enabled=true;c.gs_require_merge_progress=true;
+  c.distance_confirm=0.;c.window_confirm_frames=4;c.window_s0=2.;c.window_headway=.5;c.window_ego_accel=3.;
+  c.yield_point={10,-10};c.mandatory_stop_seconds=0.;c.gs_commit_abort_enabled=true;
+  return c;
+}
+RoundaboutInput windowInput(double now,double s=-10.,double v=0.){
+  auto in=approachInput(now);in.route={{10,-30},{10,0}};
+  for(int j=1;j<=40;++j)in.route.push_back({10*std::cos(j*.025),10*std::sin(j*.025)});
+  in.ego.position={10,s};in.ego.speed=v;in.prediction_speed_limit=8.5;in.prediction_accel_limit=3.;return in;
+}
+TEST(WindowEntry,EmptyRingNeedsConsecutiveFrames){
+  RoundaboutMission m(windowConfig());RoundaboutState st=RoundaboutState::kIdle;int commit_frame=-1;
+  for(int i=0;i<10;++i){auto out=m.update(windowInput(i*.05));st=out.state;if(st==RoundaboutState::kCommit&&commit_frame<0)commit_frame=i;}
+  EXPECT_EQ(st,RoundaboutState::kCommit);
+  EXPECT_GE(commit_frame,3);  // N=4 프레임 연속 OK 전에는 GO 하지 않는다
+}
+TEST(WindowEntry,VehicleAtMergeBlocksRegardlessOfWindow){
+  RoundaboutMission m(windowConfig());RoundaboutOutput out;
+  for(int i=0;i<10;++i){auto in=windowInput(i*.05);auto o=circulatingObject(5,-0.02,0.2);o.hit_count=20;in.objects={o};out=m.update(in);}
+  EXPECT_NE(out.state,RoundaboutState::kCommit);
+}
+TEST(WindowEntry,ApproachingVehicleCloseUpstreamIsMissedNotEntered){
+  RoundaboutMission m(windowConfig());RoundaboutOutput out;bool committed=false;
+  // 상류 6 m 에서 6 m/s 로 오는 차: 자차가 정지 출발로 들어가면 뒷차 창이 닫혀 있다.
+  for(int i=0;i<12;++i){auto in=windowInput(i*.05);auto o=circulatingObject(7,-.6+i*.05*.6,6.);o.hit_count=20;in.objects={o};out=m.update(in);
+    committed|=out.state==RoundaboutState::kCommit;}
+  EXPECT_FALSE(committed);
+}
+TEST(RoundaboutAcc,KeepsTwoMetreGapByAcceleratingAndBraking){
+  auto c=windowConfig();c.acc_enabled=true;c.acc_target_gap=2.;c.acc_time_gap=.2;c.acc_gain=.8;
+  c.gs_prediction_follow_standstill_gap=1.;c.gs_prediction_follow_time_gap=.35;
+  auto run=[&](double gap_angle){RoundaboutMission m(c);RoundaboutOutput out;
+    for(int i=0;i<40;++i){auto in=windowInput(i*.05);
+      if(i>=20){in.ego.position={10*std::cos(-.3),10*std::sin(-.3)};in.ego.yaw=-.3+kPi/2;in.ego.speed=4.;}
+      auto lead=circulatingObject(9,-.3+gap_angle,4.);lead.hit_count=30;in.objects={lead};out=m.update(in);}
+    return out;};
+  const auto far=run(.9),near=run(.62);   // 중심 간 9 m / 6.2 m -> 범퍼 간 약 4.6 m / 1.8 m
+  ASSERT_TRUE(far.acc_active);ASSERT_TRUE(near.acc_active);
+  EXPECT_GT(far.acc_v_des,4.0);EXPECT_GT(far.acc_a_des,0.);   // 간격이 크면 가속
+  EXPECT_LT(near.acc_v_des,4.0);EXPECT_LT(near.acc_a_des,0.); // 간격이 작으면 감속
+}
+}
+
+namespace mission_planner {
+// 2026-10-12 갭 1/4 지점 진입(entry_model: quarter). 반지름 10 m, 합류점 각 0, 차량 길이 4 m.
+RoundaboutConfig quarterConfig(double stop_s=0.){
+  auto c=windowConfig();c.window_enabled=false;c.quarter_enabled=true;c.mandatory_stop_seconds=stop_s;c.acc_enabled=true;
+  c.quarter_min_gap=9.;c.quarter_band=1.;c.quarter_fraction=.25;c.quarter_open_rear_tail=2.;c.quarter_confirm_frames=2;
+  c.quarter_lead_time=0.;c.quarter_activate_distance=5.;  // 아래 기본 테스트: 기준점 = 우리 차 앞(여기서는 합류점과 같음)
+  return c;
+}
+TrackedObject ringCar(int id,double arc,double v=4.){auto o=circulatingObject(id,arc/10.,v);o.hit_count=30;return o;}
+RoundaboutOutput runQuarter(RoundaboutConfig c,std::vector<std::pair<int,double>> cars,int frames=8,double stop_speed=0.){
+  RoundaboutMission m(c);RoundaboutOutput out;
+  for(int i=0;i<frames;++i){auto in=windowInput(i*.05,-10.,stop_speed);for(auto&p:cars)in.objects.push_back(ringCar(p.first,p.second));out=m.update(in);
+    if(out.state==RoundaboutState::kCommit)break;}
+  return out;
+}
+TEST(QuarterEntry,GoesWhenQuarterPointAtMerge){
+  // 앞차 뒷범퍼 +2.5, 뒷차 앞범퍼 -8.5 -> 갭 11 m, 1/4 지점 -0.25 m
+  auto out=runQuarter(quarterConfig(),{{1,4.5},{2,-10.5}});
+  EXPECT_EQ(out.state,RoundaboutState::kCommit);
+}
+TEST(QuarterEntry,ShortGapSkipped){
+  auto out=runQuarter(quarterConfig(),{{1,4.5},{2,-7.0}});   // 갭 7.5 m < 9 m
+  EXPECT_NE(out.state,RoundaboutState::kCommit);
+}
+TEST(QuarterEntry,PassedQuarterPointMovesToNextGap){
+  auto out=runQuarter(quarterConfig(),{{1,6.5},{2,-8.5}});   // 1/4 지점 +1.75 m -> 놓침
+  EXPECT_NE(out.state,RoundaboutState::kCommit);
+  EXPECT_NE(out.reason.find("L2/"),std::string::npos);  // 대상이 다음 갭(앞차 = 이전 뒷차 2)으로 넘어감
+}
+TEST(QuarterEntry,OpenRearUsesLeaderTailPlusTwoMetres){
+  EXPECT_EQ(runQuarter(quarterConfig(),{{1,4.5}}).state,RoundaboutState::kCommit);   // 뒷범퍼 +2.5
+  EXPECT_NE(runQuarter(quarterConfig(),{{1,0.5}}).state,RoundaboutState::kCommit);   // 뒷범퍼 -1.5 (꼬리+2 m 까지 3.5 m)
+}
+TEST(QuarterEntry,WaitsOneSecondAtYieldLine){
+  auto c=quarterConfig(1.0);RoundaboutMission m(c);double commit=-1;
+  for(int i=0;i<60;++i){auto in=windowInput(i*.05,-10.,0.);in.objects={ringCar(1,4.5)};auto out=m.update(in);
+    if(out.state==RoundaboutState::kCommit){commit=i*.05;break;}}
+  ASSERT_GE(commit,0.);EXPECT_GE(commit,0.95);
+}
+TEST(QuarterEntry,AccLeadPrelatchedAndHandedOverAtGo){
+  auto c=quarterConfig();RoundaboutMission m(c);RoundaboutOutput out;bool pre=false;
+  for(int i=0;i<10;++i){auto in=windowInput(i*.05,-10.,0.);in.objects={ringCar(1,4.5),ringCar(2,-10.5)};out=m.update(in);
+    if(out.state!=RoundaboutState::kCommit&&out.acc_id==1&&!out.acc_active)pre=true;
+    if(out.state==RoundaboutState::kCommit)break;}
+  EXPECT_TRUE(pre);
+  ASSERT_EQ(out.state,RoundaboutState::kCommit);
+  EXPECT_TRUE(out.constraint.lead_vehicle_active);EXPECT_EQ(out.constraint.lead_vehicle_id,1);
+}
+}
+
+namespace mission_planner {
+TEST(QuarterEntry,LeadTimeMovesTriggerUpstreamOfFrontPoint){
+  auto c=quarterConfig();c.quarter_lead_time=1.6;   // 흐름 4 m/s -> 기준점 = 우리 차 앞 - 6.4 m
+  // 1/4 지점 -6.4: 앞차 뒷범퍼 -3.65(중심 -1.65), 뒷차 앞범퍼 -14.65(중심 -16.65), 갭 11 m
+  EXPECT_EQ(runQuarter(c,{{1,-1.65},{2,-16.65}}).state,RoundaboutState::kCommit);
+  // 앞당김 없이(우리 차 앞 기준) 보면 같은 갭은 아직 대기
+  EXPECT_NE(runQuarter(quarterConfig(),{{1,-1.65},{2,-16.65}}).state,RoundaboutState::kCommit);
+}
+TEST(QuarterEntry,InactiveBeyondActivateDistance){
+  RoundaboutMission m(quarterConfig());RoundaboutOutput out;
+  for(int i=0;i<8;++i){auto in=windowInput(i*.05,-18.,0.);in.objects={ringCar(1,4.5),ringCar(2,-10.5)};out=m.update(in);}
+  EXPECT_EQ(out.quarter_case,"inactive");EXPECT_NE(out.state,RoundaboutState::kCommit);
+}
+TEST(QuarterEntry,MissedGapNotRevisitedWhenPointJitters){
+  RoundaboutMission m(quarterConfig());RoundaboutOutput out;
+  auto in=windowInput(0.,-10.,0.);in.objects={ringCar(1,6.5),ringCar(2,-8.5)};out=m.update(in);  // 1/4 지점 +1.75 -> 놓침
+  in=windowInput(.05,-10.,0.);in.objects={ringCar(1,4.5),ringCar(2,-10.5)};out=m.update(in);    // 다시 창 안처럼 보여도
+  EXPECT_NE(out.reason.find("L2/"),std::string::npos);EXPECT_NE(out.state,RoundaboutState::kCommit);
+}
+}
+
+namespace mission_planner {
+// 2026-10-12(18:59:56 백): 회전 중 바로 뒤에 붙어 멈춘 차 때문에 차체 가드가 9 s 넘게 정지(서로 대기).
+TEST(RoundaboutEntryGuard,StoppedFollowerBehindInRingDoesNotHoldEgo){
+  auto c=lockedEntryTestConfig();c.gs_body_collision_guard=true;c.gs_route_body_projection=true;c.gs_confirm_seconds=0;c.gs_collision_horizon=.5;
+  RoundaboutMission mission(c);auto in=lockedEntryTestInput();
+  in.route={{10,-30},{10,0}};for(int i=1;i<=40;++i)in.route.push_back({10*std::cos(i*.025),10*std::sin(i*.025)});
+  in.objects.clear();ASSERT_EQ(mission.update(in).state,RoundaboutState::kCommit);
+  RoundaboutOutput out;
+  for(int k=1;k<=6;++k){in.now=1.+.1*k;in.ego.position={10*std::cos(.3),10*std::sin(.3)};in.ego.yaw=.3+kPi/2;in.ego.speed=0;in.objects.clear();out=mission.update(in);}
+  ASSERT_EQ(out.state,RoundaboutState::kCirculate);
+  auto follower=circulatingObject(2,.3-.43,0.);follower.hit_count=30;   // 중심 4.3 m 뒤, 앞범퍼가 우리 뒷범퍼에 닿음
+  in.now=2.;in.objects={follower};out=mission.update(in);
+  EXPECT_EQ(out.reason.find("body collision guard"),std::string::npos)<<out.reason;
+  auto fast=circulatingObject(2,.3-.43,6.);fast.hit_count=31;           // 같은 자리에서 빠르게 다가오면 기존처럼 보호
+  in.now=2.1;in.objects={fast};out=mission.update(in);
+  EXPECT_NE(out.reason.find("body collision guard"),std::string::npos)<<out.reason;
+}
+}

@@ -1,0 +1,462 @@
+#pragma once
+
+#include "mission_planner/roundabout_observation.hpp"
+
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace mission_planner {
+
+struct Point2 {
+  double x = 0.0;
+  double y = 0.0;
+};
+
+struct EgoState {
+  Point2 position;
+  double yaw = 0.0;
+  double speed = 0.0;
+  bool valid = false;
+};
+
+struct TrackedObject {
+  int id = -1;
+  Point2 position;
+  double velocity_x = 0.0;
+  double velocity_y = 0.0;
+  double length = 4.5;
+  bool velocity_valid = false;
+  bool has_moved = false;
+  // false = 속도/이동 확인 전 트랙(gap_select 의 미확정 뒤차 처리용).
+  //   기존 판단(evaluateGap)과 순환 앞차 탐색은 이런 트랙을 쓰지 않는다.
+  bool confirmed = true;
+  int hit_count = 0;
+  double height = 1.5, width = 1.8, confidence = 1.0;
+  double aabb_x = 0.0, aabb_y = 0.0; // Original world-axis bounds; never rotate them as an OBB.
+  int collision_parent_id = -1; // Duplicate fragment: keep geometry, not a second gap vehicle.
+};
+
+enum class RoundaboutState : std::uint8_t {
+  kIdle = 0,
+  kApproach = 1,
+  kYield = 2,
+  kCommit = 3,
+  kCirculate = 4,
+  kExit = 5,
+  kFailsafe = 6,
+};
+
+struct RoundaboutConfig {
+  bool enabled = false;
+  bool counter_clockwise = true;
+  bool require_tracker_stream = true;
+  bool require_localization = true;
+
+  Point2 center;
+  Point2 yield_point;
+  Point2 conflict_point;
+  Point2 exit_point;
+  double entry_heading = 0.0;
+
+  double inner_radius = 8.0;
+  double outer_radius = 18.0;
+  double nominal_radius = 13.0;
+  // Vehicle centers have their own road ROI; ego state geometry stays separate.
+  double vehicle_roi_inner_radius = -1.0;
+  double vehicle_roi_outer_radius = -1.0;
+  double exit_lead_lateral_tolerance = 2.0;
+  double activation_distance = 35.0;
+  double decision_distance = 18.0;
+  double exit_detection_radius = 6.0;
+  double exit_clear_distance = 12.0;
+  double entry_heading_tolerance = 1.2;
+  double tangent_heading_tolerance = 1.05;
+  double route_projection_tolerance = 4.0;
+
+  double approach_speed = 6.0;
+  double circulation_speed = 7.0;
+  double exit_speed = 8.0;
+  double degraded_speed = 2.0;
+  double ego_merge_time = 2.0;
+  double rear_time_gap = 4.0;
+  // YIELD 교착 완화의 하한 [s]. rear_time_gap 아래로 얼마나 내려갈 수 있는지.
+  // 하드코딩 3.0 이었는데, rear_time 을 3.0 미만으로 튜닝한 현장에서는
+  // 완화가 오히려 값을 '올려버리는' 역전이 생겼다. 설정으로 뺀다.
+  double rear_ttc_relax_floor = 3.0;
+  // 교착 완화의 최대 감소량 [s].
+  double rear_ttc_relax_max = 0.5;
+  // YIELD 진입 후 완화를 시작할 대기 시간과 초당 완화량.
+  // relax_rate=0이면 모든 점진 완화를 비활성화한다.
+  double gap_relax_start_seconds = 5.0;
+  double gap_relax_rate = 0.1;
+  bool rear_time_is_total_ttc = false;
+  double front_time_gap = 2.0;
+  double front_time_relax_floor = 1.2;
+  double front_standstill_distance = 5.0;
+  double front_departure_speed_ratio = 1.0;
+  double front_check_distance = 35.0;
+  double stationary_speed = 0.3;
+  double stationary_block_distance = 20.0;
+  double uncertain_object_block_distance = 15.0;
+  double prediction_uncertainty_time = 0.5;
+  double safe_confirm_seconds = 0.5;
+  double safe_confirm_relax_floor = 0.15;
+  double tracker_timeout = 0.5;
+  // COMMIT 중 트래커 가림 보호(expiry guard)로 valid=false 가 돼도(메시지는 신선) 이 시간 안에는
+  // stale 로 보지 않는다. 0 = 끔. 16:24:06 백: 15.7 s 1 초 valid=false -> 감속 -> 뒤차 침범 -> 취소.
+  double tracker_guard_commit_grace = 0.0;
+  // 2026-10-05: 양보/접근 중 트래커가 잠깐(이 시간 이내) 끊기면 직전 정상 스트림으로 판단을 이어간다.
+  double tracker_stale_grace = 0.3;
+  double mandatory_stop_seconds = 0.0;
+  // 2026-10-06: 의무 정지 없이(mandatory_stop_seconds=0) YIELD 에서 굴러가며 판단할 때 상한 [m/s]. <=0 이면 approach.
+  double yield_roll_speed = 0.0;
+  // 굴러가며 판단할 때 진입 확정은 양보선 이 거리 안에서만 [m] (18:58:36 백: 11 m 전 확정 -> 취소 -> 8.4 m 전 정지).
+  double yield_go_distance = 1.5;
+  double mandatory_stop_position_tolerance = 0.5;
+  double mandatory_stop_speed_threshold = 0.25;
+  double minimum_circulate_seconds = 1.0;
+  double commit_timeout_seconds = 8.0;
+  double exit_hold_seconds = 1.0;
+  double reset_jump_distance = 5.0;
+
+  double comfortable_decel = 2.5;
+  double emergency_decel = 5.0;
+  double stop_buffer = 1.0;
+  // 의무 정지를 마친 뒤 gap 을 기다리는 위치 [m]. 양보선 기준이며 음수면
+  // 양보선을 지나 합류점 쪽으로 더 나간다.
+  // 왜 분리하나: 양보선 뒤에서 기다리면 중앙분리대가 링 반대편을 가려
+  // 순환 차량이 105° 밖에 안 보인다. 규정 정지는 stop_buffer 로 지키고,
+  // 관측은 시야가 열리는 앞쪽에서 한다. creep_buffer 를 stop_buffer 와
+  // 같게 두면 기존 동작과 동일하다.
+  double creep_buffer = 1.0;
+  double lead_search_distance = 45.0;
+
+  // ★ 흐름 틈 선택 진입(2026-09-29). 켜면 evaluateGap 대신 GapSelector 로
+  //   순환 차량 사이 틈을 예측해 '가장 먼저 들어갈 수 있는 틈'과 출발 시각을
+  //   고른다. 시간 기반 완화(relax_*)와 safe_confirm 은 쓰지 않는다.
+  //   추적 끊김 / 속도 미확정 객체 / 합류점 상류 정지 차량 차단은 그대로.
+  bool gap_select_enabled = false;
+  bool gs_use_mpc_prediction = false;
+  bool gs_require_merge_progress = false;
+  bool gs_use_tracker_velocity = false; // Single raw-observation estimator, no second pose fit.
+  double gs_speed_min_span = 0.8;
+  double gs_speed_disagreement_limit = 1.0;
+  double gs_stop_reaction_time = 0.3;
+  double gs_stop_margin = 0.5;
+  double gs_ego_accel = 2.2;          // 정지 출발 가속 [m/s^2] (09-18 실측 평균 ~2.2)
+  double gs_ego_start_delay = 0.2;    // 출발 반응 지연 [s]
+  double gs_ego_max_speed = 0.0;      // 합류 속도 상한 [m/s] (0 = circulation_speed)
+  double gs_ego_length = 4.6;         // 자차 길이 [m]
+  double gs_min_vehicle_length = 4.0; // 순환 차량 길이 하한 [m] (부분 관측 보정)
+  double gs_front_headway = 1.0;      // 앞차 시간 간격 [s]
+  double gs_rear_headway = 1.2;       // 뒤차 시간 간격 [s]
+  double gs_standstill_gap = 2.0;     // 범퍼 간 최소 거리 [m]
+  double gs_check_horizon = 3.0;      // 합류 뒤 검사 시간 [s]
+  double gs_speed_margin = 0.5;       // 순환 차량 속도 불확실성 [m/s]
+  double gs_entry_zone = 1.0;         // 합류 구역 시작(합류점 앞) [m]
+  double gs_max_wait = 12.0;          // 출발 지연 탐색 범위 [s]
+  double gs_go_tolerance = 0.05;      // 이 지연 이하면 '지금 출발' [s]
+  // ★ 2026-09-30 (12:34 백) 앞차만 막는 틈의 출발 허용 [s].
+  //   상류에서 다가오는 앞차가 합류점 앞에서 7 -> 4 m/s 로 감속하자 '앞차가 지나간
+  //   뒤 출발' 예측이 매 주기 밀려(1.2 -> 0.1 -> 1.2 s) 0.05 s 에 한 번도 못 닿고,
+  //   그 사이 뒤차 마감이 지나 틈이 사라졌다(17 s 동안 5 번). 뒤차 조건을 지금
+  //   만족하면 이만큼 일찍 출발한다 - 자차는 합류점 8 m 전 정지 출발이라 앞차
+  //   뒤로 맞출 여유가 있다. 사후검증(실제 궤적): 최소 앞 2.5 m / 뒤 2.1 m 이상.
+  double gs_go_tolerance_front = 0.4;
+  // COMMIT 중 앞차 쪽만 부족(뒤차는 만족)하고 대기가 이 이하면 진입을 계속한다 [s].
+  double gs_commit_front_tolerance = 1.0;
+  // ★ 2026-09-30 순차 틈 판단(GapSelector::evaluateSequential). 틈을 도착 순서대로
+  //   보고, 앞차를 따라 들어갈 시점에 뒤차 TTC/간격을 못 지키면 그 틈은 패스하고
+  //   뒤차의 뒤 공간으로 넘어간다(되돌아가지 않음).
+  bool gs_commit_rear_yield_lock = false; // Cooperative NPC assumption after approval only.
+  bool gs_route_body_projection = false; // Project ego body on the NPC tangent from the actual route.
+  double gs_ego_width = 1.9;
+  double gs_prediction_npc_width = 3.0;
+  bool gs_spatial_gap_enabled = false;
+  bool gs_spatial_arrival_check = false, gs_adaptive_approach = false;
+  bool gs_body_collision_guard = false;
+  bool gs_opportunity_enabled = false;
+  bool gs_observed_entry_enabled = false; // Departure requires observed slot + arrival forecast.
+  bool gs_preparation_enabled=false;
+  double gs_preparation_wait_distance=3.0, gs_preparation_max_speed=1.5;
+  double gs_preparation_margin=.5, gs_preparation_horizon=4.0;
+  double gs_observation_timeout=.5, gs_unknown_speed_upper=8.0;
+  double gs_observation_radial_half=.7, gs_post_clear_horizon=.5;
+  bool gs_spatial_only_admission = false; // Current available slot space; no arrival forecast or ego speed/distance gate.
+  bool gs_opportunity_rear_yield = false;
+  bool gs_commit_acc_only = false;
+  double gs_entry_commit_distance = 8.0, gs_entry_commit_max_speed = 5.0;
+  double gs_opportunity_horizon = 1.2, gs_opportunity_step = 0.1;
+  double gs_opportunity_expire_confirm = 0.8;
+  double gs_duplicate_distance = 1.5, gs_duplicate_coverage = 0.8;
+  int gs_duplicate_max_hits = 5, gs_duplicate_parent_min_hits = 6;
+  double gs_approach_response = 0.3;
+  double gs_collision_horizon = 1.0, gs_collision_margin = 0.2;
+  double gs_spatial_front_gap = 2.5, gs_spatial_rear_gap = 2.0;
+  double gs_approach_decel = 1.0;
+  double gs_approach_slow_distance = 18.0; // Observe early; cap approach speed only near yield.
+  bool gs_timed_entry_approach = false;
+  bool gs_approach_accel_compensation = false;
+  double gs_approach_accel_upper = 4.0; // Upper acceleration bound for contact timing, not an actuator request.
+  double gs_approach_time_buffer = 0.5; // Contact timing reserve; independent of front braking reaction.
+  bool gs_rear_ttc_at_entry = false;
+  bool gs_measured_entry_profile = false; // Reuse measured ego profile for TTC prediction.
+  bool gs_sequential = false;  // 노드/yaml 기본은 true(여기는 기존 단위 테스트용)
+  double gs_ttc_rear = 1.0;          // 뒤차 최소 TTC [s]
+  double gs_late_margin = 0.2;       // 뒤차 검사용 진입 늦음 여유 [s]
+  double gs_seq_go_tolerance = 0.3;  // Legacy compatibility; sequential GO requires zero wait.
+  double gs_seq_rear_headway = 0.3;  // 순차 판단 뒤차 시간 간격 [s]
+  bool gs_adaptive_leader_start = false;
+  double gs_leader_start_max_distance = 12.0;
+  double gs_leader_start_distance = 9.0;  // 앞차가 합류점 이 거리 안에 와야 출발 [m]
+  double gs_leader_decel_horizon = 0.5; // Recent measured slowdown projected ahead [s].
+  double gs_leader_decel_limit = 1.5;   // Maximum projected slowdown [m/s^2].
+  double gs_prediction_follow_standstill_gap = 4.0;
+  double gs_prediction_follow_time_gap = 1.5;
+  // 차량별 등속 추정 창 [s]. NPC 속도는 차량마다 랜덤한 등속이라, 순간 속도 대신
+  // 최근 원호 위치의 1차 회귀 기울기를 쓴다(트래커 순간값은 6.9 -> 4.8 처럼 흔들림).
+  double gs_speed_window = 1.5;
+  // 틈 패스 확인 시간 [s]: 목표 틈이 이 시간 연속으로 안 될 때만 패스한다(되돌아가지
+  // 않으므로). 12:34 백: 새로 생긴 트랙의 첫 프레임 속도(7.5 m/s) 한 번에 틈을 버렸다.
+  double gs_skip_confirm = 0.3;
+  // 2026-10-05: 직전까지 가능하던(확인 중이던) 틈은 이 시간 연속 불가일 때만 다음 틈으로 넘긴다.
+  double gs_skip_confirm_after_safe = 0.8;
+  // 2026-10-05: COMMIT 뒤 '앞차 통과 대기' 해제 - 앞차가 자차 도착 예정보다 이만큼 먼저 합류점을 비우면 출발.
+  double gs_leader_release_margin = 0.6;   // [s], <=0 이면 해제 안 함(이전 동작)
+  double gs_leader_release_accel = 1.0;    // 자차 출발 가속 가정 [m/s^2]
+  // 2026-10-06: 가장 가까운 틈만 - 고른 틈의 앞차 뒤끝이 합류점을 standstill_gap 지난 뒤에만 GO(예측 출발 금지).
+  bool gs_go_after_leader_passed = false;
+  double gs_leader_release_min_speed = 2.0;
+  // ── 2026-10-06 시간창 진입 모델(entry_model: time_window) ──
+  //   합류 구역(합류점 ±(자차 반길이 + entry_zone)) 점유 시간으로만 판단한다.
+  //   확정(has_moved) 차량은 등속 예측, 정지 차량은 재출발 가정, 막 나타난 미확정 물체는 흐름 속도 가정.
+  bool distance_enabled = false;
+  bool distance_clearance_only = false;
+  bool distance_commit_rear_yield_lock = false;
+  double distance_front_gap = 2.5, distance_rear_gap = 2.0, distance_horizon = 1.5;
+  double distance_front_response = 0.3;
+  double distance_front_max_decel = 3.0;
+  double distance_reaction = 0.5, distance_rear_decel = 2.0, distance_confirm = 0.2;
+  double distance_pair_invalid = 0.3, distance_unknown_hold = 0.6;
+  bool distance_rear_yield = false;
+  bool distance_measured_profile = false;
+  bool distance_project_leader = false;
+  // 2026-10-12 갭 시간 창 진입 모델(entry_model: window). 갭마다 t_open/t_close 를 구해 자차 도착 t_ego 가
+  //   창 안이면 진입, 놓친 갭(t_ego > t_close)은 다시 보지 않는다. 뒷차는 양보하지 않는다고 가정한다.
+  // 2026-10-12 회전교차로 ACC: 앞차와 범퍼 간격 acc_target_gap + acc_time_gap*v 를 유지하도록 목표 속도를 만든다.
+  //   v_des = v_lead + acc_gain*(gap - gap_ref) 을 속도 상한으로 넣어 가속/감속 둘 다 한다(MPC 무변경).
+  bool acc_enabled = false;
+  double acc_target_gap = 2.0, acc_time_gap = 0.2, acc_gain = 0.8, acc_accel_gain = 1.0, acc_max_accel = 2.5, acc_max_brake = 3.0;
+  bool window_enabled = false;
+  double window_s0 = 4.0, window_headway = 1.2, window_length_margin = 0.5, window_lag_decel = 1.5;
+  double window_ego_accel = 1.5, window_start_delay = 0.24, window_merge_margin = 1.0, window_commit_tolerance = 0.5;
+  int window_confirm_frames = 4;
+  int window_miss_frames = 6;
+  // 뒷차 양보(MORAI NPC 실측): >0 이면 뒷차는 상대속도에 반응 window_lag_reaction 뒤 이 감속으로 양보한다고 본다. 0 = 비양보(자료 원식).
+  double window_lag_yield_decel = 2.0, window_lag_reaction = 0.5;  // 놓침(t_ego > t_close)도 연속 확인 후 확정(새 트랙 첫 프레임 속도 노이즈)
+  std::vector<double> distance_profile_times, distance_profile_speeds;
+  bool tw_enabled = false;
+  double tw_m_front = 0.5;          // 앞차가 구역을 비운 뒤 자차 진입까지 [s]
+  double tw_m_rear = 1.2;           // 자차 통과 완료 뒤 뒤차 도착까지 [s]
+  double tw_commit_m_front = 0.0;   // 진입 확정 중 유지 기준 [s]
+  double tw_commit_m_rear = 0.3;
+  double tw_sigma_v = 0.5;          // 속도 불확실성 [m/s] (뒤차 +, 앞차 -)
+  double tw_young_age = 2.5;        // 이 시간 안의 미확정 물체는 막 나타난 차일 수 있다 [s]
+  double tw_near_upstream = 25.0;   // 미확정 물체를 볼 상류 거리 [m]
+  double tw_assumed_speed = 5.0;    // 미확정 물체 가정 속도 [m/s]
+  double tw_restart_accel = 2.0;    // 정지 확정 차량 재출발 가정 가속 [m/s^2]
+  double tw_restart_delay = 0.5;    // 재출발 반응 [s]
+  double tw_ghost_age = 1.0;        // 마지막 실제 검출 뒤 이 시간 넘은 정지 트랙은 유령 [s]
+  double tw_min_observe = 1.0;      // 트래커가 끊김 없이 이 시간 이상 갱신돼야 GO [s]
+  double tw_leader_headway = 0.5;   // 앞차 뒤 공간 = standstill_gap + 이값 * 자차 합류 속도 [s]
+  double tw_confirm = 0.3;          // GO 연속 성립 시간 [s]
+  double tw_stopped_wait = 2.0;     // 이 시간 넘게 서 있는 상류 확정 차량은(구역과 stopped_min_gap 이상) 막지 않는다 [s]
+  double tw_stopped_min_gap = 1.5;  // [m]
+  double tw_rear_decel = 2.0;       // 자차가 반쯤 들어갔을 때 뒤차가 따라오며 낼 감속 상한 [m/s^2]
+  double tw_moving_speed = 1.5;     // 미확정이라도 이 이상 접선 속도면 나이와 무관하게 차량으로 본다 [m/s]
+  double tw_front_space = 2.5;      // 자차 앞끝이 합류점에 닿을 때 앞차 뒤끝과의 최소 거리 [m]
+  double tw_rear_space = 2.0;       // 자차 뒤끝이 합류점을 지날 때 뒤차 앞끝과의 최소 거리 [m]// 앞차가 이 속도 이상으로 움직일 때만 [m/s]
+  // 앞차 대기/진입 중단 정지점은 원형 차로 판정 반경(outer_radius + 이 값) 밖에 둔다 [m]
+  double gs_circle_stop_margin = 0.5;
+  double gs_confirm_seconds = 0.1;    // 출발 판단 연속 유지 [s]
+  // ★ 거리 기준 진입(2026-10-02, roundabout_mission.cpp evaluateZoneRule 주석).
+  //   차량별 순간 속도로 미래를 예측하지 않고, 지금 위치와 흐름 속도 하나로 판단한다.
+  bool gs_zone_rule_enabled = false;   // false = 기존 순차 예측 로직
+  double gs_zone_front_gap = 2.5;      // 합류 시 앞차와 남길 범퍼 간격 [m]
+  double gs_zone_rear_gap = 3.0;       // 합류 시 뒤차와 남길 범퍼 간격 [m]
+  double gs_zone_front_time = 0.75;    // 앞차가 정지 유지선을 벗어난 뒤 자차 도착까지 여유 [s]
+  double gs_zone_vehicle_length = 4.6; // 순환 차량 길이 기본값: 차량별 추정이 불가능할 때만 쓴다 [m]
+  // ★ 차량별 길이(2026-10-02). NPC 차종은 주행마다 랜덤이라(관측 4.0~7.0 m) 고정값을 쓰지 않는다.
+  //   프레임별 관측 길이는 보이는 면에 따라 1.9~6.8 m 로 흔들리므로 차량 id별 창 안의
+  //   백분위수를 쓰고, 표본이 부족한 차는 스트림 prior(중앙값)와 비교해 큰 쪽을 쓴다.
+  bool gs_zone_length_estimate = false;   // false = 모든 차량에 gs_zone_vehicle_length
+  double gs_zone_length_percentile = 0.8; // 0~1. 최대값은 병합 클러스터에, 중앙값은 부분 관측에 끌려간다
+  double gs_zone_length_window = 8.0;     // 길이 표본 보관 시간 [s]
+  int gs_zone_length_min_samples = 10;    // 이 이상이면 자기 추정을 신뢰한다
+  double gs_zone_length_max = 7.5;        // 합쳐진 클러스터 방어 상한 [m]
+  double gs_zone_length_prior_memory = 60.0; // 지나간 차량의 길이 추정을 prior 로 기억하는 시간 [s]
+  // ★ 대기 완화(2026-10-02). YIELD 대기가 start 를 넘기면 초당 rate [m] 만큼 앞/뒤 간격을
+  //   줄인다(뒤 간격을 먼저, 하한 floor). rate = 0 이면 끈다.
+  double gs_zone_relax_start = 5.0;       // [s]
+  // 2026-10-05(20:38 백): true 면 완화 시간을 YIELD 진입이 아니라 의무 정지 완료부터 잰다
+  //   (정지 직후 처음 보는 틈부터 같은 기준이 줄어들게). 의무 정지가 없으면 기존(YIELD 진입) 기준.
+  bool gs_zone_relax_from_stop = false;
+  double gs_zone_relax_rate = 0.0;        // [m/s]
+  double gs_zone_rear_gap_floor = 1.0;    // 뒤 간격 하한 [m]
+  double gs_zone_front_gap_floor = 2.0;   // 앞 간격 하한(시간 항 포함 전체) [m]
+  // ★ 상호 대기 해소(2026-10-02). 자차가 기다리는 동안 계속 서 있던 순환 차량은 양보 중으로 보고
+  //   하드 차단에서 뺀다. 진입 중 속도가 abort_speed 를 넘으면 침범으로 본다.
+  bool gs_stationary_yield_enabled = false;
+  double gs_stationary_yield_start = 8.0;       // YIELD 대기 시간 하한 [s]
+  double gs_stationary_yield_confirm = 3.0;     // 그 차가 계속 서 있던 시간 [s]
+  double gs_stationary_yield_min_distance = 8.0; // 합류점 상류 거리 하한(차체 앞끝 기준) [m]
+  double gs_stationary_yield_abort_speed = 1.5; // 해제된 차가 이 속도를 넘으면 침범 [m/s]
+  double gs_zone_confirm_seconds = 0.2;   // 출발 판단 연속 유지 [s]
+  // 2026-10-05(20:02 백): 확인을 '같은 앞/뒤 차 쌍이 연속으로 가능한 시간'으로 재서, 앞차가 앞 경계를
+  //   지나는 순간 바로 출발한다(출발 창 (간격-W)/v 가 0.2~0.3 s 인 틈도 놓치지 않게).
+  bool gs_zone_preconfirm = true;
+  // 확인을 마친 쌍은 간격 부족이 이 값 이내면 계속 가능(트랙 위치 튐 대비). 완화 하한을 넘지 않게 잘린다.
+  double gs_zone_pair_tolerance = 0.8;
+  double gs_zone_commit_tolerance = 1.5;  // COMMIT 중 구간 침범 허용(위치 오차/자차 모델 오차) [m]
+  double gs_stream_speed_min_travel = 15.0; // 이만큼 이동한 차량만 흐름 속도 표본 [m]
+  double gs_stream_speed_memory = 30.0;     // 지나간 차량의 표본을 기억하는 시간 [s]
+  int gs_velocity_hold_min_hits = 20;  // 이동 확인 + 이 이상 추적된 차는 속도 무효여도 차단하지 않음
+  // 추적 위치 편차 보정표: [호 위치, 편차, 호 위치, 편차, ...] (호 위치 오름차순).
+  // 편차 = 추적 위치 - 실제 차 중심. 비우면 보정하지 않는다.
+  std::vector<double> gs_zone_position_bias;
+  double gs_switch_margin = 0.5;      // 고른 틈을 바꾸는 최소 이득 [s]
+  // 가림 대비: 상류 관측 끝에 보이지 않는 차량을 가정(기본 끔).
+  bool gs_phantom_enabled = false;
+  double gs_phantom_arc = 22.0;       // 상류 관측 한계 호 거리 [m]
+  double gs_phantom_speed = 5.0;      // 가정 차량 속도 [m/s]
+  // ★ 미확정 상류 트랙을 뒤차로 넣는다(2026-09-29, 12:50 백: -22.8 m 에서 막
+  //   생긴 트랙이 속도 미확정이라 빠졌고, 그 차와 0.54 s 간격으로 합류했다).
+  //   hit_count <= unconfirmed_max_hits 인 '갓 생긴' 트랙만(오래 안 움직이면 시설물).
+  //   속도는 max(측정, unconfirmed_speed).
+  bool gs_unconfirmed_enabled = true;
+  double gs_unconfirmed_range = 40.0;   // 상류 호 거리 [m]
+  double gs_unconfirmed_speed = 5.0;    // 가정 속도 하한 [m/s]
+  int gs_unconfirmed_max_hits = 45;     // 이보다 오래된 미확정 트랙은 무시(15 Hz ~3 s)
+  // ★ COMMIT 중 들어가던 틈이 무너지면(늦게 잡힌 뒤차 등) 링 앞에서 편하게
+  //   설 수 있을 때 다시 양보한다. 서는 위치 = 합류 구역 앞 abort_margin.
+  bool gs_commit_abort_enabled = true;
+  double gs_commit_abort_confirm = 0.2; // 무너짐 연속 유지 [s]
+  double gs_abort_margin = 0.5;         // 합류 구역 앞 여유 [m]
+  double gs_viz_range = 35.0;           // 틈 시각화 범위(합류점 기준 +-) [m]
+  // 합류점/출구 자동 판정. 경로(route)와 원형 차로에서 구한다.
+  bool auto_conflict_point = false;   // 경로가 nominal+margin 반경 안으로 처음 들어가는 점
+  double auto_conflict_radius_margin = 1.0;
+  bool auto_exit = false;             // 순환 중 반경이 outer+margin 을 넘으면 EXIT
+  double auto_exit_radius_margin = 0.5;
+};
+
+struct RoundaboutInput {
+  double now = 0.0;
+  EgoState ego;
+  bool localization_valid = false;
+  bool tracker_stream_valid = false;
+  // 트래커 메시지가 제때 왔는가(valid 와 달리 가림 보호 expiry guard 를 포함하지 않는다).
+  bool tracker_stream_fresh = true;
+  std::vector<Point2> route;
+  std::vector<TrackedObject> objects;
+  double objects_stamp = -1.0;
+  ObservationHistory observation;
+  double prediction_speed_limit = std::numeric_limits<double>::quiet_NaN();
+  double prediction_accel_limit = std::numeric_limits<double>::infinity();
+};
+
+struct MissionConstraint {
+  bool active = false;
+  std::uint8_t priority = 0;
+  double max_speed = -1.0;
+  bool stop_required = false;
+  double stop_distance = 0.0;
+  bool lead_vehicle_active = false;
+  int lead_vehicle_id = -1;
+  double lead_distance = 0.0;
+  double lead_speed = 0.0;
+  bool lead_profile_override = false;
+  double lead_standstill_distance = 0.0;
+  double lead_time_gap = 0.0;
+  double comfortable_decel = 0.0;
+  double emergency_decel = 0.0;
+  std::string reason;
+};
+
+// 틈 선택 시각화용(흐름 좌표: 합류점 0, 진행 방향 +) [m]
+struct RoundaboutGapViz {
+  int leader_id = -1;
+  int follower_id = -1;
+  double lo = 0.0;   // 틈 뒤끝(뒤차 앞범퍼)
+  double hi = 0.0;   // 틈 앞끝(앞차 뒤범퍼)
+  bool feasible = false;
+  bool selected = false;
+  bool preview = false;
+  std::string failure_reason;
+  bool go = false;
+  double depart_delay = 0.0;
+};
+struct RoundaboutVehicleViz {
+  int id = -1;
+  double pos = 0.0;
+  double speed = 0.0;
+  double physical_speed = std::numeric_limits<double>::quiet_NaN();
+  double length = 4.5;
+  bool confirmed = true;
+  Point2 measured_position;
+  bool measured_position_valid = false;
+};
+
+struct RoundaboutOutput {
+  RoundaboutState state = RoundaboutState::kIdle;
+  MissionConstraint constraint;
+  bool gap_safe = false;
+  int blocking_object_id = -1;
+  int tracked_object_count = 0;
+  double distance_to_yield = std::numeric_limits<double>::infinity();
+  double next_npc_ttc = std::numeric_limits<double>::infinity();
+  double front_gap = std::numeric_limits<double>::infinity();
+  double ego_radius = 0.0;
+  double ego_angle = 0.0;
+  // 틈 선택(gap_select_enabled) 결과
+  int gap_leader_id = -1;
+  int gap_follower_id = -1;
+  double gap_depart_delay = std::numeric_limits<double>::infinity();
+  double future_departure = -1.0;
+  double future_front_gap = std::numeric_limits<double>::infinity();
+  double future_rear_gap = std::numeric_limits<double>::infinity();
+  std::string gap_switch_reason;
+  std::string observation_state="unknown";
+  double observation_stamp=-1.0, observed_free_length=0.0;
+  double physical_gap_length=0.0, preparation_speed=0.0, preparation_stop_distance=0.0;
+  double acceleration_start_delay=-1.0;
+  std::string entry_phase="waiting", trajectory_observation="unknown";
+  double approval_time=-1.0, approval_distance=-1.0, confirmation_time=0.0;
+  bool approval_latched=false;
+  std::vector<int> duplicate_track_ids;
+  double conflict_distance = std::numeric_limits<double>::infinity();
+  double ego_zone_time = std::numeric_limits<double>::infinity();
+  double ego_prediction_speed = 0.0;
+    double ego_reference_time = 0.0;
+    double ego_delay_remaining = 0.0;
+    bool ego_leader_limited = false, ego_curve_limited = false;
+  bool gap_select_active = false;       // 이번 주기에 틈 선택을 돌렸나
+  Point2 effective_conflict_point;      // 자동 판정 포함 실제 사용한 합류점
+  double conflict_angle = 0.0;
+  std::vector<RoundaboutGapViz> gaps;
+  std::vector<RoundaboutVehicleViz> stream;
+  double predicted_front_gap = std::numeric_limits<double>::infinity();
+  double predicted_rear_gap = std::numeric_limits<double>::infinity();
+  double current_rear_gap = std::numeric_limits<double>::infinity();
+  double required_rear_decel = 0.0;
+  double ego_clear_time = std::numeric_limits<double>::infinity();
+  double window_t_open = std::numeric_limits<double>::infinity(), window_t_close = std::numeric_limits<double>::infinity(), window_t_ego = std::numeric_limits<double>::infinity();
+  int window_ok_frames = 0, window_missed = 0;
+  bool acc_active = false; int acc_id = -1;
+  double acc_gap = 0.0, acc_gap_ref = 0.0, acc_lead_speed = 0.0, acc_v_des = 0.0, acc_a_des = 0.0;
+  std::string reason;
+};
+
+}  // namespace mission_planner

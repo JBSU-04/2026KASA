@@ -55,6 +55,11 @@ class ReverseEscape(object):
         self.split_idx = int(g('~static_dynamic_split_idx', 3700))
         self.dyn_max_idx = int(g('~dynamic_zone_max_idx', 4900))
         self.trigger_stop_sec = float(g('~trigger_stop_sec', 8.0))
+        # 2026-10-12: 터널은 '회피 반경 부족(엔진 공간 실패)이 tunnel_trigger_stop_sec 연속'이면 후진 탐색한다.
+        #   정지 8 s 타이머는 탈출 중 조금만 움직여도 0 부터 다시 세어 후진이 안 나왔다(21:51:17 백).
+        #   동→정 전환(인지, 1.5 s)과는 별개의 제어 타이머다.
+        self.tunnel_trigger_stop_sec = float(g('~tunnel_trigger_stop_sec', 3.0))
+        self.spatial_fail_since = None
         self.stop_speed = float(g('~stop_speed', 0.2))
         self.trigger_gap = float(g('~trigger_gap_m', 5.0))
         self.stale_dynamic_sec = float(g('~stale_dynamic_sec', 1.5))
@@ -201,6 +206,8 @@ class ReverseEscape(object):
         rospy.Subscriber('/tunnel/wall_limits', Float64MultiArray, self.wall_heading_cb, queue_size=1)
         rospy.Subscriber('/tunnel/background_ids', String, self.bg_cb, queue_size=1)
         rospy.Subscriber('/avoidance_failed', Bool, self.fail_cb, queue_size=1)
+        self.filtered_pipeline=bool(rospy.get_param('/tunnel_recovery/filtered_pipeline_enabled',False))
+        rospy.Subscriber('/groundgrid/nonground_exact',PointCloud2,self.filtered_rear_cb,queue_size=1,buff_size=2**24)
         rospy.Subscriber(g('~cloud_topic', '/perception/points_gravity'), PointCloud2, self.cloud_cb,
                          queue_size=1, buff_size=2 ** 24)
         rospy.Timer(rospy.Duration(0.05), self.tick)
@@ -362,13 +369,20 @@ class ReverseEscape(object):
         if m.data:
             self.avoid_fail_t = rospy.Time.now().to_sec()
 
-    def cloud_cb(self, m):
+    def filtered_rear_cb(self,m):
+        if self.filtered_pipeline and self.zone()=='tunnel':self.cloud_cb(m,filtered=True)
+
+    def cloud_cb(self, m, filtered=False):
         """후방 확인용 점만 저장(센서 좌표, 뒤범퍼 뒤, 높이 범위). 계산은 후진 판단/후진 중에만."""
-        pts = cloud_xyz(m)
+        if self.filtered_pipeline and self.zone()=='tunnel' and not filtered:return
+        if filtered:
+            from m8_filtered_input import cloud_rows
+            rows=cloud_rows(m);pts=rows[:,:3]
+        else:pts = cloud_xyz(m)
         if self.pose is None or m.header.frame_id != "velodyne_ground":
             return
         x0 = -(self.rear_overhang + self.sensor_x)          # 센서 좌표 뒤범퍼
-        h = pts[:, 2] - self.ground_z
+        h = rows[:,3] if filtered else pts[:, 2] - self.ground_z
         # 2026-10-07(20:01:54 백): MORAI 점군에는 자차 지붕 반사점이 매 프레임 ~770개 있다. 차체 안 점을 두면
         #   후진 탐색 시작 자세부터 body_clearance=0 -> 'no_collision_free_reverse' 로 후진이 한 번도 안 됐다.
         #   차체(후축 기준 -rear..front, |y|<=half) 안쪽 점은 자차라 버린다(그 공간엔 다른 물체가 있을 수 없다).
@@ -832,13 +846,22 @@ class ReverseEscape(object):
     def forward_selection_cb(self,msg):
         try:d=json.loads(msg.data)
         except (ValueError,TypeError):return
+        self.forward_mission_blocked=bool(d.get('mission_obstacle_blocked',False) or d.get('trigger_count',0)>0)
         self.forward_failure_reason=d.get('reason','')
         self.forward_failure_stamp=float(d.get('stamp',-1e9))
 
     def m8_escape_allowed(self,now):
-        spatial={'no_connected_corridor','corridor_dynamics_infeasible','occupancy','collision','no_valid_connector','curvature'}
-        return (now-getattr(self,'forward_failure_stamp',-1e9)<=.5 and
+        spatial={'no_connected_corridor','corridor_dynamics_infeasible','occupancy','collision','no_valid_connector'}
+        return (getattr(self,'forward_mission_blocked',False) and now-getattr(self,'forward_failure_stamp',-1e9)<=.5 and
                 getattr(self,'forward_failure_reason','') in spatial)
+
+    def tunnel_trigger_ready(self, now):
+        """터널 후진 탐색 시작: 회피 반경 부족(엔진 공간 실패)이 tunnel_trigger_stop_sec 연속."""
+        if not self.m8_escape_allowed(now):
+            self.joint_reason = 'waiting_spatial_failure_not_sensor_or_dynamic'
+            return False
+        since = getattr(self, 'spatial_fail_since', None)
+        return since is not None and now - since >= self.tunnel_trigger_stop_sec
 
     def tick(self, _evt):
         now = rospy.Time.now().to_sec()
@@ -848,6 +871,8 @@ class ReverseEscape(object):
         self.still_since = (self.still_since or now) if abs(v) < 0.05 else None
         hold = self.dyn_hold and now - self.dyn_t < 0.5
         cloud_ok = now - self.cloud_t < self.cloud_timeout
+        self.spatial_fail_since = ((getattr(self, 'spatial_fail_since', None) or now)
+                                   if self.m8_escape_allowed(now) else None)
         st = self.state
         if now-self.pose_t > .25 or now-self.speed_t > .5:
             if st != IDLE:
@@ -866,14 +891,16 @@ class ReverseEscape(object):
             zone = self.zone()
             if zone is None or self.stopped_since is None:
                 return
-            if now - self.stopped_since < self.trigger_stop_sec:
+            if zone == 'tunnel':
+                if not self.tunnel_trigger_ready(now):
+                    return
+            elif now - self.stopped_since < self.trigger_stop_sec:
                 return
             if hold:
                 return
-            if zone=='tunnel' and not self.m8_escape_allowed(now):
-                self.joint_reason='waiting_spatial_failure_not_sensor_or_dynamic'
-                return
             ob = self.blocking_obstacle(now)
+            if ob is None and zone=='tunnel':
+                self.joint_reason='no_verified_blocking_mission_object';return
             if ob is None:
                 # 2026-10-08(10:58:27 백): 앞범퍼 바로 앞에 멈춘 저상 물체(0.2 m)가 근거리 사각에 들어가 인지
                 #   목록에서 사라졌지만, 엔진 점유 지도는 기억해 회피 실패가 17 s 계속됐다. 인지에 막는 물체가

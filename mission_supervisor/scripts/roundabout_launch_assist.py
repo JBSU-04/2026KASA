@@ -19,11 +19,30 @@ MPC 피팅값은 건드리지 않고, MPC 출력과 정지 노드 사이에서 �
 페달 = max(MPC, min(accel_max, base + gain * (상한 - 속도))). 조향/브레이크는 그대로.
 """
 import rospy
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Float64MultiArray
 from morai_msgs.msg import CtrlCmd, EgoVehicleStatus
 from mission_planner_msgs.msg import MissionState
 
 COMMIT, CIRCULATE = 3, 4
+
+
+EXIT = 5
+
+
+def acc_accel(cmd_accel, cmd_brake, state, acc, speed, cap, p):
+    """2026-10-12 ACC 거리 유지 가속 보조. acc = (active, a_des, v_des). 보조하지 않으면 None.
+
+    진입/순환/이탈 중 미션 ACC 가 가속을 요구(a_des >= acc_min_accel)하고, MPC 가 제동 중이 아니며,
+    상한이 현재 속도보다 높을 때만 a_des 에 비례한 페달을 보탠다. 감속은 MPC 가 v_des 상한으로 한다."""
+    if acc is None or cmd_brake > 0.0 or cap is None or speed is None:
+        return None
+    active, a_des, v_des = acc
+    if not active or state not in (COMMIT, CIRCULATE, EXIT) or a_des < p['acc_min_accel']:
+        return None
+    if cap - speed < p['acc_min_margin'] or v_des - speed < p['acc_min_margin']:
+        return None
+    pedal = min(p['accel_max'], p['acc_base'] + p['acc_gain'] * a_des)
+    return max(cmd_accel, pedal)
 
 
 def assist_accel(cmd_accel, cmd_brake, state, circulate_age, speed, cap, p):
@@ -51,7 +70,14 @@ class RoundaboutLaunchAssist(object):
             min_margin=float(g('~min_margin', 0.5)),
             accel_max=float(g('~accel_max', 1.0)),
             base=float(g('~base', 0.6)),
-            gain=float(g('~gain', 0.2)))
+            gain=float(g('~gain', 0.2)),
+            acc_min_accel=float(g('~acc_min_accel', 0.2)),
+            acc_min_margin=float(g('~acc_min_margin', 0.2)),
+            acc_base=float(g('~acc_base', 0.15)),
+            acc_gain=float(g('~acc_gain', 0.25)))
+        self.handback_s = float(g('~handback_s', 0.3))
+        self.acc = None; self.acc_t = None
+        self.last_assist = 0.0; self.last_assist_t = -1e9
         self.stale = float(g('~stale_s', 0.3))
         self.enabled = bool(g('~enabled', True))
         self.state = self.state_t = None
@@ -64,6 +90,7 @@ class RoundaboutLaunchAssist(object):
         rospy.Subscriber('/mission/roundabout/state', MissionState, self.state_cb, queue_size=1)
         rospy.Subscriber(g('~cap_topic', '/smpc/target_speed_mps_gated'), Float64, self.cap_cb, queue_size=1)
         rospy.Subscriber('/Competition_topic', EgoVehicleStatus, self.ego_cb, queue_size=1)
+        rospy.Subscriber('/mission/roundabout/acc', Float64MultiArray, self.acc_cb, queue_size=1)
         rospy.Subscriber(g('~input_topic', '/ctrl_cmd_mpc'), CtrlCmd, self.cmd_cb, queue_size=1, tcp_nodelay=True)
 
     def state_cb(self, m):
@@ -74,6 +101,11 @@ class RoundaboutLaunchAssist(object):
 
     def cap_cb(self, m):
         self.cap, self.cap_t = m.data, rospy.Time.now().to_sec()
+
+    def acc_cb(self, m):
+        d = list(m.data)
+        if len(d) >= 7:
+            self.acc, self.acc_t = (d[0] > 0.5, d[6], d[5]), rospy.Time.now().to_sec()
 
     def ego_cb(self, m):
         self.speed, self.speed_t = m.velocity.x, rospy.Time.now().to_sec()
@@ -88,6 +120,18 @@ class RoundaboutLaunchAssist(object):
                 and self.fresh(self.cap_t, now) and self.fresh(self.speed_t, now)):
             age = now - self.circ_since if self.circ_since is not None else None
             acc = assist_accel(cmd.accel, cmd.brake, self.state, age, self.speed, self.cap, self.p)
+            acc_state = self.acc if self.fresh(self.acc_t, now) else None
+            follow = acc_accel(cmd.accel, cmd.brake, self.state, acc_state, self.speed, self.cap, self.p)
+            if follow is not None:
+                acc = follow if acc is None else max(acc, follow)
+        # 보조가 끝나면 handback_s 동안 페달을 MPC 값으로 서서히 넘긴다(MPC 적분기 차이로 인한 페달 급변 방지).
+        #   감속 요구(상한 < 속도)나 MPC 제동이 있으면 바로 MPC 명령을 따른다.
+        faded = False
+        if (acc is None and cmd.brake <= 0.0 and now - self.last_assist_t < self.handback_s and
+                self.cap is not None and self.speed is not None and self.cap >= self.speed):
+            fade = self.last_assist * (1.0 - (now - self.last_assist_t) / max(1e-3, self.handback_s))
+            if fade > cmd.accel:
+                acc, faded = fade, True
         if acc is not None and acc > cmd.accel:
             out = CtrlCmd(longlCmdType=cmd.longlCmdType, accel=acc, brake=0.0, steering=cmd.steering,
                           velocity=cmd.velocity, acceleration=cmd.acceleration)
@@ -95,6 +139,8 @@ class RoundaboutLaunchAssist(object):
                 rospy.loginfo('[launch_assist] 출발 보조 시작 v=%.2f cap=%.2f pedal %.2f->%.2f',
                               self.speed, self.cap, cmd.accel, acc)
             self.active = True
+            if not faded:
+                self.last_assist, self.last_assist_t = acc, now
             self.pub.publish(out)
             self.dbg.publish(Float64(acc))
             return

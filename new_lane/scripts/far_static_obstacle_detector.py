@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0,os.path.dirname(os.path.realpath(__file__)))
 from tunnel_map_geometry import fields_array
 from temporal_components import connected_components
+from m8_filtered_input import WallSurface, filtered_cloud, far_ground_working_set
 from obstacle_geometry import measured_geometry, pose_at, regional_plane_heights
 from collections import deque
 
@@ -152,7 +153,14 @@ class FarStaticDetector:
         self.hold_sec = float(rospy.get_param('~proposal_hold_sec', 1.25))
         self.tracked = []      # [{'id', 'xy', 'stamp', 'proposal'}]
         self.next_id = 900001
-        self.map_enabled=bool(rospy.get_param("/tunnel_recovery/enabled",True))
+        self.cpp_prefilter=bool(rospy.get_param("/tunnel_recovery/cpp_prefilter_enabled",False))
+        import threading
+        self.far_queue=threading.Condition();self.far_pending=None;self.far_processing=threading.Lock()
+        self.filtered_pipeline=bool(rospy.get_param("/tunnel_recovery/filtered_pipeline_enabled",False))
+        self.wall_surface=WallSurface.load(rospy.get_param("/tunnel_recovery/wall_profile_file",None)) if self.filtered_pipeline else None
+        self.filtered_pub=rospy.Publisher("/tunnel/filtered_far",PointCloud2,queue_size=1)
+        self.map_build_pub=rospy.Publisher("/tunnel/filtered_background_input",PointCloud2,queue_size=1)
+        self.map_enabled=bool(rospy.get_param("/tunnel_recovery/enabled",True)) and not self.filtered_pipeline
         self.map_stamp=-1e9
         self.section = ''
         self.pose = None
@@ -170,7 +178,7 @@ class FarStaticDetector:
         rospy.Subscriber('/mission/active_section', SectionState, self._section, queue_size=1)
         rospy.Subscriber('/odom', Odometry, self._odom, queue_size=1)
         rospy.Subscriber('/final_waypoint', Lane, self._route, queue_size=1)
-        rospy.Subscriber('/tunnel/map_foreground',PointCloud2,self._map_cloud,queue_size=1,buff_size=2**24)
+        if not self.filtered_pipeline:rospy.Subscriber('/tunnel/map_foreground',PointCloud2,self._map_cloud,queue_size=1,buff_size=2**24)
         rospy.Subscriber('/perception/points_gravity', PointCloud2, self._cloud,
                          queue_size=1, buff_size=8 * 1024 * 1024)
 
@@ -256,10 +264,32 @@ class FarStaticDetector:
         self.marker_pub.publish(MarkerArray(markers=[clear]))
 
     def _map_cloud(self,msg):
-        if self.section!='M8' or not getattr(self,'map_enabled',True):return
+        if self.filtered_pipeline or self.section!='M8' or not getattr(self,'map_enabled',True):return
         self.map_stamp=msg.header.stamp.to_sec();self._cloud(msg)
 
-    def _cloud(self, msg):
+    def _far_loop(self):
+        while not rospy.is_shutdown():
+            with self.far_queue:
+                if self.far_pending is None:self.far_queue.wait(.1)
+                if self.far_pending is None:continue
+                msg=self.far_pending;self.far_pending=None
+            with self.far_processing:
+                if self.section!='M8':continue
+                try:self._cloud_process(msg)
+                except Exception as exc:rospy.logerr_throttle(2.,'M8 far worker: %s',exc)
+
+    def _cloud(self,msg):
+        if self.cpp_prefilter and self.section=='M8':
+            import threading
+            if not hasattr(self,'far_worker'):
+                self.far_worker=threading.Thread(target=self._far_loop,daemon=True);self.far_worker.start()
+            with self.far_queue:
+                if self.far_pending is None or msg.header.stamp>self.far_pending.header.stamp:
+                    self.far_pending=msg;self.far_queue.notify()
+            return
+        with self.far_processing:self._cloud_process(msg)
+
+    def _cloud_process(self, msg):
         annotated=self.section=='M8' and any(f.name=='map_label' for f in msg.fields)
         if self.section=='M8' and not annotated and rospy.Time.now().to_sec()-getattr(self,'map_stamp',-1e9)<.35:return
         stamp = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
@@ -269,11 +299,14 @@ class FarStaticDetector:
         if scan_pose is None:
             self._empty(stamp);return
         p = _xyz(msg)
+        if self.cpp_prefilter and self.section=='M8':
+            p=far_ground_working_set(p,self.x_min,self.x_max,self.y_max,self.plane_fit_x,self.section_y_limits.get(self.section,[-self.y_max,self.y_max]))
         height = p[:, 2] - self.ground_z
         h_max = float(self.section_h_max.get(self.section, self.h_max))
         if self.section in self.plane_sections and not annotated:
             plane_h = self._plane_height(p)
             if plane_h is None:
+                if self.section=="M8" and self.filtered_pipeline:self.filtered_pub.publish(filtered_cloud(msg.header,np.empty((0,4))))
                 self._empty(stamp); return      # 지면을 못 잡으면 제안하지 않는다
             height = plane_h
             # 2026-10-09(14:56:06 백): 평면 하나는 종단 경사 변화 구간에서 30 m 앞 노면을 0.2 m 위로 띄워
@@ -296,6 +329,12 @@ class FarStaticDetector:
             keep &= (p[:, 1] >= float(lim[0])) & (p[:, 1] <= float(lim[1]))
         p = p[keep]
         hloc = height[keep]
+        if self.section=="M8" and self.filtered_pipeline:
+            rows=np.column_stack([p,hloc])
+            self.map_build_pub.publish(filtered_cloud(msg.header,rows))
+            rows=rows[self.wall_surface.keep(rows,scan_pose,(self.sensor_x,self.sensor_y))]
+            self.filtered_pub.publish(filtered_cloud(msg.header,rows))
+            p=rows[:,:3].astype(np.float32);hloc=rows[:,3]
         if len(p):
             # One sample per voxel per scan prevents a dense scan from satisfying
             # the temporal confirmation rule by itself.
@@ -330,7 +369,7 @@ class FarStaticDetector:
             if len(route_tan) == len(route):
                 tx, ty = route_tan[j, 0], route_tan[j, 1]
                 lat = -ty * (world[:, 0] - route[j, 0]) + tx * (world[:, 1] - route[j, 1])
-                if path_lim is not None and len(path_lim) >= 2:
+                if path_lim is not None and len(path_lim) >= 2 and not (self.section=="M8" and self.filtered_pipeline):
                     lo = np.full(len(lat), float(path_lim[0]))
                     hi = np.full(len(lat), float(path_lim[1]))
                     if (self.wprof is not None and self.section in self.profile_sections and
@@ -346,7 +385,7 @@ class FarStaticDetector:
                         hi = np.where(l_ok, l - self.profile_margin, hi)
                     keep &= (lat >= lo) & (lat <= hi)
                 # 우측 연석 제외: 횡거리가 연석선 - margin 보다 바깥이면 뺀다.
-                if len(route_idx) == len(route):
+                if len(route_idx) == len(route) and not (self.section=="M8" and self.filtered_pipeline):
                     line = self._curb_line(route_idx[j])
                     keep &= ~(lat < -(line - self.curb_margin))
             world = world[keep]

@@ -58,6 +58,22 @@ def projection(obs,yaw):
     return [min(a),max(a),min(b),max(b)]
 
 
+def support_subset(points, voxel=.1, cap=300):
+    """2026-10-12 트랙 지지점 축약: voxel 격자당 1점, 최대 cap 점.
+
+    19:09:58 백에서 벽 조각 트랙의 지지점 합이 2만~3.2만 점(near JSON 2.5~4 MB)이 되어
+    검출 연관 KD-tree, JSON, 병합 노드가 스캔 주기를 넘겼다. 0.12 m 표면 일치 판정은 0.1 m 격자로 유지된다."""
+    q = np.asarray(points, dtype=np.float64)
+    if q.ndim != 2 or len(q) == 0:
+        return q.reshape(0, 3)
+    if voxel > 0:
+        _, first = np.unique(np.floor(q[:, :3] / voxel).astype(np.int64), axis=0, return_index=True)
+        q = q[np.sort(first)]
+    if cap > 0 and len(q) > cap:
+        q = q[np.linspace(0, len(q) - 1, cap).astype(int)]
+    return q
+
+
 def measured_geometry(points, yaw, min_extent=.35):
     """One contract for both detectors. No shifted origin, size cap or range padding.
 

@@ -4,6 +4,13 @@ import numpy as np
 from scipy.spatial import cKDTree
 from tunnel_scene_policy import tag_reference_corridor
 
+def detector_profile(profiles,zone,shared=True):
+    """M8 uses the M2 detection profile; physical walls are handled before detection."""
+    base=profiles.get('static' if zone=='static_preview' else zone,{})
+    if zone!='tunnel' or not shared:
+        return dict(base)
+    return dict(profiles.get('static',{}))
+
 
 class SurfaceMotion:
     """M8 admission from independent observed surfaces, not a growing box centre.

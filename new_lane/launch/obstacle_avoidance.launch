@@ -1,4 +1,14 @@
 <launch>
+  <arg name="tunnel_cpp_prefilter" default="true"/>
+  <param name="/tunnel_recovery/cpp_prefilter_enabled" value="$(arg tunnel_cpp_prefilter)"/>
+  <!-- Mission input is independent of detector, far proposals and map processing. -->
+  <node if="$(arg tunnel_cpp_prefilter)" pkg="new_lane" type="tunnel_prefilter_node" name="tunnel_prefilter" output="screen">
+    <param name="wall_route" value="$(find waypoint_system)/data/default/3.csv"/>
+    <rosparam command="load" file="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
+  </node>
+  <node unless="$(arg tunnel_cpp_prefilter)" pkg="new_lane" type="tunnel_map_filter_node" name="tunnel_filtered_input" output="screen">
+    <param name="join_only" value="true"/>
+  </node>
   <arg name="tunnel_map_enabled" default="true"/>
   <arg name="tunnel_static_map" default="$(find new_lane)/config/tunnel_static_gps_20261009.npz"/>
   <arg name="tunnel_map_backend" default="cpp"/>
@@ -36,12 +46,13 @@
     <arg name="tl_guard_enabled" value="$(arg tl_guard_enabled)"/>
   </include>
 
-  <arg name="tunnel_common_scene_enabled" default="true"/>
-  <arg name="tunnel_native_scene_enabled" default="true"/>
+  <arg name="tunnel_common_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
+  <arg name="tunnel_native_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_wall_profile_file" default="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
   <arg name="tunnel_physical_boundary_policy" default="true"/>
-  <arg name="tunnel_verified_background_filter_enabled" default="true"/>
+  <arg name="tunnel_verified_background_filter_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_continuous_transition_enabled" default="true"/>
+  <param name="/tunnel_recovery/cpp_prefilter_enabled" value="$(arg tunnel_cpp_prefilter)"/>
   <param name="/tunnel_recovery/common_scene_enabled" value="$(arg tunnel_common_scene_enabled)"/>
   <node if="$(arg tunnel_common_scene_enabled)" name="tunnel_perception_scene" pkg="occupancy_avoidance" type="tunnel_perception_scene_node" output="screen" respawn="true">
     <rosparam command="load" file="$(find occupancy_avoidance)/config/avoidance.yaml"/>
@@ -105,7 +116,8 @@
     <param name="tunnel_wall_limits_timeout" value="0.5" />
     <param name="tunnel_lidar_kick_enabled" value="true" />
     <!-- 2026-09-30: 20 -> 35 m (선감속 범위) -->
-    <param name="tunnel_kick_range_m" value="35.0" />
+    <param name="tunnel_kick_range_m" value="25.0" />
+    <param name="tunnel_kick_min_mps" value="4.0" />
     <!-- 음영구간 선감속 속도 [m/s] (2026-09-29). 정동적(M3) 카메라 선감속은 /speed_limit/camera_kick_mps 그대로. -->
     <!-- 2026-09-30: 6.5 -> 6.0 m/s -->
     <param name="tunnel_kick_target_mps" value="6.0" />
@@ -900,7 +912,7 @@
     <param name="deadband_m" value="0.6" />
     <param name="kick_enabled" value="true" />
     <!-- 2026-09-30: 20 -> 35 m (선감속 범위, 후보 기억 범위와 같음) -->
-    <param name="kick_range_m" value="35.0" />
+    <param name="kick_range_m" value="25.0" />
     <param name="kick_min_x_m" value="3.0" />
     <!-- 선감속 영역 경계 = 벽에서 1.0 m 안쪽(턱 0.5 + 0.5, 출구부 턱이 -3.3 m 까지 나옴). 제한선(curb_inset)과 별개. -->
     <param name="kick_wall_inset_m" value="1.0" />
@@ -939,7 +951,7 @@
          0.5 m 칸 연결 성분(점 4 개 이상)을 스캔마다 이어 붙여
            빠름: 0.35 s 안에 0.5 m 이상(횡 0.4 m 이상) / 느림: 1.2 s(0.8 s 이상 이력) 안에 횡 0.55 m 이상,
          구간별 같은 방향, 횡이동이 종이동의 절반 이상이면 움직이는 물체(~0.7 m/s 까지). -->
-    <param name="bg_motion_enabled" value="true" />
+    <param name="bg_motion_enabled" value="false" />
     <param name="bg_motion_fast_window" value="0.35" />
     <param name="bg_motion_fast_move_m" value="0.5" />
     <param name="bg_motion_slow_window" value="1.2" />
@@ -963,6 +975,7 @@
 
   <rosparam command="load" file="$(find new_lane)/config/tunnel_recovery.yaml"/>
   <param name="/tunnel_recovery/approach_route_csv" value="$(find waypoint_system)/data/default/3.csv"/>
+  <param name="/tunnel_recovery/cpp_prefilter_enabled" value="$(arg tunnel_cpp_prefilter)"/>
   <param name="/tunnel_recovery/common_scene_enabled" value="$(arg tunnel_common_scene_enabled)"/>
   <param name="/tunnel_recovery/continuous_transition_enabled" value="$(arg tunnel_continuous_transition_enabled)"/>
   <param name="/tunnel_recovery/native_scene_enabled" value="$(arg tunnel_native_scene_enabled)"/>

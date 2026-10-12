@@ -36,6 +36,7 @@ class StaticOccupancy:
         self.max_length_m,self.max_width_m=max_length_m,max_width_m
         self.far_min_top_m=.25
         self.far_confirm_min_x,self.far_confirm_max_x,self.far_confirm_sec=7.7,16.,1.
+        self.far_lost_min_x,self.far_lost_sec=13.,.6
         self.parents={};self.next_id=1000000;self.mode=None
         self._ray_cache=None
 
@@ -159,6 +160,8 @@ class StaticOccupancy:
                       o.get('motion_state')!='dynamic' and not background and
                       (mode!='tunnel' or o.get('motion_state')=='static' or
                        float(o.get('stationary_sec',0.))>=.8 or o.get('source')=='raw_temporal_far'))
+            if mode=='tunnel' and getattr(self,'shared_detector_policy',False):
+                eligible=eligible and o.get('motion_state')=='static'
             if pid is None:
                 if not(eligible and fresh) or o.get('passed',False):continue
                 reference_yaw=float(o.get('geometry_reference_yaw',o['footprint_yaw']))
@@ -189,6 +192,7 @@ class StaticOccupancy:
                 continue
             p['background_hits']=0
             p['owners'].add((o.get('source','lidar_only'),int(o.get('id',-1))))
+            if o.get('source')=='raw_temporal_far':p['far_seen']=now
             mapped[id(o)]=pid;live.add(pid)
             if fresh:current.setdefault(pid,[]).extend(footprint(o))
             if fresh:
@@ -277,17 +281,14 @@ class StaticOccupancy:
                     p['history'][-1]=(previous[0],b,eligible,o.get('source','lidar_only'))
                 p['updated']=now
                 if o.get('source')!='raw_temporal_far' or p['object'].get('source')=='raw_temporal_far':p['object']=copy.deepcopy({k:v for k,v in o.items() if k not in ('support_points_world','geometry_seed_footprint_world')})
-        # 원거리 단독 부모가 근거리 시야(센서 앞 6.6~15 m)에 1 s 넘게 있는데 근거리 관측이 안 붙으면 지운다.
-        #   근거리가 볼 수 있는 자리에서 못 봤다면 원거리 오검출(노면 등)이다.
+        # 2026-10-11 M8 최종: 터널에서 GroundGrid 근거리는 14 m(저상 6 m) 밖을 못 보므로 '근거리 확인 없으면 삭제'는
+        #   실제 장애물(21:24:39 저상 0.45 m)을 지운다. 원거리 단독 부모는 원거리가 볼 수 있는 거리(far_lost_min_x 이상)에서
+        #   far_lost_sec 넘게 다시 안 보일 때만 오검출로 지우고, 그보다 가까우면 근거리 인계/통과까지 유지한다.
         if mode=='tunnel':
             for pid,p in list(self.parents.items()):
-                if any(src!='raw_temporal_far' for src,_ in p['owners']):
-                    p.pop('far_unconfirmed_since',None);continue
+                if any(src!='raw_temporal_far' for src,_ in p['owners']):continue
                 fwd=min(c*(x-ex)+s*(y-ey) for x,y in self.corners(p))
-                if self.far_confirm_min_x<=fwd<=self.far_confirm_max_x:
-                    since=p.setdefault('far_unconfirmed_since',now)
-                    if now-since>self.far_confirm_sec:del self.parents[pid]
-                else:p.pop('far_unconfirmed_since',None)
+                if fwd>=self.far_lost_min_x and now-p.get('far_seen',now)>self.far_lost_sec:del self.parents[pid]
         canonical={}
         if mode=='tunnel' and getattr(self,'native_clear_enabled',False) and any(p.get('support') and abs(float(p.get('stamp',-1e9))-float(root.get('geometry_scan',{}).get('stamp',-1e9)))>1e-6 for p in self.parents.values()):
             scan=root.get('geometry_scan',{})
@@ -344,11 +345,25 @@ class Merger:
         self.compute_lock=threading.RLock()
         self.native_condition=threading.Condition()
         self.native_pending=None
+        self.cpp_prefilter=bool(rospy.get_param('/tunnel_recovery/cpp_prefilter_enabled',False))
+        self.json_condition=threading.Condition();self.json_pending={}
         self.native_worker_enabled=bool(rospy.get_param("~native_worker_enabled",True))
         self.route = []
         self.background_ids = set()
         self.background_time = 0.
         self.road_profile = rospy.get_param("/obstacle_avoidance_node/road_width_profile", [])
+        # 2026-10-11 M8 최종: 터널 벽 = 연석형 제한 구역. 실측 벽 경계(tunnel_wall_profile) 너머 물체는 제외한다.
+        self.tunnel_wall_rows=None;self.tunnel_wall_offset=0.;self.tunnel_wall_offset_stamp=-1e9
+        try:
+            import yaml
+            fn=rospy.get_param('/tunnel_recovery/wall_profile_file',os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','config','tunnel_wall_profile.yaml'))
+            flat=yaml.safe_load(open(fn))['tunnel_wall_profile']
+            self.tunnel_wall_rows=sorted([flat[i:i+3] for i in range(0,len(flat)-2,3)])
+        except Exception as e:
+            rospy.logwarn('[obstacle_info_merger] tunnel wall profile load failed: %s',e)
+        def _wall_offset_cb(m):
+            self.tunnel_wall_offset=float(m.data);self.tunnel_wall_offset_stamp=rospy.Time.now().to_sec()
+        rospy.Subscriber('/tunnel/wall_offset',Float64,_wall_offset_cb,queue_size=1)
         self.vehicle_half_width = float(rospy.get_param("/obstacle_avoidance_node/vehicle_half_width", .95))
         self.curb_enabled = bool(rospy.get_param("/obstacle_avoidance_node/right_curb_skip_enabled", True))
         self.curb_margin = float(rospy.get_param("/obstacle_avoidance_node/right_curb_skip_margin", 0.))
@@ -374,6 +389,7 @@ class Merger:
         rospy.Subscriber('/odom', Odometry, self.cb_odom, queue_size=1)
         rospy.Subscriber('/final_waypoint', Lane, self.cb_route, queue_size=1)
         self.occupancy.preserve_surface_certificate=bool(rospy.get_param('/tunnel_recovery/surface_certificate_hold_enabled',True))
+        self.occupancy.shared_detector_policy=bool(rospy.get_param('/tunnel_recovery/shared_detector_policy_enabled',True))
         self.tunnel_region=read_region(rospy.get_param)
         self.tunnel_shadow_first=next((int(s['idx'][0])for s in rospy.get_param('/section_router/sections',[])if s.get('id')=='M8'),self.tunnel_region[1])
         self.random_active=False;self.random_active_stamp=-1e9
@@ -513,8 +529,13 @@ class Merger:
         if mode=='tunnel' and getattr(self,'native_scene_enabled',False) and getattr(self,'common_scene_enabled',False):
             if o.get('background_excluded') and -.05<=now-float(o.get('background_evidence_stamp',-1e9))<=.35:return 'verified_same_scan_3d_background'
             return None # legacy ID/morphology filters do not override the common source
-        if self.occupancy.real_motion(o):return None
         oid=int(o.get('observed_track_id',o.get('id',-1)))
+        if mode=='tunnel':
+            # 2026-10-12(19:09:58 백): 벽 조각 트랙이 자차 속도로 '움직여' real_motion 으로 벽 제외를 건너뛰었다.
+            #   터널 벽 너머에는 동적 물체가 있을 수 없으므로 벽 판정을 움직임 판정보다 먼저 한다.
+            why=self.wall_hysteresis(oid,self.outside_tunnel_wall(o,now) or self.co_moving_wall_track(o),now)
+            if why:return why
+        if self.occupancy.real_motion(o):return None
         if mode=='tunnel' and 0<=now-self.background_time<=.5 and oid in self.background_ids:
             return 'tunnel_background_map'
         if not getattr(self,'curb_enabled',True) or mode not in ('static','static_preview','static_obstacle') or len(self.route)<2:return None
@@ -543,12 +564,71 @@ class Merger:
         if flags and all(f[1] for f in flags):return 'outside_measured_left_boundary'
         return None
 
+    def wall_hysteresis(self,oid,why,now):
+        """한 번 벽으로 제외된 트랙은 hold 초 연속 경계 안쪽이어야 다시 포함한다(출구 50.8 s 제외 -> 51.0 s 해제 -> 정지)."""
+        if oid<0:return why
+        state=self.__dict__.setdefault('wall_exclusion',{})
+        hold=getattr(self,'tunnel_wall_release_sec',.5)
+        if why:
+            state[oid]=[why,now,None];return why
+        s=state.get(oid)
+        if s is None:return None
+        if now-s[1]>3.:state.pop(oid,None);return None
+        if s[2] is None:s[2]=now
+        if now-s[2]<hold:return s[0]
+        state.pop(oid,None);return None
+
+    def co_moving_wall_track(self,o):
+        """길이 > 8 m, 경로와 평행, 세계 속도가 자차 속도 +-1 m/s 인 물체 = 벽 조각을 이어 붙인 추적(실제 정지 벽)."""
+        try:
+            length=max(float(o.get('length',0.)),float(o.get('width',0.)))
+            v=o.get('observed_velocity',o.get('velocity',[0.,0.]))
+            vx,vy=float(v[0]),float(v[1])
+        except (TypeError,ValueError,IndexError):return None
+        ego=getattr(self,'ego_speed',None)
+        if ego is None or length<=getattr(self,'tunnel_wall_track_length',8.) or self.pose is None:return None
+        speed=math.hypot(vx,vy)
+        if speed<.6 or abs(speed-abs(ego))>1.:return None
+        yaw=self.pose[2];along=abs(vx*math.cos(yaw)+vy*math.sin(yaw))/speed
+        return 'tunnel_wall_co_moving_track' if along>=math.cos(math.radians(20.)) else None
+
+    def outside_tunnel_wall(self,o,now):
+        """모든 외곽선 모서리가 실측 벽 경계(+tunnel_wall_margin) 너머면 이유 문자열. 벽에 붙은 장애물은 남는다.
+
+        추측항법 횡 드리프트는 /tunnel/wall_offset 으로 보정한다(실제 횡거리 = 계산 횡거리 - offset)."""
+        rows=getattr(self,'tunnel_wall_rows',None)
+        if not rows or len(self.route)<2:return None
+        off=self.tunnel_wall_offset if 0<=now-getattr(self,'tunnel_wall_offset_stamp',-1e9)<=.5 else 0.
+        margin=getattr(self,'tunnel_wall_margin',.1)
+        def side(q):
+            j=min(range(len(self.route)),key=lambda i:(q[0]-self.route[i][0])**2+(q[1]-self.route[i][1])**2)
+            j=min(j,len(self.route)-2);a,b=self.route[j],self.route[j+1]
+            if a[3]!=3:return (False,False)
+            dx,dy=b[0]-a[0],b[1]-a[1];n=math.hypot(dx,dy)
+            if n<1e-6:return (False,False)
+            lat=(-dy*(q[0]-a[0])+dx*(q[1]-a[1]))/n-off
+            idx=a[2]+max(0.,min(1.,((q[0]-a[0])*dx+(q[1]-a[1])*dy)/(n*n)))*(b[2]-a[2])
+            if idx<rows[0][0] or idx>rows[-1][0]:return (False,False)
+            for lo,hi in zip(rows,rows[1:]):
+                if lo[0]<=idx<=hi[0]:
+                    if lo[1]>=0 or hi[1]>=0:right=None
+                    else:right=lo[1]+(idx-lo[0])/max(1.,hi[0]-lo[0])*(hi[1]-lo[1])
+                    if lo[2]<=0 or hi[2]<=0:left=None
+                    else:left=lo[2]+(idx-lo[0])/max(1.,hi[0]-lo[0])*(hi[2]-lo[2])
+                    return (right is not None and lat<right-margin, left is not None and lat>left+margin)
+            return (False,False)
+        flags=[side(q) for q in footprint(o)]
+        if flags and all(f[0] for f in flags):return 'outside_tunnel_wall_right'
+        if flags and all(f[1] for f in flags):return 'outside_tunnel_wall_left'
+        return None
+
     def cb_odom(self, msg):
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
         with self.lock:
             self.pose = (p.x, p.y, yaw)
             self.pose_stamp = msg.header.stamp.to_sec()
+            self.ego_speed = msg.twist.twist.linear.x
 
     @staticmethod
     def parse(msg):
@@ -556,7 +636,39 @@ class Merger:
         except Exception as e:
             rospy.logwarn_throttle(2.0, 'obstacle_info_merger JSON error: %s', e); return {}
 
+    def _queue_json(self,msg,source):
+        if not (getattr(self,'cpp_prefilter',False) and self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True)):return False
+        if not hasattr(self,'json_worker'):
+            self.json_worker=threading.Thread(target=self._json_loop,daemon=True);self.json_worker.start()
+        with self.json_condition:
+            self.json_pending[source]=(msg,time.perf_counter(),rospy.Time.now());self.json_condition.notify()
+        return True
+
+    def _json_loop(self):
+        while not rospy.is_shutdown():
+            with self.json_condition:
+                if not self.json_pending:self.json_condition.wait(.1)
+                if not self.json_pending:continue
+                pending=self.json_pending;self.json_pending={}
+            begin=time.perf_counter();wait=(begin-min(v[1] for v in pending.values()))*1000.
+            try:
+                with self.compute_lock:
+                    if not (self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True)):continue
+                    accepted=False
+                    for source,(msg,queued,received) in pending.items():
+                        data=self.parse(msg);stamp=float(data.get('stamp',-1.))
+                        if not -.05<=rospy.Time.now().to_sec()-stamp<=.35:continue
+                        with self.lock:
+                            if source=='near':self.near=(data,received)
+                            else:self.far=(data,received)
+                        accepted=True
+                    if accepted:self.publish()
+            except Exception as exc:rospy.logerr_throttle(2.,'M8 merger worker: %s',exc)
+            self.merger_queue_pub.publish(Float64(data=wait))
+            self.merger_compute_pub.publish(Float64(data=(time.perf_counter()-begin)*1000.))
+
     def cb_near(self, msg):
+        if self._queue_json(msg,'near'):return
         if (getattr(self,'native_scene_enabled',False) and getattr(self,'common_scene_enabled',False) and self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True)):return
         data=self.parse(msg)
         with self.compute_lock:
@@ -564,6 +676,7 @@ class Merger:
             self.publish()
 
     def cb_far(self, msg):
+        if self._queue_json(msg,'far'):return
         data=self.parse(msg)
         if (self.native_scene_enabled and self.common_scene_enabled and self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True)):
             with self.lock:self.far=(data,rospy.Time.now())
@@ -630,14 +743,20 @@ class Merger:
             for o in root.get('collision_objects',[]) if o.get('background_excluded')]
         for pid,p in list(self.occupancy.parents.items()):
             held=dict(p['object'],footprint_world=p.get('model_poly',self.occupancy.corners(p)))
-            if self.background_reason(held,mode,now.to_sec()) in ('outside_measured_right_curb','outside_measured_left_boundary'):
+            if self.background_reason(held,mode,now.to_sec()) in ('outside_measured_right_curb','outside_measured_left_boundary','outside_tunnel_wall_right','outside_tunnel_wall_left','tunnel_wall_co_moving_track'):
                 del self.occupancy.parents[pid]
         if (getattr(self,'native_scene_enabled',False) and getattr(self,'common_scene_enabled',False) and mode=='tunnel' and self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True)):
             stamp=float(root.get('geometry_scan',{}).get('stamp',-1.))
             if stamp<=self.detector_stamp or stamp<=self.coordinate_stamp:return
         pose = self.pose if 0 <= now.to_sec()-self.pose_stamp <= .5 else None
-        if native_m8 and self.restatic_enabled:
-            self.stationary_handoff.update(root,float(root.get('geometry_scan',{}).get('stamp',-1.)),self.route,self.coordinate_version)
+        # 2026-10-11 M8 최종: 동적으로 인지한 물체가 5 s 같은 자리에서 경로를 막으면 정적(m8_restatic)으로 바꿔 회피한다.
+        #   native 가 아닌 정동적 경로에서도 같은 판정을 쓴다(스캔 시각이 없으면 이번 근거리 스캔 물체의 최신 last_seen).
+        if getattr(self,'restatic_enabled',False) and (native_m8 or mode=='tunnel'):
+            hstamp=float(root.get('geometry_scan',{}).get('stamp',-1.))
+            if hstamp<0:
+                seen=[float(o.get('last_seen',-1.)) for o in root.get('collision_objects',[]) if o.get('source')!='raw_temporal_far']
+                hstamp=max(seen) if seen else -1.
+            if hstamp>0:self.stationary_handoff.update(root,hstamp,self.route,self.coordinate_version)
         root = self.occupancy.update(root, pose, now.to_sec())
         preparing=(getattr(self,'common_scene_enabled',False) and self.route and contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True))
         if mode=='tunnel' and preparing:
@@ -685,7 +804,14 @@ class Merger:
         for key in ('obstacles','collision_objects'):
             for o in root.get(key,[]):
                 o.pop('support_points_world',None);o.pop('geometry_seed_footprint_world',None)
-        if preparing and not self.common_m8():
+        # 2026-10-12: 공용 장면을 꺼도 같은 경계를 쓴다. 인지는 터널 벽 60 m 전부터 준비(장애물 누적)하고,
+        #   제어는 터널 벽 25 m 전(tunnel_region 제어 시작, idx 7101)부터만 받는다. 그 전 M8 구간(7001~7100)에서
+        #   회피 노드가 터널 모드로 엔진 경로를 기다리다 엔진 미활성으로 정지했다(21:50:53, 21:52:02, 21:52:49 백).
+        preview_only=preparing and not self.common_m8()
+        if not getattr(self,'common_scene_enabled',False) and mode=='tunnel' and self.route:
+            preview_only=(contains(self.tunnel_region,self.route[0][3],self.route[0][2],prepare=True) and
+                          not contains(self.tunnel_region,self.route[0][3],self.route[0][2]))
+        if preview_only:
             root['mission_mode']='out_of_section'
             root['obstacles']=[];root['collision_objects']=[] # Perception preview cannot arm control.
         self.pub.publish(String(data=json.dumps(root, separators=(',', ':'))))

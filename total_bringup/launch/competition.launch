@@ -1,10 +1,11 @@
 <launch>
-  <arg name="tunnel_common_scene_enabled" default="true"/>
-  <arg name="tunnel_native_scene_enabled" default="true"/>
+  <arg name="tunnel_cpp_prefilter" default="true"/>
+  <arg name="tunnel_common_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
+  <arg name="tunnel_native_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_wall_profile_file" default="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
   <arg name="tunnel_physical_boundary_policy" default="true"/>
   <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_gps_20261009.bin"/>
-  <arg name="tunnel_verified_background_filter_enabled" default="true"/>
+  <arg name="tunnel_verified_background_filter_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_continuous_transition_enabled" default="true"/>
   <!-- M8: DR plus validated X-ICP yaw; dr/ufld remain explicit rollback modes. -->
   <arg name="tunnel_heading_mode" default="xicp"/>
@@ -180,6 +181,7 @@
 
   <group if="$(arg enable_planning)">
     <include file="$(find total_bringup)/launch/layers/planning.launch">
+      <arg name="tunnel_cpp_prefilter" value="$(arg tunnel_cpp_prefilter)"/>
       <arg name="tunnel_common_scene_enabled" value="$(arg tunnel_common_scene_enabled)"/>
       <arg name="tunnel_native_scene_enabled" value="$(arg tunnel_native_scene_enabled)"/>
       <arg name="tunnel_wall_profile_file" value="$(arg tunnel_wall_profile_file)"/>
@@ -316,7 +318,7 @@
               /tunnel/xicp/status /tunnel/xicp/comparison_pose
               /tunnel/lidar_obstacle_distance /obstacle_avoidance/frenet_d
               /tunnel/wall_yaw_error /tunnel/bg_markers /localization/dr_pose
-              /obstacle_stop/dynamic_state /obstacle_avoidance/validation_debug /tunnel/background_ids /tunnel/bg_moving /tunnel/bg_candidates_debug /tunnel/map_state /tunnel/nonground_filter_state /tunnel/map_total_processing_ms /tunnel/map_input_age_ms /tunnel/merger_processing_ms /tunnel/merger_queue_ms /tunnel/scene_processing_ms /tunnel/scene_input_age_ms /tunnel/planning_input_age_ms /tunnel/perception_scene /tunnel/preslow_state /localization/frame_update /tunnel/heading/state /localization/speed_valid /localization/speed_state /tunnel/detection_processing_ms /tunnel/detection_queue_ms /tunnel/lane_heading/state /tunnel/lane_yaw_measurement /tunnel/xicp/yaw_measurement /perception/divider_boundary /occupancy_avoidance/obstacles /occupancy_avoidance/candidate_state /occupancy_avoidance/candidate_path /occupancy_avoidance/validation_debug /occupancy_avoidance/markers /obstacle_avoidance/selection_state /obstacle_avoidance/boundary_profile /obstacle_avoidance/planning_obstacles /reverse_escape/joint_plan /reverse_escape/handoff /occupancy_avoidance/escape_handoff_state /reverse_escape/reverse_path /reverse_escape/forward_path /reverse_escape/state /control/gear /morai/gear /control/reverse_cmd
+              /obstacle_stop/dynamic_state /obstacle_avoidance/validation_debug /tunnel/background_ids /tunnel/bg_moving /tunnel/bg_candidates_debug /tunnel/map_state /tunnel/nonground_filter_state /tunnel/map_total_processing_ms /tunnel/map_input_age_ms /tunnel/merger_processing_ms /tunnel/merger_queue_ms /tunnel/scene_processing_ms /tunnel/scene_input_age_ms /tunnel/planning_input_age_ms /tunnel/perception_scene /tunnel/preslow_speed_cap_mps /tunnel/preslow_state /tunnel/near_payload_kb /tunnel/near_support_points /tunnel/wall_offset /tunnel/wall_limits /obstacle_avoidance/static_speed_scale /localization/frame_update /tunnel/heading/state /localization/speed_valid /localization/speed_state /tunnel/detection_processing_ms /tunnel/detection_queue_ms /tunnel/preprocess_state /tunnel/preprocess_compute_ms /tunnel/preprocess_queue_ms /tunnel/preprocess_output_age_ms /tunnel/engine_integrate_ms /tunnel/lane_heading/state /tunnel/lane_yaw_measurement /tunnel/xicp/yaw_measurement /perception/divider_boundary /occupancy_avoidance/obstacles /occupancy_avoidance/candidate_state /occupancy_avoidance/candidate_path /occupancy_avoidance/validation_debug /occupancy_avoidance/markers /obstacle_avoidance/selection_state /obstacle_avoidance/boundary_profile /obstacle_avoidance/planning_obstacles /reverse_escape/joint_plan /reverse_escape/handoff /occupancy_avoidance/escape_handoff_state /reverse_escape/reverse_path /reverse_escape/forward_path /reverse_escape/state /control/gear /morai/gear /control/reverse_cmd
               /perception/roundabout/tracked_objects
               /path_switch_preview" />
 
@@ -330,6 +332,6 @@
               /velodyne_points /perception/points_gravity
               /groundgrid/segmented_sensor /groundgrid/ground /nonground
               /tunnel/xicp/markers /tunnel/scene_markers /tunnel/preslow_markers
-              /tunnel/map_classified /tunnel/map_foreground /tunnel/map_background /tunnel/nonground_filtered /tunnel/detections_native /tunnel/detector_native /tunnel/perception_scene_native
+              /tunnel/filtered_background_input /tunnel/filtered_near /tunnel/filtered_far /tunnel/filtered_points /tunnel/map_classified /tunnel/map_classified_far /tunnel/map_foreground /tunnel/map_background /tunnel/nonground_filtered /tunnel/detections_native /tunnel/detector_native /tunnel/perception_scene_native
               /image_jpeg/compressed" />
 </launch>

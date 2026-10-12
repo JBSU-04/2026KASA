@@ -1,0 +1,73 @@
+#pragma once
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <numeric>
+#include <vector>
+#include <map>
+#include <limits>
+
+namespace m8_prefilter {
+using XY=std::array<double,2>;
+using Sample=std::array<float,4>;
+// Double precision preserves UTM coordinates; immutable trees are shared by scans.
+class PathIndex {
+  struct Node {size_t point;int left=-1,right=-1;unsigned axis;};
+  std::vector<Node> nodes_;
+  int build(std::vector<size_t>&ids,size_t lo,size_t hi,unsigned axis){
+    if(lo>=hi)return -1;size_t mid=(lo+hi)/2;
+    std::nth_element(ids.begin()+lo,ids.begin()+mid,ids.begin()+hi,[&](size_t a,size_t b){return points[a][axis]<points[b][axis];});
+    int n=nodes_.size();nodes_.push_back({ids[mid],-1,-1,axis});
+    int l=build(ids,lo,mid,1-axis),r=build(ids,mid+1,hi,1-axis);nodes_[n].left=l;nodes_[n].right=r;return n;
+  }
+  void query(int n,const XY&q,size_t&best,double&distance)const{
+    if(n<0)return;const auto&v=nodes_[n];const auto&p=points[v.point];double dx=q[0]-p[0],dy=q[1]-p[1],d=dx*dx+dy*dy;
+    if(d<distance){distance=d;best=v.point;}double side=q[v.axis]-p[v.axis];
+    query(side<0?v.left:v.right,q,best,distance);if(side*side<distance)query(side<0?v.right:v.left,q,best,distance);
+  }
+ public:
+  std::vector<XY>points;
+  explicit PathIndex(std::vector<XY>p):points(std::move(p)){std::vector<size_t>ids(points.size());std::iota(ids.begin(),ids.end(),0);build(ids,0,ids.size(),0);}
+  std::pair<size_t,double>nearest(const XY&q)const{size_t id=0;double d=std::numeric_limits<double>::infinity();if(!nodes_.empty())query(0,q,id,d);return {id,d};}
+};
+inline double median(std::vector<double>v){if(v.empty())return NAN;std::sort(v.begin(),v.end());return (v[(v.size()-1)/2]+v[v.size()/2])*.5;}
+struct Config {
+ double sensor_x=1.1,sensor_y=0,min_range=1.,max_range=40.;
+ double x_min=-5.,x_max=40.,y_min=-8.,y_max=8.,z_min=-1.65,z_max=1.;
+ double self_x_min=-3.,self_x_max=2.,self_y_min=-1.,self_y_max=1.;
+ double gather_half=7.5;bool use_corridor=true,skip_missing_path=true;
+};
+inline bool keepCommon(const Sample&p,const Config&c,const PathIndex*path,const XY&origin,double yaw){
+ if(!std::isfinite(p[0]+p[1]+p[2]+p[3]))return false;
+ double x=p[0]+c.sensor_x,y=p[1]+c.sensor_y,r2=x*x+y*y;
+ if(r2<=c.min_range*c.min_range||r2>=c.max_range*c.max_range)return false;
+ if(x>=c.self_x_min&&x<=c.self_x_max&&y>=c.self_y_min&&y<=c.self_y_max)return false;
+ if(x<c.x_min||x>c.x_max||y<c.y_min||y>c.y_max||p[2]<c.z_min||p[2]>c.z_max)return false;
+ if(!c.use_corridor)return true;
+ if(!path||path->points.size()<2)return c.skip_missing_path;
+ double cs=std::cos(yaw),sn=std::sin(yaw);XY world{origin[0]+cs*x-sn*y,origin[1]+sn*x+cs*y};
+ return path->nearest(world).second<=c.gather_half*c.gather_half;
+}
+// Same supported-wall rule as Python WallSurface.keep. Low points and protrusions
+// are retained. Zero/unobserved profile knots never extend a wall into an opening.
+inline std::vector<bool>wallKeep(const std::vector<Sample>&p,const PathIndex&road,const std::vector<std::array<double,3>>&profile,const XY&origin,double yaw,double sx,double sy){
+ std::vector<bool>keep(p.size(),true);if(profile.size()<2||road.points.size()<2)return keep;
+ struct Hit{size_t id,index;double lat,wx,wy,tx,ty;};std::map<std::pair<int,int>,std::vector<Hit>>groups;
+ double c=std::cos(yaw),s=std::sin(yaw);
+ for(size_t i=0;i<p.size();++i){double bx=p[i][0]+sx,by=p[i][1]+sy;XY w{origin[0]+c*bx-s*by,origin[1]+s*bx+c*by};size_t j=road.nearest(w).first;
+  if(j<profile.front()[0]||j>profile.back()[0])continue;
+  auto it=std::upper_bound(profile.begin(),profile.end(),double(j),[](double x,const std::array<double,3>&row){return x<row[0];});if(it==profile.begin())continue;--it;
+  auto a=road.points[j?j-1:j],b=road.points[std::min(j+1,road.points.size()-1)];double tx=b[0]-a[0],ty=b[1]-a[1],n=std::hypot(tx,ty);if(n<=1e-9)continue;tx/=n;ty/=n;
+  double lat=-ty*(w[0]-road.points[j][0])+tx*(w[1]-road.points[j][1]);
+  for(int col=1;col<=2;++col){double side=col==1?-1.:1.;if(side*(*it)[col]>0&&std::abs(lat-(*it)[col])<=.4)groups[{col,int(j/50)}].push_back({i,j,lat,w[0],w[1],tx,ty});}
+ }
+ for(const auto&entry:groups){const auto&hits=entry.second;std::vector<double>lat;double tx=0,ty=0;
+  for(const auto&h:hits)if(p[h.id][3]>=.30){lat.push_back(h.lat);tx+=h.tx;ty+=h.ty;}
+  if(lat.size()<6)continue;tx/=lat.size();ty/=lat.size();double lo=INFINITY,hi=-INFINITY;int inliers=0;double mid=median(lat);
+  for(const auto&h:hits)if(p[h.id][3]>=.30){double v=h.wx*tx+h.wy*ty;lo=std::min(lo,v);hi=std::max(hi,v);inliers+=std::abs(h.lat-mid)<=.12;}
+  if(hi-lo<2.||double(inliers)/lat.size()<.8)continue;
+  for(const auto&h:hits)if(p[h.id][3]>=.30&&std::abs(h.lat-mid)<=.12)keep[h.id]=false;
+ }
+ return keep;
+}
+}

@@ -1,23 +1,29 @@
 tunnel_recovery:
+  cpp_prefilter_enabled: true # Independent GroundGrid -> shared filter input; false restores Python producer
+  filtered_pipeline_enabled: true
+  independent_preslow_enabled: true
+  shared_detector_policy_enabled: true
+  raw_detection_residual_enabled: false # map evidence must not bypass GroundGrid
   stationary_handoff_enabled: true
-  stationary_handoff_sec: 5.0
+  stationary_handoff_sec: 1.5 # 2026-10-12 사용자 결정: 정지 노드 tunnel_dynamic_restatic_sec 1.5 와 같은 값
   stationary_speed_mps: 0.18
   stationary_displacement_m: 0.30
   speed_integrity_enabled: true
-  entry_surface_policy_enabled: true
+  entry_surface_policy_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
   static_hold_release_enabled: true
   native_scene_enabled: true
   detection_worker_enabled: true
   native_geometry_enabled: true
   preserve_static_certificate: true
   verified_background_filter_enabled: true
-  # Preparation only; control reads section_router M8 bounds.
+  # GPS bounds are unchanged; obstacle approach uses measured CSV arc distance.
   perception_prepare_idx: 100 # rollback range
   approach_control_enabled: true
-  control_prepare_distance_m: 40.0
+  approach_anchor_idx: 7350 # first measured bilateral wall in tunnel_wall_profile
+  control_prepare_distance_m: 25.0
   perception_prepare_distance_m: 60.0
-  unified_detection_input_enabled: true
-  far_temporal_input_enabled: true
+  unified_detection_input_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+  far_temporal_input_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
   surface_certificate_hold_enabled: true
   surface_id_association_enabled: true
   common_scene_enabled: true
@@ -41,11 +47,16 @@ tunnel_map_filter:
   sensor_z: 1.33
 tunnel_wall_detector:
   object_risk_preslow_enabled: true
+  map_classification_topic: /tunnel/map_classified
+  preslow_start_distance_m: 25.0
+  preslow_min_speed_mps: 4.0
+  preslow_initial_speed_mps: 5.0 # /speed_limit/sections/M8 이 있으면 그 값(2026-10-12)
   map_classification_enabled: true
-  map_preslow_distance_m: 20.0
-  map_preslow_memory_sec: 4.0
+  map_preslow_distance_m: 25.0
+  map_preslow_memory_sec: 0.35
 obstacle_stop_node:
-  tunnel_cells_authoritative_enabled: true
+  tunnel_bg_moving_enabled: false # map comparison has no mission-stop authority
+  tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
   tunnel_motion_evidence_enabled: true
   tunnel_swept_stop_enabled: true
   tunnel_swept_guard_enabled: true
@@ -55,8 +66,8 @@ reverse_escape_node:
 obstacle_avoidance_node:
   tunnel_verified_hold_only: true
   embedded_engine:
-    tunnel_cells_authoritative_enabled: true
-    tunnel_map_enabled: true
+    tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+    tunnel_map_enabled: false # map evidence is preslow only
     tunnel_integrated_enabled: true
     tunnel_immediate_replan: true
     tunnel_replan_enabled: true
@@ -66,4 +77,4 @@ morai_measurement_adapter:
 
 obstacle_info_merger:
   native_worker_enabled: true
-  tunnel_cells_authoritative_enabled: true
+  tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false

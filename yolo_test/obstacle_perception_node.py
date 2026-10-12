@@ -35,8 +35,9 @@ import os
 import sys
 import rospkg
 sys.path.insert(0, os.path.join(rospkg.RosPack().get_path("new_lane"), "scripts"))
-from obstacle_geometry import measured_geometry, pose_at, sensor_to_base_xy
-from m8_object_policy import SurfaceMotion
+from obstacle_geometry import measured_geometry, pose_at, sensor_to_base_xy, support_subset
+from m8_object_policy import SurfaceMotion, detector_profile
+from m8_filtered_input import WallSurface, filtered_cloud
 from temporal_components import TemporalFarInput
 from collections import deque
 from scipy.optimize import linear_sum_assignment
@@ -1026,6 +1027,9 @@ class ObstaclePerceptionNode:
         self.rigid_gate_enabled = bool(rospy.get_param('~rigid_motion_gate', True))
         self.tunnel_wall_strip_enabled = bool(rospy.get_param('~tunnel_wall_strip', True))
         self.tunnel_wall_strip_m = float(rospy.get_param('~tunnel_wall_strip_m', 0.5))
+        # 2026-10-12 지연: 트랙 지지점 0.1 m 격자 + 최대 300점(JSON·연관·병합 부하 상한).
+        self.support_voxel_m = float(rospy.get_param('~support_voxel_m', 0.1))
+        self.support_max_points = int(rospy.get_param('~support_max_points', 300))
         self.tunnel_wall_profile = None
         try:
             import yaml
@@ -1114,8 +1118,13 @@ class ObstaclePerceptionNode:
         self.m8_worker_enabled=bool(rospy.get_param('/tunnel_recovery/detection_worker_enabled',True))
         self.m8_entry_surface_policy=bool(rospy.get_param('/tunnel_recovery/entry_surface_policy_enabled',True))
         self.m8_unified_input=bool(rospy.get_param('/tunnel_recovery/unified_detection_input_enabled',True))
+        self.m8_shared_detector_policy=bool(rospy.get_param('/tunnel_recovery/shared_detector_policy_enabled',True))
         self.m8_far_temporal=bool(rospy.get_param('/tunnel_recovery/far_temporal_input_enabled',True))
         self.m8_surface_id_association=bool(rospy.get_param('/tunnel_recovery/surface_id_association_enabled',True))
+        self.m8_cpp_prefilter=bool(rospy.get_param("/tunnel_recovery/cpp_prefilter_enabled",False))
+        self.m8_filtered_pipeline=bool(rospy.get_param("/tunnel_recovery/filtered_pipeline_enabled",False))
+        self.m8_filtered_pub=rospy.Publisher("/tunnel/filtered_near",PointCloud2,queue_size=1) if not self.m8_cpp_prefilter else None
+        self.m8_wall_surface=WallSurface.load(rospy.get_param("/tunnel_recovery/wall_profile_file",None)) if self.m8_filtered_pipeline and not self.m8_cpp_prefilter else None
         self.filtered_scan_stamp=-1e9
         self.native_tunnel_enabled=bool(rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True))
         self.native_sequence=0;self.native_debug_stamp=-1e9;self.native_coordinate_version=0;self.native_frame_offset=(0.,0.);self.native_frame_stamp=-1.;self.m8_frame_lock=threading.RLock()
@@ -1125,13 +1134,22 @@ class ObstaclePerceptionNode:
             rospy.Subscriber('/perception/points_gravity',PointCloud2,lambda m:self.native_gravity_clouds.append(m),queue_size=1,buff_size=2**26)
             self.native_tunnel_pub=rospy.Publisher('/tunnel/detections_native',TunnelScene,queue_size=1)
             rospy.Subscriber('/localization/frame_update',String,self.native_frame_update,queue_size=1)
-        if self.verified_background_filter_enabled:
+        if self.verified_background_filter_enabled and not self.m8_filtered_pipeline:
             rospy.Subscriber('/tunnel/nonground_filtered',PointCloud2,self.filtered_nonground_callback,queue_size=1,buff_size=2**26)
         self.tunnel_background_tree=None;self.tunnel_background_stamp=-1e9;self.tunnel_background_scenes=deque(maxlen=4)
-        if not rospy.get_param("/tunnel_recovery/common_scene_enabled",True):
+        # 2026-10-11 M8 최종: 터널 근거리 입력은 M2 와 같은 GroundGrid /nonground. 지도 전경(입구 노면 오검출)은
+        #   근거리 입력으로 쓰지 않고(먼 거리는 원거리 검출기 담당), 지도는 선감속에만 쓴다. true 면 이전 방식.
+        self.tunnel_map_detector_input=bool(rospy.get_param('~tunnel_map_detector_input',False))
+        self.tunnel_wall_offset=0.0;self.tunnel_wall_offset_stamp=-1e9
+        def _wall_offset_cb(m):
+            self.tunnel_wall_offset=float(m.data);self.tunnel_wall_offset_stamp=rospy.Time.now().to_sec()
+        rospy.Subscriber('/tunnel/wall_offset',Float64,_wall_offset_cb,queue_size=1)
+        if self.tunnel_map_detector_input and not self.m8_filtered_pipeline and not rospy.get_param("/tunnel_recovery/common_scene_enabled",True):
             rospy.Subscriber("/tunnel/map_foreground",PointCloud2,self.map_foreground_callback,queue_size=1,buff_size=2**24)
-        rospy.Subscriber("/tunnel/map_background",PointCloud2,self.tunnel_background_callback,queue_size=1,buff_size=2**24)
-        rospy.Subscriber(self.lidar_topic, PointCloud2, self.lidar_callback, queue_size=1, buff_size=2 ** 26)
+        if not self.m8_filtered_pipeline:rospy.Subscriber("/tunnel/map_background",PointCloud2,self.tunnel_background_callback,queue_size=1,buff_size=2**24)
+        rospy.Subscriber(self.lidar_topic, PointCloud2, self.shared_lidar_callback, queue_size=1, buff_size=2 ** 26)
+        if self.m8_cpp_prefilter:
+            rospy.Subscriber('/tunnel/filtered_points',PointCloud2,self.filtered_nonground_callback,queue_size=1,buff_size=2**24,tcp_nodelay=True)
 
         rospy.loginfo("Obstacle Perception node started (lidar-only). infra_points=%d",
                       len(self.infra_points))
@@ -1387,6 +1405,10 @@ class ObstaclePerceptionNode:
             if stamp<=self.native_frame_stamp:return
             self.lidar_callback(msg,filtered_background=True)
 
+    def shared_lidar_callback(self,msg):
+        if self.m8_cpp_prefilter and self._in_mission_section()[1]=='tunnel':return
+        self.lidar_callback(msg)
+
     def lidar_callback(self,msg,raw_map=False,filtered_background=False):
         if getattr(self,'native_tunnel_enabled',False) and self._in_mission_section()[1]=='tunnel':
             with self.m8_frame_lock:
@@ -1396,7 +1418,8 @@ class ObstaclePerceptionNode:
 
     def _process_lidar(self, msg,raw_map=False,filtered_background=False):
         if getattr(self,'verified_background_filter_enabled',False) and not filtered_background and self._in_mission_section()[1]=='tunnel':return
-        if (not rospy.get_param("/tunnel_recovery/common_scene_enabled",True) and not raw_map and self._in_mission_section()[1]=='tunnel' and
+        if (getattr(self,'tunnel_map_detector_input',False) and
+                not rospy.get_param("/tunnel_recovery/common_scene_enabled",True) and not raw_map and self._in_mission_section()[1]=='tunnel' and
                 rospy.get_param('/tunnel_recovery/enabled',True) and
                 rospy.Time.now().to_sec()-getattr(self,'map_foreground_stamp',-1e9)<=.35):return
         for key, value in self.filter_defaults.items():
@@ -1413,7 +1436,7 @@ class ObstaclePerceptionNode:
         self.boundary_objects = []
         # Restore defaults before applying each profile, so tunnel tuning never
         # leaks back into M2/M3. GroundGrid and its input remain shared.
-        profile = self.mission_filter_profiles.get('static' if zone == 'static_preview' else zone, {})
+        profile=detector_profile(self.mission_filter_profiles,zone,self.m8_shared_detector_policy)
         for key, value in self.filter_defaults.items():
             setattr(self, key, profile.get(key, value))
         if self.filter_profile != zone:
@@ -1439,10 +1462,15 @@ class ObstaclePerceptionNode:
             self.publish_tracks()
             return
         if self.path_world is not None:
-            self.path_xy = np.array([world_to_ego(p, self.scan_pose) for p in self.path_world])
+            if zone=='tunnel' and self.m8_cpp_prefilter:
+                c,sn=math.cos(self.scan_pose[2]),math.sin(self.scan_pose[2])
+                d=self.path_world-np.asarray(self.scan_pose[:2]);self.path_xy=d@np.array([[c,-sn],[sn,c]])
+                self._m8_lateral_tree=cKDTree(self._decimated_path())
+            else:
+                self.path_xy = np.array([world_to_ego(p, self.scan_pose) for p in self.path_world])
         arr = pointcloud2_to_xyz_array_fast(msg, self.ground_relative_field)
         if zone=='tunnel' and filtered_background:
-            if getattr(self,'m8_unified_input',True):
+            if getattr(self,'m8_unified_input',True) and not self.m8_shared_detector_policy:
                 # Same-stamp Raw residuals are bundled by the C++ producer.
                 # No cross-topic arrival-order dependency, no second scan processing.
                 self.min_points_for_confirm=min(self.min_points_for_confirm,3)
@@ -1450,7 +1478,7 @@ class ObstaclePerceptionNode:
                 self.min_obstacle_elevation=min(self.min_obstacle_elevation,.08)
                 self.min_obstacle_elevation_dynamic=min(self.min_obstacle_elevation_dynamic,.08)
                 self.roi_z_min=min(self.roi_z_min,self.ground_z+.08)
-            else:
+            elif not getattr(self,'m8_unified_input',True):
                 residual=next((m for m in list(self.m8_foreground_clouds)
                     if m.header.stamp==msg.header.stamp and m.header.frame_id==msg.header.frame_id),None)
                 if residual is not None:
@@ -1476,6 +1504,8 @@ class ObstaclePerceptionNode:
             self.min_obstacle_elevation=min(self.min_obstacle_elevation,.08)
             self.min_obstacle_elevation_dynamic=min(self.min_obstacle_elevation_dynamic,.08)
         if len(arr) == 0:
+            if zone=="tunnel" and self.m8_filtered_pipeline and not self.m8_cpp_prefilter:
+                self.m8_filtered_pub.publish(filtered_cloud(msg.header,np.empty((0,4))))
             # A successfully observed empty scan is a fresh scene, not sensor loss.
             self.geometry_scan=self.native_empty_scan(now) if self.mission_zone=='tunnel' and filtered_background else {}
             self._age_out_tracks(rospy.Time.now().to_sec())
@@ -1520,35 +1550,52 @@ class ObstaclePerceptionNode:
             # Omitted rays are unknown, never evidence of clearance.
             if len(ends)>8192:ends=ends[np.linspace(0,len(ends)-1,8192,dtype=int)]
             self.geometry_scan=dict(stamp=now,frame='map',origin=origin.tolist(),endpoints=np.round(ends,3).tolist())
-        dist = np.linalg.norm(arr[:, :2], axis=1)
-        self_filter = (
-            (arr[:, 0] >= self.self_x_min) & (arr[:, 0] <= self.self_x_max) &
-            (arr[:, 1] >= self.self_y_min) & (arr[:, 1] <= self.self_y_max)
-        )
-        local_height_input=(zone=='tunnel' and filtered_background and
-                            getattr(self,'m8_unified_input',True) and
-                            arr.shape[1]>3)
-        low_height_keep=(arr[:,3]>=.08) if local_height_input else (arr[:,2]>=self.roi_z_min)
-        roi_filter = (
-            (arr[:, 0] >= self.roi_x_min) & (arr[:, 0] <= self.roi_x_max) &
-            (arr[:, 1] >= self.roi_y_min) & (arr[:, 1] <= self.roi_y_max) &
-            (raw_map | low_height_keep) & (arr[:, 2] <= self.roi_z_max)
-        )
-        # 1차(수집): 기준경로 좌우를 '넓게' 잡아 후보 점을 모은다. 여기서
-        #   버린 점은 다시 못 보므로 좁히지 않는다. 클러스터가 온전한 모양을
-        #   갖추려면 물체 전체가 들어와야 하고, 경로가 휘거나 측위가 흔들려도
-        #   진짜 장애물이 잘리면 안 된다.
-        #   좁히는 판정은 클러스터가 만들어진 뒤 _filter_ground_residue 에서
-        #   중심 기준으로 한다(2차).
-        corridor = self._path_corridor_mask(
-            arr, self.path_corridor_gather_half_width)
-        mask = ((dist > self.min_range) & (dist < self.max_range) &
-                (~self_filter) & roi_filter & corridor)
-        if self.mission_zone == 'tunnel' and np.any(mask):
-            idx_m = np.nonzero(mask)[0]
-            mask[idx_m[~self._tunnel_wall_strip_keep(arr[idx_m])]] = False
+        prefiltered=(zone=='tunnel' and self.m8_cpp_prefilter and any(f.name=='m2_prefilter' for f in msg.fields))
+        if prefiltered:
+            mask=np.ones(len(arr),dtype=bool) # C++ already applied shared ROI/corridor/wall filter.
+        else:
+            dist = np.linalg.norm(arr[:, :2], axis=1)
+            self_filter = (
+                (arr[:, 0] >= self.self_x_min) & (arr[:, 0] <= self.self_x_max) &
+                (arr[:, 1] >= self.self_y_min) & (arr[:, 1] <= self.self_y_max)
+            )
+            local_height_input=(zone=='tunnel' and filtered_background and
+                                getattr(self,'m8_unified_input',True) and
+                                arr.shape[1]>3)
+            low_height_keep=(arr[:,3]>=.08) if local_height_input else (arr[:,2]>=self.roi_z_min)
+            roi_filter = (
+                (arr[:, 0] >= self.roi_x_min) & (arr[:, 0] <= self.roi_x_max) &
+                (arr[:, 1] >= self.roi_y_min) & (arr[:, 1] <= self.roi_y_max) &
+                (raw_map | low_height_keep) & (arr[:, 2] <= self.roi_z_max)
+            )
+            # 1차(수집): 기준경로 좌우를 '넓게' 잡아 후보 점을 모은다. 여기서
+            #   버린 점은 다시 못 보므로 좁히지 않는다. 클러스터가 온전한 모양을
+            #   갖추려면 물체 전체가 들어와야 하고, 경로가 휘거나 측위가 흔들려도
+            #   진짜 장애물이 잘리면 안 된다.
+            #   좁히는 판정은 클러스터가 만들어진 뒤 _filter_ground_residue 에서
+            #   중심 기준으로 한다(2차).
+            corridor = self._path_corridor_mask(
+                arr, self.path_corridor_gather_half_width)
+            mask = ((dist > self.min_range) & (dist < self.max_range) &
+                    (~self_filter) & roi_filter & corridor)
+            if self.mission_zone == "tunnel" and self.m8_filtered_pipeline and np.any(mask):
+                ids=np.flatnonzero(mask);sensor_rows=arr[ids].copy()
+                sensor_rows[:,:2]-=np.asarray(self.sensor_offset[:2])
+                if sensor_rows.shape[1]<4:
+                    mask[:]=False # missing terrain height is unknown, never confirmed ground removal
+                else:
+                    mask[ids[~self.m8_wall_surface.keep(sensor_rows,self.scan_pose,self.sensor_offset[:2])]]=False
+            if self.mission_zone == 'tunnel' and not self.m8_filtered_pipeline and np.any(mask):
+                idx_m = np.nonzero(mask)[0]
+                mask[idx_m[~self._tunnel_wall_strip_keep(arr[idx_m])]] = False
         filtered = arr[mask]
-        if self.mission_zone != "tunnel" and self.cluster_voxel_m > 0.0 and len(filtered):
+        if zone=="tunnel" and self.m8_filtered_pipeline and not self.m8_cpp_prefilter:
+            # GroundGrid + shared M2 ROI + supported-wall filter are the common
+            # scan input. Do not wait for clustering/tracking to keep geometry
+            # fresh, or discard sparse supports because no box was produced.
+            rows=filtered[:,:4] if filtered.shape[1]>=4 else np.empty((0,4))
+            self.m8_filtered_pub.publish(filtered_cloud(msg.header,rows,self.sensor_offset[:2]))
+        if (self.mission_zone != "tunnel" or self.m8_filtered_pipeline) and self.cluster_voxel_m > 0.0 and len(filtered):
             # Keep real 3D representatives (and ground-relative fields), not
             # averaged points that flatten low obstacles into the road.
             cells = np.floor(filtered[:, :3] / self.cluster_voxel_m).astype(np.int64)
@@ -1572,20 +1619,21 @@ class ObstaclePerceptionNode:
                                          self.min_points_for_confirm, self.cluster_max_points,
                                          far_range=self.far_cluster_range,
                                          far_min_points=self.far_min_points,
-                                         preserve_large=(zone == 'tunnel'),
+                                         preserve_large=(zone == 'tunnel' and not self.m8_filtered_pipeline),
                                          max_span_y=self.cluster_max_span_y,
                                          max_span_x=self.cluster_max_span_x,
                                          tall_keep_top=self.cluster_tall_keep_top,
-                                         native_connectivity=(zone=="tunnel"))
+                                         native_connectivity=(zone=="tunnel" and not self.m8_filtered_pipeline))
         if zone=='tunnel' and filtered_background and getattr(self,'m8_far_temporal',True):
             # Same sparse connectivity as M2, but only current returns reach
             # the tracker. Historical points never fake a fresh surface.
             groups=self.m8_far_input.groups(filtered,self.scan_pose,now,self.native_coordinate_version)
+            covered={tuple(q) for ids in groups for q in filtered[ids,:3]}
+            if covered:
+                clusters=[(center,pts) for center,pts in clusters
+                          if not any(tuple(q) in covered for q in pts[:,:3])]
             for ids in groups:
                 support=filtered[ids]
-                keys=set(map(tuple,support[:,:3]))
-                clusters=[(center,pts) for center,pts in clusters
-                          if not any(tuple(q) in keys for q in pts[:,:3])]
                 clusters.append((support[:,:3].mean(axis=0),support))
         if zone != 'tunnel' or not self.m8_entry_surface_policy:
             clusters = merge_close_clusters(clusters, self.merge_cluster_dist)
@@ -1788,10 +1836,12 @@ class ObstaclePerceptionNode:
                 # 2026-10-07(20:29:27 백): 차가 24 도 틀어져 멈추자 오른쪽 벽 조각(20.5 x 0.9 m)이 코리도 안으로
                 #   들어와 남았다(RViz 반경 10 m 원). 터널에 길이 8 m 넘는 장애물(차량 <= 5 m)은 없으므로
                 #   길고 폭 1.5 m 미만인 군집은 위치와 관계없이 벽이다.
-                if (self.mission_zone == 'tunnel' and length > 8.0 and width < 1.5 and self.verified_tunnel_background(pts)):
+                if (self.mission_zone == 'tunnel' and not self.m8_shared_detector_policy and length > 8.0 and width < 1.5 and
+                        (self.verified_tunnel_background(pts) or self._tunnel_near_wall(pts))):
                     dropped.append((center, top, f"tunnel_wall_long_{length:.1f}"))
                     continue
-                if (self.mission_zone == 'tunnel' and self.verified_tunnel_background(pts) and not in_trigger and
+                if (self.mission_zone == 'tunnel' and not self.m8_shared_detector_policy and not in_trigger and
+                        (self.verified_tunnel_background(pts) or self._tunnel_near_wall(pts)) and
                         length > self.curb_linear_min_length and
                         width < self.curb_linear_max_width and
                         abs(float(axes[0, 0])) > 0.75):
@@ -1817,7 +1867,7 @@ class ObstaclePerceptionNode:
                 # 2-1. 비정상적으로 긴 선형 구조물(연석, 가드레일, 벽체, 길이 2.5m 이상) 기각
                 if (length > self.curb_linear_min_length and
                         width < self.curb_linear_max_width and
-                        self.mission_zone != 'tunnel'):
+                        (self.mission_zone != 'tunnel' or self.m8_shared_detector_policy)):
                     dropped.append((center, top, f"linear_curb_len_{length:.1f}"))
                     continue
 
@@ -1834,7 +1884,7 @@ class ObstaclePerceptionNode:
                 # 2-2. 도로를 따라 길게 뻗은(종방향) 연석 조각 기각
                 #      (차선을 가로막는 횡방향 물체나 높이 35cm 이상의 확실한 장애물은 제외)
                 if not is_transverse and top < self.low_obstacle_top_m:
-                    if aspect > self.curb_max_aspect and self.mission_zone != 'tunnel':
+                    if aspect > self.curb_max_aspect and (self.mission_zone != 'tunnel' or self.m8_shared_detector_policy):
                         dropped.append((center, top, f"curb_aspect_{aspect:.1f}"))
                         continue
 
@@ -1888,7 +1938,7 @@ class ObstaclePerceptionNode:
         # 2026-10-08(12:43:27 백): 터널 오른쪽 벽 쪽 장애물(경로 -2.7 m)이 비스듬히 보여 여러 조각으로 줄지어
         #   잡히자 '쪼개진 연석 줄'로 통째로 지워져 8 m 앞에서야 출력됐다(선감속 늦음). 터널은 벽/턱을 지도로
         #   군집 전에 지우므로(_tunnel_wall_strip_keep) 모양 추정인 정렬 기각을 쓰지 않는다.
-        tunnel_map_walls = (self.mission_zone == 'tunnel' and self.tunnel_wall_strip_enabled and
+        tunnel_map_walls = (self.mission_zone == 'tunnel' and not self.m8_shared_detector_policy and self.tunnel_wall_strip_enabled and
                             self.tunnel_wall_profile is not None)
         if self.align_reject_enabled and not tunnel_map_walls and len(kept) >= self.align_min_count:
             # lateral 은 원본 clusters 인덱스 기준이라 kept 와 어긋난다.
@@ -2012,7 +2062,7 @@ class ObstaclePerceptionNode:
                     j=int(np.argmin(np.linalg.norm(self.path_world-world,axis=1)));j=min(j,len(self.path_world)-2)
                     d=self.path_world[j+1]-self.path_world[j]
                     if np.linalg.norm(d)>1e-6:reference_yaw=math.atan2(d[1],d[0])
-                g=measured_geometry(wp,reference_yaw);g['support_points_world']=wp.tolist()
+                g=measured_geometry(wp,reference_yaw);g['support_points_world']=support_subset(wp,getattr(self,'support_voxel_m',.1),getattr(self,'support_max_points',300)).tolist()
                 geometry_by_item[id(item)]=g
                 world=np.asarray(g['position_world'])
             detections.append((item, world, top, thickness))
@@ -2189,7 +2239,7 @@ class ObstaclePerceptionNode:
                     recently_moving = now - getattr(target, 'apollo_last_moving', -1e9) < 2.0
                     target.motion_state = ('dynamic' if recently_moving else
                         ('static' if now-target.apollo_static_since >= 0.8 else 'unknown'))
-                if self.mission_zone == 'tunnel':
+                if self.mission_zone == 'tunnel' and not self.m8_shared_detector_policy:
                     if not hasattr(target, 'surface_motion'):
                         target.surface_motion = SurfaceMotion(hold=rospy.get_param('/tunnel_recovery/surface_certificate_hold_enabled',True))
                     state, vector = target.surface_motion.update(
@@ -2340,8 +2390,16 @@ class ObstaclePerceptionNode:
             if rospy.Time.now().to_sec()-self.native_debug_stamp>=.5:
                 self.native_debug_stamp=rospy.Time.now().to_sec();msg.data=json.dumps(payload);self.info_pub.publish(msg)
         else:
-            msg.data = json.dumps(payload)
+            # 2026-10-12 지연: obstacles 는 collision_objects 의 부분집합이라 지지점을 한 번만 싣는다
+            #   (같은 dict 가 두 목록에 있어 JSON 에 두 번 직렬화되었다). 병합 노드는 collision_objects 지지점만 쓴다.
+            light = dict(payload, obstacles=[{k: v for k, v in o.items() if k != 'support_points_world'} for o in obstacles])
+            msg.data = json.dumps(light, separators=(',', ':'))
             self.info_pub.publish(msg)
+            if not hasattr(self, 'near_payload_pub'):
+                self.near_payload_pub = rospy.Publisher('/tunnel/near_payload_kb', Float64, queue_size=1)
+                self.near_support_pub = rospy.Publisher('/tunnel/near_support_points', Float64, queue_size=1)
+            self.near_payload_pub.publish(Float64(data=len(msg.data) / 1024.))
+            self.near_support_pub.publish(Float64(data=float(sum(len(o.get('support_points_world') or []) for o in collision_objects))))
         n_extra = len(collision_objects) - len(obstacles)
         if n_extra:
             rospy.loginfo_throttle(
@@ -2406,6 +2464,8 @@ class ObstaclePerceptionNode:
                  len(self.path_xy) >= 2)
         if not fresh:
             return None
+        if self.mission_zone=='tunnel' and getattr(self,'m8_cpp_prefilter',False):
+            return self._m8_lateral_tree.query(np.asarray(pts_xy)[:,:2],k=1)[0]
         path = self._decimated_path()
         d2 = ((np.asarray(pts_xy)[:, None, :2] - path[None, :, :]) ** 2).sum(axis=2)
         return np.sqrt(d2.min(axis=1))
@@ -2490,21 +2550,17 @@ class ObstaclePerceptionNode:
             self.current_wp_idx = int(msg.waypoint_index)
         self.current_lane = int(getattr(msg, 'lane_number', -1))
 
-    def _tunnel_wall_strip_keep(self, pts_base):
-        """터널 벽/턱 띠 밖(차로 안쪽) 점만 True.
+    def _tunnel_wall_lateral(self, pts_base):
+        """점별 (경로 횡거리, 오른쪽 벽, 왼쪽 벽, 오른쪽 벽 있음, 왼쪽 벽 있음, 프로파일 범위 안).
 
-        2026-10-08(11:59:37 백): 오른쪽 벽+턱 점이 21 m x 2.8 m 군집 하나가 돼(폭이 넓어 길이 필터 통과)
-        병합 노드에서 25 m 부모(RViz 큰 원)가 되고 후진까지 막았다. Autoware 의 지도 안쪽 필터처럼
-        군집 '전'에 idx 별 실측 벽 경계(new_lane/config/tunnel_wall_profile.yaml, 3.csv 횡거리)에서
-        tunnel_wall_strip_m 안쪽까지의 점을 지운다. 경계가 없는 idx(입구/출구)와 경로가 없을 때는 통과.
-        """
-        keep = np.ones(len(pts_base), dtype=bool)
+        2026-10-11 M8 최종: 추측항법 횡 드리프트는 /tunnel/wall_offset(실측 벽 기준, + 면 실제 차가 오른쪽)
+        으로 보정한다. 실제 횡거리 = 계산 횡거리 - offset. 없거나 오래되면 보정 없이 쓴다."""
         prof = self.tunnel_wall_profile
         pw = getattr(self, 'path_world', None)
         pidx = getattr(self, 'path_idx', None)
         if (prof is None or pw is None or pidx is None or len(pw) < 3 or self.scan_pose is None or
-                getattr(self, 'path_lane', -1) != 3 or not self.tunnel_wall_strip_enabled or getattr(self,'verified_background_input',False)):
-            return keep
+                getattr(self, 'path_lane', -1) != 3):
+            return None
         ex, ey, eyaw = self.scan_pose[:3]
         c, sn = math.cos(eyaw), math.sin(eyaw)
         wx = ex + c * pts_base[:, 0] - sn * pts_base[:, 1]
@@ -2514,12 +2570,42 @@ class ObstaclePerceptionNode:
         tang = pw[j2] - pw[j1]
         norm = np.hypot(tang[:, 0], tang[:, 1]); norm[norm < 1e-6] = 1.0
         lat = (-tang[:, 1] * (wx - pw[j, 0]) + tang[:, 0] * (wy - pw[j, 1])) / norm
+        stamp = getattr(self, 'tunnel_wall_offset_stamp', None)
+        if stamp is not None and stamp > 0 and rospy.Time.now().to_sec() - stamp <= 0.5:
+            lat = lat - getattr(self, 'tunnel_wall_offset', 0.0)
         k = pidx[j]
         ik, rk, lk = prof
         inside = (k >= ik[0]) & (k <= ik[-1])
         r = np.interp(k, ik, rk); l = np.interp(k, ik, lk)
         r_ok = np.interp(k, ik, (rk < 0).astype(float)) >= 0.999
         l_ok = np.interp(k, ik, (lk > 0).astype(float)) >= 0.999
+        return lat, r, l, r_ok, l_ok, inside
+
+    def _tunnel_near_wall(self, pts_base, band=0.6, frac=0.8):
+        """군집 점의 frac 이상이 실측 벽 경계 안쪽 (벽 띠 + band) 안이면 True(벽 근처 벽 형상 판정용)."""
+        w = self._tunnel_wall_lateral(np.asarray(pts_base))
+        if w is None or len(pts_base) == 0:
+            return False
+        lat, r, l, r_ok, l_ok, inside = w
+        m = self.tunnel_wall_strip_m + band
+        near = inside & ((r_ok & (lat <= r + m)) | (l_ok & (lat >= l - m)))
+        return float(np.mean(near)) >= frac
+
+    def _tunnel_wall_strip_keep(self, pts_base):
+        """터널 벽/턱 띠 밖(차로 안쪽) 점만 True.
+
+        2026-10-08(11:59:37 백): 오른쪽 벽+턱 점이 21 m x 2.8 m 군집 하나가 돼(폭이 넓어 길이 필터 통과)
+        병합 노드에서 25 m 부모(RViz 큰 원)가 되고 후진까지 막았다. Autoware 의 지도 안쪽 필터처럼
+        군집 '전'에 idx 별 실측 벽 경계(new_lane/config/tunnel_wall_profile.yaml, 3.csv 횡거리)에서
+        tunnel_wall_strip_m 안쪽까지의 점을 지운다. 경계가 없는 idx(입구/출구)와 경로가 없을 때는 통과.
+        """
+        keep = np.ones(len(pts_base), dtype=bool)
+        if not self.tunnel_wall_strip_enabled or getattr(self,'verified_background_input',False):
+            return keep
+        w = self._tunnel_wall_lateral(pts_base)
+        if w is None:
+            return keep
+        lat, r, l, r_ok, l_ok, inside = w
         m = self.tunnel_wall_strip_m
         keep &= ~(inside & r_ok & (lat <= r + m))
         keep &= ~(inside & l_ok & (lat >= l - m))
@@ -2596,6 +2682,11 @@ class ObstaclePerceptionNode:
         This is not the ego-forward auxiliary band or the occupancy planner ROI.
         A separate topic makes DELETEALL independent of obstacle-track markers.
         """
+        if getattr(self,'m8_cpp_prefilter',False) and self._in_mission_section()[1]=='tunnel':
+            if self.reference_corridor_pub.get_num_connections()==0:return
+            now=rospy.Time.now().to_sec()
+            if now-getattr(self,'_m8_corridor_vis_stamp',-1e9)<.5:return
+            self._m8_corridor_vis_stamp=now
         arr = MarkerArray()
         clear = Marker()
         clear.header.frame_id = 'map'
@@ -2666,6 +2757,11 @@ class ObstaclePerceptionNode:
             self.publish_empty_markers()
             return
 
+        if zone=='tunnel' and getattr(self,'m8_cpp_prefilter',False):
+            if self.marker_pub.get_num_connections()==0:return
+            now=rospy.Time.now().to_sec()
+            if now-getattr(self,'_m8_marker_stamp',-1e9)<.5:return
+            self._m8_marker_stamp=now
         arr = MarkerArray()
 
         clear = Marker()
@@ -2707,7 +2803,7 @@ class ObstaclePerceptionNode:
                 m.type=Marker.POINTS;m.pose.position.x=m.pose.position.y=m.pose.position.z=0.
                 m.scale.x=m.scale.y=.1
                 m.points=[Point(*map(float,q[:3])) for q in getattr(track,'support_points_world',[])]
-            m.lifetime = rospy.Duration(0.3)
+            m.lifetime = rospy.Duration(0.75 if self.mission_zone=="tunnel" and getattr(self,"m8_cpp_prefilter",False) else 0.3)
             arr.markers.append(m)
 
             # 동적 트랙은 속도 벡터를 화살표로 같이 보여준다 - 정적 오판을
@@ -2729,7 +2825,7 @@ class ObstaclePerceptionNode:
                     p0 = Point(float(track.position[0]), float(track.position[1]), 1.0)
                     p1 = Point(p0.x + float(vel[0]), p0.y + float(vel[1]), 1.0)
                     ar.points = [p0, p1]
-                    ar.lifetime = rospy.Duration(0.3)
+                    ar.lifetime = rospy.Duration(0.75 if self.mission_zone=="tunnel" and getattr(self,"m8_cpp_prefilter",False) else 0.3)
                     arr.markers.append(ar)
 
             label = Marker()
@@ -2753,7 +2849,7 @@ class ObstaclePerceptionNode:
                 track.motion_state, '미확정')
             mark = '' if confirmed else '?'
             label.text = f"#{track.id}{mark} {state_kr} {track.speed:.1f}m/s"
-            label.lifetime = rospy.Duration(0.3)
+            label.lifetime = rospy.Duration(0.75 if self.mission_zone=="tunnel" and getattr(self,"m8_cpp_prefilter",False) else 0.3)
             arr.markers.append(label)
 
         # 지금 어느 구간을 보고 있는지 화면에 띄운다.

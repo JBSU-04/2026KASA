@@ -1,5 +1,6 @@
 frame_id: map
 lidar_tracker:
+  section_gating_enabled: false # prewarm inside existing 80m processing ROI only
   cloud_timeout: 0.5
   cluster:
     max_points: 3000
@@ -115,10 +116,10 @@ roundabout:
       times_s: [0.0, 0.3, 0.8, 1.3, 1.8, 2.3, 2.8]
       speeds_mps: [0.0, 0.8, 2.8, 4.6, 6.0, 7.0, 7.6]
     confirm_s: 0.2
-    front_gap_m: 2.5
+    front_gap_m: 2.0
     pair_invalid_s: 0.3
     post_clear_horizon_s: 1.5
-    rear_gap_m: 2.0
+    rear_gap_m: 1.5
     rear_max_decel_mps2: 2.0
     rear_reaction_s: 0.5
     rear_yield_assumption: true
@@ -126,7 +127,44 @@ roundabout:
   enabled: true
   entry_heading_deg: 69.713
   entry_heading_tolerance_deg: 70.0
-  entry_model: distance
+  # 2026-10-12: 갭 시간 창 모델(사용자 조사 자료). 복귀: observed_follow(관측 슬롯) / distance(거리 예측).
+  # 2026-10-12: 갭 1/4 지점 진입(사용자 설계). 복귀: window(시간 창) / observed_follow / distance.
+  entry_model: quarter
+  quarter:
+    fraction: 0.25 # 1/4 지점 = 앞차 뒷범퍼 - 0.25*갭 (앞차 쪽)
+    band_m: 1.0 # 1/4 지점이 출발 기준점 +-1 m 안에 들면 출발, +1 m 넘으면 다음 갭
+    activate_distance_m: 5.0 # 2026-10-12 양보선 5 m 안에서만 갭 판단(멀리서 고른 대상이 흔들림)
+    lead_time_s: 1.6 # 출발 기준점 = '우리 차 앞' 교점 - 흐름속도*(lead_time + 남은 정지시간). 0 = 우리 차 앞 그대로
+    front_fallback_m: 3.8 # 교점 계산 실패 시 합류점 상류 거리(18:14:41 정지 자세 실측 3.8 m)
+    min_gap_m: 9.0 # 앞차 뒷범퍼~뒷차 앞범퍼 최소 (자차 4.6 + 앞 2 + 뒤 2.4)
+    open_rear_tail_m: 2.0 # 뒤 개방: 앞차 뒷범퍼가 합류점 +2 m 지나면 출발
+    open_rear_view_m: 20.0 # 뒤 개방 인정: 합류점 상류 이 거리 안에 차량 없음(트래커 정상)
+    open_front_time_s: 3.0 # 앞 개방: 뒷차가 L + front_margin + v*3 s 보다 멀면 출발
+    front_margin_m: 2.0
+    abort_rear_m: 2.0 # 진입 중 뒷차가 합류점 +-2 m 안이고
+    abort_yield_m: 1.0 #   양보선에서 1 m 이내로만 움직였으면 취소 제동
+    confirm_frames: 2
+  acc:
+    enabled: true # 2026-10-12 진입/순환/이탈 앞차 범퍼 간격 유지(가속·감속)
+    target_gap_m: 2.0 # 유지 간격 = 2.0 + time_gap*v
+    time_gap_s: 0.2
+    gain: 0.8 # v_des = v_lead + gain*(간격 - 유지 간격) [1/s]
+    accel_gain: 1.0 # a_des = accel_gain*(v_des - v) -> 페달 보조
+    max_accel_mps2: 2.5
+    max_brake_mps2: 3.0
+  window:
+    s0_m: 2.0 # 앞/뒤 차와 남길 범퍼 간격 [m] (자료 초기 4.0 -> 튜닝 순서 4단계 값)
+    headway_s: 0.5 # 시간 간격 T_h [s] (자료 초기 1.2)
+    length_margin_m: 0.5 # L = 자차 길이 + 여유
+    lag_decel_mps2: 1.5 # 비양보 식의 상대속도 감속 a
+    lag_yield_decel_mps2: 2.0 # 뒷차 양보 감속(MORAI NPC). 0 = 비양보(자료 원식)
+    lag_reaction_s: 0.5
+    ego_accel_mps2: 3.0 # 자차 출발 가속(페달 보조 기준)
+    start_delay_s: 0.24 # 출발 지연 실측
+    merge_margin_m: 1.0 # 합류점 +-(L/2+여유+차량 반길이) 안 차량이면 대기
+    commit_tolerance_s: 0.5 # 진입 중 뒷차 창 허용
+    confirm_frames: 4 # 연속 OK 프레임 후 GO
+    miss_frames: 6 # 놓침 확정 연속 프레임(새 트랙 속도 노이즈 방지)
   exit_point:
     x: 302512.545
     y: 4124484.278
@@ -154,13 +192,13 @@ roundabout:
     check_horizon: 1.5
     circle_stop_margin: 0.5
     commit_abort_confirm: 0.2
-    commit_abort_enabled: true
+    commit_abort_enabled: false
     commit_front_tolerance: 1.0
     confirm_seconds: 0.1
     ego_accel: 3.0
     ego_length: 4.6
     ego_max_speed: 0.0
-    ego_start_delay: 0.2
+    ego_start_delay: 0.24
     enabled: true
     entry_zone: 1.0
     front_headway: 0.3
@@ -181,8 +219,8 @@ roundabout:
     phantom_arc: 22.0
     phantom_enabled: false
     phantom_speed: 5.0
-    prediction_follow_standstill_gap: 3.0 # 2026-10-11 4.0 -> 3.0 사람 진입 앞차 간격 3~6 m
-    prediction_follow_time_gap: 0.8 # 2026-10-11 1.5 -> 0.8
+    prediction_follow_standstill_gap: 1.0 # 2026-10-12 ACC(2 m 유지) 아래 안전 하한. observed_follow 복귀 시 2.0
+    prediction_follow_time_gap: 0.35
     rear_headway: 0.5
     require_merge_progress: true
     seq_go_tolerance: 0.3
@@ -232,10 +270,39 @@ roundabout:
     zone_relax_from_stop: true
     zone_relax_rate_mps: 0.4
     zone_relax_start_s: 0.0
-    zone_rule_enabled: true
+    zone_rule_enabled: false
     zone_vehicle_length_m: 5.0
+    observed_entry_enabled: true
+    preparation_enabled: true
+    spatial_gap_enabled: true
+    spatial_arrival_check: true
+    spatial_only_admission: false
+    opportunity_enabled: true
+    opportunity_rear_yield: true
+    commit_rear_yield_lock: true
+    commit_acc_only: true
+    body_collision_guard: true
+    ego_center_offset_m: 1.53     # 2026-10-12 /odom 뒷차축 -> 차체 중심(차체 -0.79 ~ +3.85 m)
+    ego_rear_overhang_m: 0.79
+    rear_follower_lateral_m: 2.5  # 순환/이탈 중 같은 차로 뒤따르는 차는 차체 가드 제외(18:59:56 교착)
+    use_route_body_projection: true
+    timed_entry_approach: true
+    use_measured_entry_profile: true
+    entry_commit_distance_m: 8.0
+    ego_width: 1.9
+    spatial_front_gap_m: 2.0
+    spatial_rear_gap_m: 1.5
+    preparation_wait_distance_m: 3.0
+    preparation_max_speed_mps: 1.5
+    preparation_margin_m: 0.5
+    preparation_horizon_s: 4.0
+    observation_timeout_s: 0.35
+    post_clear_horizon_s: 0.5
+    unknown_speed_upper_mps: 8.0
+    approach_decel_mps2: 2.5
+    approach_response_s: 0.24
   radius:
-    inner: 16.0
+    inner: 16.1
     nominal: 18.338
     outer: 21.5
   require_localization: true
@@ -248,9 +315,9 @@ roundabout:
     approach: 8.0
     circulation: 8.5
     degraded: 2.0
-    exit: 15.0
+    exit: 6.0
     stationary_threshold: 0.3
-    yield_roll: 0.0
+    yield_roll: 1.5
   tangent_heading_tolerance_deg: 75.0
   time_window:
     assumed_speed: 5.0
@@ -277,7 +344,7 @@ roundabout:
     commit_timeout_seconds: 6.0
     exit_hold_seconds: 1.0
     mandatory_stop_position_tolerance: 0.8
-    mandatory_stop_seconds: 0.0
+    mandatory_stop_seconds: 1.0 # 2026-10-12 양보선 1초 정지 후 출발(사용자)
     mandatory_stop_speed_threshold: 0.25
     minimum_circulate_seconds: 1.0
     tracker_guard_commit_grace_s: 1.2

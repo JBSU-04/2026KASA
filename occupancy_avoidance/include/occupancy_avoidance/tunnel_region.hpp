@@ -26,17 +26,18 @@ struct TunnelRegion {
           r.shadow_first=r.first;
           bool early=false;nh.param("/tunnel_recovery/approach_control_enabled",early,false);
           if(early){
-            std::string path;double control=40.,prepare=60.;
+            std::string path;double control=40.,prepare=60.;int anchor=r.first;
+            nh.param("/tunnel_recovery/approach_anchor_idx",anchor,r.first);
             nh.getParam("/tunnel_recovery/approach_route_csv",path);
             nh.param("/tunnel_recovery/control_prepare_distance_m",control,40.);
             nh.param("/tunnel_recovery/perception_prepare_distance_m",prepare,60.);
             std::ifstream file(path);if(!file||control<0||prepare<control)throw std::runtime_error("invalid M8 approach route/distance");
             std::map<int,std::pair<double,double>> points;std::string line;
             while(std::getline(file,line)){std::stringstream row(line);std::string id,x,y;if(std::getline(row,id,',')&&std::getline(row,x,',')&&std::getline(row,y,','))points[std::stoi(id)]={std::stod(x),std::stod(y)};}
-            if(!points.count(r.first))throw std::runtime_error("M8 start absent from approach route");
-            int c=r.first,p=r.first,start=r.first;double distance=0;
+            if(!points.count(anchor))throw std::runtime_error("M8 anchor absent from approach route");
+            int c=anchor,p=anchor,start=r.first;double distance=0;
             for(int j=0;j<sections.size();++j)if(std::string(sections[j]["id"])=="M7B"&&int(sections[j]["csv"])==r.lane)start=int(sections[j]["idx"][0]);
-            for(int j=r.first-1;j>=0&&points.count(j);--j){const auto a=points.at(j),b=points.at(j+1);double step=std::hypot(a.first-b.first,a.second-b.second);if(!std::isfinite(step)||step<=0)throw std::runtime_error("invalid M8 route segment");distance+=step;if(distance<=control+1e-6)c=j;if(distance<=prepare+1e-6)p=j;else break;}
+            for(int j=anchor-1;j>=0&&points.count(j);--j){const auto a=points.at(j),b=points.at(j+1);double step=std::hypot(a.first-b.first,a.second-b.second);if(!std::isfinite(step)||step<=0)throw std::runtime_error("invalid M8 route segment");distance+=step;if(distance<=control+1e-6)c=j;if(distance<=prepare+1e-6)p=j;else break;}
             r.first=std::max(start,c);r.preview=r.first-std::max(start,p);
           }
           ROS_INFO("[M8 region] csv=%d control=%d..%d perception=%d..%d",r.lane,r.first,r.last,r.first-r.preview,r.last);

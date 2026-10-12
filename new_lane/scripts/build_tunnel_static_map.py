@@ -65,7 +65,15 @@ def build(metadata,wall_pcd,out):
     report=dict(source_metadata=str(metadata),included_scans=scan_count,floor_points=len(floor),wall_points=len(walls),notes='Floor only in reviewed old windows; repeated observed points, no new foreground learning. Map validation remains geometric and incomplete cells UNKNOWN.')
     Path(str(out)+'.json').write_text(json.dumps(report,indent=2)+'\n');print(report)
 
-def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,sections=None):
+def map_topics(filtered=False,shared=False):
+    """2026-10-12 shared: 런타임 지도 비교와 같은 입력(/tunnel/filtered_points 근거리 + /tunnel/filtered_far 원거리).
+    벽·연석 점은 사전 필터가 지우므로 벽 정합(wall alignment)용으로 원시 점 중 벽 높이 띠(센서 z >= 0)만 더한다.
+    이 띠는 필터 점(센서 z <= 0.9 지면 근처 물체)과 겹치지 않아 장애물 판정에 영향이 없다."""
+    if shared:return ['/tunnel/filtered_points','/tunnel/filtered_far','/perception/points_gravity']
+    return ['/tunnel/filtered_background_input' if filtered else '/perception/points_gravity']
+
+
+def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,sections=None,filtered=False,shared=False):
     """GPS NORMAL empty drives, independent maps and measured cross-drive checks."""
     import yaml,hashlib
     from datetime import datetime
@@ -96,7 +104,8 @@ def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,section
         poses=np.asarray(poses);poses[:,3]=np.unwrap(poses[:,3]);rt=np.array([x[0]for x in routes]);gt=np.array([x[0]for x in gps])
         all_cells={};floor_cells={};supports={};floor_supports={};free=set();scans=0;skipped=0
         with rosbag.Bag(heavy) as bag:
-            for topic,msg,t in bag.read_messages(topics=['/perception/points_gravity','/groundgrid/ground']):
+            sources=map_topics(filtered,shared)
+            for topic,msg,t in bag.read_messages(topics=sources+['/groundgrid/ground']):
                 stamp=msg.header.stamp.to_sec();ri=np.searchsorted(rt,stamp,side='right')-1;gi=np.searchsorted(gt,stamp,side='right')-1
                 if ri<0 or routes[ri][1]!=3 or not map_first<=routes[ri][2]<=map_last:continue
                 if gi<0 or gps[gi][1]!='normal' or stamp-gps[gi][0]>.3:skipped+=1;continue
@@ -106,9 +115,11 @@ def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,section
                 body=(bx>-.79)&(bx<3.85)&(np.abs(by)<.95)
                 p=p[~body&(p[:,0]>-15)&(p[:,0]<40)&(np.abs(p[:,1])<12)&(p[:,2]>-height-.45)&(p[:,2]<1.5)]
                 if topic.endswith('ground'):p=p[np.abs(p[:,2]+height)<.15]
+                elif shared and topic.endswith('gravity'):p=p[p[:,2]>=0.]
+                elif (filtered or shared) and not any(f.name=='m2_filtered' for f in msg.fields):raise ValueError('Filtered map requires M2 near/far point contract')
                 w=to_local_world(p,pose[:3],origin,offset);w[:,2]+=pose[3]
-                cells=all_cells if topic.endswith('gravity') else floor_cells
-                support=supports if topic.endswith('gravity') else floor_supports
+                cells=all_cells if topic in sources else floor_cells
+                support=supports if topic in sources else floor_supports
                 # Repeat support belongs to a physical surface patch. Retain
                 # measured 5cm detail inside a patch seen in 3 distinct scans;
                 # sparse 16-channel returns need not hit the identical 5cm voxel.
@@ -121,7 +132,7 @@ def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,section
                     old=cells.get(key)
                     if old is None:cells[key]=(q,1,stamp)
                     elif abs(stamp-old[2])>1e-6:cells[key]=((old[0]*old[1]+q)/(old[1]+1),old[1]+1,stamp)
-                if topic.endswith('gravity'):
+                if topic==sources[0]:
                     scans+=1
                     # Only actual measured ray interiors establish visibility;
                     # never manufacture free space from absent returns.
@@ -152,7 +163,10 @@ def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,section
         return np.vstack(accepted),comparisons
     points,comparison=checked_merge(drive_maps);floor,floor_comparison=checked_merge(drive_floors)
     np.savez_compressed(out,origin=origin,points=points.astype('f4'),floor=floor.astype('f4'))
-    report=dict(format_version=2,empty_drives=pairs,gps_required='normal',sensor_offset=offset,sensor_height=height,origin=origin.tolist(),resolution=.05,minimum_distinct_scans=3,support_patch_m=.2,points=len(points),floor_points=len(floor),drives=stats,cross_drive=comparison,floor_comparison=floor_comparison,version='gps_empty_'+datetime.now().strftime('%Y%m%d_%H%M%S'),sensor_config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),notes='Each accepted background point matches both independently repeated empty-drive maps within 0.12m. Unsupported/conflicting coverage remains unknown; physical boundaries contain no vehicle inset.')
+    report=dict(format_version=2,empty_drives=pairs,gps_required='normal',sensor_offset=offset,sensor_height=height,origin=origin.tolist(),resolution=.05,minimum_distinct_scans=3,support_patch_m=.2,points=len(points),floor_points=len(floor),drives=stats,cross_drive=comparison,floor_comparison=floor_comparison,input_contract='shared_filtered_near_far_plus_raw_wall_band' if shared else 'm2_filtered_near_far' if filtered else 'legacy_raw',version='gps_empty_'+datetime.now().strftime('%Y%m%d_%H%M%S'),sensor_config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),notes='Each accepted background point matches both independently repeated empty-drive maps within 0.12m. Unsupported/conflicting coverage remains unknown; physical boundaries contain no vehicle inset.')
+    if wall_out and shared:
+        # 필터 점 지도에는 경계 밖 벽·연석 점이 없어 경계를 다시 잴 수 없다(순환). 경계는 원시 점 모드로 잰다.
+        print('--wall-out ignored with --shared-filtered: measure boundaries from raw points',flush=True);wall_out=None
     if wall_out:
         profiles=[physical_profile(p,f,origin,road,map_first,map_last) for p,f in zip(drive_maps,drive_floors)]
         profile=common_profile(profiles)
@@ -164,6 +178,6 @@ def build_empty_pairs(pairs, metadata, out, extrinsic=None,wall_out=None,section
     Path(str(out)+'.json').write_text(json.dumps(report,indent=2)+'\n');print(report,flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--metadata',required=True);p.add_argument('--extrinsic');p.add_argument('--walls');p.add_argument('--wall-out');p.add_argument('--sections');p.add_argument('--out',required=True);p.add_argument('--empty-pair',nargs=2,action='append');a=p.parse_args()
-    if a.empty_pair:build_empty_pairs(a.empty_pair,a.metadata,a.out,a.extrinsic,a.wall_out,a.sections)
+    p=argparse.ArgumentParser();p.add_argument('--metadata',required=True);p.add_argument('--extrinsic');p.add_argument('--walls');p.add_argument('--wall-out');p.add_argument('--sections');p.add_argument('--filtered-inputs',action='store_true');p.add_argument('--shared-filtered',action='store_true');p.add_argument('--out',required=True);p.add_argument('--empty-pair',nargs=2,action='append');a=p.parse_args()
+    if a.empty_pair:build_empty_pairs(a.empty_pair,a.metadata,a.out,a.extrinsic,a.wall_out,a.sections,a.filtered_inputs,a.shared_filtered)
     else:build(a.metadata,a.walls,a.out)

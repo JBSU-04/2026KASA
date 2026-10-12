@@ -205,6 +205,8 @@ void RoundaboutMission::reset(double now) {
   seq_timed_approach_ = committed_timed_approach_ = false;
   if(config_.distance_enabled)track_meta_.clear();
   distance_cache_.clear();distance_leader_=distance_follower_=-2;distance_wrap_=0;distance_bad_since_=-1;
+  quarter_ok_frames_=0;quarter_missed_.clear();
+  window_missed_.clear();window_miss_count_.clear();window_target_leader_=window_target_follower_=-2;window_target_wrap_=0;window_ok_frames_=0;
   state_ = RoundaboutState::kIdle;
   state_enter_time_ = now;
   safe_since_ = -1.0;
@@ -837,6 +839,194 @@ RoundaboutMission::GapResult RoundaboutMission::evaluateDistance(
   else{for(size_t i=1;i<stream.size();++i)make(&stream[i-1],&stream[i],0);
     auto l=stream.back(),f=stream.front();l.pos+=C;make(&l,&f,1);
     l=stream.back();f=stream.front();f.pos-=C;make(&l,&f,-1);}
+  // 2026-10-12 갭 시간 창 진입(entry_model: window, 사용자 조사 자료 방식).
+  //   회전 차로 1차원 좌표(합류점 0, 하류 +)에서 연속 (뒷차, 앞차) 갭마다
+  //     t_open  = 앞차가 합류점을 L + s0 + v_m*T_h 지나는 시각(앞차 없으면 0)
+  //     t_close = 뒷차가 L + s0 + v_lag*T_h + max(0,v_lag-v_m)^2/(2a) 앞까지 오는 시각(뒷차 없으면 inf)
+  //   를 구하고, 자차 도착 t_ego 가 [t_open, t_close] 이면 후보. t_ego > t_close 는 놓친 갭(다시 보지 않음).
+  //   타깃 갭(leader, follower, wrap)을 유지하고 N 프레임 연속 OK 일 때만 GO. 뒷차는 양보하지 않는다고 가정한다.
+  // 2026-10-12 갭 1/4 지점 진입(entry_model: quarter, 사용자 설계 + 18:13~18:15 백 보완).
+  //   - 양보선 activate_distance(5 m) 안에서만 갭을 판단한다(멀리서 고른 대상이 흔들리던 문제).
+  //   - 기준점: 자차 진행 방향 직선이 회전 차로 중심선과 만나는 '우리 차 앞' 교점 s_front 에서
+  //     흐름 속도 x (lead_time + 남은 정지 시간) 만큼 상류 s_trig. 도착할 때 1/4 지점이 합류점에 오도록 맞춘다.
+  //   - 일반 갭(>= min_gap): 1/4 지점 P = 앞차 뒷범퍼 - 0.25*갭 이 s_trig +-band 면 출발, 넘으면 놓침.
+  //   - 뒤 개방: 앞차 뒷범퍼 - open_rear_tail 이 s_trig - band 를 지나면 출발. 트래커 불량이면 가상 뒷차로 일반 규칙.
+  //   - 앞 개방: 뒷차 앞범퍼가 s_front - (L + margin + v*open_front_time) 보다 멀면 출발, 아니면 놓침.
+  //   - 대상 = 하류부터 첫 '놓치지 않은' 갭. 한 번 놓친 갭(키)은 이번 접근 동안 다시 보지 않는다.
+  //   진입(COMMIT) 뒤에는 다시 판정하지 않고, 양보선 1 m 이내에서 뒷차가 합류점 2 m 안일 때만 취소한다.
+  if(config_.quarter_enabled){
+    const bool in_commit=state_==RoundaboutState::kCommit;
+    const double INF=std::numeric_limits<double>::infinity(),NaN=std::numeric_limits<double>::quiet_NaN(),half=.5*C,L=config_.gs_ego_length;
+    const bool view_ok=input.tracker_stream_valid;
+    auto lead_far=[&](const GapCandidate& g){return g.leader_id<0||g.leader_pos-.5*g.leader_length>half;};
+    auto lag_far=[&](const GapCandidate& g){return g.follower_id<0||g.follower_pos+.5*g.follower_length< -half;};
+    auto lead_rear=[&](const GapCandidate& g){return lead_far(g)?INF:g.leader_pos-.5*g.leader_length;};
+    auto lag_front=[&](const GapCandidate& g){return lag_far(g)?-INF:g.follower_pos+.5*g.follower_length;};
+    if(!in_commit)quarter_yield_conflict_=result.conflict_distance;
+    if(in_commit){
+      double lag=-INF;for(const auto& v:stream)if(v.id==committed_follower_)lag=std::max(lag,v.pos+.5*v.length);
+      const double moved=quarter_yield_conflict_-result.conflict_distance;
+      const bool abort=lag>-config_.quarter_abort_rear&&lag<config_.quarter_abort_rear&&moved<=config_.quarter_abort_yield;
+      result.safe=result.strict_go=result.front_wait_ok=!abort;result.depart_delay=0.;
+      result.leader_id=committed_leader_;result.follower_id=committed_follower_;result.wrap=committed_wrap_;result.has_leader=committed_leader_>=0;
+      for(const auto& v:stream)if(v.id==committed_leader_){result.leader_pos=v.pos;result.leader_speed=v.physical_speed;result.leader_length=v.length;}
+      result.front_gap=result.has_leader?result.leader_pos-.5*result.leader_length:INF;
+      result.predicted_front=result.predicted_rear=INF;result.blocking_object_id=abort?committed_follower_:-1;
+      result.quarter_case="committed";result.reason=abort?"quarter abort: rear vehicle at merge":"quarter committed";return result;
+    }
+    if(distance_to_yield>config_.quarter_activate_distance){
+      quarter_ok_frames_=0;quarter_missed_.clear();
+      result.quarter_case="inactive";result.reason="quarter inactive (yield distance > activate)";return result;
+    }
+    // '우리 차 앞' 교점: 자차 기준점에서 진행 방향 직선과 회전 차로 중심선(nominal 반지름)의 첫 교점.
+    double s_front=-config_.quarter_front_fallback;
+    {
+      const double R=std::max(1.,config_.nominal_radius),dx=std::cos(input.ego.yaw),dy=std::sin(input.ego.yaw);
+      const double fx=input.ego.position.x-config_.center.x,fy=input.ego.position.y-config_.center.y;
+      const double B=2*(fx*dx+fy*dy),Cq=fx*fx+fy*fy-R*R,disc=B*B-4*Cq;
+      if(disc>=0){double t1=(-B-std::sqrt(disc))/2,t2=(-B+std::sqrt(disc))/2,t=t1>0?t1:t2;
+        if(t>0&&t<40){const Point2 hit{input.ego.position.x+t*dx,input.ego.position.y+t*dy};
+          s_front=sign*normalizeAngle(angleFrom(config_.center,hit)-angle0)*R;}}
+    }
+    // 1초 정지가 남아 있으면 그만큼 더 앞당긴다(정지가 끝나는 순간 맞을 갭을 고른다).
+    double remaining=0.;
+    if(config_.mandatory_stop_seconds>0.&&!mandatory_stop_completed_)
+      remaining=mandatory_stop_since_>=0.?std::max(0.,config_.mandatory_stop_seconds-(input.now-mandatory_stop_since_)):config_.mandatory_stop_seconds;
+    const double lead_t=std::max(0.,config_.quarter_lead_time)+remaining;
+    auto gap_speed=[&](const GapCandidate& g){double v=0;int n=0;
+      if(!lead_far(g)){v+=g.leader_speed;++n;}if(!lag_far(g)){v+=g.follower_speed;++n;}return std::max(1.,n?v/n:config_.quarter_flow_speed);};
+    struct Q{int idx;std::string kind;bool ok,missed;double x,trig,P,gap,lr,lf;};
+    std::vector<Q> qs;
+    for(size_t i=0;i<candidates.size();++i){const auto& g=candidates[i];
+      Q q{int(i),"",false,false,NaN,NaN,NaN,NaN,lead_rear(g),lag_front(g)};
+      if(q.lf>=s_front&&!(lead_far(g)&&lag_far(g)))continue;   // 갭 뒤끝이 이미 우리 차 앞을 지남
+      const double vg=gap_speed(g);q.trig=s_front-vg*lead_t;
+      const bool lf=lead_far(g),gf=lag_far(g),rear_open=!lf&&(gf||q.lf< -config_.quarter_open_rear_view);
+      if(lf&&gf){q.kind="open_both";q.ok=view_ok;}
+      else if(lf){q.kind="open_front";const double need=L+config_.quarter_front_margin+std::max(0.,g.follower_speed)*config_.quarter_open_front_time;
+        q.x=q.lf;q.ok=q.lf<=s_front-need;q.missed=!q.ok;}
+      else if(rear_open&&view_ok){q.kind="open_rear";q.x=q.lr-config_.quarter_open_rear_tail;q.ok=q.x>=q.trig-config_.quarter_band;}
+      else{double lagf=q.lf;if(rear_open){q.kind="virtual_rear";lagf=-config_.quarter_open_rear_view;}else q.kind="normal";
+        q.gap=q.lr-lagf;q.P=q.lr-config_.quarter_fraction*q.gap;q.x=q.P;
+        const bool long_enough=q.gap>=config_.quarter_min_gap;
+        q.ok=long_enough&&std::abs(q.P-q.trig)<=config_.quarter_band;q.missed=!long_enough||q.P>q.trig+config_.quarter_band;}
+      const auto key=std::make_pair(g.leader_id,g.follower_id);
+      if(q.missed)quarter_missed_.insert(key);
+      if(quarter_missed_.count(key)){q.missed=true;q.ok=false;}
+      qs.push_back(q);}
+    // 하류(앞 경계가 큰 쪽)부터 첫 '놓치지 않은' 갭이 대상.
+    std::sort(qs.begin(),qs.end(),[](const Q& a,const Q& b){return a.lr>b.lr;});
+    const Q* tq=nullptr;for(const auto& q:qs)if(!q.missed){tq=&q;break;}
+    // 합류점 근처 미확정(unknown) 물체가 있으면 대기.
+    const double zone=.5*L+1.;bool occupied=false;int occupant=-1;
+    for(const auto& u:unknown)if(std::abs(u.pos)<=zone+.5*u.length){occupied=true;occupant=u.id;break;}
+    const bool ok=tq&&tq->ok&&!occupied;
+    quarter_ok_frames_=ok?quarter_ok_frames_+1:0;
+    const bool go=ok&&quarter_ok_frames_>=std::max(1,config_.quarter_confirm_frames);
+    result.quarter_s_front=s_front;
+    if(!tq){result.reason="quarter no target gap";result.quarter_case="none";return result;}
+    const GapCandidate& g=candidates[tq->idx];
+    result.safe=go;result.strict_go=result.front_wait_ok=go;result.depart_delay=go?0.:INF;
+    result.leader_id=lead_far(g)?-1:g.leader_id;result.follower_id=lag_far(g)?-1:g.follower_id;result.wrap=g.wrap;result.has_leader=result.leader_id>=0;
+    result.leader_pos=g.leader_pos;result.leader_speed=g.leader_speed;result.leader_length=g.leader_length;
+    for(const auto& v:stream)if(v.id==g.leader_id)result.leader_speed=v.physical_speed;
+    result.front_gap=result.has_leader?g.leader_pos-.5*g.leader_length:INF;
+    result.predicted_front=result.predicted_rear=INF;result.current_rear=result.follower_id>=0?-lag_front(g):INF;
+    result.blocking_object_id=go?-1:(occupied?occupant:g.leader_id);
+    result.quarter_P=tq->P;result.quarter_gap=tq->gap;result.quarter_s_trig=tq->trig;result.quarter_x=tq->x;result.quarter_case=tq->kind;
+    if(go){distance_leader_=g.leader_id;distance_follower_=g.follower_id;distance_wrap_=g.wrap;}
+    for(const auto& q:qs){const auto& c=candidates[q.idx];RoundaboutGapViz viz;viz.leader_id=c.leader_id;viz.follower_id=c.follower_id;
+      viz.lo=c.follower_id<0?-config_.gs_viz_range:c.follower_pos+.5*c.follower_length;viz.hi=c.leader_id<0?config_.gs_viz_range:c.leader_pos-.5*c.leader_length;
+      viz.selected=&q==tq;viz.go=&q==tq&&go;viz.feasible=!q.missed;viz.failure_reason=q.missed?"missed":"";last_gaps_.push_back(viz);}
+    std::ostringstream reason;reason<<"quarter "<<(go?"GO":occupied?"merge_occupied":"wait")<<" "<<tq->kind
+      <<" L"<<g.leader_id<<"/F"<<g.follower_id<<" x "<<tq->x<<" trig "<<tq->trig<<" s_front "<<s_front<<" P "<<tq->P<<" gap "<<tq->gap
+      <<" stop_left "<<remaining<<" ok "<<quarter_ok_frames_<<" missed "<<quarter_missed_.size();
+    result.reason=reason.str();return result;
+  }
+  if(config_.window_enabled){
+    const bool in_commit=state_==RoundaboutState::kCommit;
+    const double a=std::max(.3,config_.window_ego_accel),vmax=std::max(.5,ego.max_speed),v0=std::max(0.,ego.speed);
+    const double d=std::max(0.,ego.distance_to_merge);
+    double t_ego=0.,v_m=v0;
+    {
+      const double delay=(v0<.5&&!in_commit)?std::max(0.,config_.window_start_delay):0.;
+      if(v0>=vmax){t_ego=d/std::max(.1,v0);v_m=v0;}
+      else{const double d_acc=(vmax*vmax-v0*v0)/(2*a);
+        if(d<=d_acc){v_m=std::sqrt(v0*v0+2*a*d);t_ego=(v_m-v0)/a;}
+        else{v_m=vmax;t_ego=(vmax-v0)/a+(d-d_acc)/vmax;}}
+      t_ego+=delay;
+    }
+    const double L=config_.gs_ego_length+config_.window_length_margin,s0=config_.window_s0,Th=config_.window_headway;
+    const double INF=std::numeric_limits<double>::infinity();
+    struct Win{double open,close;bool valid;};
+    auto window=[&](const GapCandidate& g)->Win{
+      Win w{0.,INF,true};
+      if(g.leader_id>=0){const double need=L+s0+v_m*Th,vl=std::max(0.,g.leader_speed);
+        w.open=g.leader_pos>=need?0.:(vl>.3?(need-g.leader_pos)/vl:INF);}
+      if(g.follower_id>=0&&g.follower_pos>-.5*C){const double vf=std::max(0.,g.follower_speed);
+        const double dv=std::max(0.,vf-v_m);
+        const double point=config_.window_lag_yield_decel>0.
+            ?-(L+s0+dv*std::max(0.,config_.window_lag_reaction)+dv*dv/(2*config_.window_lag_yield_decel))
+            :-(L+s0+vf*Th+dv*dv/(2*std::max(.3,config_.window_lag_decel)));
+        w.close=g.follower_pos>=point?0.:(vf>.3?(point-g.follower_pos)/vf:INF);}
+      w.valid=w.open<=w.close;return w;};
+    // 합류점 근처(±(L/2+여유))에 차량이 있으면 창과 무관하게 대기(진입 중에는 앞 차량 추종이 맡는다).
+    bool occupied=false;int occupant=-1;const double zone=.5*L+config_.window_merge_margin;
+    for(const auto& v:stream)if(std::abs(v.pos)<=zone+.5*v.length){occupied=true;occupant=v.id;break;}
+    if(!occupied)for(const auto& u:unknown)if(std::abs(u.pos)<=zone+.5*u.length){occupied=true;occupant=u.id;break;}
+    auto key=[](const GapCandidate& g){return std::make_tuple(g.leader_id,g.follower_id,g.wrap);};
+    std::vector<Win> wins;for(const auto& g:candidates)wins.push_back(window(g));
+    int target=-1;
+    if(in_commit){
+      for(size_t i=0;i<candidates.size();++i)if(candidates[i].leader_id==committed_leader_&&candidates[i].follower_id==committed_follower_&&candidates[i].wrap==committed_wrap_){target=int(i);break;}
+      // 승인한 앞차가 합류점을 지나 목록에서 빠지면 같은 뒷차 갭으로 이어 간다(앞차 추종은 별도 lead 탐색이 맡는다).
+      if(target<0&&committed_follower_>=0)for(size_t i=0;i<candidates.size();++i)if(candidates[i].follower_id==committed_follower_){target=int(i);committed_leader_=candidates[i].leader_id;committed_wrap_=candidates[i].wrap;break;}
+      // 그래도 없으면(빈 원형 차로에서 승인 뒤 새 차량 등장 등) 합류점을 포함하는 갭(뒷차 < 0 <= 앞차)으로 이어 간다.
+      if(target<0){double nearest=-INF;
+        for(size_t i=0;i<candidates.size();++i){const auto& c=candidates[i];
+          const bool covers=(c.leader_id<0||c.leader_pos>=0.)&&(c.follower_id<0||c.follower_pos<0.);
+          const double fpos=c.follower_id<0?-INF*0.5:c.follower_pos;
+          if(covers&&(target<0||fpos>nearest)){target=int(i);nearest=fpos;}}
+        if(target>=0){committed_leader_=candidates[target].leader_id;committed_follower_=candidates[target].follower_id;committed_wrap_=candidates[target].wrap;}}
+    }else{
+      for(size_t i=0;i<candidates.size();++i){const auto k=key(candidates[i]);
+        if(wins[i].valid&&t_ego>wins[i].close){if(++window_miss_count_[k]>=std::max(1,config_.window_miss_frames))window_missed_.insert(k);}
+        else window_miss_count_.erase(k);}
+      for(size_t i=0;i<candidates.size();++i){const auto& g=candidates[i];
+        if(g.leader_id==window_target_leader_&&g.follower_id==window_target_follower_&&g.wrap==window_target_wrap_&&
+           wins[i].valid&&!window_missed_.count(key(g))){target=int(i);break;}}
+      if(target<0){double best=INF;
+        for(size_t i=0;i<candidates.size();++i){if(!wins[i].valid||window_missed_.count(key(candidates[i])))continue;
+          if(wins[i].open<best){best=wins[i].open;target=int(i);}}}
+      if(target>=0){const auto& g=candidates[target];
+        if(g.leader_id!=window_target_leader_||g.follower_id!=window_target_follower_||g.wrap!=window_target_wrap_)window_ok_frames_=0;
+        window_target_leader_=g.leader_id;window_target_follower_=g.follower_id;window_target_wrap_=g.wrap;}
+      else{window_target_leader_=window_target_follower_=-2;window_ok_frames_=0;}
+    }
+    if(target<0){result.reason=in_commit?"window committed gap missing":"window no gap";result.window_t_ego=t_ego;result.window_missed=int(window_missed_.size());return result;}
+    const auto& g=candidates[target];const Win& w=wins[target];
+    bool ok;
+    if(in_commit)ok=t_ego<=w.close+config_.window_commit_tolerance;
+    else{ok=!occupied&&w.valid&&w.open<=t_ego&&t_ego<=w.close;window_ok_frames_=ok?window_ok_frames_+1:0;
+      ok=ok&&window_ok_frames_>=std::max(1,config_.window_confirm_frames);}
+    result.safe=ok;result.strict_go=result.front_wait_ok=ok;result.depart_delay=ok?0.:std::max(0.,w.open-t_ego);
+    result.leader_id=g.leader_id;result.follower_id=g.follower_id;result.wrap=g.wrap;result.has_leader=g.leader_id>=0;
+    result.leader_pos=g.leader_pos;result.leader_speed=g.leader_speed;result.leader_length=g.leader_length;
+    for(const auto& sv:stream)if(sv.id==g.leader_id)result.leader_speed=sv.physical_speed;
+    result.front_gap=g.leader_id>=0?g.leader_pos-.5*g.leader_length:INF;
+    result.predicted_front=result.predicted_rear=INF;result.current_rear=g.follower_id>=0?-g.follower_pos-.5*g.follower_length:INF;
+    result.ego_zone_time=t_ego;result.clear_time=t_ego;result.ego_prediction_speed=v_m;
+    result.blocking_object_id=ok?-1:(occupied&&!in_commit?occupant:(t_ego<w.open?g.leader_id:g.follower_id));
+    result.window_t_open=w.open;result.window_t_ego=t_ego;result.window_t_close=w.close;result.window_ok_frames=window_ok_frames_;result.window_missed=int(window_missed_.size());
+    if(!in_commit&&ok){distance_leader_=g.leader_id;distance_follower_=g.follower_id;distance_wrap_=g.wrap;}
+    for(size_t i=0;i<candidates.size();++i){const auto& c=candidates[i];RoundaboutGapViz viz;viz.leader_id=c.leader_id;viz.follower_id=c.follower_id;
+      viz.lo=c.follower_id<0?-config_.gs_viz_range:c.follower_pos+.5*c.follower_length;viz.hi=c.leader_id<0?config_.gs_viz_range:c.leader_pos-.5*c.leader_length;
+      viz.feasible=wins[i].valid&&!window_missed_.count(key(c));viz.go=int(i)==target&&ok;viz.selected=int(i)==target;
+      viz.failure_reason=!wins[i].valid?"window_closed":window_missed_.count(key(c))?"missed":"";last_gaps_.push_back(viz);}
+    std::ostringstream reason;reason<<"window "<<(ok?"GO":(occupied&&!in_commit?"merge_occupied":(t_ego<w.open?"wait":"closing")))<<" L"<<g.leader_id<<"/F"<<g.follower_id
+      <<" t_open "<<w.open<<" t_ego "<<t_ego<<" t_close "<<w.close<<" ok "<<window_ok_frames_<<" missed "<<window_missed_.size();
+    result.reason=reason.str();return result;
+  }
   DistanceEntryParams p;p.clearance_only=config_.distance_clearance_only;p.front_gap=config_.distance_front_gap;p.rear_gap=config_.distance_rear_gap;p.horizon=config_.distance_clearance_only?0.:config_.distance_horizon;
   p.reaction=config_.distance_reaction;p.rear_decel=config_.distance_rear_decel;p.rear_yield=config_.distance_rear_yield;p.speed_margin=config_.gs_speed_margin;
   p.follow_standstill_gap=config_.gs_prediction_follow_standstill_gap;
@@ -876,19 +1066,21 @@ RoundaboutMission::GapResult RoundaboutMission::evaluateDistance(
     viz.feasible=check.safe&&!uncertain;viz.go=viz.feasible;
     viz.failure_reason=check.safe?"":check.reason;last_gaps_.push_back(viz);
   }
-  // 2026-10-11(20:13:40 백 21.5 s): 승인한 앞차가 합류점을 지나 추적 목록에서 빠지면 쌍을 잃어
-  //   진입을 취소했다. 진입 중에는 뒤차(없으면 앞차)가 같은 틈을 계속 같은 틈으로 본다.
-  //   앞차가 멈춰 흐름에서 빠진 경우와 구분하려고, 마지막 확인 위치/속도로 앞차 뒤끝이 이미
-  //   합류점을 standstill_gap 이상 지났다고 볼 수 있을 때만 쌍을 이어 간다.
+  // 2026-10-11(20:13:40 백 14.4/21.9 s): 진입 중 상류에 새 뒤차가 처음 잡히거나(#15) 앞차가 같은 자리에서
+  //   새 ID 로 다시 잡혀(#17->#22) 쌍을 잃고 취소됐다. 같은 앞차면 같은 틈(새 뒤차는 아래에서 다시 판정),
+  //   같은 뒤차면 새 앞차가 이전 앞차 예측 위치보다 3 m 넘게 앞이 아닐 때만 같은 틈으로 본다.
+  //   (멈춰서 흐름에서 빠진 앞차는 어느 쪽도 아니므로 기존처럼 취소한다.)
   if(commit&&latched>=0&&candidates[latched].leader_id>=0){const auto& g=candidates[latched];
     committed_leader_rear_=g.leader_pos-.5*g.leader_length;committed_leader_speed_=g.leader_speed;committed_leader_seen_=input.now;}
-  const bool leader_cleared=committed_leader_seen_>=0&&
-      committed_leader_rear_+committed_leader_speed_*std::max(0.,input.now-committed_leader_seen_)>=config_.gs_standstill_gap;
-  if(commit&&latched<0&&leader_cleared&&(committed_follower_>=0||committed_leader_>=0)){
-    for(int pass=0;pass<2&&latched<0;++pass)for(size_t i=0;i<candidates.size();++i){const auto& g=candidates[i];
-      if(pass==0&&g.wrap!=committed_wrap_)continue;
-      if(committed_follower_>=0?g.follower_id==committed_follower_:g.leader_id==committed_leader_){
-        latched=i;committed_leader_=g.leader_id;committed_follower_=g.follower_id;committed_wrap_=g.wrap;break;}
+  if(commit&&latched<0){
+    const double old_rear=committed_leader_seen_<0?-1e9:
+        committed_leader_rear_+committed_leader_speed_*std::max(0.,input.now-committed_leader_seen_);
+    for(size_t i=0;i<candidates.size()&&latched<0;++i){const auto& g=candidates[i];
+      const bool same_leader=committed_leader_>=0&&g.leader_id==committed_leader_;
+      const bool same_follower=committed_follower_>=0&&g.follower_id==committed_follower_&&
+          g.leader_id>=0&&g.leader_id!=g.follower_id&&committed_leader_seen_>=0&&
+          g.leader_pos-.5*g.leader_length<=old_rear+3.;
+      if(same_leader||same_follower){latched=i;committed_leader_=g.leader_id;committed_follower_=g.follower_id;committed_wrap_=g.wrap;}
     }
   }
   int selected=best;
@@ -1347,6 +1539,14 @@ RoundaboutMission::GapResult RoundaboutMission::evaluateGapSelect(
   ego.measured_profile = config_.gs_measured_entry_profile;
   ego.profile_times = config_.distance_profile_times;
   ego.profile_speeds = config_.distance_profile_speeds;
+  if(config_.gs_observed_entry_enabled && ego.measured_profile &&
+      ego.profile_times.size()==ego.profile_speeds.size() && ego.accel>0.) {
+    // The measured pedal curve must not predict acceleration above the live
+    // MPC limit. Stretch its time axis, preserving measured speed breakpoints.
+    for(size_t i=1;i<ego.profile_times.size();++i)
+      ego.profile_times[i]=std::max(ego.profile_times[i],ego.profile_times[i-1]+
+          std::max(0.,ego.profile_speeds[i]-ego.profile_speeds[i-1])/ego.accel);
+  }
   if (state_ == RoundaboutState::kCommit && ego.speed < 0.5) {
     const double remaining = config_.gs_ego_start_delay - std::max(0.0, input.now-state_enter_time_);
     if (remaining > 0.0) { ego.start_delay = remaining; ego.departure_in_progress = false; }
@@ -2280,6 +2480,21 @@ bool RoundaboutMission::bodyCollisionRisk(const RoundaboutInput& input,double sp
     auto remembered=body_front_cache_;remembered.velocity_valid=false;candidates.push_back(remembered);
   }
   const Point2 offset{input.ego.position.x-projection.point.x,input.ego.position.y-projection.point.y};
+  // 2026-10-12(18:59:56 백): 회전 중 바로 뒤에 붙어 선 NPC(id11)를 '겹침'으로 보고 9 s 넘게 정지했다(서로 대기).
+  //   (1) /odom 이 뒷차축이라 자차 상자가 1.5 m 뒤로 밀려 있었다 -> 상자 중심을 gs_ego_center_offset 만큼 앞으로.
+  //   (2) 원형 차로 안(순환/이탈)에서 같은 차로를 뒤따르는 느린/정지 차(앞범퍼가 우리 뒷범퍼보다 뒤)는 우리가 멈춰도
+  //       추돌을 막을 수 없고 교착만 생기므로 가드 대상에서 뺀다. 진입 중(COMMIT) 옆/앞 차량 보호는 그대로.
+  const bool in_ring=state_==RoundaboutState::kCirculate||state_==RoundaboutState::kExit;
+  auto rear_follower=[&](const TrackedObject& o){
+    if(!in_ring)return false;
+    const double c=std::cos(input.ego.yaw),s=std::sin(input.ego.yaw);
+    const double dx=o.position.x-input.ego.position.x,dy=o.position.y-input.ego.position.y;
+    const double lon=c*dx+s*dy,lat=-s*dx+c*dy;
+    const double half_len=.5*std::max(config_.gs_min_vehicle_length,o.length);
+    // 빠르게 다가오는 뒤차(자차보다 1 m/s 넘게 빠름)는 기존대로 보호 대상으로 남긴다.
+    const double v_obj=std::hypot(o.velocity_x,o.velocity_y);
+    const bool slow=!o.velocity_valid||v_obj<=std::max(.5,std::max(0.,input.ego.speed)+1.);
+    return slow && std::abs(lat)<=config_.gs_rear_follower_lateral && lon+half_len<=-config_.gs_ego_rear_overhang;};
   double travel=0.0,speed=std::max(0.0,input.ego.speed);
   for(double time=0.0;time<=std::max(.1,config_.gs_collision_horizon)+1e-9;time+=.1) {
     const double at=projection.s+travel;
@@ -2287,12 +2502,13 @@ bool RoundaboutMission::bodyCollisionRisk(const RoundaboutInput& input,double sp
     const auto upper=std::upper_bound(arc.begin(),arc.end(),at);
     const size_t i=std::min(arc.size()-1,std::max<size_t>(1,upper-arc.begin()));
     const double f=std::max(0.0,std::min(1.0,(at-arc[i-1])/std::max(1e-6,arc[i]-arc[i-1])));
-    const Point2 ego{input.route[i-1].x+f*(input.route[i].x-input.route[i-1].x)+offset.x,
-                     input.route[i-1].y+f*(input.route[i].y-input.route[i-1].y)+offset.y};
     const double path_yaw=std::atan2(input.route[i].y-input.route[i-1].y,input.route[i].x-input.route[i-1].x);
     const double yaw=input.ego.yaw+normalizeAngle(path_yaw-projection.yaw);
+    const Point2 ego{input.route[i-1].x+f*(input.route[i].x-input.route[i-1].x)+offset.x+config_.gs_ego_center_offset*std::cos(yaw),
+                     input.route[i-1].y+f*(input.route[i].y-input.route[i-1].y)+offset.y+config_.gs_ego_center_offset*std::sin(yaw)};
     for(const auto& o:candidates) {
       if(!o.has_moved || (o.collision_parent_id<0 && (o.height<.15 || o.width<1.0)))continue;
+      if(rear_follower(o))continue;
       double angle=0,vt=0;if(!isCirculatingObject(o,&angle,&vt))continue;
       const double radius=std::max(1.0,radiusFrom(config_.center,o.position));
       if(!o.velocity_valid) {
@@ -2328,6 +2544,8 @@ RoundaboutMission::LeadResult RoundaboutMission::findLeadVehicle(
   // Keep entry-path distance until the ego center actually reaches it.
   const bool bumper_model = config_.distance_enabled || config_.gs_measured_entry_profile || config_.gs_observed_entry_enabled;
   const bool before_merge=bumper_model&&!exiting&&merge_distance>0.;
+  const bool approved_front=config_.gs_observed_entry_enabled&&committed_valid_&&
+      committed_leader_>=0&&!exiting&&before_merge;
 
   auto candidates = input.objects;
   if (config_.gs_route_body_projection) {
@@ -2354,6 +2572,9 @@ RoundaboutMission::LeadResult RoundaboutMission::findLeadVehicle(
   }
   for (const TrackedObject& object : candidates) {
     if(object.collision_parent_id>=0)continue;
+    // Entry timing and ACC must follow the same approved vehicle. A farther
+    // already-departed car cannot replace the still approaching slot leader.
+    if(approved_front&&object.id!=committed_leader_)continue;
     double object_angle = 0.0;
     double tangential_speed = 0.0;
     if(config_.distance_enabled&&!object.has_moved)continue;
@@ -2391,7 +2612,11 @@ RoundaboutMission::LeadResult RoundaboutMission::findLeadVehicle(
       // increase in ACC clearance exactly during the merge.
       arc = std::max(0.0, arc - 0.5 * config_.gs_ego_length);
     }
-    if (config_.gs_route_body_projection && !exiting) {
+    if(approved_front) {
+      const double sign=config_.counter_clockwise?1.:-1.;
+      const double from_conflict=sign*normalizeAngle(object_angle-angleFrom(config_.center,conflict))*config_.nominal_radius;
+      arc=std::max(0.,merge_distance+from_conflict-.5*object.length-.5*config_.gs_ego_length);
+    } else if (config_.gs_route_body_projection && !exiting) {
       const double delta=normalizeAngle(input.ego.yaw-tangentYaw(ego_angle,config_.counter_clockwise));
       const double half=0.5*config_.gs_ego_length,width=0.5*config_.gs_ego_width;
       const double support=std::abs(std::cos(delta))*half+std::abs(std::sin(delta))*width;
@@ -2656,6 +2881,8 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
   output.blocking_object_id = gap.blocking_object_id;
   output.next_npc_ttc = gap.next_npc_ttc;
   output.front_gap = gap.front_gap;
+  output.window_t_open=gap.window_t_open;output.window_t_close=gap.window_t_close;output.window_t_ego=gap.window_t_ego;output.window_ok_frames=gap.window_ok_frames;output.window_missed=gap.window_missed;
+  output.quarter_P=gap.quarter_P;output.quarter_gap=gap.quarter_gap;output.quarter_case=gap.quarter_case;output.quarter_s_front=gap.quarter_s_front;output.quarter_s_trig=gap.quarter_s_trig;output.quarter_x=gap.quarter_x;
   const double required_safe_confirm_seconds =
       config_.distance_enabled ? std::max(0.0,config_.distance_confirm) : config_.tw_enabled ? std::max(0.0, config_.tw_confirm) :
       config_.gap_select_enabled
@@ -2733,11 +2960,19 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
     for(auto& viz:output.gaps)if(viz.selected){viz.go=false;viz.feasible=false;viz.failure_reason="unapproved_entry";}
   }
 
-  // 2026-10-11(20:13:40 백 11~21 s): 진입 취소 뒤 멈춘 다음에도 취소 표시가 남아, 양보선 쪽으로
-  //   움직일 때마다 상한 0 급제동 -> 재출발이 10 s 반복됐다(움찔거림). 취소 제동은 멈추면 끝난 것이다.
-  if (commit_aborted_ && state_ == RoundaboutState::kYield &&
-      input.ego.speed <= config_.mandatory_stop_speed_threshold)
-    commit_aborted_ = false;
+  // 2026-10-11(20:13:40 백 11~21 s): 진입 취소 뒤 양보선 앞에서 멈춘 다음에도 움직일 때마다 상한 0
+  //   급제동 -> 재출발이 10 s 반복됐다(움찔거림). 취소 표시(재진입은 정지 상태에서만)는 유지하고,
+  //   한 번 멈춘 뒤에는 즉시 제동 대신 양보선 정지 목표로 다가간다(아래 YIELD 상한).
+  //   경로 투영으로 양보선 '앞'이 확실할 때만(양보선을 넘어 멈췄으면 그 자리 정지 유지).
+  bool before_yield = false;
+  {
+    const PolylineProjection ep = projectToPolyline(input.route, input.ego.position);
+    const PolylineProjection yp = projectToPolyline(input.route, config_.yield_point);
+    before_yield = ep.valid && yp.valid && ep.distance <= config_.route_projection_tolerance &&
+                   yp.distance <= config_.route_projection_tolerance && ep.s < yp.s - 0.5;
+  }
+  if (!commit_aborted_ || !before_yield) abort_stopped_ = false;
+  else if (input.ego.speed <= config_.mandatory_stop_speed_threshold) abort_stopped_ = true;
 
   if (state_ == RoundaboutState::kApproach ||
       state_ == RoundaboutState::kYield) {
@@ -2775,7 +3010,8 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
       const bool roll_mode = config_.mandatory_stop_seconds <= 0.0 && config_.yield_roll_speed > 0.0;
       const bool roll_ready = config_.gs_observed_entry_enabled
           ? output.distance_to_yield<=config_.gs_entry_commit_distance
-          : (config_.gs_spatial_gap_enabled && config_.gs_spatial_only_admission) || !roll_mode ||
+          // 2026-10-12: 시간 창 모델은 현재 속도로 도착 시각을 계산하므로 감속 대기 없이 바로 GO(자료 APPROACH 규칙).
+          : config_.window_enabled || (config_.gs_spatial_gap_enabled && config_.gs_spatial_only_admission) || !roll_mode ||
             (output.distance_to_yield <= (opportunity?config_.gs_entry_commit_distance:config_.yield_go_distance) &&
              input.ego.speed <= (opportunity?config_.gs_entry_commit_max_speed:config_.yield_roll_speed + 0.5));
       if (roll_mode && !roll_ready && state_ == RoundaboutState::kApproach &&
@@ -2832,6 +3068,7 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
             std::isfinite(stop_room) && need <= stop_room) {
           commit_unsafe_since_ = -1.0;
           commit_aborted_ = true;
+          abort_stopped_ = false;
           transition(RoundaboutState::kYield, input.now);
         }
       }
@@ -2931,7 +3168,7 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
         //   즉시 제동은 움직이는 동안(또는 이미 양보선 위/너머)만, 양보선 전에 섰으면 양보선 정지 목표로 돌아가 다가간다.
         if (config_.gap_select_enabled && commit_aborted_ &&
             std::isfinite(gap.conflict_distance) &&
-            (input.ego.speed > config_.mandatory_stop_speed_threshold ||
+            ((!abort_stopped_ && input.ego.speed > config_.mandatory_stop_speed_threshold) ||
              output.distance_to_yield <= 0.5)) {
           // Abort means brake now, not drive toward a later hold line.
           output.constraint.stop_distance = 0.0;
@@ -3001,7 +3238,8 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
         // 거리 0 으로 잘려 급정지 명령이 된다.
         if (!config_.gs_route_body_projection && config_.gap_select_enabled && (commitGapOk(gap) || rear_yield_commit_lock) && gap.has_leader &&
             gap.leader_pos > -0.5 * std::max(0.1, gap.leader_length) &&
-            (!config_.distance_enabled || rear_yield_commit_lock ||
+            // 2026-10-12 quarter: 출발 순간 앞차를 바로 ACC 대상으로 넘긴다(사전 확보).
+            (!config_.distance_enabled || rear_yield_commit_lock || config_.quarter_enabled ||
              gap.leader_pos - 0.5 * std::max(0.1,gap.leader_length) >= config_.gs_standstill_gap) &&
             std::isfinite(gap.conflict_distance)) {
           const double lead_gap = gap.conflict_distance + gap.leader_pos -
@@ -3169,6 +3407,28 @@ RoundaboutOutput RoundaboutMission::update(const RoundaboutInput& raw_input) {
         output.constraint.lead_profile_override=false;
       }
     }
+  }
+  // 2026-10-12 quarter: 양보선 대기 중에도 대상 갭 앞차를 ACC 대상으로 미리 계산해 둔다(active=false, 페달 보조 없음).
+  if(config_.acc_enabled && config_.quarter_enabled && gap.has_leader && std::isfinite(gap.conflict_distance) &&
+     (state_==RoundaboutState::kApproach||state_==RoundaboutState::kYield)){
+    output.acc_active=false;output.acc_id=gap.leader_id;
+    output.acc_gap=gap.conflict_distance+gap.leader_pos-.5*gap.leader_length-.5*config_.gs_ego_length;
+    output.acc_gap_ref=config_.acc_target_gap;output.acc_lead_speed=gap.leader_speed;
+  }
+  // 2026-10-12 ACC 2 m 거리 유지: 진입/순환/이탈 중 앞차가 있으면 목표 속도로 가속·감속 둘 다 한다.
+  //   v_des = v_lead + gain*(gap - (target + T*v)). 속도 상한에 넣으면 MPC 가 감속을 즉시 따르고,
+  //   가속은 roundabout_launch_assist 가 /mission/roundabout/acc 의 a_des 로 페달을 보탠다.
+  //   기존 braking/headway 상한(prediction_follow_*)은 안전 하한으로 남는다.
+  if(config_.acc_enabled && output.constraint.lead_vehicle_active &&
+     (state_==RoundaboutState::kCommit||state_==RoundaboutState::kCirculate||state_==RoundaboutState::kExit)){
+    const double v=std::max(0.,input.ego.speed),vl=std::max(0.,output.constraint.lead_speed),d=output.constraint.lead_distance;
+    const double ref=config_.acc_target_gap+config_.acc_time_gap*v;
+    const double vmax=output.constraint.max_speed<0.?(state_==RoundaboutState::kExit?config_.exit_speed:config_.circulation_speed):output.constraint.max_speed;
+    const double v_des=std::max(0.,std::min(vmax,vl+config_.acc_gain*(d-ref)));
+    const double a_des=std::max(-config_.acc_max_brake,std::min(config_.acc_max_accel,config_.acc_accel_gain*(v_des-v)));
+    output.constraint.max_speed=v_des;
+    output.acc_active=true;output.acc_id=output.constraint.lead_vehicle_id;output.acc_gap=d;output.acc_gap_ref=ref;
+    output.acc_lead_speed=vl;output.acc_v_des=v_des;output.acc_a_des=a_des;
   }
   if (config_.gs_body_collision_guard && !((config_.gs_observed_entry_enabled || (opportunity && config_.gs_commit_acc_only)) && committed_valid_) && (state_==RoundaboutState::kCommit ||
       state_==RoundaboutState::kCirculate)) {

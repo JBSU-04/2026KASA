@@ -59,14 +59,25 @@ TEST(TunnelMap,DifferentOffsetsOnEachWallCannotAlign){
  std::vector<V>scan;for(double x=1;x<30;x+=.1){scan.emplace_back(x,3.15,.5);scan.emplace_back(x,-3.15,.5);}
  EXPECT_FALSE(wallAlignment(scan,Pose(),m,V::Zero()).valid);
 }
-TEST(TunnelDetectionUnion,EmptyNongroundDoesNotLoseSameScanResidual){
+TEST(TunnelDetectionUnion,RawMismatchCannotReintroduceGround){
  Row r;r.sensor=V(24.,0.,-1.5);r.world=V(302620.,4123600.,0.);r.valid=true;r.height=.2;r.candidate=true;r.label=3;
- auto rows=mergeDetectionRows({}, {r});ASSERT_EQ(rows.size(),1u);EXPECT_DOUBLE_EQ(rows[0].sensor.x(),24.);EXPECT_EQ(rows[0].label,3);
+ EXPECT_TRUE(mergeDetectionRows({}, {r}).empty());
+ auto rows=mergeDetectionRows({}, {r},true);ASSERT_EQ(rows.size(),1u);EXPECT_DOUBLE_EQ(rows[0].sensor.x(),24.);
 }
 TEST(TunnelDetectionUnion,ExactDuplicatesOnlyAndUnknownGroundNotConfirmed){
  Row r;r.sensor=V(24.,0.,-1.5);r.valid=true;r.candidate=true;r.label=2;r.height=.2;
  Row close=r;close.sensor.x()+=.001;
  Row unknown=r;unknown.valid=false;unknown.label=4;unknown.sensor.x()+=1;
  Row bg=r;bg.bg=true;bg.sensor.x()+=2;
- auto rows=mergeDetectionRows({r},{r,close,unknown,bg});ASSERT_EQ(rows.size(),2u);EXPECT_DOUBLE_EQ(rows[1].sensor.x(),24.001);EXPECT_EQ(rows[1].label,2);
+ auto rows=mergeDetectionRows({r},{r,close,unknown,bg},true);ASSERT_EQ(rows.size(),2u);EXPECT_DOUBLE_EQ(rows[1].sensor.x(),24.001);EXPECT_EQ(rows[1].label,2);
+}
+
+TEST(TunnelDetectionUnion,SharedGroundHeightCannotBeOverwrittenByMapFloor){
+ Row near;near.sensor=V(24.,0.,-1.7);near.height=.01;near.valid=true;
+ Row mapped=near;mapped.height=.09;mapped.candidate=true;mapped.label=3;
+ auto rows=mergeDetectionRows({near},{mapped});ASSERT_EQ(rows.size(),1u);EXPECT_DOUBLE_EQ(rows[0].height,.01);EXPECT_EQ(rows[0].label,0);
+}
+TEST(TunnelDetectionUnion,ActualLowNongroundIsPreservedWithoutMapEvidence){
+ Row low;low.sensor=V(18.,.3,-1.6);low.height=.16;low.valid=true;
+ auto rows=mergeDetectionRows({low},{});ASSERT_EQ(rows.size(),1u);EXPECT_DOUBLE_EQ(rows[0].height,.16);
 }

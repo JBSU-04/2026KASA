@@ -280,12 +280,14 @@ class FarOnlyTunnelTests(fixture.StaticOccupancyTests):
     def test_low_far_only_proposal_not_accumulated(self):
         for t in (9.8,9.9,10.):self.update([self.far(25.,.17,t)],t,mode='tunnel')
         self.assertFalse(self.cache.parents)
-    def test_far_only_parent_dropped_when_near_cannot_confirm(self):
+    def test_close_far_only_parent_kept_for_near_handoff(self):
+        # 2026-10-11 M8 최종: GroundGrid 근거리는 터널 저상 물체를 6 m 에서야 본다(21:24:39 백).
+        #   원거리 시야(13 m) 안쪽으로 들어온 원거리 단독 부모는 근거리 확인 없이도 유지한다.
         for t in (9.8,9.9,10.):self.update([self.far(12.,.4,t)],t,mode='tunnel')
-        self.assertEqual(len(self.cache.parents),1)
         for t in (10.2,10.6,11.2):self.update([],t,mode='tunnel')
-        self.assertFalse(self.cache.parents)
-    def test_far_parent_kept_far_away(self):
-        for t in (9.8,9.9,10.):self.update([self.far(25.,.4,t)],t,mode='tunnel')
-        for t in (10.6,11.2):self.update([],t,mode='tunnel')
         self.assertEqual(len(self.cache.parents),1)
+    def test_far_only_parent_dropped_when_far_loses_it(self):
+        # 원거리가 볼 수 있는 거리(13 m 이상)에서 0.6 s 넘게 다시 안 보이면 원거리 오검출로 지운다.
+        for t in (9.8,9.9,10.):self.update([self.far(25.,.4,t)],t,mode='tunnel')
+        for t in (10.3,10.6,11.2):self.update([],t,mode='tunnel')
+        self.assertFalse(self.cache.parents)

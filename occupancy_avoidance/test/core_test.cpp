@@ -553,3 +553,26 @@ TEST(Corridor,M8OpenEntranceHasNoInventedProfileWall){
  Engine e;e.setStrictSceneMargins(true);e.setRoad(road(),{{0,800,-1,-1}});observe(e,ground());
  auto p=road();for(auto&q:p)q.y-=2.;EXPECT_TRUE(e.validate(p,1.2));
 }
+
+TEST(Admission,NativeSparseStaticCellsAdmitWithoutFillingDiagnosticBox){
+ Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});e.integrate(pose(1),ground());
+ auto digest=e.geometryDigest();CertifiedTrigger h;h.stamp=1.;h.measured_cells=true;
+ h.footprint={{302520.,4124000.,0}};e.setCertifiedTriggers({h});
+ auto result=e.plan(pose(1),road());EXPECT_GT(result.trigger_count,0);
+ EXPECT_EQ(result.trigger_reason,"certified_static_geometry");EXPECT_EQ(e.geometryDigest(),digest);
+}
+TEST(Admission,SeparatedNativeSideCellsCannotBridgeEmptyReferenceCorridor){
+ Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});e.integrate(pose(1),ground());
+ CertifiedTrigger h;h.stamp=1.;h.measured_cells=true;
+ h.footprint={{302520.,4123997.,0},{302520.,4124003.,0}};e.setCertifiedTriggers({h});
+ auto result=e.plan(pose(1),road());EXPECT_EQ(result.trigger_count,0);
+}
+
+TEST(Admission,FilteredTunnelCellsCannotApproveWithoutMissionCertificate){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto samples=ground();
+  for(double x=20;x<21;x+=.2)for(double y=-.4;y<.5;y+=.2)samples.push_back({x,y,-1.3});
+  observe(e,samples);ASSERT_GT(e.staticCount(),0u);e.setCertifiedAdmissionOnly(true);
+  auto result=e.planningSnapshot()->plan(pose(1.2),road());EXPECT_EQ(result.trigger_count,0);
+  CertifiedTrigger h;h.stamp=1.2;h.footprint={{302521.,4123999.6,0},{302522.,4123999.6,0},{302522.,4124000.5,0},{302521.,4124000.5,0}};
+  e.setCertifiedTriggers({h});auto approved=e.planningSnapshot()->plan(pose(1.2),road());EXPECT_GT(approved.trigger_count,0);
+}

@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from tunnel_region import read_region, contains
 from obstacle_geometry import regional_plane_heights
 from tunnel_scene_policy import preslow
+from m8_filtered_input import cloud_rows, preslow_speed_cap
+from scipy.spatial import cKDTree
 from tunnel_map_geometry import fields_array
 import rospy
 from sensor_msgs.msg import PointCloud2
@@ -353,6 +355,9 @@ class TunnelWallDetector:
         import m8_geometry_native
         m8_geometry_native.enabled=bool(rospy.get_param('/tunnel_recovery/native_geometry_enabled',True))
         self.physical_boundary_policy = bool(rospy.get_param('~physical_boundary_policy', False))
+        # 2026-10-12: 1001 스냅샷의 벽 추적 예측과 1 s 경계 유지를 물리 경계 정책과 분리해 다시 쓴다(벽 2.2 s 미검출 후
+        #   벽 충돌, 20:56 백). 엔진은 실측 프로파일로 다시 좁히므로(strict_scene_margins) 예측이 터널을 넓히지 못한다.
+        self.wall_prediction_hold_enabled = bool(rospy.get_param('~wall_prediction_hold_enabled', True))
         # ★ 2026-09-29 (19:23 백): 선감속은 원본 점군 + 국소 지면으로 판정한다.
         #   낮은 장애물(윗면 0.33 m)을 /nonground(GroundGrid)가 10 m 밖에서 지면으로
         #   지워 선감속이 한 번도 안 걸렸다(원본 점은 25~30 m 부터 있었다).
@@ -384,6 +389,14 @@ class TunnelWallDetector:
         self.tunnel_region=read_region(rospy.get_param)
         self.common_scene_enabled=bool(rospy.get_param("/tunnel_recovery/common_scene_enabled",True))
         self.common_scene={}
+        self.independent_preslow=bool(rospy.get_param("/tunnel_recovery/independent_preslow_enabled",False))
+        self.preslow_root={};self.preslow_root_stamp=-1e9;self.preslow_input_stamp=-1e9
+        self.preslow_cap_pub=rospy.Publisher("/tunnel/preslow_speed_cap_mps",Float64,queue_size=1)
+        self.preslow_start=float(rospy.get_param("~preslow_start_distance_m",25.))
+        self.preslow_min=float(rospy.get_param("~preslow_min_speed_mps",4.))
+        # 2026-10-12 시작 속도 = M8 구간 속도 상한(mpc_params speed_limit.sections.M8, 지금 5.0).
+        #   전에는 6.0 이라 구간 상한 5.0 아래로 내려가는 15 m 안쪽에서야 실제 감속이 시작됐다.
+        self.preslow_initial=float(rospy.get_param("/speed_limit/sections/M8",rospy.get_param("~preslow_initial_speed_mps",5.)))
         self.preslow_marker_pub=rospy.Publisher("/tunnel/preslow_markers",MarkerArray,queue_size=1)
         self.preslow_state_pub=rospy.Publisher("/tunnel/preslow_state",String,queue_size=1)
         self.accepted_selection={}
@@ -395,7 +408,6 @@ class TunnelWallDetector:
             self.scene_sub=rospy.Subscriber('/tunnel/perception_scene_native',TunnelScene,lambda m:self.common_scene_cb(scene_dict(m)),queue_size=1,buff_size=2**24,tcp_nodelay=True)
         else:
             self.scene_sub=rospy.Subscriber("/tunnel/perception_scene",String,self.common_scene_cb,queue_size=1,buff_size=2**24)
-        self.scene_timer=rospy.Timer(rospy.Duration(.1),self.common_scene_tick)
         self.map_preslow_distance=float(rospy.get_param('~map_preslow_distance_m',20.))
         self.object_risk_preslow=bool(rospy.get_param('~object_risk_preslow_enabled',True))
         self.map_preslow_memory=float(rospy.get_param('~map_preslow_memory_sec',4.))
@@ -473,7 +485,7 @@ class TunnelWallDetector:
         self.bg_moving_pub = rospy.Publisher('/tunnel/bg_moving', String, queue_size=1)
         self.bg_track_debug_pub = rospy.Publisher('/tunnel/bg_tracks_debug', String, queue_size=5)
         bg_file = rospy.get_param('~bg_map_file', '')
-        if bool(rospy.get_param('~bg_map_enabled', True)) and bg_file:
+        if not self.independent_preslow and bool(rospy.get_param('~bg_map_enabled', True)) and bg_file:
             try:
                 self.bgmap = TunnelBgMap(bg_file)
                 rospy.loginfo('[tunnel_wall] background map %s (%dx%d, res %.2f)', bg_file,
@@ -551,7 +563,17 @@ class TunnelWallDetector:
             self.publish_bg_map()
 
         rospy.Subscriber("/tunnel/map_classified",PointCloud2,self.classified_kick_cb,queue_size=1,buff_size=2**24)
-        rospy.Subscriber("/tunnel/map_background",PointCloud2,self.verified_wall_cb,queue_size=1,buff_size=2**24)
+        # 2026-10-12 원거리 필터 점의 지도 분류(12~40 m). GroundGrid 는 터널에서 약 14 m 밖 저상 물체를 놓쳐
+        #   25 m 선서행이 15 m 안쪽에서만 걸렸다. 최근 0.35 s 안의 원거리 결과를 근거리 결과와 합친다.
+        self.preslow_far=([],-1e9)
+        rospy.Subscriber("/tunnel/map_classified_far",PointCloud2,self.far_preslow_cb,queue_size=1,buff_size=2**24)
+        # 2026-10-12 벽선 측정은 벽 점 제거 전 입력(/perception/points_gravity, 벽 높이 띠)으로 한다.
+        #   사전 필터가 벽·연석 점을 지우므로 필터 점 기반 /tunnel/map_background 에는 벽이 남지 않는다.
+        self.wall_from_raw_points=bool(rospy.get_param('~wall_from_raw_points',True))
+        if self.wall_from_raw_points:
+            rospy.Subscriber(rospy.get_param('~wall_raw_topic','/perception/points_gravity'),PointCloud2,self.raw_wall_cb,queue_size=1,buff_size=2**24)
+        else:
+            rospy.Subscriber("/tunnel/map_background",PointCloud2,self.verified_wall_cb,queue_size=1,buff_size=2**24)
         # Subscribers
         rospy.Subscriber('/localization/gps_mode', String, self.gps_mode_cb, queue_size=1)
         try:
@@ -577,9 +599,10 @@ class TunnelWallDetector:
             rospy.Subscriber('/final_waypoint', Lane, self.route_cb, queue_size=1)
         except Exception:
             pass
-        if self.kick_use_raw:
+        if self.kick_use_raw and not self.independent_preslow:
             rospy.Subscriber(self.kick_cloud_topic, PointCloud2, self.raw_kick_cb, queue_size=1,
                              buff_size=2 ** 24)
+        self.scene_timer=rospy.Timer(rospy.Duration(.1),self.common_scene_tick)
         rospy.loginfo('[tunnel_wall_detector] width=%.2f target=%.2f (auto=%s) curb_inset=%.2f kick=%s %.0fm',
                       self.nominal_tunnel_width, self.target_wall_dist, self.auto_target,
                       self.curb_inset, self.kick_enabled, self.kick_range)
@@ -731,6 +754,7 @@ class TunnelWallDetector:
             data = json.loads(msg.data)
         except ValueError:
             return
+        self.preslow_root=data;self.preslow_root_stamp=float(data.get("stamp",-1e9))
         fps = []
         seen_fp = set()
         for key in ('collision_objects', 'obstacles'):
@@ -751,6 +775,8 @@ class TunnelWallDetector:
                     fps.append((poly, poly.min(axis=0), poly.max(axis=0)))
         self.kick_static_footprints = fps
         self.kick_static_t = rospy.Time.now().to_sec()
+        if self.independent_preslow:
+            self.bg_ids_pub.publish(String(data='{"ids":[]}'));return
         if self.bgmap is None:
             return
         ids = []
@@ -781,6 +807,8 @@ class TunnelWallDetector:
             return
         if d.get('motion_state') in ('AVOIDING', 'RETURNING'):
             self.kick_avoiding_t = rospy.Time.now().to_sec()
+        if d.get('valid'):
+            self.kick_engine_valid_t = rospy.Time.now().to_sec()
 
     def path_distance(self, wx, wy):
         """지금 발행 경로(/local_path)까지 거리. 경로가 없거나 오래되면 0(=경로 근처로 본다, 보수적)."""
@@ -810,6 +838,23 @@ class TunnelWallDetector:
         u = np.clip(((wx - a[:, 0]) * e[:, 0] + (wy - a[:, 1]) * e[:, 1]) / l2, 0.0, 1.0)
         d = np.hypot(wx - a[:, 0] - u * e[:, 0], wy - a[:, 1] - u * e[:, 1])
         return float(d.min()) > getattr(self, 'kick_avoid_clear_m', 1.0)
+
+    def avoidance_target(self, wx, wy):
+        """회피 대상으로 잡은 정적 장애물 점이면 True(선감속 제외).
+
+        2026-10-11 M8 최종: 정적 장애물 외곽선(+kick_static_margin) 안의 점이고, 엔진이 최근 유효 경로를
+        냈으며 그 경로(/local_path)가 이 점에서 kick_avoid_clear_m 넘게 떨어져 지나가면 회피가 맡은 것이다.
+        회피 시작 전 계획 단계도 포함한다. 유효 경로가 없거나 경로가 점을 지나면 그대로 선감속한다.
+        """
+        now = rospy.Time.now().to_sec()
+        if now - getattr(self, 'kick_engine_valid_t', -1e9) > 0.5:
+            return False
+        path = getattr(self, 'kick_avoid_path', None)
+        if path is None or now - getattr(self, 'kick_avoid_path_t', 0.0) > 0.5:
+            return False
+        if not self.near_static_obstacle(wx, wy):
+            return False
+        return self.path_distance(wx, wy) > getattr(self, 'kick_avoid_clear_m', 1.0)
 
     def near_static_obstacle(self, wx, wy):
         """정적으로 인지된 물체 외곽선(+kick_static_margin) 안인가."""
@@ -1100,6 +1145,11 @@ class TunnelWallDetector:
         self.kick_pub.publish(Bool(data=False))
         self.kick_dist_pub.publish(Float64(data=-1.0))
 
+    def raw_wall_cb(self,msg):
+        if not getattr(self,'map_classification_enabled',False) or not self.is_tunnel_zone():return
+        self.map_wall_stamp=msg.header.stamp.to_sec()
+        self.lidar_cb(msg,verified=True)
+
     def verified_wall_cb(self,msg):
         if not getattr(self,'map_classification_enabled',False):return
         self.map_wall_stamp=msg.header.stamp.to_sec()
@@ -1207,14 +1257,15 @@ class TunnelWallDetector:
             decay = max(0.0, abs(self.filtered_shift) - self.shift_rate_limit * dt)
             self.filtered_shift = math.copysign(decay, self.filtered_shift)
         fresh_limits = limits is not None
-        if limits is None and self.wall_track_enabled and not self.physical_boundary_policy:
+        allow_hold = (not self.physical_boundary_policy) or getattr(self, 'wall_prediction_hold_enabled', False)
+        if limits is None and self.wall_track_enabled and allow_hold:
             # 실측 실패: 예측한 벽 위치로 제한을 낸다(차가 움직인 만큼 반영된 값).
             limits = self.predicted_limits(wall_pred, now)
             if limits is not None:
                 rospy.loginfo_throttle(
                     0.5, '[tunnel_wall] 벽 실측 실패 - 예측 벽으로 제한 유지 (R %s / L %s)',
                     'pred' if 'r' in wall_pred else 'width', 'pred' if 'l' in wall_pred else 'width')
-        elif (not self.physical_boundary_policy and limits is None and self.last_limits is not None and
+        elif (allow_hold and limits is None and self.last_limits is not None and
                 (now - self.last_limits[0]).to_sec() <= self.limits_hold_sec):
             limits = self.last_limits
         self.offset_pub.publish(Float64(data=self.filtered_shift))
@@ -1261,7 +1312,7 @@ class TunnelWallDetector:
                              kick_lines if fresh_limits else None, self.last_kick_confirmed)
 
     def publish_kick(self, present, nearest):
-        if self.common_m8():return
+        if getattr(self,"independent_preslow",False) or self.common_m8():return
         self.kick_hits = self.kick_hits + 1 if present else 0
         confirmed = present and self.kick_hits >= (1 if getattr(self,"map_raw_active",False) else self.kick_confirm_frames)
         self.last_kick_confirmed = confirmed
@@ -1290,11 +1341,15 @@ class TunnelWallDetector:
         except (ValueError,TypeError):return
 
     def common_scene_tick(self,event):
+        if self.independent_preslow:
+            if rospy.Time.now().to_sec()-self.preslow_input_stamp>.35:
+                self.emit_preslow(False,-1.,9999.,[],"filtered_input_expired")
+            return
         if not self.common_m8():return
         now=rospy.Time.now().to_sec()
         if self.pose is None:return
         path=getattr(self,'kick_avoid_path',None);path_stamp=getattr(self,'kick_path_stamp',-1e9)
-        selection=min(self.accepted_selections.values(),key=lambda v:abs(float(v.get('stamp',-1e9))-path_stamp),default={})
+        selection=min(list(self.accepted_selections.values()),key=lambda v:abs(float(v.get('stamp',-1e9))-path_stamp),default={})
         if not (selection.get('valid',False) and abs(float(selection.get('stamp',-1e9))-path_stamp)<1e-5 and selection.get('coordinate_version')==self.common_scene.get('coordinate_version')):path=None
         route=getattr(self,'route',None)
         reference=route[0] if route is not None and -.05<=now-getattr(self,'route_stamp',-1e9)<=.5 else None
@@ -1328,14 +1383,75 @@ class TunnelWallDetector:
             self.preslow_marker_pub.publish(MarkerArray(markers=markers))
 
 
+    def emit_preslow(self,present,distance,cap,objects,reason):
+        self.last_kick_confirmed=present
+        self.kick_pub.publish(Bool(data=present));self.kick_dist_pub.publish(Float64(data=distance))
+        self.kick_inpath_pub.publish(Float64(data=distance));self.preslow_cap_pub.publish(Float64(data=cap))
+        self.preslow_state_pub.publish(String(data=json.dumps(dict(stamp=self.preslow_input_stamp,
+            present=present,distance=distance,speed_cap_mps=cap,reason=reason,objects=objects,
+            input="m2_filtered_near_far",mission_control=False),separators=(',',':'))))
+
+    def preslow_residuals(self,msg):
+        """필터 점 중 지도에 없는 점(2스캔 확인, label 3)으로 기준경로 횡 1.3 m 안, 앞 3~start m 의 위험 목록. 실패 시 이유 문자열."""
+        stamp=msg.header.stamp.to_sec();now=rospy.Time.now().to_sec()
+        if not self.is_tunnel_zone() or not -.05<=now-stamp<=.35:return "outside_zone_or_expired"
+        pose=self.kick_pose_at(stamp)
+        if pose is None:return "pose_unavailable"
+        rows=cloud_rows(msg);labels=fields_array(msg,['x','y','z','map_label'])
+        if len(rows)!=len(labels):return "invalid_height_contract"
+        rows=rows[labels[:,3]==3]
+        route=getattr(self,'route',None)
+        if route is None or len(route[0])<2:return "reference_unavailable"
+        if len(rows)==0:return []
+        c,s=math.cos(pose[2]),math.sin(pose[2]);b=rows[:,:2].copy();b[:,0]+=self.sensor_x
+        world=b@np.array([[c,s],[-s,c]])+np.asarray(pose[:2])
+        ref=np.asarray(route[0]);tree=cKDTree(ref[:,:2]);_,ri=tree.query(world)
+        tangent=np.gradient(ref[:,:2],axis=0);tangent/=np.maximum(1e-9,np.linalg.norm(tangent,axis=1))[:,None]
+        delta=world-ref[ri,:2];lat=-tangent[ri,1]*delta[:,0]+tangent[ri,0]*delta[:,1]
+        # 2026-10-12 선서행은 미션 로직과 완전 분리: 필터 점 중 지도에 없는 점(2스캔 확인)과 기준경로만 본다.
+        #   /obstacle_info·회피 경로·선택 상태(safe_static_ids)로 제외하지 않는다. 물체 id 는 표시용으로만 붙인다.
+        root=self.preslow_root if -.05<=now-self.preslow_root_stamp<=.35 else {}
+        objects=root.get('collision_objects',root.get('obstacles',[]));active=[]
+        # Confirmation already counted raw supports. Repeated points in one
+        # confirmed cell need only one per-object preslow check (nearest first).
+        order=np.argsort(b[:,0]);_,take=np.unique(np.floor(world[order]/.5).astype(np.int64),axis=0,return_index=True)
+        for j in order[take]:
+            p=world[j]
+            if b[j,0]<3. or b[j,0]>self.preslow_start or abs(lat[j])>1.3:continue
+            owner=min(objects,key=lambda o:np.linalg.norm(np.asarray(o.get('position_world',[1e12,1e12]))[:2]-p),default=None)
+            oid=None
+            if owner is not None and np.linalg.norm(np.asarray(owner.get('position_world',[1e12,1e12]))[:2]-p)<=1.5:oid=int(owner['id'])
+            active.append(dict(id=oid,distance_m=float(b[j,0]),reason="filtered_map_residual_in_progress_region"))
+        return active
+
+    def far_preslow_cb(self,msg):
+        found=self.preslow_residuals(msg)
+        if isinstance(found,list):
+            for o in found:o['reason']="filtered_far_map_residual"
+            self.preslow_far=(found,msg.header.stamp.to_sec())
+
+    def filtered_preslow_cb(self,msg):
+        found=self.preslow_residuals(msg)
+        if not isinstance(found,list):
+            self.emit_preslow(False,-1.,9999.,[],found);return
+        self.preslow_input_stamp=msg.header.stamp.to_sec()
+        far,far_stamp=getattr(self,'preslow_far',([],-1e9))
+        active=found+(far if -.05<=rospy.Time.now().to_sec()-far_stamp<=.35 else [])
+        distance=min((o['distance_m'] for o in active),default=-1.)
+        # 거리 연속 곡선: 25 m 에서 구간 속도(M8 5.0), 5 m 에서 4.0 m/s. 정지는 내지 않는다.
+        cap=preslow_speed_cap(distance,self.preslow_start,self.preslow_min,self.preslow_initial) if active else 9999.
+        self.emit_preslow(bool(active),distance,float(cap),active,"residual_risk" if active else "clear")
+
     def classified_kick_cb(self,msg):
+        if self.independent_preslow:
+            self.filtered_preslow_cb(msg);return
         if not getattr(self,"map_classification_enabled",True):return
         self.map_raw_active=True
         self.map_raw_stamp=msg.header.stamp.to_sec()
         self.raw_kick_cb(msg)
 
     def raw_kick_cb(self, msg):
-        if self.common_m8():return
+        if getattr(self,"independent_preslow",False) or self.common_m8():return
         annotated=any(f.name=='map_label' for f in getattr(msg,'fields',[]))
         if not annotated and rospy.Time.now().to_sec()-getattr(self,'map_raw_stamp',-1e9)<.35:return
         self.map_raw_active=annotated
@@ -1416,7 +1532,8 @@ class TunnelWallDetector:
             bx = sx + self.sensor_x
             wx = ex + c * bx - s * sy
             wy = ey + s * bx + c * sy
-            if getattr(self, 'kick_static_exclude', False) and self.near_static_obstacle(wx, wy):
+            if ((getattr(self, 'kick_static_exclude', False) and self.near_static_obstacle(wx, wy)) or
+                    self.avoidance_target(wx, wy)):
                 continue
             best, bd = None, merge2
             for i, it in enumerate(self.kick_memory):
@@ -1463,7 +1580,7 @@ class TunnelWallDetector:
                 continue
             if not (self.kick_min_x <= bx <= (getattr(self,"map_preslow_distance",20.) if getattr(self,"map_raw_active",False) else self.kick_range)):
                 continue
-            if not it[4] and self.handled_by_avoidance(it[0], it[1]):
+            if (not it[4] and self.handled_by_avoidance(it[0], it[1])) or self.avoidance_target(it[0], it[1]):
                 continue
             if not it[4]:
                 # 기존 방식 후보: 벽 조각 제외 + 곧은 벽선 안쪽

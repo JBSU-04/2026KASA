@@ -194,6 +194,10 @@ struct RoundaboutConfig {
   int gs_duplicate_max_hits = 5, gs_duplicate_parent_min_hits = 6;
   double gs_approach_response = 0.3;
   double gs_collision_horizon = 1.0, gs_collision_margin = 0.2;
+  // 2026-10-12: /odom 은 뒷차축 기준(차체 -0.79 ~ +3.85 m). 차체 충돌 가드의 자차 상자 중심을 앞으로 옮긴다.
+  double gs_ego_center_offset = 0.0;  // 단위 테스트 합성 좌표(위치 = 차체 중심). 실차는 노드/yaml 1.53
+  double gs_ego_rear_overhang = 0.79;      // 뒷차축 -> 뒷범퍼
+  double gs_rear_follower_lateral = 2.5;   // 순환/이탈 중 이 횡거리 안의 뒤따르는 차는 가드 대상에서 제외
   double gs_spatial_front_gap = 2.5, gs_spatial_rear_gap = 2.0;
   double gs_approach_decel = 1.0;
   double gs_approach_slow_distance = 18.0; // Observe early; cap approach speed only near yield.
@@ -243,6 +247,27 @@ struct RoundaboutConfig {
   bool distance_rear_yield = false;
   bool distance_measured_profile = false;
   bool distance_project_leader = false;
+  // 2026-10-12 갭 시간 창 진입 모델(entry_model: window). 갭마다 t_open/t_close 를 구해 자차 도착 t_ego 가
+  //   창 안이면 진입, 놓친 갭(t_ego > t_close)은 다시 보지 않는다. 뒷차는 양보하지 않는다고 가정한다.
+  // 2026-10-12 회전교차로 ACC: 앞차와 범퍼 간격 acc_target_gap + acc_time_gap*v 를 유지하도록 목표 속도를 만든다.
+  //   v_des = v_lead + acc_gain*(gap - gap_ref) 을 속도 상한으로 넣어 가속/감속 둘 다 한다(MPC 무변경).
+  bool acc_enabled = false;
+  double acc_target_gap = 2.0, acc_time_gap = 0.2, acc_gain = 0.8, acc_accel_gain = 1.0, acc_max_accel = 2.5, acc_max_brake = 3.0;
+  // 2026-10-12 갭 1/4 지점 진입(entry_model: quarter). 합류점을 걸친 갭의 1/4 지점(앞차 쪽)이 합류점 +-band 를
+  //   지날 때 출발. 뒤 개방이면 앞차 뒷범퍼가 +open_rear_tail 지나면 출발, 앞 개방이면 뒷차 거리로 판단.
+  bool quarter_enabled = false;
+  double quarter_fraction = 0.25, quarter_band = 1.0, quarter_min_gap = 9.0;
+  double quarter_open_rear_tail = 2.0, quarter_open_rear_view = 20.0, quarter_open_front_time = 3.0, quarter_front_margin = 2.0;
+  double quarter_abort_rear = 2.0, quarter_abort_yield = 1.0, quarter_flow_speed = 5.0;
+  int quarter_confirm_frames = 2;
+  double quarter_activate_distance = 5.0, quarter_lead_time = 1.6, quarter_front_fallback = 3.8;
+  bool window_enabled = false;
+  double window_s0 = 4.0, window_headway = 1.2, window_length_margin = 0.5, window_lag_decel = 1.5;
+  double window_ego_accel = 1.5, window_start_delay = 0.24, window_merge_margin = 1.0, window_commit_tolerance = 0.5;
+  int window_confirm_frames = 4;
+  int window_miss_frames = 6;
+  // 뒷차 양보(MORAI NPC 실측): >0 이면 뒷차는 상대속도에 반응 window_lag_reaction 뒤 이 감속으로 양보한다고 본다. 0 = 비양보(자료 원식).
+  double window_lag_yield_decel = 2.0, window_lag_reaction = 0.5;  // 놓침(t_ego > t_close)도 연속 확인 후 확정(새 트랙 첫 프레임 속도 노이즈)
   std::vector<double> distance_profile_times, distance_profile_speeds;
   bool tw_enabled = false;
   double tw_m_front = 0.5;          // 앞차가 구역을 비운 뒤 자차 진입까지 [s]
@@ -439,6 +464,13 @@ struct RoundaboutOutput {
   double current_rear_gap = std::numeric_limits<double>::infinity();
   double required_rear_decel = 0.0;
   double ego_clear_time = std::numeric_limits<double>::infinity();
+  double window_t_open = std::numeric_limits<double>::infinity(), window_t_close = std::numeric_limits<double>::infinity(), window_t_ego = std::numeric_limits<double>::infinity();
+  int window_ok_frames = 0, window_missed = 0;
+  double quarter_P = std::numeric_limits<double>::quiet_NaN(), quarter_gap = std::numeric_limits<double>::quiet_NaN();
+  double quarter_s_front = std::numeric_limits<double>::quiet_NaN(), quarter_s_trig = std::numeric_limits<double>::quiet_NaN(), quarter_x = std::numeric_limits<double>::quiet_NaN();
+  std::string quarter_case;
+  bool acc_active = false; int acc_id = -1;
+  double acc_gap = 0.0, acc_gap_ref = 0.0, acc_lead_speed = 0.0, acc_v_des = 0.0, acc_a_des = 0.0;
   std::string reason;
 };
 

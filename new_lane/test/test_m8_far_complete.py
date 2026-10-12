@@ -80,3 +80,14 @@ def test_reference_intrusion_decelerates_before_any_avoidance_path_exists():
     assert decision['present'] and decision['inpath']==16.
     obj['occupied_cells_world']=[[16.,4.]]
     assert not preslow(scene,(0,0,0),None,-1.,10.,reference=[[0,0],[30,0]])['present']
+
+def test_portal_25m_control_is_independent_of_gps_shadow_start():
+    path=Path(__file__).parents[2]/'waypoint_system/data/default/3.csv'
+    params={'/section_router/sections':[dict(id='M7B',csv=3,idx=[6197,7000]),dict(id='M8',csv=3,idx=[7001,8850])],
+            '/tunnel_recovery/approach_control_enabled':True,'/tunnel_recovery/approach_route_csv':str(path),
+            '/tunnel_recovery/approach_anchor_idx':7350,'/tunnel_recovery/control_prepare_distance_m':25.}
+    r=read_region(lambda key,default=None:params.get(key,default))
+    assert r[1]==7101 and r[1]-r[3]==6751
+    assert not contains(r,3,7001) and not contains(r,3,7100)
+    assert contains(r,3,7101) and contains(r,3,6751,True)
+    assert params['/section_router/sections'][1]['idx'][0]==7001

@@ -168,8 +168,8 @@ class SectionRouter(object):
 
         random_active = bool(sec is not None and msg.section_id in ('M7B','M8') and valid and
                              contains(self.tunnel_region,self.csv,index))
-        if random_active and msg.section_id == 'M7B':
-            msg.executors = ['static_obstacle','dynamic_obstacle']
+        if msg.section_id in ('M7B','M8'):
+            msg.executors = ['static_obstacle','dynamic_obstacle'] if random_active else []
         self.random_pub.publish(Bool(data=random_active))
         self.pub.publish(msg)
 

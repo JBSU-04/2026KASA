@@ -18,10 +18,15 @@
 #include <thread>
 using namespace tunnel_map;
 class Filter {
-  ros::NodeHandle nh_,pnh_{"~"};ros::Subscriber odom_,cloud_,nonground_,section_,registration_;ros::Publisher classified_,foreground_,background_,state_,map_pub_,filtered_,filter_state_;ros::Timer map_timer_;
+  ros::NodeHandle nh_,pnh_{"~"};ros::Subscriber odom_,cloud_,nonground_,section_,registration_,near_filtered_,far_filtered_;ros::Publisher classified_,foreground_,background_,state_,map_pub_,filtered_,filter_state_;ros::Timer map_timer_;
   occupancy_avoidance::TunnelRegion region_;
   Map map_;bool map_valid_=false,enabled_=true;Confirmation confirmation_;V sensor_{1.1,0,1.33};double sensor_height_=1.765,max_age_=.35,min_height_=.08;
-  bool common_wall_alignment_=true,detector_mask_=true,unified_input_=true;WallAlignment wall_alignment_;
+  bool common_wall_alignment_=true,detector_mask_=true,unified_input_=true,legacy_raw_detection_=false;WallAlignment wall_alignment_;
+  bool filtered_pipeline_=false,join_only_=false;ros::Publisher mission_points_;
+  // 2026-10-12 원거리 필터 점(/tunnel/filtered_far, x 12~40 m)도 같은 지도로 분류한다. 선서행(25 m) 전용 출력이고
+  //   근거리 검출·엔진 입력(/tunnel/map_classified)에는 섞지 않는다(원거리 노면 오검출이 정지로 번지지 않게).
+  bool far_classification_=true;ros::Subscriber far_cloud_;ros::Publisher classified_far_;Confirmation far_confirmation_;sensor_msgs::PointCloud2ConstPtr pending_far_;
+  std::map<double,sensor_msgs::PointCloud2ConstPtr> near_cache_,far_cache_;double combined_stamp_=-1;
   ros::Publisher total_ms_,queue_ms_;double raw_compute_ms_=0,raw_compute_stamp_=-1;
   std::string heading_mode_;std::string map_path_;std::atomic<bool>active_{false},quit_{false};std::atomic<double>section_time_{-1};std::thread worker_;
   std::mutex pose_mutex_,queue_mutex_;std::condition_variable cv_;sensor_msgs::PointCloud2ConstPtr pending_,pending_ng_;std::deque<Pose>lookup_cache_;std::deque<std::pair<double,std::vector<Row>>> residual_cache_;std::deque<Pose>poses_;double registration_stamp_=-1;Eigen::Vector2d delta_=Eigen::Vector2d::Zero();
@@ -33,6 +38,32 @@ class Filter {
   void odom(const nav_msgs::Odometry::ConstPtr&m){const auto&p=m->pose.pose.position;const auto&q=m->pose.pose.orientation;Pose v{m->header.stamp.toSec(),p.x,p.y,p.z,std::atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))};v.speed=m->twist.twist.linear.x;v.wz=m->twist.twist.angular.z;v.twist_valid=std::isfinite(v.speed+v.wz);std::lock_guard<std::mutex>lock(pose_mutex_);if(!poses_.empty()&&v.stamp<poses_.back().stamp){poses_.clear();registration_stamp_=-1;}poses_.push_back(v);while(poses_.size()>500)poses_.pop_front();}
   void registration(const geometry_msgs::PoseStamped::ConstPtr&m){if(heading_mode_!="existing")return;double stamp=m->header.stamp.toSec(),age=ros::Time::now().toSec()-stamp;if(age<-.05||age>.3)return;Pose p;if(!poseAt(stamp,p))return;Eigen::Vector2d d(m->pose.position.x-p.x,m->pose.position.y-p.y);if(!d.allFinite()||d.norm()>.6)return;std::lock_guard<std::mutex>lock(pose_mutex_);registration_stamp_=stamp;delta_=d;}
   void cloud(const sensor_msgs::PointCloud2::ConstPtr&m){if(!enabled_||!active_||ros::Time::now().toSec()-section_time_>1)return;{std::lock_guard<std::mutex>lock(queue_mutex_);pending_=m;}cv_.notify_one();}
+  void filteredInput(const sensor_msgs::PointCloud2ConstPtr&m,bool near){
+    if(!filtered_pipeline_||!active_||m->header.frame_id!="velodyne_ground")return;
+    const double stamp=m->header.stamp.toSec();if(ros::Time::now().toSec()-stamp>max_age_)return;
+    std::lock_guard<std::mutex>lock(queue_mutex_);if(combined_stamp_>ros::Time::now().toSec()+.05){combined_stamp_=-1;near_cache_.clear();far_cache_.clear();pending_.reset();}auto& cache=near?near_cache_:far_cache_;cache[stamp]=m;
+    while(cache.size()>5)cache.erase(cache.begin());
+    // M2 contract: far temporal proposals never gate fresh near detection.
+    // Far objects independently reach /obstacle_info through the existing merger.
+    // Only include same-scan far supports if they have already arrived; a late
+    // far result cannot overwrite a newer scene or count that scan twice.
+    if(!near||stamp<=combined_stamp_)return;
+    auto a=m;
+    sensor_msgs::PointCloud2ConstPtr b;
+    auto far_it=far_cache_.find(stamp);
+    if(far_it!=far_cache_.end())b=far_it->second;
+    if(a->point_step!=20||(b&&(a->header.frame_id!=b->header.frame_id||b->point_step!=20)))return;
+    sensor_msgs::PointCloud2Ptr combined(new sensor_msgs::PointCloud2(*a));combined->height=1;combined->width=0;combined->data.clear();
+    std::set<std::array<float,3>>seen;
+    for(const auto& source:{a,b})if(source)for(size_t row=0;row<source->height;++row)for(size_t col=0;col<source->width;++col){
+      const size_t off=row*source->row_step+col*20;if(off+20>source->data.size())return;
+      std::array<float,3>key;std::memcpy(key.data(),source->data.data()+off,12);
+      if(!std::isfinite(key[0]+key[1]+key[2])||!seen.insert(key).second)continue;
+      combined->data.insert(combined->data.end(),source->data.begin()+off,source->data.begin()+off+20);++combined->width;
+    }
+    combined->row_step=20*combined->width;combined_stamp_=stamp;mission_points_.publish(combined);if(!join_only_)pending_=combined;
+    near_cache_.erase(near_cache_.begin(),near_cache_.upper_bound(stamp));far_cache_.erase(far_cache_.begin(),far_cache_.upper_bound(stamp));cv_.notify_one();
+  }
   void nonground(const sensor_msgs::PointCloud2::ConstPtr&m){if(!detector_mask_||!active_||ros::Time::now().toSec()-section_time_>1)return;{std::lock_guard<std::mutex>lock(queue_mutex_);pending_ng_=m;}cv_.notify_one();}
   void filterNonground(const sensor_msgs::PointCloud2ConstPtr&m){
     const auto begin=std::chrono::steady_clock::now();double stamp=m->header.stamp.toSec();
@@ -62,7 +93,7 @@ class Filter {
         observed.push_back(r);
       }
       const std::vector<Row>*raw=nullptr;for(const auto&entry:residual_cache_)if(std::abs(entry.first-stamp)<1e-6){raw=&entry.second;break;}
-      if(raw){auto rows=mergeDetectionRows(observed,*raw);residual_count=rows.size()>observed.size()?rows.size()-observed.size():0;publishCloud(filtered_,m->header,rows,0);}
+      if(raw){auto rows=mergeDetectionRows(observed,*raw,legacy_raw_detection_);residual_count=rows.size()>observed.size()?rows.size()-observed.size():0;publishCloud(filtered_,m->header,rows,0);}
       else {if(active_)filtered_.publish(out);} // Missing data cannot invent residual evidence.
     }else if(active_)filtered_.publish(out);
     Json::Value state;state["stamp"]=stamp;state["map_valid"]=valid;state["removed"]=Json::UInt64(removed);state["bundled_residual_points"]=Json::UInt64(residual_count);state["unified_input"]=unified_input_;state["reason"]=valid?"verified_3d_background_only":"unknown_background_passthrough";state["compute_ms"]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();state["cache_hits"]=Json::UInt64(map_.cache_hits);state["cache_queries"]=Json::UInt64(map_.cache_queries);std_msgs::String st;st.data=Json::FastWriter().write(state);filter_state_.publish(st);if(std::abs(raw_compute_stamp_-stamp)<1e-6){std_msgs::Float64 value;value.data=raw_compute_ms_+state["compute_ms"].asDouble();total_ms_.publish(value);}
@@ -89,26 +120,55 @@ class Filter {
           V b=q+sensor_,w(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
           before+=map_.matches(w,map_.distance);w.x()+=trial.x-lookup.x;w.y()+=trial.y-lookup.y;after+=map_.matches(w,map_.distance);++counts[q.y()>0?0:1];}
         if(after>before+.10*(counts[0]+counts[1]))lookup=trial;else wall_alignment_.valid=false;
-      }}auto rows=classify(points,lookup,map_valid_?&map_:nullptr,sensor_,sensor_height_,min_height_);
+      }}std::vector<Row> rows;
+    if(filtered_pipeline_){
+      const double c=std::cos(lookup.yaw),sn=std::sin(lookup.yaw);rows.reserve(points.size());
+      for(size_t i=0;i<points.size();++i){Row v;v.sensor=points[i];float h;std::memcpy(&h,m->data.data()+i*m->point_step+12,4);
+        v.height=h;v.valid=std::isfinite(h);v.ground=v.sensor.z()-h;V b=v.sensor+sensor_;
+        v.world=V(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
+        v.bg=map_valid_&&map_.matches(v.world,map_.distance);
+        v.candidate=map_valid_&&v.valid&&!v.bg&&h>=min_height_&&h<=2.8;
+        v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);
+      }
+    }else rows=classify(points,lookup,map_valid_?&map_:nullptr,sensor_,sensor_height_,min_height_);
     // Registration changes background lookup only, not object motion coordinates.
     for(auto&r:rows){r.world.x()+=pose.x-lookup.x;r.world.y()+=pose.y-lookup.y;}confirmation_.update(rows,stamp);
     residual_cache_.emplace_back(stamp,rows);while(residual_cache_.size()>10)residual_cache_.pop_front();
     lookup_cache_.push_back(lookup);while(lookup_cache_.size()>10)lookup_cache_.pop_front();
     if(ros::Time::now().toSec()-stamp>max_age_||!active_)return;publishCloud(classified_,m->header,rows,0);publishCloud(foreground_,m->header,rows,1);if(background_.getNumSubscribers())publishCloud(background_,m->header,rows,2);
-    Json::Value st;st["backend"]="cpp";st["map_version"]=map_path_;st["stamp"]=stamp;st["map_valid"]=map_valid_;int bg=0,cand=0,confirmed=0,unknown=0,cgu=0;for(const auto&r:rows){bg+=r.bg;cand+=r.candidate;confirmed+=r.label>=3;unknown+=!r.bg&&!r.valid;cgu+=r.label==4;}st["background"]=bg;st["candidate"]=cand;st["confirmed"]=confirmed;st["confirmed_ground_unknown"]=cgu;st["unknown"]=unknown;st["registration_age_sec"]=std::isfinite(registration_age)?Json::Value(registration_age):Json::Value();st["wall_alignment_valid"]=wall_alignment_.valid;st["wall_alignment_lateral_m"]=wall_alignment_.lateral;st["wall_alignment_left_support"]=wall_alignment_.left;st["wall_alignment_right_support"]=wall_alignment_.right;st["lookup_delta_xy"].append(lookup.x-pose.x);st["lookup_delta_xy"].append(lookup.y-pose.y);st["compute_ms"]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();raw_compute_ms_=st["compute_ms"].asDouble();raw_compute_stamp_=stamp;std_msgs::String msg;msg.data=Json::FastWriter().write(st);state_.publish(msg);}
+    Json::Value st;st["backend"]="cpp";st["input_contract"]=filtered_pipeline_?"m2_filtered_near_far":"legacy_raw";st["map_version"]=map_path_;st["stamp"]=stamp;st["map_valid"]=map_valid_;int bg=0,cand=0,confirmed=0,unknown=0,cgu=0;for(const auto&r:rows){bg+=r.bg;cand+=r.candidate;confirmed+=r.label>=3;unknown+=!r.bg&&!r.valid;cgu+=r.label==4;}st["background"]=bg;st["candidate"]=cand;st["confirmed"]=confirmed;st["confirmed_ground_unknown"]=cgu;st["unknown"]=unknown;st["registration_age_sec"]=std::isfinite(registration_age)?Json::Value(registration_age):Json::Value();st["wall_alignment_valid"]=wall_alignment_.valid;st["wall_alignment_lateral_m"]=wall_alignment_.lateral;st["wall_alignment_left_support"]=wall_alignment_.left;st["wall_alignment_right_support"]=wall_alignment_.right;st["lookup_delta_xy"].append(lookup.x-pose.x);st["lookup_delta_xy"].append(lookup.y-pose.y);st["compute_ms"]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();raw_compute_ms_=st["compute_ms"].asDouble();raw_compute_stamp_=stamp;std_msgs::String msg;msg.data=Json::FastWriter().write(st);state_.publish(msg);}
+  void farCloud(const sensor_msgs::PointCloud2::ConstPtr&m){if(!enabled_||!active_||ros::Time::now().toSec()-section_time_>1)return;{std::lock_guard<std::mutex>lock(queue_mutex_);pending_far_=m;}cv_.notify_one();}
+  void processFar(const sensor_msgs::PointCloud2ConstPtr&m){double stamp=m->header.stamp.toSec(),age=ros::Time::now().toSec()-stamp;
+    if(age<-.05||age>max_age_||m->header.frame_id!="velodyne_ground"||!active_||!map_valid_||m->is_bigendian)return;
+    Pose lookup;bool found=false;for(const auto&p:lookup_cache_)if(std::abs(p.stamp-stamp)<1e-6){lookup=p;found=true;break;}
+    Pose pose;if(!poseAt(stamp,pose))return;if(!found)lookup=pose;
+    int ho=-1;for(const auto&f:m->fields)if(f.name=="ground_relative"&&f.datatype==sensor_msgs::PointField::FLOAT32)ho=f.offset;if(ho<0||ho+4>int(m->point_step))return;
+    auto points=xyz(*m);if(points.size()!=size_t(m->width)*m->height)return; // xyz drops non-finite rows; keep row order exact
+    map_.beginScan();const double c=std::cos(lookup.yaw),sn=std::sin(lookup.yaw);std::vector<Row>rows;rows.reserve(points.size());
+    for(size_t i=0;i<points.size();++i){size_t row=i/m->width,col=i%m->width;Row v;v.sensor=points[i];float h;std::memcpy(&h,m->data.data()+row*m->row_step+col*m->point_step+ho,4);
+      v.height=h;v.valid=std::isfinite(h);v.ground=v.sensor.z()-h;V b=v.sensor+sensor_;
+      v.world=V(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
+      v.bg=map_.matches(v.world,map_.distance);v.candidate=v.valid&&!v.bg&&h>=min_height_&&h<=2.8;v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);}
+    for(auto&r:rows){r.world.x()+=pose.x-lookup.x;r.world.y()+=pose.y-lookup.y;}far_confirmation_.update(rows,stamp);
+    if(ros::Time::now().toSec()-stamp>max_age_)return;publishCloud(classified_far_,m->header,rows,0);}
   void mapView(const ros::TimerEvent&){if(!active_||!map_valid_||!map_pub_.getNumSubscribers())return;Pose pose;{std::lock_guard<std::mutex>lock(pose_mutex_);if(poses_.empty())return;pose=poses_.back();}visualization_msgs::Marker m;m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns="active_gps_3d_map";m.id=0;m.type=m.POINTS;m.action=m.ADD;m.pose.orientation.w=1;m.scale.x=m.scale.y=.12;m.color.r=.15;m.color.g=.45;m.color.b=1;m.color.a=.45;m.lifetime=ros::Duration(2.);std::set<std::array<int,3>>seen;
     for(const auto&p:*map_.points){double x=p.x+map_.origin.x(),y=p.y+map_.origin.y();if(std::abs(x-pose.x)>45||std::abs(y-pose.y)>45)continue;std::array<int,3>key{int(std::floor(p.x/.3)),int(std::floor(p.y/.3)),int(std::floor(p.z/.3))};if(!seen.insert(key).second)continue;geometry_msgs::Point q;q.x=x;q.y=y;q.z=p.z+map_.origin.z();m.points.push_back(q);if(m.points.size()>=30000)break;}visualization_msgs::MarkerArray a;a.markers.push_back(m);map_pub_.publish(a);}
  public:
-  Filter(){nh_.param<std::string>("/tunnel_recovery/heading_mode",heading_mode_,"existing");region_=occupancy_avoidance::TunnelRegion::load(nh_);bool master=true;nh_.param("/tunnel_recovery/enabled",master,true);pnh_.param("enabled",enabled_,true);enabled_&=master;pnh_.param<std::string>("map_binary",map_path_,"");pnh_.param("background_distance_m",map_.distance,.12);pnh_.param("floor_distance_m",map_.floor_distance,.055);pnh_.param("min_height_m",min_height_,.08);pnh_.param("max_scan_age_sec",max_age_,.35);pnh_.param("min_points",confirmation_.min_points,3);pnh_.param("confirm_scans",confirmation_.scans,2);pnh_.param("observation_memory_sec",confirmation_.memory,.35);pnh_.param("common_wall_alignment",common_wall_alignment_,true);nh_.param("/tunnel_recovery/unified_detection_input_enabled",unified_input_,true);nh_.param("/tunnel_recovery/verified_background_filter_enabled",detector_mask_,true);pnh_.param("allow_unknown_ground_confirmation",confirmation_.allow_unknown_ground,false);nh_.param("/lidar_extrinsic/z_from_ground",sensor_height_,1.765);pnh_.param("sensor_x",sensor_.x(),1.1);nh_.param("/lidar_extrinsic/y",sensor_.y(),0.);pnh_.param("sensor_z",sensor_.z(),1.33);
+  Filter(){pnh_.param("join_only",join_only_,false);nh_.param("/tunnel_recovery/filtered_pipeline_enabled",filtered_pipeline_,false);nh_.param("/tunnel_recovery/raw_detection_residual_enabled",legacy_raw_detection_,false);nh_.param<std::string>("/tunnel_recovery/heading_mode",heading_mode_,"existing");region_=occupancy_avoidance::TunnelRegion::load(nh_);bool master=true;nh_.param("/tunnel_recovery/enabled",master,true);pnh_.param("enabled",enabled_,true);enabled_&=master;pnh_.param<std::string>("map_binary",map_path_,"");pnh_.param("background_distance_m",map_.distance,.12);pnh_.param("floor_distance_m",map_.floor_distance,.055);pnh_.param("min_height_m",min_height_,.08);pnh_.param("max_scan_age_sec",max_age_,.35);pnh_.param("min_points",confirmation_.min_points,3);pnh_.param("confirm_scans",confirmation_.scans,2);pnh_.param("observation_memory_sec",confirmation_.memory,.35);pnh_.param("common_wall_alignment",common_wall_alignment_,true);nh_.param("/tunnel_recovery/unified_detection_input_enabled",unified_input_,true);nh_.param("/tunnel_recovery/verified_background_filter_enabled",detector_mask_,true);pnh_.param("allow_unknown_ground_confirmation",confirmation_.allow_unknown_ground,false);nh_.param("/lidar_extrinsic/z_from_ground",sensor_height_,1.765);pnh_.param("sensor_x",sensor_.x(),1.1);nh_.param("/lidar_extrinsic/y",sensor_.y(),0.);pnh_.param("sensor_z",sensor_.z(),1.33);
     pnh_.param("voxel_search_enabled",map_.voxel_search,true);
     total_ms_=nh_.advertise<std_msgs::Float64>("/tunnel/map_total_processing_ms",1);queue_ms_=nh_.advertise<std_msgs::Float64>("/tunnel/map_input_age_ms",1);
-    try{if(enabled_){map_.load(map_path_);map_valid_=true;}}catch(const std::exception&e){ROS_ERROR("[tunnel_map_filter] %s; UNKNOWN retained",e.what());}
+    try{if(enabled_&&!join_only_){map_.load(map_path_);map_valid_=true;}}catch(const std::exception&e){ROS_ERROR("[tunnel_map_filter] %s; UNKNOWN retained",e.what());}
     classified_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_classified",1);foreground_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_foreground",1);background_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_background",1);state_=nh_.advertise<std_msgs::String>("/tunnel/map_state",1);map_pub_=nh_.advertise<visualization_msgs::MarkerArray>("/tunnel/static_map",1);
     std::string nonground_input; pnh_.param<std::string>("nonground_input",nonground_input,"/groundgrid/nonground_exact");
-    filtered_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/nonground_filtered",1);filter_state_=nh_.advertise<std_msgs::String>("/tunnel/nonground_filter_state",1);nonground_=nh_.subscribe(nonground_input,1,&Filter::nonground,this);
-    odom_=nh_.subscribe("/odom",100,&Filter::odom,this);cloud_=nh_.subscribe("/perception/points_gravity",1,&Filter::cloud,this);registration_=nh_.subscribe("/tunnel/xicp/yaw_measurement",1,&Filter::registration,this);section_=nh_.subscribe<mission_supervisor::SectionState>("/mission/active_section",1,[this](const mission_supervisor::SectionState::ConstPtr&m){active_=m->index_valid&&region_.prepares(m->csv,m->index);section_time_=ros::Time::now().toSec();});map_timer_=nh_.createTimer(ros::Duration(1.),&Filter::mapView,this);
-    worker_=std::thread([this](){while(!quit_){sensor_msgs::PointCloud2ConstPtr msg,ng;{std::unique_lock<std::mutex>lock(queue_mutex_);cv_.wait_for(lock,std::chrono::milliseconds(10),[this](){return pending_||quit_||(pending_ng_&&(ros::Time::now().toSec()-pending_ng_->header.stamp.toSec()>max_age_||std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[this](const Pose&p){return std::abs(p.stamp-pending_ng_->header.stamp.toSec())<1e-6;})));});if(quit_)break;msg=pending_;pending_.reset();}
+    filtered_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/nonground_filtered",1);filter_state_=nh_.advertise<std_msgs::String>("/tunnel/nonground_filter_state",1);if(!filtered_pipeline_&&!join_only_)nonground_=nh_.subscribe(nonground_input,1,&Filter::nonground,this);
+    if(join_only_)mission_points_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/filtered_points",1);
+    if(join_only_&&filtered_pipeline_){near_filtered_=nh_.subscribe<sensor_msgs::PointCloud2>("/tunnel/filtered_near",1,[this](const sensor_msgs::PointCloud2ConstPtr&m){filteredInput(m,true);});far_filtered_=nh_.subscribe<sensor_msgs::PointCloud2>("/tunnel/filtered_far",1,[this](const sensor_msgs::PointCloud2ConstPtr&m){filteredInput(m,false);});}
+    odom_=nh_.subscribe("/odom",100,&Filter::odom,this);if(!join_only_)cloud_=nh_.subscribe(filtered_pipeline_?"/tunnel/filtered_points":"/perception/points_gravity",1,&Filter::cloud,this);registration_=nh_.subscribe("/tunnel/xicp/yaw_measurement",1,&Filter::registration,this);section_=nh_.subscribe<mission_supervisor::SectionState>("/mission/active_section",1,[this](const mission_supervisor::SectionState::ConstPtr&m){active_=m->index_valid&&region_.prepares(m->csv,m->index);section_time_=ros::Time::now().toSec();});map_timer_=nh_.createTimer(ros::Duration(1.),&Filter::mapView,this);
+    pnh_.param("far_classification",far_classification_,true);far_confirmation_=confirmation_;
+    if(filtered_pipeline_&&!join_only_&&far_classification_){classified_far_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_classified_far",1);far_cloud_=nh_.subscribe("/tunnel/filtered_far",1,&Filter::farCloud,this);}
+    worker_=std::thread([this](){while(!quit_){sensor_msgs::PointCloud2ConstPtr msg,ng,far;{std::unique_lock<std::mutex>lock(queue_mutex_);cv_.wait_for(lock,std::chrono::milliseconds(10),[this](){return pending_||pending_far_||quit_||(pending_ng_&&(ros::Time::now().toSec()-pending_ng_->header.stamp.toSec()>max_age_||std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[this](const Pose&p){return std::abs(p.stamp-pending_ng_->header.stamp.toSec())<1e-6;})));});if(quit_)break;msg=pending_;pending_.reset();far=pending_far_;pending_far_.reset();}
       if(msg)try{process(msg);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_map_filter] %s",e.what());}
+      if(far)try{processFar(far);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_map_filter far] %s",e.what());}
       {std::lock_guard<std::mutex>lock(queue_mutex_);if(pending_ng_){double stamp=pending_ng_->header.stamp.toSec();bool ready=std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[stamp](const Pose&p){return std::abs(p.stamp-stamp)<1e-6;});if(ready||ros::Time::now().toSec()-stamp>max_age_){ng=pending_ng_;pending_ng_.reset();}}}
       if(ng)try{filterNonground(ng);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_nonground_filter] %s",e.what());}
     }});}
