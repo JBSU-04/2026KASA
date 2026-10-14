@@ -1,0 +1,102 @@
+tunnel_recovery:
+  # Independent rollback controls; retain current engine and mission settings.
+  wall_surface_background_enabled: true # false restores old wall/floor matching and shape gate
+  stationary_wall_motion_priority_enabled: true # false restores old along-wall motion policy
+  object_scene_enabled: true # false restores the previous M8 input policy
+  verified_wall_surface_only_enabled: true # false restores legacy wall shape filtering
+  raw_dr_required_for_motion: true # false restores map-pose motion fallback
+  verified_motion_policy_enabled: true
+  repair_path_policy_enabled: true
+  repair_preslow_policy_enabled: true
+  # 2026-10-13 X-ICP 횡보정을 DR 에 반영(GPS 동결 + M8 + VALID + 횡관측 0.95 이상). 끄면 이전처럼 yaw 만 보정.
+  xicp_lateral_correction_enabled: true
+  xicp_lateral_rate_mps: 0.2 # 초당 이동 상한(0.2 m 오차 약 1 s 수렴, 정적 물체 겉보기 이동 < 후보 1 m/s)
+  xicp_lateral_deadband_m: 0.03
+  xicp_lateral_max_m: 0.6 # X-ICP max_lateral_correction_m 과 같다
+  # 2026-10-14 장애물 이동 판정(속도·후보·동적)의 자차 이동 보상은 보정 전 순수 DR(/localization/dr_raw_odom)로.
+  #   측위 보정(yaw bias 단계, GPS 재획득, X-ICP 횡)이 가짜 이동을 만들지 않게. 위치·계획·정지는 /odom 그대로.
+  raw_dr_motion_frame_enabled: true
+  cpp_prefilter_enabled: true # Independent GroundGrid -> shared filter input; false restores Python producer
+  filtered_pipeline_enabled: true
+  independent_preslow_enabled: true
+  shared_detector_policy_enabled: true
+  raw_detection_residual_enabled: false # map evidence must not bypass GroundGrid
+  stationary_handoff_enabled: true
+  stationary_handoff_sec: 3.0 # M8 dynamic-history blocker handoff, shared by producer and stop
+  stationary_speed_mps: 0.18
+  stationary_displacement_m: 0.30
+  speed_integrity_enabled: true
+  entry_surface_policy_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+  static_hold_release_enabled: true
+  native_scene_enabled: false # old planner-owned scene transport is disabled
+  detection_worker_enabled: true
+  native_geometry_enabled: true
+  preserve_static_certificate: true
+  verified_background_filter_enabled: true
+  # GPS bounds are unchanged; obstacle approach uses measured CSV arc distance.
+  perception_prepare_idx: 100 # rollback range
+  approach_control_enabled: true
+  approach_anchor_idx: 7350 # first measured bilateral wall in tunnel_wall_profile
+  control_prepare_distance_m: 25.0
+  perception_prepare_distance_m: 60.0
+  unified_detection_input_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+  far_temporal_input_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+  surface_certificate_hold_enabled: true
+  surface_id_association_enabled: true
+  common_scene_enabled: false # direct detector-owned obstacle_scene is independent
+  continuous_transition_enabled: true
+
+# M8 only. Rollback: disable map node and these policies, then restart launch.
+tunnel_map_filter:
+  nonground_input: /groundgrid/nonground_exact # preserve original XYZ; legacy /nonground is rollback
+  enabled: true
+  min_height_m: 0.08
+  min_points: 3
+  confirm_scans: 2
+  common_wall_alignment: false # DR+X-ICP pose is the sole coordinate basis
+  allow_unknown_ground_confirmation: false
+  voxel_search_enabled: true
+  background_distance_m: 0.12
+  floor_distance_m: 0.055
+  max_scan_age_sec: 0.35
+  observation_memory_sec: 0.35
+  sensor_x: 1.1
+  sensor_z: 1.33
+tunnel_wall_detector:
+  # Monitoring envelope for unconfirmed stationary map residuals, not NPC speed.
+  preslow_unconfirmed_crossing_speed_mps: 3.0
+  preslow_unconfirmed_crossing_window_sec: 1.5
+  object_risk_preslow_enabled: true
+  map_classification_topic: /tunnel/map_classified
+  preslow_start_distance_m: 30.0 # 2026-10-13 25 -> 30 (M8 11 m/s, 저상 장애물 회피 여유)
+  preslow_min_speed_mps: 4.0
+  preslow_entry_cap_mps: 7.0 # 2026-10-13 선서행이 걸리면 바로 이 상한부터(구간 속도와 작은 쪽), 5 m 에서 최소값
+  preslow_hold_sec: 0.6
+  preslow_initial_speed_mps: 5.0 # /speed_limit/sections/M8 이 있으면 그 값(2026-10-12)
+  map_classification_enabled: true
+  map_preslow_distance_m: 30.0
+  map_preslow_memory_sec: 0.35
+obstacle_stop_node:
+  tunnel_bg_moving_enabled: false # map comparison has no mission-stop authority
+  tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+  tunnel_motion_evidence_enabled: true
+  tunnel_swept_stop_enabled: true
+  tunnel_swept_guard_enabled: true
+reverse_escape_node:
+  integrated_escape_enabled: true
+  integrated_steer_limit_rad: 0.45 # physical limit 0.6; curvature < existing engine 0.18
+obstacle_avoidance_node:
+  tunnel_verified_hold_only: true
+  embedded_engine:
+    tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
+    tunnel_map_enabled: false # map evidence is preslow only
+    tunnel_integrated_enabled: true
+    tunnel_immediate_replan: true
+    tunnel_replan_enabled: true
+    tunnel_corridor_relaxed: true
+morai_measurement_adapter:
+  tunnel_xicp_yaw_enabled: true
+
+obstacle_info_merger:
+  native_worker_enabled: true
+  tunnel_cells_authoritative_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false

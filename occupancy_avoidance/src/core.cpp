@@ -61,6 +61,12 @@ void Engine::reset(){
   grid_.setFrameId("map");grid_.setGeometry(grid_map::Length(cfg_.length,cfg_.width),cfg_.resolution);
 }
 void Engine::rebasePlanning(double dx,double dy){for(auto&p:last_path_){p.x+=dx;p.y+=dy;}for(auto&p:held_trigger_){p.x+=dx;p.y+=dy;}}
+void Engine::rebaseVisibility(double dx,double dy){
+  if(!std::isfinite(dx+dy))return;
+  visibility_shift_x_+=dx;visibility_shift_y_+=dy;
+  const int ix=std::lround(visibility_shift_x_/.5),iy=std::lround(visibility_shift_y_/.5);
+  if(ix||iy){auto old=std::move(ground_visibility_);ground_visibility_.clear();for(auto&kv:old)ground_visibility_[{kv.first.first+ix,kv.first.second+iy}]=kv.second;visibility_shift_x_-=ix*.5;visibility_shift_y_-=iy*.5;}
+}
 void Engine::rebaseEvidence(double dx,double dy){
   if(!initialized_||!std::isfinite(dx+dy))return;
   // Preserve hit/miss receipts across GPS correction; correction is not a new
@@ -69,9 +75,7 @@ void Engine::rebaseEvidence(double dx,double dy){
   tree_.reset(new octomap::OcTree(cfg_.resolution));tree_->setProbHit(.7);tree_->setProbMiss(.4);
   for(auto&kv:previous){auto e=kv.second;e.p.x+=dx;e.p.y+=dy;octomap::OcTreeKey k;
     if(tree_->coordToKeyChecked(octomap::point3d(e.p.x-origin_x_,e.p.y-origin_y_,e.p.z-origin_z_),k)){evidence_[key(k)]=e;tree_->updateNode(k,true,true);}}
-  visibility_shift_x_+=dx;visibility_shift_y_+=dy;
-  const int ix=std::lround(visibility_shift_x_/.5),iy=std::lround(visibility_shift_y_/.5);
-  if(ix||iy){auto old=std::move(ground_visibility_);ground_visibility_.clear();for(auto&kv:old)ground_visibility_[{kv.first.first+ix,kv.first.second+iy}]=kv.second;visibility_shift_x_-=ix*.5;visibility_shift_y_-=iy*.5;}
+  rebaseVisibility(dx,dy);
   auto receipts=std::move(ray_clear_receipts_);ray_clear_receipts_.clear();
   for(auto&kv:receipts){auto q=kv.second;q.first.x+=dx;q.first.y+=dy;octomap::OcTreeKey k;if(tree_->coordToKeyChecked(octomap::point3d(q.first.x-origin_x_,q.first.y-origin_y_,q.first.z-origin_z_),k))ray_clear_receipts_[key(k)]=q;}
   scan_pose_.x+=dx;scan_pose_.y+=dy;rebuild(last_scan_);
@@ -90,13 +94,16 @@ bool Engine::importScene(const SceneSnapshot& scene){
   // Scene owns measurement history. Planning state stays local; no ray casting,
   // classification or second confirmation is performed by a consumer.
   if(!initialized_){origin_x_=p.x;origin_y_=p.y;origin_z_=p.z;initialized_=true;}
-  evidence_.clear();ground_visibility_.clear();ray_clear_receipts_.clear();
+  evidence_.clear();ray_clear_receipts_.clear();
+  if(cfg_.scene_visibility_memory){const double horizon=visibilityHorizon(p.stamp);
+    for(auto it=ground_visibility_.begin();it!=ground_visibility_.end();)if(p.stamp-it->second>horizon)it=ground_visibility_.erase(it);else ++it;
+  }else ground_visibility_.clear();
   for(const auto&v:scene.voxels){
     if(!std::isfinite(v.point.x+v.point.y+v.point.z+v.seen))return false;
     octomap::OcTreeKey k;if(!tree_->coordToKeyChecked(octomap::point3d(v.point.x-origin_x_,v.point.y-origin_y_,v.point.z-origin_z_),k))return false;
     Evidence e;e.p=v.point;e.fixed=v.fixed;e.last=v.seen;e.first=v.seen;e.hits=v.fixed?cfg_.confirm_scans:1;evidence_[key(k)]=e;
   }
-  for(const auto&v:scene.visibility)ground_visibility_[{int(v[0]),int(v[1])}]=v[2];
+  for(const auto&v:scene.visibility){auto&t=ground_visibility_[{int(v[0]),int(v[1])}];t=std::max(t,v[2]);}
   for(const auto&q:scene.cleared){octomap::OcTreeKey k;if(tree_->coordToKeyChecked(octomap::point3d(q.x-origin_x_,q.y-origin_y_,q.z-origin_z_),k))ray_clear_receipts_[key(k)]={q,p.stamp};}
   scan_pose_=p;last_scan_=last_pose_stamp_=p.stamp;measured_curvature_=scene.curvature;rebuild(p.stamp);return true;
 }
@@ -312,7 +319,7 @@ bool Engine::integrate(const Pose& pose,const std::vector<Point>& returns,const 
     // The scene's unsupported far residual is uncertainty, not a filled obstacle.
     // Keep the same physical point as a transient near-body risk; never promote it.
     if(p.map_label==5&&(bx>cfg_.front+2.||bx<-cfg_.rear-2.||std::abs(by)>cfg_.half_width+1.))obstacle=false;
-    if(obstacle){w.map_label=p.map_label;occupied.emplace(code,w);}
+    if(obstacle){w.map_label=p.map_label;w.map_ground=h;occupied.emplace(code,w);}  // map_ground: 이 점의 지면 위 높이
     endpoints.push_back({end,obstacle});
   }
   // 2026-10-07(20:08:55 백): 정지 8 s 뒤 후진을 시도할 때 차 바로 뒤 바닥(근거리 사각)은 11 s 전에 본 것이라
@@ -341,8 +348,8 @@ bool Engine::integrate(const Pose& pose,const std::vector<Point>& returns,const 
   // persistent layer. Its current returns remain immediate transient hazards.
   for(auto&kv:evidence_)if(is_dynamic(kv.second.p)){kv.second.fixed=false;kv.second.hits=0;}
   for(const auto&kv:occupied){auto&e=evidence_[kv.first];bool moving=is_dynamic(kv.second);
-    if(e.hits==0||pose.stamp-e.last>cfg_.transient_sec){e.hits=0;e.first=pose.stamp;}
-    ++e.hits;e.last=pose.stamp;e.misses=0;
+    if(e.hits==0||pose.stamp-e.last>cfg_.transient_sec){e.hits=0;e.first=pose.stamp;e.height=0;}
+    ++e.hits;e.last=pose.stamp;e.misses=0;e.height=std::max(e.height,kv.second.map_ground);
     octomap::OcTreeKey voxel_key;voxel_key[0]=kv.first>>32;voxel_key[1]=kv.first>>16;voxel_key[2]=kv.first;
     auto center=tree_->keyToCoord(voxel_key);e.p={origin_x_+center.x(),origin_y_+center.y(),origin_z_+center.z()};
     // Raw fallback and pending map evidence remain transient even after many scans.
@@ -370,7 +377,10 @@ void Engine::rebuild(double now){
       octomap::OcTreeKey k;k[0]=it->first>>32;k[1]=it->first>>16;k[2]=it->first;tree_->deleteNode(k);it=evidence_.erase(it);continue;}
     // Preserve accumulated geometry; conditional boundaries only mask collision admission.
     if(!roadInside(e.p.x,e.p.y,0)){++it;continue;}
-    obstacle_bins_[bin(e.p.x,e.p.y)].push_back(e.p);
+    Point q=e.p;
+    if(cfg_.tunnel_new_obstacle_margin>0&&(now-e.first<cfg_.tunnel_new_obstacle_sec||e.height<cfg_.tunnel_low_obstacle_height))
+      q.plan_extra=cfg_.tunnel_new_obstacle_margin;
+    obstacle_bins_[bin(e.p.x,e.p.y)].push_back(q);
     grid_map::Index index;if(grid_.getIndex(grid_map::Position(e.p.x,e.p.y),index)){
       grid_.at(e.fixed?"static":"transient",index)=1;grid_.at("observed",index)=float(now-e.last);}
     ++it;
@@ -467,12 +477,13 @@ bool Engine::bodyClear(const Reference&p,double now,std::string* reason) const {
   for(double x:{-cfg_.rear,0.,cfg_.front})for(double y:{-cfg_.half_width,cfg_.half_width})
     if(!roadInside(p.x+c*x-s*y,p.y+s*x+c*y,0)){if(body_debug_c)std::fprintf(stderr,"BODY curb_body corner(%.1f,%.1f)\n",x,y);if(reason)*reason="curb_body";return false;}
   const double margin=effectiveMargin();
-  double rad=cfg_.front+margin+.15;auto b=bin(p.x,p.y);int m=int(std::ceil(rad));
+  const double extra_max=plan_extra_active_?std::max(0.,cfg_.tunnel_new_obstacle_margin):0.;
+  double rad=cfg_.front+margin+extra_max+.15;auto b=bin(p.x,p.y);int m=int(std::ceil(rad));
   for(int dx=-m;dx<=m;++dx)for(int dy=-m;dy<=m;++dy){auto it=obstacle_bins_.find({b.first+dx,b.second+dy});
     if(it==obstacle_bins_.end())continue;
     for(const auto&q:it->second){double qx=q.x-p.x,qy=q.y-p.y;
       double a=c*qx+s*qy,d=-s*qx+c*qy;
-      double pad=margin+cfg_.resolution*.7072;
+      double pad=margin+(plan_extra_active_?q.plan_extra:0.)+cfg_.resolution*.7072;
       if(a>=-cfg_.rear-pad&&a<=cfg_.front+pad&&std::abs(d)<=cfg_.half_width+pad){
         static const bool body_debug=std::getenv("OCC_BODY_DEBUG")!=nullptr;
         if(body_debug)std::fprintf(stderr,"BODY occ at body(%.2f,%.2f) z %.2f world(%.2f,%.2f)\n",a,d,q.z,q.x,q.y);
@@ -480,6 +491,16 @@ bool Engine::bodyClear(const Reference&p,double now,std::string* reason) const {
         if(reason)*reason="occupancy";
         return false;}}}
   (void)now;return true;
+}
+bool Engine::observedFree(const Reference&p,double now) const {return observedFraction(p,now)>=cfg_.return_observed_ratio;}
+double Engine::observedFraction(const Reference&p,double now) const {
+  // 차체 범위(뒤~앞, 폭)의 0.5 m 칸 중 지면이 관측된(가시 기록이 살아 있는) 비율. 장애물 자리·가려진 자리는 관측되지 않는다.
+  const double c=std::cos(p.yaw),s=std::sin(p.yaw),horizon=visibilityHorizon(now);int total=0,seen=0;
+  for(double a=-cfg_.rear;a<=cfg_.front+1e-6;a+=.5)for(double b=-cfg_.half_width;b<=cfg_.half_width+1e-6;b+=.5){
+    double x=p.x+c*a-s*b,y=p.y+s*a+c*b;++total;
+    auto it=ground_visibility_.find({int(std::floor(x/.5)),int(std::floor(y/.5))});
+    if(it!=ground_visibility_.end()&&now>=it->second-.05&&now-it->second<=horizon)++seen;}
+  return total>0?double(seen)/total:0.;
 }
 std::vector<Reference> Engine::resample(const std::vector<Reference>& in,double ds) const {
   std::vector<Reference> out;if(in.size()<2)return in;out.push_back(in.front());double next=ds,total=0;
@@ -760,7 +781,7 @@ bool Engine::validateReverse(const std::vector<Reference>& path,double now,std::
   return true;
 }
 Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
-  struct Restore{const Engine* e;~Restore(){e->margin_override_=-1;}} restore{this};relaxMarginForStart(pose);
+  struct Restore{const Engine* e;~Restore(){e->margin_override_=-1;e->plan_extra_active_=false;}} restore{this};relaxMarginForStart(pose);
   applyConditionalEdges(pose.stamp);
   auto begin=std::chrono::steady_clock::now();Result out;out.static_voxels=staticCount();out.transient_voxels=count()-out.static_voxels;
   const bool tunnel=!route.empty()&&route.front().idx>=7000&&route.front().idx<=9000;
@@ -855,7 +876,12 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
   double return_distance=std::max(cfg_.return_min_distance,std::abs(pose.speed)*cfg_.return_min_time);
   std::vector<bool> center_return(N,false),center_free(N,false);std::vector<double> return_ramp(N,1.);
   const double ramp_len=cfg_.return_ramp_time>0?std::max(cfg_.return_ramp_min_m,std::abs(pose.speed)*cfg_.return_ramp_time):0.;
-  for(size_t i=0;i<N;++i)center_free[i]=bodyClear(ref[i],pose.stamp);
+  // 터널: 중심선이 확정 점유로 막히지 않았더라도, 차체 범위 지면이 관측되지 않았으면 '복귀 가능'으로 보지 않는다.
+  //   충돌 판정이 아니라 복귀 여부에만 쓴다(근거가 불확실한 곳 때문에 서지 않고, 지금 쪽 횡이동을 유지).
+  const bool observed_gate=tunnel&&cfg_.tunnel_return_observed_free;
+  std::vector<bool> center_observed(N,true);
+  for(size_t i=0;i<N;++i){center_free[i]=bodyClear(ref[i],pose.stamp);
+    if(observed_gate&&center_free[i]&&!observedFree(ref[i],pose.stamp)){center_free[i]=false;center_observed[i]=false;}}
   bool return_available=false,prefix_return=false;size_t terminal_return=N,terminal_start=N;
   for(size_t start=0;start<N;){
     if(!center_free[start]){++start;continue;}
@@ -961,6 +987,7 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
     }
   }
   // Reuse the world path, trim the driven prefix, and validate against new data.
+  Result deferred_hold;bool have_deferred_hold=false;
   if(last_path_.size()>5){size_t j=0;double best=INF;
     for(size_t i=0;i<last_path_.size();++i){double d=std::hypot(last_path_[i].x-pose.x,last_path_[i].y-pose.y);if(d<best){best=d;j=i;}}
     std::vector<Reference> remain=tunnel_connected_hold_&&continuous_transition_?trimProgress(last_path_,pose,&best):std::vector<Reference>(last_path_.begin()+j,last_path_.end());
@@ -979,9 +1006,21 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
       double maxd=0;for(const auto&p:out.path){const auto*r=nearestRoad(p.x,p.y);if(r)maxd=std::max(maxd,std::abs(-(p.x-r->x)*std::sin(r->yaw)+(p.y-r->y)*std::cos(r->yaw)));}
       out.avoiding=maxd>.25;out.speed_cap=std::min(out.avoiding?cfg_.speedCeiling():9999.,std::sqrt(cfg_.max_lateral_accel/std::max(.001,out.max_curvature)));
       // A rejected direct return must not discard a still-safe avoidance path.
-      return finish();
+      if(!(tunnel&&cfg_.tunnel_hold_extra_clearance>0))return finish();
+      // 자차 앞(차 길이 + 1 m 이후) 부분이 추가 여유까지 통과하면 그대로. 지금 옆에 붙은 물체 때문에 매번 재계획하지 않는다.
+      std::vector<Reference> ahead;double arc=0;
+      for(size_t i=0;i<out.path.size();++i){if(i)arc+=distance(out.path[i-1],out.path[i]);if(arc>=cfg_.front+1.)ahead.push_back(out.path[i]);}
+      bool roomy=true;
+      if(ahead.size()>=2){const double saved=margin_override_;margin_override_=effectiveMargin()+cfg_.tunnel_hold_extra_clearance;
+        roomy=validate(ahead,pose.stamp);margin_override_=saved;}
+      if(roomy)return finish();
+      // 재계획을 시도하고, 실패하면 이 유지 경로(보통 여유는 통과)를 그대로 쓴다. 트리거 등 앞 단계 결과는 유지.
+      deferred_hold=out;have_deferred_hold=true;out.path.clear();out.clear=false;out.held=false;out.avoiding=false;out.reason.clear();
     }
   }
+  // 2026-10-14 격자·QP 계획. 터널은 새/낮은 칸 추가 여유와 관측 안 된 땅을 격자 비용으로 피한다(충돌 판정은 보통 여유).
+  auto lattice=[&](int max_attempts)->bool{
+  out.corridor.clear();out.failure_distance=-1;
   int J=int(std::ceil((cfg_.open_left+cfg_.open_right)/cfg_.lateral_step))+1;
   std::vector<double> offsets(J);for(int j=0;j<J;++j)offsets[j]=-cfg_.open_right+j*cfg_.lateral_step;
   std::vector<std::vector<double>> cost(N,std::vector<double>(J,INF));
@@ -995,7 +1034,16 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
   offsets[j0]=d0;Reference initial=offset(ref[0],d0);initial.yaw=pose.yaw;
   for(size_t i=1;i<N;++i){auto lim=bounds(ref[i].idx);
     valid[i][j0]=d0>=lim.first+cfg_.half_width+cfg_.curb_margin&&d0<=lim.second-cfg_.half_width-cfg_.curb_margin&&bodyClear(offset(ref[i],d0),pose.stamp);}
-  if(!bodyClear(initial,pose.stamp,&out.reason))return finish();
+  if(!bodyClear(initial,pose.stamp,&out.reason))return false;
+  bool hold_side=false;if(observed_gate)for(size_t i=0;i<N;++i)if(!center_observed[i]){hold_side=true;break;}
+  // 새(처음 본 지 얼마 안 된)·낮은 칸에서 추가 여유 안에 드는 격자 칸은 비용(금지 아님). 계획을 두 번 돌리지 않는다.
+  std::vector<std::vector<char>> tight(N);
+  if(tunnel&&cfg_.tunnel_new_obstacle_margin>0){plan_extra_active_=true;
+    for(size_t i=1;i<N;++i){tight[i].assign(J,0);for(int j=0;j<J;++j)if(valid[i][j])tight[i][j]=!bodyClear(offset(ref[i],offsets[j]),pose.stamp);}
+    plan_extra_active_=false;}
+  std::vector<std::vector<float>> unobserved_cost(N);
+  if(observed_gate)for(size_t i=1;i<N;++i)if(!center_observed[i]){unobserved_cost[i].assign(J,0.f);
+    for(int j=0;j<J;++j)if(valid[i][j])unobserved_cost[i][j]=float(1.-observedFraction(offset(ref[i],offsets[j]),pose.stamp));}
   cost[0][j0]=0;valid[0][j0]=true;
   if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06){
     std::fprintf(stderr,"LATTICE d0 %.2f j0 %d speed %.2f\n",d0,j0,pose.speed);
@@ -1013,24 +1061,30 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
       Reference p=offset(ref[i-1],offsets[k]),q=offset(ref[i],offsets[j]);double yaw=std::atan2(q.y-p.y,q.x-p.x);
       p.yaw=q.yaw=yaw;Reference mid=p;mid.x=(p.x+q.x)/2;mid.y=(p.y+q.y)/2;mid.idx=(p.idx+q.idx)/2;
       if(!bodyClear(p,pose.stamp)||!bodyClear(q,pose.stamp)||!bodyClear(mid,pose.stamp))continue;
-      double center_weight=center_return[i]?(.1+(cfg_.return_center_weight-.1)*return_ramp[i]):.1;
+      // 터널: 앞쪽 중심선에 관측 안 된 구간이 있으면(복귀 보류) 복귀 구간 밖에서는 중앙으로 끌지 않는다.
+      //   0.1 d^2 당김은 장애물 옆 최소 횡위치에 바짝 붙게 만들어 평활화 뒤 여유를 침범했다. 지금 횡위치를 유지.
+      double center_weight=center_return[i]?(.1+(cfg_.return_center_weight-.1)*return_ramp[i]):(hold_side?0.:.1);
       double v=cost[i-1][k]+center_weight*offsets[j]*offsets[j]+15*dd*dd;
       // 2026-10-07(20:41:06 백): 왼쪽(+3.7 m)으로 첫 장애물을 지나는 중 다음 저상 장애물이 멀리서 좁게 보여
       //   오른쪽 통과(-0.8 m)를 골랐다가, 가까워져 넓어지자 다시 왼쪽으로 뒤집혀 영구정지했다.
       //   이미 한쪽으로 1 m 넘게 비켜 있으면 기준경로 반대편으로 건너가는 칸은 큰 비용(같은 쪽 유지).
       //   터널(벽면 띠가 켜진 차로)에서만. 정적 구간은 좌우 번갈아 피하는 배치가 있다.
       if(cfg_.wall_surface_band>0&&std::abs(d0)>1.&&offsets[j]*d0<0&&std::abs(offsets[j])>.3)v+=300.*(std::abs(offsets[j])-.3);
+      // 터널: 중심선이 관측되지 않은 구간에서 차체가 관측 안 된 땅(아직 확정 안 된 장애물 자리일 수 있음)에 들어가는 칸은 큰 비용.
+      //   금지는 아니다(그것밖에 없으면 통과). 이미 지나는 쪽(관측된 옆 차로)을 유지하게 한다.
+      if(observed_gate&&!center_observed[i]&&!unobserved_cost[i].empty())v+=60.*unobserved_cost[i][j];
+      if(!tight[i].empty()&&tight[i][j])v+=30.;
       if(has_previous&&(!center_return[i]||return_ramp[i]<1.))v+=2*(center_return[i]?1.-return_ramp[i]:1.)*std::pow(offsets[j]-prev_target,2);
       if(v<cost[i][j]){cost[i][j]=v;back[i][j]=k;}
     }
   }
     if(*std::min_element(cost[i].begin(),cost[i].end())>=INF){out.reason="no_connected_corridor";
-      out.failure_distance=i*cfg_.knot_ds;out.boundary_source=boundarySource(ref[i].idx);return finish();}
+      out.failure_distance=i*cfg_.knot_ds;out.boundary_source=boundarySource(ref[i].idx);return false;}
   }
   if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06)
     for(size_t i=0;i<N&&i<9;++i){std::fprintf(stderr,"COST row %zu:",i);for(int j=36;j<J;++j)std::fprintf(stderr," %d:%s",j,cost[i][j]>=INF?"x":std::to_string(int(cost[i][j])).c_str());std::fputc('\n',stderr);}
   int end=int(std::min_element(cost.back().begin(),cost.back().end())-cost.back().begin());
-  if(cost.back()[end]>=INF){out.reason="no_connected_corridor";return finish();}
+  if(cost.back()[end]>=INF){out.reason="no_connected_corridor";return false;}
   std::vector<int> chosen(N);chosen.back()=end;for(size_t i=N-1;i>0;--i)chosen[i-1]=back[i][chosen[i]];
   std::vector<double> target(N);std::vector<std::pair<double,double>> limits(N);
   for(size_t i=0;i<N;++i){int j=chosen[i],lo=j,hi=j;target[i]=offsets[j];
@@ -1039,8 +1093,9 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
     // A contiguous free interval, not the union of spaces on both sides of an obstacle.
     limits[i]={offsets[lo],offsets[hi]};
     // Soft target close to the obstacle, never a hard cap that destroys feasibility.
-    if(i>0 && limits[i].first>0)target[i]=std::min(target[i],limits[i].first+cfg_.corridor_target_extra);
-    if(i>0 && limits[i].second<0)target[i]=std::max(target[i],limits[i].second-cfg_.corridor_target_extra);limits[i].first=std::min(limits[i].first,target[i]);limits[i].second=std::max(limits[i].second,target[i]);
+    // 옆 유지(hold_side) 중에는 목표를 장애물 쪽 통로 끝으로 당기지 않는다(목표가 지그재그 -> QP 실패).
+    if(i>0 && limits[i].first>0 && !hold_side)target[i]=std::min(target[i],limits[i].first+cfg_.corridor_target_extra);
+    if(i>0 && limits[i].second<0 && !hold_side)target[i]=std::max(target[i],limits[i].second-cfg_.corridor_target_extra);limits[i].first=std::min(limits[i].first,target[i]);limits[i].second=std::max(limits[i].second,target[i]);
     if(center_return[i]&&limits[i].first<=0&&limits[i].second>=0)target[i]*=1.-return_ramp[i];
     out.corridor.push_back({ref[i].x,ref[i].y,limits[i].first,limits[i].second});
   }
@@ -1059,7 +1114,7 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
   // Repair failed corner/sweep checks by tightening the same connected corridor
   // around its searched path. Never accept a smoothed path solely on QP success.
   std::string failure="solver_failed";
-  for(int attempt=0;attempt<4;++attempt){
+  for(int attempt=0;attempt<max_attempts;++attempt){
     StandalonePathProblem qp(N,cfg_.knot_ds,{d0,slope,initial_bending});
     auto constrained=limits;
     if(attempt>=2&&!(tunnel&&cfg_.tunnel_recovery_enabled))for(size_t i=1;i<N;++i){double radius=attempt==2?.25:.05;
@@ -1142,9 +1197,15 @@ Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
     if(out.returning)out.reason="return_to_reference";
     out.max_curvature=curvature(path);double maxd=0;for(double d:qp.opt_x())maxd=std::max(maxd,std::abs(d));out.avoiding=maxd>.25;
     out.speed_cap=std::min(out.avoiding?cfg_.speedCeiling():9999.,std::sqrt(cfg_.max_lateral_accel/std::max(.001,out.max_curvature)));
-    last_path_=path;spatial_return_active_=false;return finish();
+    last_path_=path;spatial_return_active_=false;return true;
   }
-  out.reason=failure=="solver_status_-3"?"corridor_dynamics_infeasible":failure;return finish();
+  out.reason=failure=="solver_status_-3"?"corridor_dynamics_infeasible":failure;return false;
+  };
+  const bool use_extra=tunnel&&cfg_.tunnel_new_obstacle_margin>0;
+  bool planned_ok=false;
+  (void)use_extra;planned_ok=lattice(4);
+  if(!planned_ok&&have_deferred_hold){out=deferred_hold;out.reason="held_valid_path_replan_failed";}
+  return finish();
 }
 } // namespace occupancy_avoidance
 

@@ -1,0 +1,80 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(smpc_lane_change)
+
+add_compile_options(-std=c++17 -Wall -Wextra)
+
+find_package(catkin REQUIRED COMPONENTS
+  roscpp
+  std_msgs
+  nav_msgs
+  visualization_msgs
+  message_generation
+  morai_msgs
+  waypoint_maker
+  waypoint_system
+  lidar_ttc_tracker
+  mission_supervisor
+)
+
+add_message_files(FILES
+  TargetVehicle.msg
+  TargetVehicleSet.msg
+  LaneChangeDecision.msg
+  BehaviorPlan.msg
+  BehaviorLongitudinalRequest.msg
+  BehaviorLongitudinalStatus.msg
+  LaneChangeStatus.msg
+)
+
+generate_messages(DEPENDENCIES std_msgs)
+
+catkin_package(
+  INCLUDE_DIRS include
+  CATKIN_DEPENDS roscpp std_msgs nav_msgs visualization_msgs message_runtime morai_msgs waypoint_maker waypoint_system lidar_ttc_tracker mission_supervisor
+)
+
+include_directories(include ${catkin_INCLUDE_DIRS})
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(test_projected_gap_contract test/test_projected_gap_contract.cpp)
+  add_dependencies(test_projected_gap_contract ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_projected_gap_contract ${catkin_LIBRARIES})
+  add_executable(test_gap_speed_policy test/test_gap_speed_policy.cpp)
+  add_dependencies(test_gap_speed_policy ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_gap_speed_policy ${catkin_LIBRARIES})
+  add_test(NAME highway_gap_speed_policy COMMAND test_gap_speed_policy)
+  add_executable(test_merge_acc_contract test/test_merge_acc_contract.cpp)
+  add_dependencies(test_merge_acc_contract ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_merge_acc_contract ${catkin_LIBRARIES})
+  add_test(NAME highway_merge_acc_contract COMMAND test_merge_acc_contract)
+  add_executable(test_lane_prelude test/test_lane_prelude.cpp)
+  add_test(NAME highway_lane_prelude COMMAND test_lane_prelude
+    ${CMAKE_CURRENT_SOURCE_DIR}/../waypoint_system/data/default)
+endif()
+
+add_executable(target_selector_node src/target_selector_node.cpp)
+add_dependencies(target_selector_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(target_selector_node ${catkin_LIBRARIES})
+
+add_executable(lane_change_supervisor_node src/lane_change_supervisor_node.cpp)
+add_dependencies(lane_change_supervisor_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(lane_change_supervisor_node ${catkin_LIBRARIES})
+
+add_executable(acc_speed_planner_node src/acc_speed_planner_node.cpp)
+add_dependencies(acc_speed_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(acc_speed_planner_node ${catkin_LIBRARIES})
+
+add_executable(smpc_decision_node src/smpc_decision_node.cpp)
+add_dependencies(smpc_decision_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(smpc_decision_node ${catkin_LIBRARIES})
+
+add_executable(gap_test_decision_node src/gap_test_decision_node.cpp)
+add_dependencies(gap_test_decision_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(gap_test_decision_node ${catkin_LIBRARIES})
+
+install(TARGETS target_selector_node lane_change_supervisor_node acc_speed_planner_node smpc_decision_node gap_test_decision_node
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+catkin_install_python(PROGRAMS scripts/smpc_visual_monitor.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(DIRECTORY include/${PROJECT_NAME}/ DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
+install(DIRECTORY launch config rviz meshes DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

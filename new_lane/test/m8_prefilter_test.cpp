@@ -13,17 +13,54 @@ TEST(WallZone,RemovesEverythingBeyondBoundary){auto r=road();std::vector<Sample>
  auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),&st);EXPECT_FALSE(k[0]);EXPECT_FALSE(k[1]);EXPECT_FALSE(k[2]);EXPECT_TRUE(k[3]);EXPECT_EQ(st.outside,3u);}
 TEST(WallZone,VerticalWallInBandRemovedOverTwoMetres){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float h:{.1f,.6f,1.2f})p.push_back({float(.5+i*.1),-2.8,0,h});
  auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());for(bool v:k)EXPECT_FALSE(v);}
-TEST(WallZone,ShortTallObjectAtWallIsKept){auto r=road();std::vector<Sample>p;for(int i=0;i<6;++i)for(float h:{.1f,.6f,1.2f})p.push_back({float(2+i*.1),-2.8,0,h});
+TEST(WallZone,ShortTallObjectAtWallIsKept){auto r=road();std::vector<Sample>p;for(int i=0;i<6;++i)for(float y:{-2.8f,-2.4f})for(float h:{.1f,.6f,1.2f})p.push_back({float(2+i*.1),y,0,h});
  auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());for(bool v:k)EXPECT_TRUE(v);}
 TEST(WallZone,LowObstacleBodyInLaneSurvivesNextToWall){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float h:{.1f,.6f,1.2f})p.push_back({float(.5+i*.1),-2.8,0,h});
  size_t n=p.size();p.push_back({2,-2.2,0,.45});p.push_back({2,-1.8,0,.45});auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());EXPECT_TRUE(k[n]);EXPECT_TRUE(k[n+1]);}
-TEST(WallZone,LongLowObstacleAlongWallIsKept){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float h:{.05f,.25f,.45f})p.push_back({float(.5+i*.1),-2.8,0,h});
+TEST(WallZone,LongLowObstacleAlongWallIsKept){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float y:{-2.8f,-2.4f})for(float h:{.05f,.25f,.45f})p.push_back({float(.5+i*.1),y,0,h});
  auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());for(bool v:k)EXPECT_TRUE(v);}
 TEST(WallZone,ThinRingWallBesideEgoRemoved){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)p.push_back({float(.5+i*.1),-2.9,0,.8f});
  auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());for(bool v:k)EXPECT_FALSE(v);}
+// 2026-10-13: 벽 밑 드문 점(21:55:44 백 1~7점)은 strip 안이면 제거, 차로 쪽으로 이어지는 장애물 몸체는 유지.
+TEST(WallZone,SparseWallBasePointsInStripRemoved){auto r=road();std::vector<Sample>p{{4,-2.85,0,.5f},{4.1,-2.8,0,.48f},{6,-2.9,0,.3f}};WallZoneStats st;
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),&st);for(bool v:k)EXPECT_FALSE(v);EXPECT_EQ(st.strip,3u);}
+TEST(WallZone,ObstacleTouchingWallKeepsStripPoints){auto r=road();std::vector<Sample>p{{4,-2.85,0,.4f},{4.1,-2.5,0,.4f},{4.2,-2.2,0,.4f}};
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone());for(bool v:k)EXPECT_TRUE(v);}
 TEST(WallZone,OpenEntranceHasNoBoundary){auto r=road();std::vector<Sample>p{{2,-5,0,.12}};auto k=wallZoneKeep(p,r,{{0,0,0},{50,-3,4},{99,-3,4}},{0,0},0,0,0,0,WallZone());EXPECT_TRUE(k[0]);}
 TEST(WallZone,DrOffsetShiftsBoundary){auto r=road();std::vector<Sample>p{{2,-3.5,0,.3}};
  // offset -1.2: 실제 횡 = -3.5 + 1.2 = -2.3 (벽 안쪽) -> 유지.
  EXPECT_TRUE(wallZoneKeep(p,r,prof(),{0,0},0,0,0,-1.2,WallZone())[0]);EXPECT_FALSE(wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone())[0]);}
 
 int main(int argc,char**argv){testing::InitGoogleTest(&argc,argv);return RUN_ALL_TESTS();}
+TEST(VerifiedWall,UnmatchedLowProtrusionAndLongShapeRemain){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float h:{.1f,.6f,1.2f})p.push_back({float(.5+i*.1),-2.8,0,h});
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t){return false;});for(bool v:k)EXPECT_TRUE(v);}
+TEST(VerifiedWall,OnlyMatchingPointsRemovedBoundaryStillPhysical){auto r=road();std::vector<Sample>p{{4,-2.85,0,.08f},{4.1,-2.8,0,.48f},{6,-3.5,0,.3f}};
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t i){return i==1;});EXPECT_TRUE(k[0]);EXPECT_FALSE(k[1]);EXPECT_FALSE(k[2]);}
+TEST(WallSurface,IrregularShortLowSurfaceNeedsNoLongFlatRun){
+ auto r=road();std::vector<Sample>p{{4,-2.85,-1.6,.1f},{4.1,-2.72,-1.45,.25f},{4.2,-2.8,-1.3,.4f},{4.2,-2.7,-1.6,.1f}};
+ WallZoneStats st;std::vector<uint8_t>why;
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),&st,&why,[](size_t i){return i<3;},true);
+ EXPECT_FALSE(k[0]);EXPECT_FALSE(k[1]);EXPECT_FALSE(k[2]);EXPECT_TRUE(k[3]);EXPECT_EQ(st.surface,3u);EXPECT_EQ(why[0],4u);
+}
+TEST(WallSurface,MissingMapEvidenceKeepsWallAdjacentReturns){
+ auto r=road();std::vector<Sample>p{{4,-2.85,-1.6,.1f},{4.1,-2.75,-.6,1.1f}};
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t){return false;},true);
+ EXPECT_TRUE(k[0]);EXPECT_TRUE(k[1]);
+}
+TEST(WallSurface,OpenEntranceNeverExtendsWallFromMapMatch){
+ auto r=road();std::vector<Sample>p{{2,-2.8,-1.6,.1f}};
+ auto k=wallZoneKeep(p,r,{{0,0,0},{50,-3,4},{99,-3,4}},{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t){return true;},true);
+ EXPECT_TRUE(k[0]);
+}
+// 2026-10-14(17:37:24, 17:39:16 백) 지도 일치 제거 + 남은 점에 형상·밑동 띠 규칙(shape_after_surface).
+TEST(WallHybrid,UnmatchedLongWallRemovedAfterSurfacePass){auto r=road();std::vector<Sample>p;for(int i=0;i<30;++i)for(float h:{.1f,.6f,1.2f})p.push_back({float(.5+i*.1),-2.8,0,h});
+ WallZoneStats st;auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),&st,nullptr,[](size_t){return false;},true,true);
+ for(bool v:k)EXPECT_FALSE(v);EXPECT_EQ(st.surface,0u);EXPECT_GT(st.shape+st.strip,0u);}
+TEST(WallHybrid,SparseUnmatchedWallBaseRemoved){auto r=road();std::vector<Sample>p{{4,-2.85,0,.5f},{4.1,-2.8,0,.48f},{6,-2.9,0,.3f}};
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t){return false;},true,true);for(bool v:k)EXPECT_FALSE(v);}
+TEST(WallHybrid,WallAttachedBodyReachingInwardKept){auto r=road();std::vector<Sample>p;
+ for(int i=0;i<15;++i)for(float y:{-2.85f,-2.6f,-2.3f,-2.0f,-1.7f})p.push_back({float(4+i*.1),y,0,.4f});  // 벽에서 1.3 m 안쪽까지 나온 저상 물체
+ auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),nullptr,nullptr,[](size_t){return false;},true,true);for(bool v:k)EXPECT_TRUE(v);}
+TEST(WallHybrid,MapMatchedSurfaceStillRemovedFirst){auto r=road();std::vector<Sample>p{{4,-2.85,0,.1f},{4.1,-2.2,0,.4f}};
+ WallZoneStats st;std::vector<uint8_t>why;auto k=wallZoneKeep(p,r,prof(),{0,0},0,0,0,0,WallZone(),&st,&why,[](size_t i){return i==0;},true,true);
+ EXPECT_FALSE(k[0]);EXPECT_EQ(why[0],4u);EXPECT_TRUE(k[1]);}

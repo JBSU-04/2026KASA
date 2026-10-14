@@ -10,12 +10,16 @@
 namespace occupancy_avoidance {
 // The router owns mission bounds; preparing perception never arms control.
 struct TunnelRegion {
-  int lane=3, first=7201, last=8850, preview=100, shadow_first=7201;
+  int lane=3, first=7201, last=8850, preview=100, shadow_first=7201, exit_hold=100;
   bool contains(int csv,int idx) const { return csv==lane&&idx>=first&&idx<=last; }
   bool prepares(int csv,int idx) const { return csv==lane&&idx>=first-preview&&idx<=last; }
+  // 2026-10-13(12:08:53, 12:09:56 백): 엔진은 구간 끝 뒤 exit_hold 까지 경로를 맡을 수 있는데 입력(사전 필터·지도
+  //   필터·엔진 입력)은 구간 끝에서 멈춰 stale_lidar -> 회피 실패 -> AEB 로 idx 8890 에서 섰다. 입력과 소유는 이 범위로 맞춘다.
+  bool serves(int csv,int idx) const { return csv==lane&&idx>=first-preview&&idx<=last+exit_hold; }
   static TunnelRegion load(const ros::NodeHandle& nh) {
     TunnelRegion r; XmlRpc::XmlRpcValue sections;
     nh.param("/tunnel_recovery/perception_prepare_idx",r.preview,100);
+    nh.param("/tunnel_recovery/exit_hold_idx",r.exit_hold,100);if(r.exit_hold<0)r.exit_hold=0;
     if(r.preview<0) throw std::runtime_error("negative tunnel perception preparation range");
     if(nh.getParam("/section_router/sections",sections)) {
       for(int i=0;i<sections.size();++i) {

@@ -362,11 +362,21 @@ gap_select_align_speed_tol_mps: 2.0 # 틈 속도와 이 이내면 '맞춤'
 gap_select_slot_margin_m: 1.0 # 안전영역 바깥에 더하는 여유(앞/뒤 각각)
 gap_select_min_slot_m: 1.0
 gap_select_max_time_sec: 12.0
-gap_select_accel_mps2: 1.2 # 시뮬레이션 가속 한계(ACC max_accel 1.6 보다 보수적)
+gap_select_accel_mps2: 3.0 # 선택 갭 준비 전용 목표 변화율(ACC 동일 설정)
+# 2026-10-13 추월(기준 차량 앞 틈) 가속과 기준 차량 가속 판단(overtake_policy.hpp).
+#   14:44:35 백: 추월로 정한 기준 차량이 1.8 m/s^2 로 같이 가속해 나란히 달리다 차로 끝 정지.
+#   가속도 = 최근 1.0 s v_long 최소제곱 기울기(등속 차량 오차 p95 0.61 m/s^2 -> 데드밴드 0.6).
+gap_select_overtake_accel_mps2: 4.0      # 추월 쪽 가속 명령·갭 시뮬레이션 자차 가속
+gap_overtake_accel_policy_enabled: true
+gap_ref_accel_window_sec: 1.0            # 기준 차량·자차 가속 추정 창
+gap_ref_accel_deadband_mps2: 0.6         # 이보다 작은 기준 차량 가속은 0(등속)
+gap_overtake_rel_accel_min_mps2: 1.0     # 자차(실측) - 기준 차량 상대 가속 최소
+gap_overtake_abort_confirm_sec: 0.5      # 추월 중 포기 조건 유지 시간
+gap_ref_speed_cap_mps: 27.8              # 가속하는 경계 차량 예측 상한(100 km/h)
 # 1.5 -> 2.5 (2026-10-01, 21:37 백). 본선보다 6 m/s 빠른 채 진입해 1.5 로는 옆 차 뒤로
 #   빠지는 데 6.5 초가 걸렸고, 그중 4.4 초를 옆 차와 나란히 달려 남은 거리를 다 썼다.
 #   상한은 behavior_yield_comfort_max_decel_mps2(3.0) 안.
-gap_select_decel_mps2: 2.5 # 시뮬레이션/YIELD 감속률
+gap_select_decel_mps2: 3.0 # 시뮬레이션/YIELD 감속률
 # 틈 시뮬레이션의 속도 상한을 구간별 제한속도로 쓴다(2026-10-01).
 #   예전에는 '지금 위치의' 미션 속도 하나를 시뮬레이션 끝까지 썼다. 이제 차로 CSV 의
 #   mission_state 열 + 규정 예외 구간(아래)으로 idx 별 제한을 구하고, 앞쪽에 더 낮은
@@ -604,3 +614,9 @@ debug_prediction_target_footprint_stride: 5
 debug_prediction_target_max_vehicles: 20
 debug_prediction_show_target_modes: true
 debug_prediction_show_labels: true
+
+# Selected-gap preparation only; legacy rollback uses false flags + 1.2/2.5 rates.
+gap_response_enabled: true
+gap_shared_speed_enabled: true
+gap_fixed_flow_enabled: false # no default NPC convergence to 11m/s
+gap_selected_max_catchup_mps: 6.0

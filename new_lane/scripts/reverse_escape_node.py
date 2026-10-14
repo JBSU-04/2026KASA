@@ -113,6 +113,7 @@ class ReverseEscape(object):
         self.joint_enabled = bool(g('~joint_planning_enabled', True))
         self.integrated_escape_enabled = bool(g('~integrated_escape_enabled', True)) and bool(g('/tunnel_recovery/enabled',True))
         self.integrated_plan = False
+        self.object_scene_enabled=bool(g('/tunnel_recovery/object_scene_enabled',True))
         self.common_scene_enabled=bool(g("/tunnel_recovery/common_scene_enabled",True))
         self.engine_cells=np.empty((0,2));self.engine_cells_stamp=-1e9
         self.escape_dynamic=[];self.escape_dynamic_stamp=-1e9
@@ -210,6 +211,9 @@ class ReverseEscape(object):
         rospy.Subscriber('/groundgrid/nonground_exact',PointCloud2,self.filtered_rear_cb,queue_size=1,buff_size=2**24)
         rospy.Subscriber(g('~cloud_topic', '/perception/points_gravity'), PointCloud2, self.cloud_cb,
                          queue_size=1, buff_size=2 ** 24)
+        if self.object_scene_enabled:
+            from occupancy_avoidance.msg import TunnelScene
+            rospy.Subscriber('/tunnel/obstacle_scene',TunnelScene,self.object_scene_cb,queue_size=1)
         rospy.Timer(rospy.Duration(0.05), self.tick)
         rospy.loginfo('[reverse_escape] ready: stop %.0fs gap %.1fm reverse %.0f~%.0fm (M3 %d~%d, tunnel)',
                       self.trigger_stop_sec, self.trigger_gap, self.rev_min, self.rev_max,
@@ -253,7 +257,36 @@ class ReverseEscape(object):
         self.corrected_obs_t = rospy.Time.now().to_sec()
         self.obs_cb(msg, corrected=True)
 
+    def object_scene_cb(self,msg):
+        from tunnel_native_scene import scene_dict,final_root
+        now=rospy.Time.now().to_sec()
+        if not -.05<=now-msg.header.stamp.to_sec()<=.35 or msg.mission_mode!='tunnel':return
+        try:scene=scene_dict(msg);root=final_root(scene)
+        except (ValueError,TypeError):return
+        old=getattr(self,'escape_offset',(scene.get('offset_x',0.),scene.get('offset_y',0.)))
+        shift=np.asarray([scene.get('offset_x',0.)-old[0],scene.get('offset_y',0.)-old[1]])
+        if np.any(shift):
+            self.memory={oid:(t,pts+shift)for oid,(t,pts) in self.memory.items()}
+            if self.rev_path is not None:self.rev_path=(self.rev_path[0]+shift,*self.rev_path[1:])
+            if self.joint_poses is not None:
+                self.joint_poses=self.joint_poses.copy();self.joint_poses[:,:2]+=shift
+            self.joint_forward=[[q[0]+shift[0],q[1]+shift[1],*q[2:]]for q in self.joint_forward]
+        self.escape_offset=(scene.get('offset_x',0.),scene.get('offset_y',0.))
+        self.engine_cells=np.asarray(scene['collision_cells_world'],float).reshape((-1,2));self.engine_cells_stamp=scene['geometry_stamp']
+        # Occluded near objects are already retained by the authoritative scene.
+        # A second ten-second memory would resurrect ray-cleared occupancy.
+        self.memory.clear()
+        self.escape_scene_id=scene['scene_id'];self.escape_coordinate_version=scene['coordinate_version'];self.escape_visibility=scene['visibility']
+        self.escape_dynamic=[];self.escape_dynamic_stamp=scene['geometry_stamp']
+        for o in root['collision_objects']:
+            if not (o.get('motion_state')=='dynamic' or (o.get('dynamic_candidate') and o.get('observed_motion_valid'))):continue
+            if not -.05<=now-o.get('last_seen',-1e9)<=.35:continue
+            v=o.get('velocity_world',[0.,0.])
+            for q in o.get('occupied_cells_world',[]):self.escape_dynamic.append([q[0],q[1],v[0],v[1],.1,.1,0.,.2])
+        self.obs_cb(root,corrected=True)
+
     def engine_geometry_cb(self,msg):
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':return
         try:
             data=msg if isinstance(msg,dict) else json.loads(msg.data)
             if 'collision_cells_world' not in data:return
@@ -263,7 +296,8 @@ class ReverseEscape(object):
 
     def obs_cb(self, m, corrected=False):
         try:
-            d = json.loads(m.data)
+            d = m if isinstance(m,dict) else json.loads(m.data)
+            if not isinstance(m,dict) and getattr(self,'object_scene_enabled',False) and d.get('mission_mode')=='tunnel':return
         except ValueError:
             return
         self.mission_mode = d.get('mission_mode', '')
@@ -282,6 +316,7 @@ class ReverseEscape(object):
                 out.append(o)
                 self.remember(o)
         self.obs = out
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':return
         forecast=[]
         for o in out:
             if o.get('motion_state')!='dynamic' and int(o.get('id',-1)) not in self.dyn_ids:continue
@@ -295,6 +330,7 @@ class ReverseEscape(object):
         """정지 물체의 세계좌표 외곽점을 memory_sec 동안 기억한다(차 주변 근거리 사각 보완)."""
         oid = int(o.get('id', -1))
         now = rospy.Time.now().to_sec()
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':return
         if oid in self.bg_ids and now - self.bg_ids_t < .5:
             return
         state = o.get('motion_state', '')
@@ -303,6 +339,10 @@ class ReverseEscape(object):
             return
         # 2026-10-07(20:29:27 백): 누적(retained) 외곽선은 실제보다 부풀어(차 옆 물체 0.34 m vs 실제 0.62 m)
         #   시작 자세부터 여유 0.5 m 미달 -> no_collision_free_reverse. 실제 관측 외곽선을 먼저 쓴다(정지 노드와 동일).
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':
+            cells=np.asarray(o.get('occupied_cells_world',[]),float).reshape((-1,2))
+            if len(cells):self.memory[oid]=(float(o.get('last_seen',now)),cells.copy())
+            return
         fp = o.get('observed_footprint_world') or o.get('footprint_world') or o.get('planning_footprint_world')
         if fp and len(fp) >= 3:
             # 2026-10-08(11:59:37 백): 벽+턱이 묶인 25 m 외곽선이 차체를 덮어 후진 시작부터 거절됐다.
@@ -357,6 +397,7 @@ class ReverseEscape(object):
             self.wall_heading_t = rospy.Time.now().to_sec()
 
     def bg_cb(self, m):
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':return
         try:
             self.bg_ids = set(int(i) for i in json.loads(m.data).get('ids', []))
             self.bg_ids_t = rospy.Time.now().to_sec()
@@ -374,6 +415,7 @@ class ReverseEscape(object):
 
     def cloud_cb(self, m, filtered=False):
         """후방 확인용 점만 저장(센서 좌표, 뒤범퍼 뒤, 높이 범위). 계산은 후진 판단/후진 중에만."""
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':return
         if self.filtered_pipeline and self.zone()=='tunnel' and not filtered:return
         if filtered:
             from m8_filtered_input import cloud_rows
@@ -514,7 +556,7 @@ class ReverseEscape(object):
         now = rospy.Time.now().to_sec()
         ex, ey, yaw = self.pose
         c, s = math.cos(yaw), math.sin(yaw)
-        if getattr(self,'common_scene_enabled',False) and self.zone()=='tunnel':
+        if (getattr(self,'common_scene_enabled',False) or getattr(self,'object_scene_enabled',False)) and self.zone()=='tunnel':
             if not -.05<=now-self.engine_cells_stamp<=.35:return None
             parts=[self.engine_cells]
         else:parts = [self.memory_points(now), self.cloud_world]
@@ -523,6 +565,17 @@ class ReverseEscape(object):
             bx = p[:, 0] + self.sensor_x
             parts.append(np.stack([ex + c * bx - s * p[:, 1], ey + s * bx + c * p[:, 1]], axis=1))
         W = np.vstack([q for q in parts if len(q)]) if any(len(q) for q in parts) else np.empty((0, 2))
+        if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel':
+            visible={(int(v[0]),int(v[1])) for v in getattr(self,'escape_visibility',[]) if -.05<=now-v[2]<=.35}
+            xy,arc=path[:2];j=max(0,int(np.searchsorted(arc,s_cur))-1)
+            for a,bb in zip(xy[j:-1],xy[j+1:]):
+                length=float(np.linalg.norm(bb-a));vh=math.atan2(bb[1]-a[1],bb[0]-a[0])+math.pi;vc,vs=math.cos(vh),math.sin(vh)
+                for u in np.arange(0.,max(length,.001),.1):
+                    center=a+(bb-a)*min(1.,u/max(length,1e-9))
+                    for lateral in (-self.half_width,0.,self.half_width):
+                        q=center+np.array([-vc*(self.rear_overhang+.5)-vs*lateral,-vs*(self.rear_overhang+.5)+vc*lateral])
+                        ix,iy=np.floor(q/.5).astype(int)
+                        if not any((ix+dx,iy+dy) in visible for dx in (-1,0,1)for dy in (-1,0,1)):return None
         if not len(W):
             return reach
         W = W[np.hypot(W[:, 0] - ex, W[:, 1] - ey) <= reach + self.front_overhang + 4.0]
@@ -538,7 +591,7 @@ class ReverseEscape(object):
             dv = np.maximum(np.abs(v) - hw, 0.0)
             return np.hypot(du, dv)
 
-        if np.any(clearance(ex, ey, yaw) < (.2 if getattr(self,"integrated_plan",False) else self.body_margin)):
+        if np.any(clearance(ex, ey, yaw) < (.2 if getattr(self,"integrated_plan",False) or (getattr(self,"object_scene_enabled",False) and self.zone()=="tunnel") else self.body_margin)):
             return 0.0
         rp, rs, _ = path
         travel = 0.0
@@ -554,7 +607,7 @@ class ReverseEscape(object):
             h = float(np.interp(st, rs, np.unwrap(self.joint_poses[:, 2]))) if (
                 self.joint_enabled and self.joint_poses is not None and len(rs) == len(self.joint_poses)) else math.atan2(py - qy, px - qx)        # 앞방향 = 경로 진행의 반대
             cl = clearance(px, py, h)
-            bad = cl < (.2 if getattr(self,"integrated_plan",False) else self.body_margin)
+            bad = cl < (.2 if getattr(self,"integrated_plan",False) or (getattr(self,"object_scene_enabled",False) and self.zone()=="tunnel") else self.body_margin)
             if np.any(bad):
                 return max(0.0, travel - 0.2)
         return reach
@@ -630,7 +683,7 @@ class ReverseEscape(object):
         self.joint_last_try = rospy.Time.now().to_sec()
         pose = tuple(self.pose)
         integrated=self.zone()=='tunnel' and getattr(self,'integrated_escape_enabled',False)
-        if getattr(self,'common_scene_enabled',False) and self.zone()=='tunnel':
+        if (getattr(self,'common_scene_enabled',False) or getattr(self,'object_scene_enabled',False)) and self.zone()=='tunnel':
             if not -.05<=self.joint_last_try-self.engine_cells_stamp<=.35:
                 self.joint_pending=False;self.joint_reason='common_scene_expired';return
             parts=[self.engine_cells.copy()]
@@ -668,7 +721,7 @@ class ReverseEscape(object):
                 if not candidates and not integrated:
                     self.joint_reason = 'no_collision_free_reverse'
                     return
-                req = dict(id=request_id, stamp=rospy.Time.now().to_sec(), candidates=candidates,
+                req = dict(id=request_id, scene_id=getattr(self,'escape_scene_id',0),coordinate_version=getattr(self,'escape_coordinate_version',0), stamp=rospy.Time.now().to_sec(), candidates=candidates,
                            blocker=[obstacle['wx'], obstacle['wy']], blocker_length=obstacle.get('length', 2.),
                            recheck=recheck,integrated=integrated,
                            skip_forward_probe=integrated and self.joint_reason in ("search_timeout","forward_evaluation_timeout"),
@@ -688,6 +741,8 @@ class ReverseEscape(object):
                 self.joint_reason = response.get('reason', 'invalid')
                 if not response.get('valid'):
                     return
+                if integrated and getattr(self,'object_scene_enabled',False) and int(response.get('coordinate_version',0))!=getattr(self,'escape_coordinate_version',0):
+                    self.joint_reason='escape_coordinate_version_changed';return
                 if integrated:
                     reverse=response.get('reverse',[]) or [pose]
                     candidate=dict(poses=reverse,controls=response.get('controls',[]) or [0.],
@@ -870,7 +925,7 @@ class ReverseEscape(object):
         self.stopped_since = (self.stopped_since or now) if stopped else None
         self.still_since = (self.still_since or now) if abs(v) < 0.05 else None
         hold = self.dyn_hold and now - self.dyn_t < 0.5
-        cloud_ok = now - self.cloud_t < self.cloud_timeout
+        cloud_ok = (-.05<=now-getattr(self,'engine_cells_stamp',-1e9)<=.35) if getattr(self,'object_scene_enabled',False) and self.zone()=='tunnel' else now - self.cloud_t < self.cloud_timeout
         self.spatial_fail_since = ((getattr(self, 'spatial_fail_since', None) or now)
                                    if self.m8_escape_allowed(now) else None)
         st = self.state

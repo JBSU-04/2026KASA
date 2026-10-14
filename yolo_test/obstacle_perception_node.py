@@ -36,6 +36,7 @@ import sys
 import rospkg
 sys.path.insert(0, os.path.join(rospkg.RosPack().get_path("new_lane"), "scripts"))
 from obstacle_geometry import measured_geometry, pose_at, sensor_to_base_xy, support_subset
+from m8_motion import RigidMotion
 from m8_object_policy import SurfaceMotion, detector_profile
 from m8_filtered_input import WallSurface, filtered_cloud
 from temporal_components import TemporalFarInput
@@ -1030,6 +1031,14 @@ class ObstaclePerceptionNode:
         # 2026-10-12 지연: 트랙 지지점 0.1 m 격자 + 최대 300점(JSON·연관·병합 부하 상한).
         self.support_voxel_m = float(rospy.get_param('~support_voxel_m', 0.1))
         self.support_max_points = int(rospy.get_param('~support_max_points', 300))
+        # 2026-10-13 터널 정적·동적 강체 이동 판정(m8_motion.RigidMotion) 파라미터.
+        self.m8_rigid_motion_enabled = bool(rospy.get_param('/tunnel_recovery/rigid_motion_enabled', True))
+        self.m8_rigid_motion_config = dict(
+            stationary_surface_priority=bool(rospy.get_param('/tunnel_recovery/stationary_wall_motion_priority_enabled',True)),
+            dyn_m=float(rospy.get_param('~m8_rigid_dynamic_m', 0.4)),
+            static_m=float(rospy.get_param('~m8_rigid_static_m', 0.15)),
+            large_extent=float(rospy.get_param('~m8_large_extent_m', 3.0)),
+            candidate_mps=float(rospy.get_param('~m8_candidate_mps', 1.0)))
         self.tunnel_wall_profile = None
         try:
             import yaml
@@ -1070,6 +1079,14 @@ class ObstaclePerceptionNode:
             rospy.Duration(0.2), self.publish_reference_corridor)
 
         rospy.Subscriber('/odom', Odometry, self.odom_callback, queue_size=1)
+        # 2026-10-14 이동 판정 전용 자차 이동 보상 프레임: 보정 전 순수 DR(/localization/dr_raw_odom).
+        #   /odom(map) 에는 X-ICP yaw bias 단계(0.5 deg, 35 m 물체 0.33 m), GPS 재획득(1.5 m/s), X-ICP 횡(0.2 m/s)
+        #   보정이 들어가 정지 물체가 '강체 이동'으로 보일 수 있다(표면 대응 검증으로도 못 거름). 위치·계획은 /odom 유지.
+        self.dr_raw_history = deque(maxlen=300); self.dr_raw_epoch = 0
+        self.m8_dr_motion_frame = bool(rospy.get_param('/tunnel_recovery/raw_dr_motion_frame_enabled', True))
+        self.m8_require_dr = bool(rospy.get_param('/tunnel_recovery/raw_dr_required_for_motion',True))
+        if self.m8_dr_motion_frame:
+            rospy.Subscriber('/localization/dr_raw_odom', Odometry, self.dr_raw_callback, queue_size=20)
         # 현재 waypoint idx. 미션 구간별 마커 필터에 쓴다(시각화 전용이라
         # 검출/추적 로직에는 영향이 없다).
         from waypoint_maker.msg import Lane as _WpLane2
@@ -1126,7 +1143,7 @@ class ObstaclePerceptionNode:
         self.m8_filtered_pub=rospy.Publisher("/tunnel/filtered_near",PointCloud2,queue_size=1) if not self.m8_cpp_prefilter else None
         self.m8_wall_surface=WallSurface.load(rospy.get_param("/tunnel_recovery/wall_profile_file",None)) if self.m8_filtered_pipeline and not self.m8_cpp_prefilter else None
         self.filtered_scan_stamp=-1e9
-        self.native_tunnel_enabled=bool(rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True))
+        self.native_tunnel_enabled=(bool(rospy.get_param('/tunnel_recovery/object_scene_enabled',True)) or bool(rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True)))
         self.native_sequence=0;self.native_debug_stamp=-1e9;self.native_coordinate_version=0;self.native_frame_offset=(0.,0.);self.native_frame_stamp=-1.;self.m8_frame_lock=threading.RLock()
         if self.native_tunnel_enabled:
             from occupancy_avoidance.msg import TunnelScene
@@ -1197,6 +1214,36 @@ class ObstaclePerceptionNode:
         self.latest_twist=(stamp,float(msg.twist.twist.linear.x),float(msg.twist.twist.angular.z))
         if self.geometry_pose_history and stamp<self.geometry_pose_history[-1][0]:self.geometry_pose_history.clear()
         self.geometry_pose_history.append((stamp,self.latest_ego_pose+(msg.pose.pose.position.z,)))
+
+    def dr_raw_callback(self, msg):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.*(q.w*q.z+q.x*q.y), 1.-2.*(q.y*q.y+q.z*q.z))
+        stamp = msg.header.stamp.to_sec(); p = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+        h = self.dr_raw_history
+        if h:
+            t0, p0 = h[-1]
+            if stamp <= t0:
+                if stamp < t0:  # 시간 되감김(재시작·재생): 새 프레임
+                    h.clear(); self.dr_raw_epoch += 1
+                else:
+                    return
+            elif math.hypot(p[0]-p0[0], p[1]-p0[1]) > abs(float(msg.twist.twist.linear.x))*(stamp-t0)+1.:
+                h.clear(); self.dr_raw_epoch += 1  # 어댑터 재시작 등 불연속: 새 프레임
+        h.append((stamp, p))
+
+    def _motion_frame_points(self, cluster_xy, map_pose, now):
+        """이동 판정용 점(세계 2D)과 프레임 키, map<-프레임 회전각. 순수 DR 이 없으면 /odom(map) 그대로."""
+        if getattr(self, 'm8_dr_motion_frame', False):
+            dr = pose_at(list(getattr(self, 'dr_raw_history', ())), now, self.pose_max_age)
+            if dr is not None:
+                c, sn = math.cos(dr[2]), math.sin(dr[2])
+                pts = np.asarray(cluster_xy, float) @ np.array([[c, sn], [-sn, c]]) + np.asarray(dr[:2])
+                return pts, ('dr_raw', self.dr_raw_epoch), math.atan2(math.sin(map_pose[2]-dr[2]), math.cos(map_pose[2]-dr[2]))
+            if getattr(self,'m8_require_dr',False):
+                return np.empty((0,2)), ('dr_raw_unavailable', self.dr_raw_epoch), 0.
+        c, sn = math.cos(map_pose[2]), math.sin(map_pose[2])
+        return (np.asarray(cluster_xy, float) @ np.array([[c, sn], [-sn, c]]) + np.asarray(map_pose[:2]),
+                ('map', getattr(self, 'native_coordinate_version', 0)), 0.)
 
     def _pose_at(self, stamp):
         samples = list(self.pose_history)
@@ -2239,6 +2286,35 @@ class ObstaclePerceptionNode:
                     recently_moving = now - getattr(target, 'apollo_last_moving', -1e9) < 2.0
                     target.motion_state = ('dynamic' if recently_moving else
                         ('static' if now-target.apollo_static_since >= 0.8 else 'unknown'))
+                if self.mission_zone == 'tunnel' and self.m8_shared_detector_policy and getattr(self, 'm8_rigid_motion_enabled', True):
+                    # 2026-10-13 터널 정적·동적: 외곽 강체 이동 근거(m8_motion.RigidMotion)로만 판정.
+                    #   중심·칼만 속도 흔들림(사고 차량 가짜 동적)과 속도 분산(횡단 물체 미확인)을 판정에서 뺀다.
+                    if not hasattr(target, 'rigid_motion'):
+                        target.rigid_motion = RigidMotion(**dict(getattr(self, 'm8_rigid_motion_config', {}), surface_translation_enabled=bool(rospy.get_param('/tunnel_recovery/verified_motion_policy_enabled',True))))
+                    motion_pts, motion_frame, frame_rot = self._motion_frame_points(cluster_pts[:, :2], pose, now)
+                    rm = target.rigid_motion
+                    if getattr(target, 'motion_frame', None) not in (None, motion_frame):
+                        # 프레임이 바뀌면 이동 근거만 다시 쌓는다(정적 상태는 유지: 근거 없이 미확정으로 바꾸지 않음).
+                        rm.bounds = []; rm.surfaces = {}; rm.hits = rm.candidate_hits = 0; rm.last_dir = None; rm.last_stamp = None
+                    target.motion_frame = motion_frame
+                    state, candidate, vector = rm.update(motion_pts, now, arrival_time=rospy.Time.now().to_sec(), coordinate_version=motion_frame[1])
+                    target.motion_support_xy=motion_pts[np.linspace(0,len(motion_pts)-1,min(64,len(motion_pts)),dtype=int)].tolist() if len(motion_pts) else []
+                    target.motion_epoch=motion_frame[1]
+                    target.motion_dr_valid=motion_frame[0]=='dr_raw'
+                    rm.evidence['coordinate_version']=getattr(self,'native_coordinate_version',0)
+                    if frame_rot:
+                        c_r, s_r = math.cos(frame_rot), math.sin(frame_rot)
+                        vector = np.array([c_r*vector[0]-s_r*vector[1], s_r*vector[0]+c_r*vector[1]])
+                    rm.evidence['motion_frame'] = motion_frame[0]
+                    target.motion_state = state
+                    target.dynamic_candidate = bool(candidate)
+                    target.motion_evidence = dict(target.rigid_motion.evidence)
+                    target.observed_motion_valid = state == 'dynamic' or bool(candidate)
+                    target.velocity_valid = target.observed_motion_valid
+                    target.velocity = np.asarray(vector, float).copy() if target.observed_motion_valid else np.zeros(2)
+                    target.observed_velocity = target.velocity.copy()
+                    target.speed = float(np.linalg.norm(target.velocity))
+                    target.apollo_dynamic_streak = target.rigid_motion.hits
                 if self.mission_zone == 'tunnel' and not self.m8_shared_detector_policy:
                     if not hasattr(target, 'surface_motion'):
                         target.surface_motion = SurfaceMotion(hold=rospy.get_param('/tunnel_recovery/surface_certificate_hold_enabled',True))
@@ -2339,6 +2415,9 @@ class ObstaclePerceptionNode:
                     (track.kf.P[2:4, 2:4].reshape(-1).tolist() if track.kf is not None else [])),
                 'observed_velocity': track.observed_velocity.tolist(),
                 'observed_motion_valid': bool(track.observed_motion_valid),
+                'dynamic_candidate': bool(getattr(track, 'dynamic_candidate', False)),
+                **(dict(motion_support_xy=getattr(track,'motion_support_xy',[]),motion_epoch=getattr(track,'motion_epoch',0),motion_dr_valid=getattr(track,'motion_dr_valid',False)) if self.mission_zone=='tunnel' else {}),
+                'motion_evidence': getattr(track, 'motion_evidence', None),
                 'observation_age': max(0.0, rospy.Time.now().to_sec() - track.last_seen),
                 'blind_hold': bool(getattr(track, 'blind_hold', False)),
                 'top_elevation': track.top_elevation,
@@ -2385,7 +2464,11 @@ class ObstaclePerceptionNode:
             scan=payload['geometry_scan'];stamp=float(scan.get('stamp',-1.))
             if stamp>0 and getattr(self,'scan_pose',None) is not None:
                 self.native_sequence+=1
-                self.native_tunnel_pub.publish(packet_from_detector(payload,payload,{},self.scan_pose+(self.geometry_z_offset-self.sensor_offset[2],),stamp,self.native_sequence,self.native_coordinate_version,self.native_frame_offset,source_packet=True))
+                packet=packet_from_detector(payload,payload,{},self.scan_pose+(self.geometry_z_offset-self.sensor_offset[2],),stamp,self.native_sequence,self.native_coordinate_version,self.native_frame_offset,source_packet=True)
+                tw=getattr(self,'latest_twist',None)
+                if tw is not None and abs(tw[0]-stamp)<=.08:
+                    packet.speed=tw[1];packet.curvature=tw[2]/tw[1] if abs(tw[1])>.3 else 0.
+                self.native_tunnel_pub.publish(packet)
             # Large JSON remains a compatibility/debug output, never M8 input.
             if rospy.Time.now().to_sec()-self.native_debug_stamp>=.5:
                 self.native_debug_stamp=rospy.Time.now().to_sec();msg.data=json.dumps(payload);self.info_pub.publish(msg)
@@ -2793,8 +2876,11 @@ class ObstaclePerceptionNode:
             # 이게 구분 안 되면 옆 차로 물체를 회피 대상으로 오해하게 된다.
             in_trig = bool(getattr(track, 'in_trigger_corridor', True))
             m.color.a = (0.75 if confirmed else 0.25) * (1.0 if in_trig else 0.4)
+            candidate = bool(getattr(track, 'dynamic_candidate', False)) and track.motion_state != 'dynamic'
             if track.motion_state == 'dynamic':
-                m.color.r, m.color.g, m.color.b = 1.0, 0.35, 0.0   # 주황: 동적
+                m.color.r, m.color.g, m.color.b = 1.0, 0.1, 0.1    # 빨강: 동적(2026-10-13, 후보와 구분)
+            elif candidate:
+                m.color.r, m.color.g, m.color.b = 1.0, 0.6, 0.0    # 주황: 동적 후보(강체 이동 1회)
             elif track.motion_state == 'static':
                 m.color.r, m.color.g, m.color.b = 0.1, 0.5, 1.0    # 파랑: 정적
             else:
@@ -2808,7 +2894,7 @@ class ObstaclePerceptionNode:
 
             # 동적 트랙은 속도 벡터를 화살표로 같이 보여준다 - 정적 오판을
             # 눈으로 잡아내려면 방향이 있어야 한다.
-            if track.motion_state == 'dynamic' and track.speed > 0.1:
+            if (track.motion_state == 'dynamic' or candidate) and track.speed > 0.1:
                 vel = getattr(track, 'velocity', None)
                 if vel is not None and len(vel) >= 2:
                     ar = Marker()
@@ -2840,15 +2926,21 @@ class ObstaclePerceptionNode:
             label.scale.z = 0.45
             label.color.a = 1.0
             if track.motion_state == 'dynamic':
-                label.color.r, label.color.g, label.color.b = 1.0, 0.6, 0.3
+                label.color.r, label.color.g, label.color.b = 1.0, 0.4, 0.4
+            elif candidate:
+                label.color.r, label.color.g, label.color.b = 1.0, 0.75, 0.3
             elif track.motion_state == 'static':
                 label.color.r, label.color.g, label.color.b = 0.5, 0.8, 1.0
             else:
                 label.color.r = label.color.g = label.color.b = 0.8
             state_kr = {'dynamic': '동적', 'static': '정적'}.get(
-                track.motion_state, '미확정')
+                track.motion_state, '후보' if candidate else '미확정')
             mark = '' if confirmed else '?'
             label.text = f"#{track.id}{mark} {state_kr} {track.speed:.1f}m/s"
+            ev = getattr(track, 'motion_evidence', None)
+            if self.mission_zone == 'tunnel' and ev:
+                # 강체 이동 근거: 함께 움직인 거리 / 비교 창 (판정 문턱)
+                label.text += f" Δ{ev.get('rigid_disp_m', 0):.2f}m/{ev.get('window_s', 0):.2f}s (≥{ev.get('threshold_m', 0):.1f})"
             label.lifetime = rospy.Duration(0.75 if self.mission_zone=="tunnel" and getattr(self,"m8_cpp_prefilter",False) else 0.3)
             arr.markers.append(label)
 

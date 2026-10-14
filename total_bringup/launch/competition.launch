@@ -4,7 +4,7 @@
   <arg name="tunnel_native_scene_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_wall_profile_file" default="$(find new_lane)/config/tunnel_wall_profile.yaml"/>
   <arg name="tunnel_physical_boundary_policy" default="true"/>
-  <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_gps_20261009.bin"/>
+  <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_shared_20261013.bin"/>
   <arg name="tunnel_verified_background_filter_enabled" default="false"/> <!-- 2026-10-11 M8 최종: 정동적 파이프라인(근거리 /nonground + 원거리 + StaticOccupancy). true 면 native scene 복귀 -->
   <arg name="tunnel_continuous_transition_enabled" default="true"/>
   <!-- M8: DR plus validated X-ICP yaw; dr/ufld remain explicit rollback modes. -->

@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""Convert MORAI GPS/IMU/vehicle speed into Autoware EKF measurements.
+
+Linear acceleration is deliberately not integrated. IMU yaw-rate drives the
+vehicle model through the twist measurement and the quaternion supplies an
+absolute wrapped-yaw observation at each GPS update.
+"""
+
+import bisect
+import math
+import json
+import threading
+from collections import deque
+
+import rospy
+from morai_sensor_fusion.lane_heading import sample_rows
+import tf
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistWithCovarianceStamped
+from morai_msgs.msg import EgoVehicleStatus, GPSMessage
+from mission_supervisor.msg import SectionState
+from sensor_msgs.msg import Imu
+from visualization_msgs.msg import Marker,MarkerArray
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool, Float32, Float64, String
+
+from morai_sensor_fusion.measurement import (
+    CourseBiasEstimator, GpsIntegrityMonitor, bicycle_sideslip, gps_to_base,
+    interpolate_angle, normalize_angle, position_variance)
+
+try:
+    from pyproj import Proj
+except ImportError:
+    Proj = None
+
+
+class MeasurementAdapter:
+    def __init__(self):
+        if Proj is None:
+            raise RuntimeError('python3-pyproj is required')
+        self.proj = Proj(proj='utm', zone=int(rospy.get_param('~utm_zone', 52)),
+                         ellps='WGS84', preserve_units=False)
+
+        self.frame_id = rospy.get_param('~frame_id', 'map')
+        self.base_frame = rospy.get_param('~base_frame', 'base_link')
+        self.imu_ned = bool(rospy.get_param('~imu_ned', False))
+        self.yaw_offset = float(rospy.get_param('~yaw_offset', 0.0))
+        self.utm_zone = int(rospy.get_param('~utm_zone', 52))
+        self.default_east_offset = float(rospy.get_param('~east_offset', 302595.0))
+        self.default_north_offset = float(rospy.get_param('~north_offset', 4124145.0))
+        # ★ 2026-09-29 UTM 자오선 수렴각 보정.
+        #   MORAI IMU yaw(와 Competition heading)는 진북 기준인데 위치는 UTM 격자
+        #   좌표다. K-City(경도 126.775, 52존 중앙경선 129)에서 둘은 -1.347 deg
+        #   어긋난다. 실측: 직선 구간 IMU yaw - GPS 진행방향 = +1.33/+1.27/+1.36 deg
+        #   (12:47/12:50/13:02 백), 터널 직선 IMU yaw - 경로방향 = +1.5 deg.
+        #   보정 없으면 EKF yaw 가 GPS 궤적과 계속 싸우고, 터널에서는 벽 헤딩(격자
+        #   기준)과 IMU 사이 1.6 deg 를 bias 로 배웠다가 GPS 복귀 순간 원시 IMU yaw
+        #   로 돌아가며 헤딩이 한 번에 1.6 deg 튀었다(20:57 백 출구 덜컹의 한 원인).
+        #   yaw_grid = yaw_true + convergence (pyproj meridian_convergence 부호).
+        self.grid_convergence = 0.0
+        if bool(rospy.get_param('~grid_convergence_correction', True)):
+            self.grid_convergence = self._grid_convergence_rad()
+        self.use_full_utm = bool(rospy.get_param('~use_full_utm', True))
+        self.lever_x = float(rospy.get_param('~gps_lever_x', 0.08))
+        self.lever_y = float(rospy.get_param('~gps_lever_y', 0.0))
+
+        self.gps_sigma = float(rospy.get_param('~gps_position_stddev', 0.35))
+        self.yaw_sigma = float(rospy.get_param('~imu_yaw_stddev', 0.05))
+        self.speed_sigma = float(rospy.get_param('~speed_stddev', 0.15))
+        self.wz_sigma = float(rospy.get_param('~yaw_rate_stddev', 0.02))
+        self.timestamp_sigma = float(rospy.get_param('~timestamp_stddev', 0.02))
+        self.max_imu_alignment = float(rospy.get_param('~max_imu_alignment', 0.12))
+        self.max_clock_offset = float(rospy.get_param('~max_clock_offset', 5.0))
+        self.gps_timeout = float(rospy.get_param('~gps_timeout', 1.0))
+        self.imu_timeout = float(rospy.get_param('~imu_timeout', 0.20))
+        self.speed_timeout = float(rospy.get_param('~speed_timeout', 0.35))
+        self.cur_speed_is_kmh = bool(rospy.get_param('~cur_speed_is_kmh', True))
+
+        # MORAI shaded areas may repeat a coordinate with a valid status and
+        # fresh timestamps.  Detect that from GPS displacement versus the
+        # independent vehicle speed, then keep the EKF in twist prediction.
+        self.gps_integrity = GpsIntegrityMonitor(
+            min_speed=rospy.get_param('~gps_freeze_min_speed', 1.0),
+            freeze_ratio=rospy.get_param('~gps_freeze_step_ratio', 0.15),
+            freeze_abs_step=rospy.get_param('~gps_freeze_abs_step', 0.03),
+            freeze_hits=rospy.get_param('~gps_freeze_confirm_hits', 4),
+            recover_min_ratio=rospy.get_param('~gps_recover_min_step_ratio', 0.25),
+            recover_max_ratio=rospy.get_param('~gps_recover_max_step_ratio', 2.5),
+            recover_margin=rospy.get_param('~gps_recover_step_margin', 0.25),
+            recover_hits=rospy.get_param('~gps_recover_confirm_hits', 5),
+            freeze_distance=rospy.get_param('~gps_freeze_distance_m', 0.6))
+        self.gps_pre_freeze_hold_distance = float(rospy.get_param(
+            '~gps_pre_freeze_hold_distance_m', 0.30))
+        self.gps_reacquire_correction_rate = float(rospy.get_param(
+            '~gps_reacquire_correction_rate_mps', 0.5))
+        self.gps_reacquire_finish_error = float(rospy.get_param(
+            '~gps_reacquire_finish_error_m', 0.05))
+        # ★ 2026-09-29 재획득 보정을 진행/횡 방향으로 나눈다.
+        #   진행방향 오차는 조향을 거의 흔들지 않으니 빨리 없애고, 횡오차만
+        #   gps_reacquire_correction_rate_mps 로 천천히 옮긴다.
+        self.gps_reacquire_along_rate = float(rospy.get_param(
+            '~gps_reacquire_along_rate_mps', 1.5))
+        # 재획득 시작점을 DR 이 아니라 EKF 출력 위치로 잡는다. 음영구간 동안 EKF 는
+        # DR 포즈(분산 ~0.25)를 느슨하게 따라가 둘이 0.2~0.3 m 벌어져 있었고, 분산
+        # 0.001 인 재획득 포즈가 들어오는 순간 /odom 이 DR 쪽으로 한 번에 튀었다.
+        self.reacquire_start_from_ekf = bool(rospy.get_param(
+            '~reacquire_start_from_ekf', True))
+        self.ekf_pose = None
+        # ★ 2026-09-29 시뮬레이터 멈춤 보상.
+        #   MORAI 가 부하로 잠깐 멈추면 IMU/GPS/차량상태가 함께 0.1~0.22 s 끊긴다
+        #   (몰아서 오지 않음 = 시뮬 시간도 멈춤). DR 이 그 벽시계 dt 를 그대로
+        #   속도에 곱해 한 번에 ~2 m 앞서 나갔다. 20:57 백 17.42 s 0.215 s 멈춤,
+        #   재획득 진행오차 +1.57 m. 멈춤 있던 백(19:21/20:49/20:57) +0.6~1.6 m,
+        #   없던 백(13:02/16:23/20:23) -0.2~+0.04 m. GPS 살아있는 구간 멈춤에서
+        #   실제 이동은 벽시계 기준의 ~30% 뿐이었다. 한 스텝 dt 를 이 값으로 자른다.
+        self.dr_max_step_dt = float(rospy.get_param('~dr_max_step_dt', 0.05))
+        self.course_correction_enabled = bool(rospy.get_param(
+            '~course_correction_enabled', True))
+        # course bias 적용 여부(위 주석 참고). false 면 sideslip 만 쓴다.
+        self.course_bias_apply = bool(rospy.get_param(
+            '~course_bias_apply', False))
+        self.steering_in_degrees = bool(rospy.get_param(
+            '~steering_in_degrees', True))
+        self.steering_sign = float(rospy.get_param('~steering_sign', -1.0))
+        self.rear_axle_fraction = float(rospy.get_param(
+            '~rear_axle_fraction', 0.50))
+        # FROZEN 진입 시 확정한 bias(rad). NORMAL 복귀 시 None 으로 되돌린다.
+        self.frozen_course_bias = None
+        self.course_bias = CourseBiasEstimator(
+            min_speed=rospy.get_param('~course_bias_min_speed_mps', 2.0),
+            min_distance=rospy.get_param('~course_bias_min_distance_m', 1.5),
+            max_dt=rospy.get_param('~course_bias_max_dt_sec', 1.5),
+            alpha=rospy.get_param('~course_bias_alpha', 0.18),
+            max_abs_bias=math.radians(rospy.get_param(
+                '~course_bias_max_abs_deg', 5.0)),
+            hold_samples=rospy.get_param('~course_bias_hold_samples', 40),
+            hold_max_std=math.radians(rospy.get_param(
+                '~course_bias_hold_max_std_deg', 0.30)))
+        self.dr_pose_rate = float(rospy.get_param('~dr_pose_rate', 20.0))
+        self.dr_position_sigma = float(rospy.get_param(
+            '~dr_position_stddev', 0.15))
+        self.dr_position_sigma_rate = float(rospy.get_param(
+            '~dr_position_stddev_rate', 0.03))
+        self.dr_position_sigma_max = float(rospy.get_param(
+            '~dr_position_stddev_max', 1.5))
+        self.dr_position = None
+        self.dr_stamp = None
+        self.dr_yaw = None
+        self.outage_start = None
+        self.last_dr_pose_pub = None
+        self.status_outage = False
+        self.valid_fix_hits = 0
+        self.last_reacquire_stamp = None
+
+        self.lock = threading.RLock()
+        self.imu_buffer = deque(maxlen=int(rospy.get_param('~imu_buffer_size', 400)))
+        self.speed = None
+        self.speed_stamp = None
+        self.cur_speed = None
+        self.cur_speed_stamp = None
+        self.steering = 0.0
+        self.gps_derived_speed = None
+        self.gps_derived_stamp = None
+        self.prev_gps_pos = None
+        self.prev_gps_time = None
+        self.last_gps = None
+        self.last_imu = None
+        self.last_twist = None
+
+        self.tunnel_camera_yaw_enabled = bool(rospy.get_param(
+            '~tunnel_camera_yaw_enabled', True))
+        self.tunnel_nominal_heading = math.radians(float(rospy.get_param(
+            '~tunnel_nominal_heading_deg', -151.84)))
+        self.camera_yaw_timeout = float(rospy.get_param(
+            '~camera_yaw_timeout', 0.5))
+        self.tunnel_exit_x_utm = float(rospy.get_param(
+            '~tunnel_exit_x_utm', 302530.0))
+        self.tunnel_entry_x_utm = float(rospy.get_param(
+            '~tunnel_entry_x_utm', 302635.0))
+        self.tunnel_min_y_utm = float(rospy.get_param(
+            '~tunnel_min_y_utm', 4123550.0))
+        self.tunnel_max_y_utm = float(rospy.get_param(
+            '~tunnel_max_y_utm', 4123750.0))
+        self.tunnel_imu_bias = None
+        # ★ 2026-09-29 (20:27 백) 터널 헤딩 기준 보강.
+        #   카메라 VP 헤딩은 EMA + 3 deg 점프 거부라, 회피처럼 빨리 돌면 새 측정을 전부
+        #   거부하고 +5.53 deg 에 멈췄다(14.1~18.6 s). 그 직전 뒤처진 카메라 값으로 IMU
+        #   bias 를 배워(~5 deg 틀림) 이후 자이로-bias 헤딩이 5~6 deg 틀렸고, 추측항법이
+        #   ~2 m 흘러 차가 벽 쪽으로 붙었다. 라이다 벽 헤딩(tunnel_wall_detector,
+        #   곧은 벽 두 면 기울기)은 같은 구간에서 참값을 +-0.6 deg 로 따라갔다.
+        #   - 직선 터널 안에서는 벽 헤딩 > 카메라 순으로 쓴다.
+        #   - IMU bias 는 직진 중(|yaw rate| < tunnel_bias_max_wz)에만 배운다.
+        self.tunnel_wall_yaw_enabled = bool(rospy.get_param('~tunnel_wall_yaw_enabled', True))
+        self.wall_yaw_timeout = float(rospy.get_param('~wall_yaw_timeout', 0.3))
+        self.tunnel_bias_max_wz = float(rospy.get_param('~tunnel_bias_max_wz', 0.05))
+        self.xicp_yaw_enabled=bool(rospy.get_param('~tunnel_xicp_yaw_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self.tunnel_heading_mode = rospy.get_param("~tunnel_heading_mode", "existing")
+        if self.tunnel_heading_mode not in ("existing", "dr", "ufld", "xicp"):
+            raise ValueError("invalid tunnel_heading_mode")
+        self.continuous_m8=bool(rospy.get_param("/tunnel_recovery/continuous_transition_enabled",True))
+        self.lane_applied_bias=0.
+        self.lane_apply_stamp=None
+        self.frame_version=0
+        self.frame_x=self.frame_y=0.
+        self.frame_pub=rospy.Publisher("/localization/frame_update",String,queue_size=20,latch=True)
+        self.lane_bias = None
+        self.lane_stamp = None
+        self.xicp_bias=None;self.xicp_yaw_stamp=None
+        self.xicp_applied_bias=0.;self.xicp_apply_stamp=None
+        # 2026-10-13 X-ICP 횡보정: GPS 동결 중 DR 횡오차 0.07~0.24 m 가 보정 없이 남았다(22:05~22:07 백, X-ICP 측정만).
+        #   터널 축(지도 road_heading)에 수직인 성분만 쓴다(종방향은 관측 불가). 관측 시각의 /odom + X-ICP 보정이 참값,
+        #   거기서 같은 시각 DR 과 그 뒤 이미 적용한 보정을 빼 DR 자체 오차를 구하고 초당 상한으로 나눠 옮긴다.
+        #   EKF 지연 때문에 /odom 오차를 DR 에 그대로 더하면 과보정된다. frame_update 는 내지 않는다(작은 연속 이동).
+        self.xicp_lateral_enabled=bool(rospy.get_param('/tunnel_recovery/xicp_lateral_correction_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self.xicp_lateral_rate=float(rospy.get_param('/tunnel_recovery/xicp_lateral_rate_mps',.2))
+        self.xicp_lateral_deadband=float(rospy.get_param('/tunnel_recovery/xicp_lateral_deadband_m',.03))
+        self.xicp_lateral_max=float(rospy.get_param('/tunnel_recovery/xicp_lateral_max_m',.6))
+        self.xicp_lateral_axis=self.tunnel_nominal_heading+math.pi/2.  # 왼쪽 + (X-ICP lat 축과 같다)
+        self.xicp_lateral_pending=0.;self.xicp_lateral_stamp=None;self.xicp_lateral_applied=deque(maxlen=400)
+        self.dr_history=deque(maxlen=400);self.odom_history=deque(maxlen=200)
+        self.tunnel_m8_active=False;self.tunnel_section_stamp=rospy.Time(0)
+        rospy.Subscriber("/mission/active_section",SectionState,self.mission_section_callback,queue_size=1)
+        self.heading_state_pub=rospy.Publisher("/tunnel/heading/state",String,queue_size=1)
+        self.heading_marker_pub=rospy.Publisher("/tunnel/heading_markers",MarkerArray,queue_size=1)
+        self.heading_status_stamp=rospy.Time(0)
+        self.wall_yaw_error = None
+        self.wall_yaw_stamp = None
+        self.last_wz = 0.0
+        self.camera_yaw_error = None
+        self.camera_yaw_valid = False
+        self.camera_yaw_stamp = None
+
+        self.pose_pub = rospy.Publisher(
+            '/in_pose_with_covariance', PoseWithCovarianceStamped, queue_size=10)
+        self.twist_pub = rospy.Publisher(
+            '/in_twist_with_covariance', TwistWithCovarianceStamped, queue_size=30)
+        self.speed_valid_pub = rospy.Publisher('/localization/speed_valid', Bool, queue_size=1, latch=True)
+        self.speed_state_pub = rospy.Publisher('/localization/speed_state', String, queue_size=1)
+        self.speed_state_time = -1e9
+        self.health_pub = rospy.Publisher(
+            '/localization/sensors_valid', Bool, queue_size=1, latch=True)
+        self.gps_frozen_pub = rospy.Publisher(
+            '/localization/gps_frozen', Bool, queue_size=1, latch=True)
+        self.gps_reacquiring_pub = rospy.Publisher(
+            '/localization/gps_reacquiring', Bool, queue_size=1, latch=True)
+        self.dr_pose_pub = rospy.Publisher(
+            '/localization/dr_pose', PoseWithCovarianceStamped, queue_size=10)
+        self.course_bias_pub = rospy.Publisher(
+            '/localization/course_bias_deg', Float32, queue_size=5)
+        self.reacquire_error_pub = rospy.Publisher(
+            '/localization/reacquire_error_m', Float32, queue_size=5)
+        self.gps_mode_pub = rospy.Publisher(
+            '/localization/gps_mode', String, queue_size=1, latch=True)
+        self.camera_dr_active_pub = rospy.Publisher(
+            '/tunnel/camera_dr_active', Bool, queue_size=1, latch=True)
+
+        gps_topic = rospy.get_param('~gps_topic', '/gps')
+        imu_topic = rospy.get_param('~imu_topic', '/imu')
+        speed_topic = rospy.get_param('~speed_topic', '/Competition_topic')
+        cur_speed_topic = rospy.get_param('~cur_speed_topic', '/cur_speed')
+        camera_yaw_topic = rospy.get_param('~camera_yaw_topic', '/tunnel/camera_yaw_error')
+        camera_valid_topic = rospy.get_param('~camera_valid_topic', '/tunnel/camera_yaw_valid')
+        rospy.Subscriber(gps_topic, GPSMessage, self.gps_callback, queue_size=20)
+        rospy.Subscriber(imu_topic, Imu, self.imu_callback, queue_size=100)
+        rospy.Subscriber(speed_topic, EgoVehicleStatus, self.speed_callback, queue_size=50)
+        rospy.Subscriber(cur_speed_topic, Float32, self.cur_speed_callback, queue_size=50)
+        rospy.Subscriber(camera_yaw_topic, Float64, self.camera_yaw_callback, queue_size=5)
+        if self.tunnel_heading_mode == "ufld":
+            rospy.Subscriber("/tunnel/lane_yaw_measurement", PoseStamped, self.lane_yaw_callback, queue_size=1)
+        rospy.Subscriber(camera_valid_topic, Bool, self.camera_valid_callback, queue_size=5)
+        rospy.Subscriber('/tunnel/xicp/yaw_measurement',PoseStamped,self.xicp_yaw_callback,queue_size=1)
+        if self.xicp_lateral_enabled:
+            try:
+                from tunnel_xicp.msg import XicpStatus
+                rospy.Subscriber('/tunnel/xicp/status',XicpStatus,self.xicp_status_callback,queue_size=5)
+                rospy.Subscriber(rospy.get_param('~odom_topic','/odom'),Odometry,self.odom_callback,queue_size=20)
+                self.xicp_lateral_pub=rospy.Publisher('/localization/xicp_lateral_state',String,queue_size=1)
+            except ImportError as e:
+                self.xicp_lateral_enabled=False
+                rospy.logwarn('[fusion_adapter] X-ICP lateral correction disabled: %s',e)
+        rospy.Subscriber(rospy.get_param('~wall_yaw_topic', '/tunnel/wall_yaw_error'),
+                         Float64, self.wall_yaw_callback, queue_size=5)
+        rospy.Subscriber(rospy.get_param('~ekf_pose_topic', '/ekf_pose_with_covariance'),
+                         PoseWithCovarianceStamped, self.ekf_pose_callback, queue_size=5)
+        self.health_timer = rospy.Timer(rospy.Duration(0.05), self.health_callback)
+
+    def _grid_convergence_rad(self):
+        # K-City 범위(1 km)에서 수렴각 변화는 0.01 deg 미만 - 기준점 하나로 충분하다.
+        conv_deg = rospy.get_param('~grid_convergence_deg', 'auto')
+        if conv_deg != 'auto':
+            value = math.radians(float(conv_deg))
+        else:
+            lon, lat = self.proj(self.default_east_offset, self.default_north_offset,
+                                 inverse=True)
+            try:
+                value = math.radians(float(
+                    self.proj.get_factors(lon, lat).meridian_convergence))
+            except Exception:  # pyproj < 2.2
+                lon0 = -183.0 + 6.0 * self.utm_zone
+                value = math.atan(math.tan(math.radians(lon - lon0)) *
+                                  math.sin(math.radians(lat)))
+        rospy.logwarn('[fusion_adapter] IMU yaw grid convergence correction %.3f deg',
+                      math.degrees(value))
+        return value
+
+    def camera_yaw_callback(self, message):
+        with self.lock:
+            self.camera_yaw_error = float(message.data)
+            self.camera_yaw_stamp = rospy.Time.now()
+
+    def camera_valid_callback(self, message):
+        with self.lock:
+            self.camera_yaw_valid = bool(message.data)
+
+    def ekf_pose_callback(self, message):
+        p = message.pose.pose.position
+        with self.lock:
+            self.ekf_pose = (self.message_time(message.header.stamp), p.x, p.y)
+
+    def _ekf_position_at(self, stamp, yaw, speed):
+        """EKF 출력 위치를 stamp 시각으로 외삽. 오래됐으면 None. lock 안에서 부른다."""
+        if not self.reacquire_start_from_ekf or self.ekf_pose is None:
+            return None
+        age = (stamp - self.ekf_pose[0]).to_sec()
+        if abs(age) > 0.3:
+            return None
+        return (self.ekf_pose[1] + speed * math.cos(yaw) * age,
+                self.ekf_pose[2] + speed * math.sin(yaw) * age)
+
+    def mission_section_callback(self,message):
+        with self.lock:
+            self.tunnel_m8_active=message.index_valid and message.section_id=="M8"
+            self.tunnel_section_stamp=rospy.Time.now()
+
+    def xicp_yaw_callback(self,message):
+        # Publisher accepts only official VALID, both-wall observable results.
+        # Match IMU at observation time; retain actual avoidance heading/turns.
+        stamp=message.header.stamp;now=rospy.Time.now()
+        if not self.xicp_yaw_enabled or not -.05<=(now-stamp).to_sec()<=.3:return
+        measured=self.quaternion_yaw(message.pose.orientation)
+        if measured is None:return
+        with self.lock:
+            if self.gps_integrity.mode!=GpsIntegrityMonitor.FROZEN:return
+            rows=list(self.imu_buffer)
+            times=[t.to_sec() for t,*_ in rows];j=bisect.bisect_left(times,stamp.to_sec())
+            if j<=0 or j>=len(rows) or times[j]-times[j-1]>.16:return
+            u=(stamp.to_sec()-times[j-1])/(times[j]-times[j-1])
+            raw=interpolate_angle(rows[j-1][1],rows[j][1],u)
+            bias=normalize_angle(raw-measured)
+            if abs(bias)>math.radians(5.):return
+            self.xicp_bias=bias;self.xicp_yaw_stamp=stamp
+
+    @staticmethod
+    def _history_at(rows, t, gap=.12):
+        """(t,x,y) 이력에서 t 시각 위치를 선형 보간. 이웃 간격이 gap 을 넘거나 범위 밖이면 None."""
+        if len(rows) < 2:
+            return None
+        times = [r[0] for r in rows]
+        j = bisect.bisect_left(times, t)
+        if j <= 0 or j >= len(rows) or times[j]-times[j-1] > gap:
+            return None
+        u = (t-times[j-1])/max(times[j]-times[j-1], 1e-9)
+        return (rows[j-1][1]+u*(rows[j][1]-rows[j-1][1]), rows[j-1][2]+u*(rows[j][2]-rows[j-1][2]))
+
+    def odom_callback(self, message):
+        p = message.pose.pose.position
+        with self.lock:
+            self.odom_history.append((message.header.stamp.to_sec(), float(p.x), float(p.y)))
+
+    def xicp_status_callback(self, message):
+        """X-ICP 횡보정 측정 -> DR 자체 횡오차(터널 축 수직, 왼쪽 +)를 남은 보정량으로."""
+        if not getattr(self, 'xicp_lateral_enabled', False):
+            return
+        stamp = message.header.stamp.to_sec(); now = rospy.Time.now().to_sec()
+        if (int(message.state) != 2 or not message.lateral_observable or message.lateral_observability < .95
+                or not math.isfinite(message.lateral_correction) or abs(message.lateral_correction) > self.xicp_lateral_max
+                or not -.05 <= now-stamp <= .3):
+            return
+        with self.lock:
+            if (self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN or not self.tunnel_m8_active
+                    or not -.05 <= now-self.tunnel_section_stamp.to_sec() <= .5):
+                return
+            odom = self._history_at(self.odom_history, stamp)
+            dr = self._history_at(self.dr_history, stamp)
+            if odom is None or dr is None:
+                return
+            ax, ay = math.cos(self.xicp_lateral_axis), math.sin(self.xicp_lateral_axis)
+            # 참값 = odom + 보정. DR 오차 = 참값 - DR(관측 시각) - 그 뒤 이미 적용한 보정.
+            error = (odom[0]-dr[0])*ax+(odom[1]-dr[1])*ay+float(message.lateral_correction)
+            error -= sum(v for t, v in self.xicp_lateral_applied if t > stamp)
+            if abs(error) > self.xicp_lateral_max:
+                return
+            self.xicp_lateral_pending = error if abs(error) >= self.xicp_lateral_deadband else 0.
+            self.xicp_lateral_stamp = stamp
+            state = dict(stamp=stamp, measured=float(message.lateral_correction), dr_error=error,
+                         pending=self.xicp_lateral_pending)
+        pub = getattr(self, 'xicp_lateral_pub', None)
+        if pub is not None:
+            pub.publish(String(data=json.dumps(state, separators=(',', ':'))))
+
+    def _xicp_lateral_step(self, stamp, dt):
+        """lock 안에서. 남은 횡보정을 초당 xicp_lateral_rate 이하로 DR 에 적용. 반환: 이번 이동량(m)."""
+        if not getattr(self, 'xicp_lateral_enabled', False) or self.dr_position is None:
+            return 0.
+        if self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN:
+            self.xicp_lateral_pending = 0.
+            return 0.
+        if self.xicp_lateral_stamp is None or not -.05 <= stamp-self.xicp_lateral_stamp <= 1.0:
+            return 0.  # 오래된 측정으로 계속 밀지 않는다
+        limit = self.xicp_lateral_rate*max(0., min(dt, .1))
+        step = max(-limit, min(limit, self.xicp_lateral_pending))
+        if abs(step) < 1e-6:
+            return 0.
+        ax, ay = math.cos(self.xicp_lateral_axis), math.sin(self.xicp_lateral_axis)
+        self.dr_position = (self.dr_position[0]+step*ax, self.dr_position[1]+step*ay)
+        self.xicp_lateral_pending -= step
+        self.xicp_lateral_applied.append((stamp, step))
+        return step
+
+    def lane_yaw_callback(self, message):
+        # Estimate IMU bias at capture time, then preserve all subsequent gyro turns.
+        stamp = message.header.stamp
+        measured = self.quaternion_yaw(message.pose.orientation)
+        if measured is None or not -.05 <= (rospy.Time.now()-stamp).to_sec() <= .3:
+            return
+        with self.lock:
+            if self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN:
+                return
+            if self.lane_stamp is not None and stamp <= self.lane_stamp:
+                return
+            rows = list(self.imu_buffer)
+            interpolated = sample_rows([(r[0].to_sec(),r[1]) for r in rows],stamp.to_sec(),(1,))
+            if interpolated is None:
+                return
+            raw = interpolated[0]
+            bias = normalize_angle(raw-measured)
+            if abs(bias) > math.radians(3.):
+                return
+            if self.lane_stamp is None or (stamp-self.lane_stamp).to_sec() > .3:
+                self.lane_bias = 0.
+            delta = normalize_angle(bias-self.lane_bias)
+            self.lane_bias = normalize_angle(self.lane_bias+max(-math.radians(.2), min(math.radians(.2), .2*delta)))
+            self.lane_stamp = stamp
+
+    def wall_yaw_callback(self, message):
+        with self.lock:
+            if math.isfinite(message.data):
+                self.wall_yaw_error = float(message.data)
+                self.wall_yaw_stamp = rospy.Time.now()
+
+    def _tunnel_heading_ref(self, stamp, x, y):
+        """직선 터널 안 GPS 동결 중 헤딩 기준. (출처, 터널 방향 대비 자차 헤딩[rad]) 또는 (None, None).
+        lock 을 잡은 상태에서 부른다."""
+        if getattr(self,'tunnel_heading_mode','existing')=='xicp':
+            if not getattr(self,'tunnel_m8_active',True):return None,None
+            section_stamp=getattr(self,'tunnel_section_stamp',stamp)
+            if not -.05<=(stamp-section_stamp).to_sec()<=.5:return None,None
+            # Correct IMU bias, never align the actual vehicle to wall direction.
+            if self.gps_integrity.mode!=GpsIntegrityMonitor.FROZEN:return None,None
+            fresh=(getattr(self,'xicp_yaw_stamp',None) is not None and self.xicp_bias is not None and -.05<=(stamp-self.xicp_yaw_stamp).to_sec()<=.3)
+            applied=getattr(self,'xicp_applied_bias',0.)
+            if fresh:
+                prev=getattr(self,'xicp_apply_stamp',None)
+                if prev is None or stamp>prev:
+                    dt=.05 if prev is None else min(.1,max(0.,(stamp-prev).to_sec()))
+                    delta=normalize_angle(self.xicp_bias-applied);step=min(math.radians(.2),math.radians(4.)*dt)
+                    applied=normalize_angle(applied+max(-step,min(step,delta)))
+                    self.xicp_applied_bias=applied;self.xicp_apply_stamp=stamp
+            # Invalid/stale registration leaves the previously corrected DR alone.
+            if not fresh and abs(applied)<1e-9:return None,None
+            sample=sample_rows([(r[0].to_sec(),r[1]) for r in self.imu_buffer],stamp.to_sec(),(1,))
+            if sample is None:return None,None
+            return ('xicp' if fresh else 'xicp_dr'),normalize_angle(sample[0]-applied-self.tunnel_nominal_heading)
+        if getattr(self,'continuous_m8',False) and self.tunnel_heading_mode=='ufld':
+            fresh=(self.gps_integrity.mode==GpsIntegrityMonitor.FROZEN and self.lane_stamp is not None and self.lane_bias is not None and -.05<=(stamp-self.lane_stamp).to_sec()<=.3)
+            target=self.lane_bias if fresh else 0.
+            prev=getattr(self,'lane_apply_stamp',None)
+            if prev is None or stamp>prev:
+                dt=.05 if prev is None else min(.1,max(0.,(stamp-prev).to_sec()))
+                delta=normalize_angle(target-getattr(self,'lane_applied_bias',0.))
+                step=math.radians(4.)*dt # 0.2 degrees per 50ms, including release
+                self.lane_applied_bias=normalize_angle(getattr(self,'lane_applied_bias',0.)+max(-step,min(step,delta)))
+                self.lane_apply_stamp=stamp
+            if self.imu_buffer and (fresh or abs(self.lane_applied_bias)>1e-7):
+                sample=sample_rows([(r[0].to_sec(),r[1]) for r in self.imu_buffer],stamp.to_sec(),(1,))
+                if sample is not None:return 'ufld',normalize_angle(sample[0]-self.lane_applied_bias-self.tunnel_nominal_heading)
+            return None,None
+        if self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN:
+            return None, None
+        if getattr(self, 'tunnel_heading_mode', 'existing') == 'dr':
+            return None, None
+        if getattr(self, 'tunnel_heading_mode', 'existing') == 'ufld':
+            if (self.lane_stamp is not None and self.lane_bias is not None and self.imu_buffer
+                    and -.05 <= (stamp-self.lane_stamp).to_sec() <= .3):
+                raw = self.imu_buffer[-1][1]
+                return 'ufld', normalize_angle(raw-self.lane_bias-self.tunnel_nominal_heading)
+            return None, None
+        in_straight = ((self.tunnel_exit_x_utm <= x <= self.tunnel_entry_x_utm) and
+                       (self.tunnel_min_y_utm <= y <= self.tunnel_max_y_utm))
+        if not in_straight:
+            return None, None
+        if (getattr(self,'xicp_yaw_enabled',False) and getattr(self,'xicp_yaw_stamp',None) is not None and
+                self.xicp_bias is not None and -.05<=(stamp-self.xicp_yaw_stamp).to_sec()<=.3 and self.imu_buffer):
+            raw=self.imu_buffer[-1][1]
+            return 'xicp',normalize_angle(raw-self.xicp_bias-self.tunnel_nominal_heading)
+        if (self.tunnel_wall_yaw_enabled and self.wall_yaw_stamp is not None and
+                self.wall_yaw_error is not None and
+                abs((stamp - self.wall_yaw_stamp).to_sec()) <= self.wall_yaw_timeout):
+            return 'wall', self.wall_yaw_error
+        if (self.tunnel_camera_yaw_enabled and self.camera_yaw_valid and
+                self.camera_yaw_stamp is not None and self.camera_yaw_error is not None and
+                (stamp - self.camera_yaw_stamp).to_sec() <= self.camera_yaw_timeout):
+            return 'camera', self.camera_yaw_error
+        return None, None
+
+    def message_time(self, stamp):
+        now = rospy.Time.now()
+        if stamp.to_sec() <= 0.0 or abs((now - stamp).to_sec()) > self.max_clock_offset:
+            return now
+        return stamp
+
+    @staticmethod
+    def quaternion_yaw(quaternion):
+        norm = math.sqrt(quaternion.x ** 2 + quaternion.y ** 2
+                         + quaternion.z ** 2 + quaternion.w ** 2)
+        if norm < 1.0e-6:
+            return None
+        values = [quaternion.x / norm, quaternion.y / norm,
+                  quaternion.z / norm, quaternion.w / norm]
+        return tf.transformations.euler_from_quaternion(values)[2]
+
+    def convert_yaw_rate(self, raw_yaw, raw_wz):
+        offset = self.yaw_offset + self.grid_convergence
+        if self.imu_ned:
+            return (normalize_angle(math.pi / 2.0 - raw_yaw + offset),
+                    -raw_wz)
+        return normalize_angle(raw_yaw + offset), raw_wz
+
+    def speed_callback(self, message):
+        value = float(math.hypot(message.velocity.x, message.velocity.y))
+        # ★ 2026-10-01 후진 탈출: 후진(velocity.x < 0)이면 부호를 붙인다. 크기만 쓰면
+        #   후진하는 동안 추측항법/EKF twist 가 앞으로 가는 것으로 적분된다(음영구간에서
+        #   후진 거리의 두 배 오차). GPS 정지 판정/코스 bias 학습에는 크기만 쓴다.
+        if float(message.velocity.x) < -0.05:
+            value = -value
+        if not math.isfinite(value) or abs(value) > 55.0:
+            rospy.logwarn_throttle(1.0, '[fusion_adapter] invalid speed %.3f ignored', value)
+            return
+        stamp = self.message_time(message.header.stamp)
+        with self.lock:
+            if self.speed_stamp is not None and stamp < self.speed_stamp:
+                return
+            self.speed = value
+            self.speed_stamp = stamp
+            steering = float(getattr(message, 'front_steer_angle', 0.0))
+            self.steering = (math.radians(steering)
+                             if self.steering_in_degrees else steering)
+
+    def motion_beta(self):
+        if not self.course_correction_enabled:
+            return 0.0
+        with self.lock:
+            steering = self.steering
+        return bicycle_sideslip(
+            steering, self.rear_axle_fraction, self.steering_sign)
+
+    def enter_gps_outage(self, stamp, reason):
+        with self.lock:
+            if self.gps_integrity.mode == GpsIntegrityMonitor.NORMAL:
+                self.gps_integrity.mark_outage()
+                self.outage_start = stamp
+                self.last_dr_pose_pub = None
+                self.status_outage = True
+                self.valid_fix_hits = 0
+                self.course_bias.reset_anchor()
+                rospy.logwarn('[fusion_adapter] GPS outage (%s); dead reckoning active',
+                              reason)
+            elif reason == 'invalid_fix':
+                # Recovery confirmation must be consecutive. An invalid fix
+                # between valid candidates restarts the confirmation window.
+                self.status_outage = True
+                self.valid_fix_hits = 0
+
+    def make_pose(self, stamp, x, y, yaw, pos_var, yaw_var):
+        output = PoseWithCovarianceStamped()
+        output.header.stamp = stamp
+        output.header.frame_id = self.frame_id
+        output.pose.pose.position.x = x
+        output.pose.pose.position.y = y
+        quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, yaw)
+        output.pose.pose.orientation.x = quaternion[0]
+        output.pose.pose.orientation.y = quaternion[1]
+        output.pose.pose.orientation.z = quaternion[2]
+        output.pose.pose.orientation.w = quaternion[3]
+        output.pose.covariance[0] = pos_var
+        output.pose.covariance[7] = pos_var
+        output.pose.covariance[14] = 10000.0
+        output.pose.covariance[21] = 10000.0
+        output.pose.covariance[28] = 10000.0
+        output.pose.covariance[35] = max(yaw_var, self.yaw_sigma ** 2)
+        return output
+
+    def publish_dead_reckoning_pose(self, stamp, yaw, yaw_var):
+        with self.lock:
+            if (self.gps_integrity.mode == GpsIntegrityMonitor.NORMAL or
+                    self.dr_position is None):
+                return
+            if (self.last_dr_pose_pub is not None and self.dr_pose_rate > 0.0 and
+                    (stamp - self.last_dr_pose_pub).to_sec() < 1.0 / self.dr_pose_rate):
+                return
+            age = (0.0 if self.outage_start is None else
+                   max(0.0, (stamp - self.outage_start).to_sec()))
+            sigma = min(self.dr_position_sigma_max,
+                        self.dr_position_sigma + self.dr_position_sigma_rate * age)
+            x, y = self.dr_position
+
+            # When camera VP yaw is active during GPS freeze in straight tunnel, use camera-aligned yaw
+            pose_yaw = yaw
+            in_straight_tunnel = ((self.tunnel_exit_x_utm <= x <= self.tunnel_entry_x_utm) and
+                                  (self.tunnel_min_y_utm <= y <= self.tunnel_max_y_utm))
+            in_tunnel_area = (self.tunnel_min_y_utm <= y <= self.tunnel_max_y_utm)
+            ref_src, ref_rel = self._tunnel_heading_ref(stamp, x, y)
+            if ref_src is not None:
+                pose_yaw = normalize_angle(self.tunnel_nominal_heading + ref_rel)
+            elif self.tunnel_heading_mode == 'existing' and self.tunnel_imu_bias is not None and self.gps_integrity.mode == GpsIntegrityMonitor.FROZEN and in_tunnel_area:
+                # Outside straight tunnel: smoothly follow gyro with held bias!
+                pose_yaw = normalize_angle(yaw - self.tunnel_imu_bias)
+
+            if ref_src == "ufld":
+                yaw_var = max(yaw_var, math.radians(1.) ** 2)
+            output = self.make_pose(stamp, x, y, pose_yaw, sigma ** 2, yaw_var)
+            self.last_dr_pose_pub = stamp
+            mode = self.gps_integrity.mode
+        # This corrected DR pose supplies continuous absolute IMU yaw and a
+        # course-aware position observation while the GPS pose is unavailable.
+        # 재획득 중에는 gps_callback 의 보간 포즈만 EKF 에 넣는다(같은 위치를
+        # 분산 0.001/0.25 로 번갈아 넣지 않게).
+        if mode == GpsIntegrityMonitor.FROZEN:
+            self.pose_pub.publish(output)
+        self.dr_pose_pub.publish(output)
+
+    def cur_speed_callback(self, message):
+        value = float(message.data)
+        if self.cur_speed_is_kmh:
+            value /= 3.6
+        if not math.isfinite(value) or abs(value) > 55.0:
+            return
+        stamp = rospy.Time.now()
+        with self.lock:
+            self.cur_speed = value
+            self.cur_speed_stamp = stamp
+
+    def real_speed_fresh(self, stamp):
+        with self.lock:
+            return any(value is not None and time is not None and
+                       abs((stamp-time).to_sec()) <= self.speed_timeout
+                       for value,time in [(self.speed,self.speed_stamp),(self.cur_speed,self.cur_speed_stamp)])
+
+    def get_effective_speed(self, stamp):
+        now = stamp if stamp is not None else rospy.Time.now()
+        with self.lock:
+            if self.speed is not None and self.speed_stamp is not None:
+                if abs((now - self.speed_stamp).to_sec()) <= self.speed_timeout:
+                    return self.speed, self.speed_sigma
+            if self.cur_speed is not None and self.cur_speed_stamp is not None:
+                if abs((now - self.cur_speed_stamp).to_sec()) <= self.speed_timeout:
+                    return self.cur_speed, self.speed_sigma
+            if self.gps_derived_speed is not None and self.gps_derived_stamp is not None:
+                if abs((now - self.gps_derived_stamp).to_sec()) <= 0.50:
+                    return self.gps_derived_speed, 0.35
+        return 0.0, 0.50
+
+    def imu_callback(self, message):
+        raw_yaw = self.quaternion_yaw(message.orientation)
+        raw_wz = float(message.angular_velocity.z)
+        if raw_yaw is None or not math.isfinite(raw_wz):
+            rospy.logwarn_throttle(1.0, '[fusion_adapter] invalid IMU ignored')
+            return
+        yaw, wz = self.convert_yaw_rate(raw_yaw, raw_wz)
+        self.last_wz = wz
+        stamp = self.message_time(message.header.stamp)
+        yaw_var = (message.orientation_covariance[8]
+                   if message.orientation_covariance[8] > 0.0 else self.yaw_sigma ** 2)
+        wz_var = (message.angular_velocity_covariance[8]
+                   if message.angular_velocity_covariance[8] > 0.0 else self.wz_sigma ** 2)
+
+        with self.lock:
+            if self.imu_buffer and stamp <= self.imu_buffer[-1][0]:
+                rospy.logwarn_throttle(1.0, '[fusion_adapter] non-increasing IMU stamp ignored')
+                return
+            self.imu_buffer.append((stamp, yaw, wz, yaw_var, wz_var))
+            self.last_imu = rospy.Time.now()
+
+        required = (rospy.get_param('/tunnel_recovery/speed_integrity_enabled',True) and
+                    self.tunnel_m8_active and
+                    (rospy.Time.now()-self.tunnel_section_stamp).to_sec() <= .5)
+        real_speed_ok = self.real_speed_fresh(stamp)
+        self.speed_valid_pub.publish(Bool(data=not required or real_speed_ok))
+        if stamp.to_sec()-self.speed_state_time >= .5:
+            self.speed_state_time=stamp.to_sec()
+            self.speed_state_pub.publish(String(data=json.dumps(dict(stamp=stamp.to_sec(),
+                required=required,valid=not required or real_speed_ok,
+                reason='actual_vehicle_speed' if real_speed_ok else 'speed_input_expired' if required else 'outside_M8'))))
+        if required and not real_speed_ok:
+            # Missing input is not a measured zero speed. Do not integrate the
+            # GPS derivative or fabricate a twist observation in the outage.
+            with self.lock:self.dr_stamp=stamp
+            rospy.logerr_throttle(2.,'[fusion_adapter] M8 speed input expired: check MORAI status UDP 9099 /Competition_topic')
+            self.publish_dead_reckoning_pose(stamp,yaw,yaw_var)
+            return
+        speed, eff_speed_sigma = self.get_effective_speed(stamp)
+        # Keep an independent, continuous dead-reckoning position.  In normal
+        # operation each trusted GPS fix anchors it.  Once GPS freezes this
+        # state continues from exact simulator speed and absolute IMU yaw, so
+        # reacquisition can be blended without jumping the canonical /odom.
+        with self.lock:
+            if self.dr_position is not None and self.dr_stamp is not None:
+                dt = (stamp - self.dr_stamp).to_sec()
+                if 0.0 < dt <= 0.5:
+                    heading = (yaw if self.dr_yaw is None else
+                               interpolate_angle(self.dr_yaw, yaw, 0.5))
+
+                    x_curr, y_curr = self.dr_position[0], self.dr_position[1]
+                    in_straight_tunnel = ((self.tunnel_exit_x_utm <= x_curr <= self.tunnel_entry_x_utm) and
+                                          (self.tunnel_min_y_utm <= y_curr <= self.tunnel_max_y_utm))
+                    in_tunnel_area = (self.tunnel_min_y_utm <= y_curr <= self.tunnel_max_y_utm)
+
+                    ref_src, ref_rel = self._tunnel_heading_ref(stamp, x_curr, y_curr)
+
+                    if ref_src is not None:
+                        # Inside straight tunnel: wall(LiDAR) > camera VP heading reference.
+                        cam_heading = normalize_angle(self.tunnel_nominal_heading + ref_rel)
+                        measured_bias = normalize_angle(yaw - cam_heading)
+                        # 기준이 뒤처지는 회전 중에는 bias 를 배우지 않는다.
+                        if self.tunnel_heading_mode == 'existing' and abs(self.last_wz) < self.tunnel_bias_max_wz:
+                            if self.tunnel_imu_bias is None:
+                                self.tunnel_imu_bias = measured_bias
+                            else:
+                                self.tunnel_imu_bias = normalize_angle(
+                                    0.95 * self.tunnel_imu_bias + 0.05 * measured_bias)
+
+                        heading = normalize_angle(cam_heading + self.motion_beta())
+                        rospy.loginfo_throttle(
+                            2.0,
+                            '[fusion_adapter] Tunnel %s heading active! heading=%.2f deg, imu_bias=%s' %
+                            (ref_src, math.degrees(heading),
+                             ('%.2f deg' % math.degrees(self.tunnel_imu_bias))
+                             if self.tunnel_imu_bias is not None else 'none'))
+                    elif self.tunnel_heading_mode == 'existing' and self.tunnel_imu_bias is not None and self.gps_integrity.mode == GpsIntegrityMonitor.FROZEN and in_tunnel_area:
+                        # Exited straight tunnel (e.g. exit curve before GPS recovery): smoothly track gyro with held bias!
+                        # This eliminates the heading discontinuity at tunnel exit!
+                        heading = normalize_angle(yaw - self.tunnel_imu_bias + self.motion_beta())
+                        rospy.loginfo_throttle(
+                            1.0,
+                            '[fusion_adapter] Tunnel exit curve! Tracking gyro yaw=%.2f deg with held bias=%.2f deg' %
+                            (math.degrees(yaw), math.degrees(self.tunnel_imu_bias)))
+                    elif self.course_correction_enabled:
+                        # course bias 는 '장착 오차' 같은 상수가 아니라
+                        # 주행 구간마다 변한다. 실측(2026-09-17):
+                        #   15:35 백 구간별 평균 +0.000 / +0.468 / -0.137 / -0.375
+                        #   15:56 백 hold 가 -0.863 deg 를 골랐는데, 그 값이
+                        #   만들 오차는 -1.80 m 였고 실제 복귀오차는 0.69 m -
+                        #   다른 오차와 우연히 상쇄된 것뿐이다.
+                        # 잘못 잡으면 오차를 '만드는' 쪽으로 작용하므로
+                        # 기본적으로 끈다. sideslip(motion_beta)은 물리 모델이라
+                        # 그대로 쓴다.
+                        bias = 0.0
+                        if self.course_bias_apply:
+                            bias = (self.frozen_course_bias
+                                    if self.frozen_course_bias is not None
+                                    else self.course_bias.bias)
+                        heading = normalize_angle(
+                            heading + bias + self.motion_beta())
+                    step_dt = min(dt, self.dr_max_step_dt)
+                    self.dr_position = (
+                        self.dr_position[0] + speed * math.cos(heading) * step_dt,
+                        self.dr_position[1] + speed * math.sin(heading) * step_dt)
+                    self._xicp_lateral_step(stamp.to_sec(), dt)
+                if dt > 0.0:
+                    self.dr_stamp = stamp
+                    self.dr_yaw = yaw
+                if self.dr_position is not None and getattr(self, 'xicp_lateral_enabled', False):
+                    self.dr_history.append((stamp.to_sec(), self.dr_position[0], self.dr_position[1]))
+        output = TwistWithCovarianceStamped()
+        output.header.stamp = stamp
+        output.header.frame_id = self.base_frame
+        output.twist.twist.linear.x = speed
+        output.twist.twist.angular.z = wz
+        output.twist.covariance[0] = eff_speed_sigma ** 2
+        output.twist.covariance[35] = max(wz_var, self.wz_sigma ** 2)
+        self.twist_pub.publish(output)
+        self.course_bias_pub.publish(Float32(
+            data=math.degrees(self.course_bias.bias)))
+        self.publish_dead_reckoning_pose(stamp, yaw, yaw_var)
+        with self.lock:
+            x_c = self.dr_position[0] if self.dr_position is not None else 0.0
+            y_c = self.dr_position[1] if self.dr_position is not None else 0.0
+            in_tunnel_c = ((self.tunnel_exit_x_utm <= x_c <= self.tunnel_entry_x_utm) and
+                           (self.tunnel_min_y_utm <= y_c <= self.tunnel_max_y_utm))
+            camera_active_flag = self._tunnel_heading_ref(stamp, x_c, y_c)[0] is not None
+            self.camera_dr_active_pub.publish(Bool(data=camera_active_flag))
+            self.last_twist = rospy.Time.now()
+
+    def imu_at(self, stamp):
+        with self.lock:
+            samples = list(self.imu_buffer)
+        if not samples:
+            return None
+        times = [item[0].to_sec() for item in samples]
+        target = stamp.to_sec()
+        index = bisect.bisect_left(times, target)
+        if index == 0:
+            sample = samples[0]
+            if abs(times[0] - target) > self.max_imu_alignment:
+                return None
+            return sample[1:]
+        if index >= len(samples):
+            sample = samples[-1]
+            dt = target - times[-1]
+            if dt > self.max_imu_alignment:
+                return None
+            return (normalize_angle(sample[1] + sample[2] * dt),
+                    sample[2], sample[3] + dt * dt * sample[4], sample[4])
+        before, after = samples[index - 1], samples[index]
+        if min(target - times[index - 1], times[index] - target) > self.max_imu_alignment:
+            return None
+        span = max(times[index] - times[index - 1], 1.0e-9)
+        ratio = (target - times[index - 1]) / span
+        return (interpolate_angle(before[1], after[1], ratio),
+                before[2] + ratio * (after[2] - before[2]),
+                max(before[3], after[3]), max(before[4], after[4]))
+
+    def gps_callback(self, message):
+        if (not math.isfinite(message.latitude) or not math.isfinite(message.longitude)
+                or (message.latitude == 0.0 and message.longitude == 0.0)
+                or int(message.status) <= 0):
+            self.enter_gps_outage(rospy.Time.now(), 'invalid_fix')
+            rospy.logwarn_throttle(1.0, '[fusion_adapter] invalid GPS fix ignored')
+            return
+        stamp = self.message_time(message.header.stamp)
+        imu = self.imu_at(stamp)
+        if imu is None:
+            rospy.logwarn_throttle(1.0, '[fusion_adapter] GPS waits for timestamp-aligned IMU')
+            return
+        yaw, _wz, yaw_var, _wz_var = imu
+        if self.use_full_utm:
+            east_offset = 0.0
+            north_offset = 0.0
+        else:
+            east_offset = (float(message.eastOffset) if message.eastOffset != 0.0
+                           else self.default_east_offset)
+            north_offset = (float(message.northOffset) if message.northOffset != 0.0
+                            else self.default_north_offset)
+        utm_x, utm_y = self.proj(message.longitude, message.latitude)
+        x, y = gps_to_base(utm_x - east_offset, utm_y - north_offset,
+                           yaw, self.lever_x, self.lever_y)
+
+        with self.lock:
+            if self.prev_gps_pos is not None and self.prev_gps_time is not None:
+                dt = (stamp - self.prev_gps_time).to_sec()
+                if 0.01 <= dt <= 0.35:
+                    dist = math.hypot(x - self.prev_gps_pos[0], y - self.prev_gps_pos[1])
+                    v_gps = dist / dt
+                    if 0.0 <= v_gps <= 55.0:
+                        self.gps_derived_speed = v_gps
+                        self.gps_derived_stamp = stamp
+            self.prev_gps_pos = (x, y)
+            self.prev_gps_time = stamp
+
+        speed, _ = self.get_effective_speed(stamp)
+        with self.lock:
+            previous_mode = self.gps_integrity.mode
+            if (self.status_outage and
+                    previous_mode == GpsIntegrityMonitor.FROZEN):
+                # status/timeout dropouts can recover while the car is stopped;
+                # require several consecutive valid fixes instead of requiring
+                # a displacement-based recovery step.
+                self.valid_fix_hits += 1
+                if self.valid_fix_hits >= self.gps_integrity.recover_hits_required:
+                    self.gps_integrity.mark_reacquiring()
+                mode = self.gps_integrity.mode
+            else:
+                mode = self.gps_integrity.update(stamp.to_sec(), x, y, abs(speed))
+
+            if previous_mode == GpsIntegrityMonitor.NORMAL:
+                self.course_bias.update(
+                    stamp.to_sec(), x, y, yaw, max(speed, 0.0), self.motion_beta())
+
+            if previous_mode != mode:
+                rospy.logwarn('[fusion_adapter] GPS integrity: %s -> %s',
+                              previous_mode, mode)
+                if mode == GpsIntegrityMonitor.FROZEN:
+                    self.outage_start = stamp
+                    self.last_dr_pose_pub = None
+                    # 음영구간 내내 쓸 bias 를 여기서 한 번 확정한다.
+                    # EMA(self.course_bias.bias)를 그대로 쓰면 GPS 가
+                    # 끊기는 순간 한 샘플의 잡음이 전체 궤적을 기울인다.
+                    #   실측(2026-09-17 15:35 백): 학습 평균 +0.043 deg 인데
+                    #   끊긴 순간 EMA 가 -0.367 deg 였고, 113 m 주행에서
+                    #   그 차이만으로 횡오차 0.73 m 가 생겼다.
+                    self.frozen_course_bias = self.course_bias.hold_value()
+                    rospy.logwarn(
+                        '[fusion_adapter] course bias hold: %.3f deg '
+                        '(EMA %.3f deg)',
+                        math.degrees(self.frozen_course_bias),
+                        math.degrees(self.course_bias.bias))
+                    self.course_bias.reset_anchor()
+                elif mode == GpsIntegrityMonitor.NORMAL:
+                    self.frozen_course_bias = None
+                    self.tunnel_imu_bias = None
+
+            if mode == GpsIntegrityMonitor.FROZEN:
+                # Do not feed repeated coordinates into the EKF.  Twist input
+                # remains live, so its 50 Hz prediction continues normally.
+                return
+
+            # MORAI keeps a fresh timestamp on a frozen coordinate. Waiting
+            # for the full FROZEN confirmation while publishing that position
+            # makes the EKF pull the moving car back toward the tunnel entry.
+            # Hold only the suspect repeated samples; a normal quantized GPS
+            # step clears travelled and resumes position updates immediately.
+            if (mode == GpsIntegrityMonitor.NORMAL and
+                    abs(speed) >= self.gps_integrity.min_speed and
+                    self.gps_integrity.suspected_freeze(
+                        self.gps_pre_freeze_hold_distance)):
+                rospy.logwarn_throttle(
+                    1.0, '[fusion_adapter] holding repeated GPS before freeze '
+                    'confirmation (travelled %.2f m)',
+                    self.gps_integrity.travelled)
+                return
+
+            if mode == GpsIntegrityMonitor.REACQUIRING:
+                if self.dr_position is None:
+                    self.dr_position = (x, y)
+                    self.dr_stamp = stamp
+                    self.dr_yaw = yaw
+                before_correction=self.dr_position
+                correction_dt = 0.05
+                if self.last_reacquire_stamp is not None:
+                    correction_dt = max(0.01, min(
+                        0.35, (stamp - self.last_reacquire_stamp).to_sec()))
+                else:
+                    start = self._ekf_position_at(stamp, yaw, speed)
+                    if start is not None:
+                        rospy.logwarn(
+                            '[fusion_adapter] reacquire starts from EKF pose '
+                            '(DR-EKF %.2f m)', math.hypot(
+                                start[0] - self.dr_position[0],
+                                start[1] - self.dr_position[1]))
+                        self.dr_position = start
+                self.last_reacquire_stamp = stamp
+                error_x = x - self.dr_position[0]
+                error_y = y - self.dr_position[1]
+                error = math.hypot(error_x, error_y)
+                self.reacquire_error_pub.publish(Float32(data=error))
+                # 진행방향(along)은 빨리, 횡(cross)은 천천히 옮긴다.
+                c, s = math.cos(yaw), math.sin(yaw)
+                along = error_x * c + error_y * s
+                cross = -error_x * s + error_y * c
+                max_along = self.gps_reacquire_along_rate * correction_dt
+                max_cross = self.gps_reacquire_correction_rate * correction_dt
+                along = max(-max_along, min(max_along, along))
+                cross = max(-max_cross, min(max_cross, cross))
+                self.dr_position = (
+                    self.dr_position[0] + along * c - cross * s,
+                    self.dr_position[1] + along * s + cross * c)
+                remaining = math.hypot(x - self.dr_position[0],
+                                       y - self.dr_position[1])
+                out_x, out_y = self.dr_position
+                if remaining <= self.gps_reacquire_finish_error:
+                    self.gps_integrity.mark_normal()
+                    self.last_reacquire_stamp = None
+                    self.dr_position = (x, y)
+                    self.outage_start = None
+                    self.status_outage = False
+                    self.valid_fix_hits = 0
+                    self.tunnel_imu_bias = None
+                    out_x, out_y = x, y
+                    rospy.loginfo('[fusion_adapter] GPS reacquisition complete')
+                if getattr(self,'continuous_m8',False):
+                    dx=self.dr_position[0]-before_correction[0];dy=self.dr_position[1]-before_correction[1]
+                    if abs(dx)+abs(dy)>1e-9:
+                        self.frame_version+=1;self.frame_x+=dx;self.frame_y+=dy
+                        self.frame_pub.publish(String(data=json.dumps(dict(stamp=stamp.to_sec(),coordinate_version=self.frame_version,offset_x=self.frame_x,offset_y=self.frame_y,reason='gps_reacquisition'))))
+
+            else:
+                # Noise-free simulator GPS is the absolute anchor.
+                self.dr_position = (x, y)
+                self.dr_stamp = stamp
+                self.dr_yaw = yaw
+                self.last_reacquire_stamp = None
+                self.outage_start = None
+                self.status_outage = False
+                self.valid_fix_hits = 0
+                out_x, out_y = x, y
+
+        pos_var = position_variance(
+            self.gps_sigma, abs(speed), self.timestamp_sigma,
+            self.lever_x, self.lever_y, math.sqrt(max(yaw_var, 0.0)))
+
+        if getattr(self,'continuous_m8',False) and self.tunnel_heading_mode in ('ufld','xicp'):
+            with self.lock:
+                src,rel=self._tunnel_heading_ref(stamp,out_x,out_y)
+                if src is not None:yaw=normalize_angle(self.tunnel_nominal_heading+rel)
+        output = self.make_pose(stamp, out_x, out_y, yaw, pos_var, yaw_var)
+        self.pose_pub.publish(output)
+        with self.lock:
+            # Reacquiring measurements are intentionally smooth but are not yet
+            # declared globally valid until they converge to raw GPS.
+            if self.gps_integrity.mode == GpsIntegrityMonitor.NORMAL:
+                self.last_gps = rospy.Time.now()
+
+    def health_callback(self, _event):
+        now = rospy.Time.now()
+        with self.lock:
+            gps = self.last_gps
+            imu = self.last_imu
+            twist = self.last_twist
+            gps_mode = self.gps_integrity.mode
+        if (gps_mode == GpsIntegrityMonitor.NORMAL and gps is not None and
+                (now - gps).to_sec() > self.gps_timeout):
+            self.enter_gps_outage(now, 'timeout')
+            with self.lock:
+                gps_mode = self.gps_integrity.mode
+        valid = (gps is not None and imu is not None and twist is not None
+                 and gps_mode == GpsIntegrityMonitor.NORMAL
+                 and (now - gps).to_sec() <= self.gps_timeout
+                 and (now - imu).to_sec() <= self.imu_timeout
+                 and (now - twist).to_sec() <= self.speed_timeout)
+        self.health_pub.publish(Bool(data=valid))
+        self.gps_frozen_pub.publish(Bool(
+            data=gps_mode != GpsIntegrityMonitor.NORMAL))
+        self.gps_reacquiring_pub.publish(Bool(
+            data=gps_mode == GpsIntegrityMonitor.REACQUIRING))
+        self.gps_mode_pub.publish(String(data=gps_mode))
+        if (now-self.heading_status_stamp).to_sec()>=.5:
+            self.heading_status_stamp=now
+            with self.lock:
+                age=None if self.xicp_yaw_stamp is None else (now-self.xicp_yaw_stamp).to_sec()
+                fresh=age is not None and -.05<=age<=.3 and self.xicp_bias is not None
+                pos=self.dr_position
+                active=(self.tunnel_m8_active and gps_mode==GpsIntegrityMonitor.FROZEN and pos is not None and self.tunnel_exit_x_utm<=pos[0]<=self.tunnel_entry_x_utm and self.tunnel_min_y_utm<=pos[1]<=self.tunnel_max_y_utm)
+                source=('X-ICP' if fresh else 'DR (X-ICP held)' if abs(self.xicp_applied_bias)>1e-9 else 'DR') if self.tunnel_heading_mode=='xicp' else self.tunnel_heading_mode.upper()
+                state=dict(stamp=now.to_sec(),mode=self.tunnel_heading_mode,source=source,active=active,registration_age_s=age,applied_bias_deg=math.degrees(self.xicp_applied_bias),coordinate_version=self.frame_version)
+            self.heading_state_pub.publish(String(data=json.dumps(state,separators=(',',':'))))
+            if self.heading_marker_pub.get_num_connections():
+                mark=Marker();mark.header.stamp=now;mark.header.frame_id=self.base_frame;mark.ns='heading_state';mark.id=0;mark.action=Marker.ADD if active else Marker.DELETE;mark.type=Marker.TEXT_VIEW_FACING;mark.pose.orientation.w=1.;mark.pose.position.z=2.5;mark.scale.z=.4;mark.color.a=1.;mark.color.r=.3;mark.color.g=1.;mark.color.b=.8;mark.lifetime=rospy.Duration(1.);mark.text=source
+                self.heading_marker_pub.publish(MarkerArray(markers=[mark]))
+
+
+
+def main():
+    rospy.init_node('morai_measurement_adapter')
+    MeasurementAdapter()
+    rospy.loginfo('[fusion_adapter] GPS + IMU yaw + Competition speed ready; accel integration disabled')
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()

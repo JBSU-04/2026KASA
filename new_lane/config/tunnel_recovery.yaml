@@ -1,17 +1,43 @@
 tunnel_recovery:
+  # Independent rollback controls; retain current engine and mission settings.
+  wall_surface_background_enabled: true # false restores old wall/floor matching and shape gate
+  stationary_wall_motion_priority_enabled: true # false restores old along-wall motion policy
+  object_scene_enabled: true # false restores the previous M8 input policy
+  verified_wall_surface_only_enabled: true # false restores legacy wall shape filtering
+  # 2026-10-14 지도 일치 제거 뒤 남은 점에 형상·밑동 띠 규칙 재적용(벽 잔여 점 제거, 안쪽 몸체 있는 벽 옆 장애물은 보존). false: 16시 동작
+  wall_shape_after_surface_enabled: true
+  # 2026-10-14 원거리 검출 제안 폭(M8): 안쪽 끝이 기준경로에서 이 거리 안(벽 안쪽 전체). 1.7 이면 이전 동작
+  far_tunnel_corridor_half_width_m: 7.0
+  # 2026-10-14 선서행 입력을 벽 제거 뒤 점으로(빈 터널 벽 밑동 오판 제거). false: 벽 제거 전 점(이전 동작)
+  preslow_after_wall_filter_enabled: true
+  # 2026-10-14 선서행: 회피 가능 영역(벽선 안쪽 margin) 안 확정 물체 전부(경로를 막지 않는 벽 옆 물체 포함). false: 경로 위험만(이전)
+  preslow_whole_area_enabled: true
+  preslow_area_margin_m: 0.6
+  raw_dr_required_for_motion: true # false restores map-pose motion fallback
+  verified_motion_policy_enabled: true
+  repair_path_policy_enabled: true
+  repair_preslow_policy_enabled: true
+  # 2026-10-13 X-ICP 횡보정을 DR 에 반영(GPS 동결 + M8 + VALID + 횡관측 0.95 이상). 끄면 이전처럼 yaw 만 보정.
+  xicp_lateral_correction_enabled: true
+  xicp_lateral_rate_mps: 0.2 # 초당 이동 상한(0.2 m 오차 약 1 s 수렴, 정적 물체 겉보기 이동 < 후보 1 m/s)
+  xicp_lateral_deadband_m: 0.03
+  xicp_lateral_max_m: 0.6 # X-ICP max_lateral_correction_m 과 같다
+  # 2026-10-14 장애물 이동 판정(속도·후보·동적)의 자차 이동 보상은 보정 전 순수 DR(/localization/dr_raw_odom)로.
+  #   측위 보정(yaw bias 단계, GPS 재획득, X-ICP 횡)이 가짜 이동을 만들지 않게. 위치·계획·정지는 /odom 그대로.
+  raw_dr_motion_frame_enabled: true
   cpp_prefilter_enabled: true # Independent GroundGrid -> shared filter input; false restores Python producer
   filtered_pipeline_enabled: true
   independent_preslow_enabled: true
   shared_detector_policy_enabled: true
   raw_detection_residual_enabled: false # map evidence must not bypass GroundGrid
   stationary_handoff_enabled: true
-  stationary_handoff_sec: 1.5 # 2026-10-12 사용자 결정: 정지 노드 tunnel_dynamic_restatic_sec 1.5 와 같은 값
+  stationary_handoff_sec: 3.0 # M8 dynamic-history blocker handoff, shared by producer and stop
   stationary_speed_mps: 0.18
   stationary_displacement_m: 0.30
   speed_integrity_enabled: true
   entry_surface_policy_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
   static_hold_release_enabled: true
-  native_scene_enabled: true
+  native_scene_enabled: false # old planner-owned scene transport is disabled
   detection_worker_enabled: true
   native_geometry_enabled: true
   preserve_static_certificate: true
@@ -26,7 +52,7 @@ tunnel_recovery:
   far_temporal_input_enabled: false # 2026-10-11 M8 최종(정동적 파이프라인): false
   surface_certificate_hold_enabled: true
   surface_id_association_enabled: true
-  common_scene_enabled: true
+  common_scene_enabled: false # direct detector-owned obstacle_scene is independent
   continuous_transition_enabled: true
 
 # M8 only. Rollback: disable map node and these policies, then restart launch.
@@ -46,13 +72,18 @@ tunnel_map_filter:
   sensor_x: 1.1
   sensor_z: 1.33
 tunnel_wall_detector:
+  # Monitoring envelope for unconfirmed stationary map residuals, not NPC speed.
+  preslow_unconfirmed_crossing_speed_mps: 3.0
+  preslow_unconfirmed_crossing_window_sec: 1.5
   object_risk_preslow_enabled: true
   map_classification_topic: /tunnel/map_classified
-  preslow_start_distance_m: 25.0
+  preslow_start_distance_m: 30.0 # 2026-10-13 25 -> 30 (M8 11 m/s, 저상 장애물 회피 여유)
   preslow_min_speed_mps: 4.0
+  preslow_entry_cap_mps: 7.0 # 2026-10-13 선서행이 걸리면 바로 이 상한부터(구간 속도와 작은 쪽), 5 m 에서 최소값
+  preslow_hold_sec: 0.6
   preslow_initial_speed_mps: 5.0 # /speed_limit/sections/M8 이 있으면 그 값(2026-10-12)
   map_classification_enabled: true
-  map_preslow_distance_m: 25.0
+  map_preslow_distance_m: 30.0
   map_preslow_memory_sec: 0.35
 obstacle_stop_node:
   tunnel_bg_moving_enabled: false # map comparison has no mission-stop authority

@@ -1,11 +1,14 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <numeric>
 #include <vector>
 #include <map>
+#include <set>
 #include <limits>
+#include <functional>
 
 namespace m8_prefilter {
 using XY=std::array<double,2>;
@@ -55,8 +58,13 @@ inline bool keepCommon(const Sample&p,const Config&c,const PathIndex*path,const 
 //     min_run m 이상 이어지면 그 칸의 띠 점을 제거. 차로 쪽으로 나온 장애물 몸체는 띠 밖이라 남고,
 //     min_top 보다 낮은 저상 장애물(0.45 m)은 벽에 붙어 있어도 남는다. 차 옆 벽은 링 1~2개만 맞아
 //     높이 범위가 0.1~0.2 m 라(19:09:58 백) 범위 조건은 기본 0 이다.
-struct WallZone {double margin=.1,band=.5,min_extent=0.,min_top=.5,min_run=2.,cell=.3,spacing=.1;};
-struct WallZoneStats {unsigned outside=0,shape=0;};
+//  3) 2026-10-13(21:55:44 백): 경계 안쪽 strip(0.4 m) 안의 드문 벽 밑 점(링이 벽 밑을 긁는 1~7점)이 자차와 같이
+//     움직이는 작은 동적 물체가 되어 세 번 정지했다. strip 안 점은 같은 위치(+-inner_reach)에서 strip 보다
+//     안쪽(차로 쪽, inner_depth 까지)으로 이어지는 점이 없으면 벽 점으로 제거한다. 차체는 경계 0.3 m 안까지
+//     들어가지 않고 엔진도 경계 0.9 m 안 점을 벽면으로 보므로(tunnel_wall_surface_band) strip 안에만 있는
+//     물체는 충돌 판단에 의미가 없다. 벽 밑 점은 경계에서 0.1~0.3 m 에 퍼져 있다.
+struct WallZone {double margin=.1,band=.5,min_extent=0.,min_top=.5,min_run=2.,cell=.3,spacing=.1,strip=.4,inner_depth=1.2,inner_reach=.6;};
+struct WallZoneStats {unsigned outside=0,shape=0,strip=0,surface=0;};
 inline bool wallBounds(const std::vector<std::array<double,3>>&profile,double idx,double&right,double&left){
  right=left=NAN;if(profile.size()<2||idx<profile.front()[0]||idx>profile.back()[0])return false;
  auto hi=std::lower_bound(profile.begin(),profile.end(),idx,[](const std::array<double,3>&row,double x){return row[0]<x;});
@@ -65,23 +73,41 @@ inline bool wallBounds(const std::vector<std::array<double,3>>&profile,double id
  if((*lo)[2]>0&&(*hi)[2]>0)left=(*lo)[2]+u*((*hi)[2]-(*lo)[2]);
  return std::isfinite(right)||std::isfinite(left);
 }
-inline std::vector<bool>wallZoneKeep(const std::vector<Sample>&p,const PathIndex&road,const std::vector<std::array<double,3>>&profile,const XY&origin,double yaw,double sx,double sy,double offset,const WallZone&z,WallZoneStats*stats=nullptr){
- std::vector<bool>keep(p.size(),true);if(profile.size()<2||road.points.size()<2)return keep;
+inline std::vector<bool>wallZoneKeep(const std::vector<Sample>&p,const PathIndex&road,const std::vector<std::array<double,3>>&profile,const XY&origin,double yaw,double sx,double sy,double offset,const WallZone&z,WallZoneStats*stats=nullptr,std::vector<uint8_t>*reasons=nullptr,const std::function<bool(size_t)>&verified={},bool surface_only=false,bool shape_after_surface=false){
+ std::vector<bool>keep(p.size(),true);if(reasons)reasons->assign(p.size(),0);if(profile.size()<2||road.points.size()<2)return keep;
  struct Cell{float lo=INFINITY,hi=-INFINITY;std::vector<size_t>ids;};std::map<std::pair<int,long>,Cell>band;
+ struct StripHit{size_t id;int side;long cell;};std::vector<StripHit>strip;std::set<std::pair<int,long>>inner;
  double c=std::cos(yaw),s=std::sin(yaw);WallZoneStats local;
  for(size_t i=0;i<p.size();++i){double bx=p[i][0]+sx,by=p[i][1]+sy;XY w{origin[0]+c*bx-s*by,origin[1]+s*bx+c*by};size_t j=road.nearest(w).first;
   double right,left;if(!wallBounds(profile,double(j),right,left))continue;
   auto a=road.points[j?j-1:j],b=road.points[std::min(j+1,road.points.size()-1)];double tx=b[0]-a[0],ty=b[1]-a[1],n=std::hypot(tx,ty);if(n<=1e-9)continue;tx/=n;ty/=n;
   double lat=-ty*(w[0]-road.points[j][0])+tx*(w[1]-road.points[j][1])-offset;
-  if((std::isfinite(right)&&lat<right-z.margin)||(std::isfinite(left)&&lat>left+z.margin)){keep[i]=false;++local.outside;continue;}
+  if((std::isfinite(right)&&lat<right-z.margin)||(std::isfinite(left)&&lat>left+z.margin)){keep[i]=false;++local.outside;if(reasons)(*reasons)[i]=1;continue;}
+  if(surface_only&&verified){
+   if(std::min(std::abs(lat-right),std::abs(lat-left))<=z.band&&verified(i)){
+    keep[i]=false;++local.surface;if(reasons)(*reasons)[i]=4;continue;
+   }
+   // 2026-10-14(17:37:24, 17:39:16 백): 지도 일치 제거만으로는 벽 점이 스캔당 300~400개 남아(원거리 입력의 82%)
+   //   원거리 군집이 벽 띠로 이어져 버려지고, 근거리가 벽을 물체로 잡고, 선서행이 터널 내내 걸렸다.
+   //   shape_after_surface: 남은 점에 이전 형상(세로 벽면 연속)·밑동 띠 규칙을 다시 적용한다. 밑동 띠는 안쪽으로 이어진
+   //   몸체가 있으면 남기므로 벽에 붙어 차로 쪽으로 나온 장애물은 보존된다.
+   if(!shape_after_surface)continue; // Unmatched low protrusions and wall-attached bodies survive.
+  }
+  long sc=long(std::floor(j*z.spacing/z.cell));
+  double dr=std::isfinite(right)?lat-right:INFINITY,dl=std::isfinite(left)?left-lat:INFINITY,inward=std::min(dr,dl);int nside=dr<=dl?-1:1;
+  if(inward<=z.strip)strip.push_back({i,nside,sc});else if(inward<=z.strip+z.inner_depth)inner.insert({nside,sc});
   int side=std::isfinite(right)&&lat<=right+z.band?-1:std::isfinite(left)&&lat>=left-z.band?1:0;if(!side)continue;
   auto&cell=band[{side,long(std::floor(j*z.spacing/z.cell))}];cell.lo=std::min(cell.lo,p[i][3]);cell.hi=std::max(cell.hi,p[i][3]);cell.ids.push_back(i);
  }
  // 같은 쪽에서 세로 벽면 칸이 (한 칸 빈틈 허용) min_run 이상 이어진 구간만 벽으로 본다.
  std::vector<std::pair<int,long>>run;auto flush=[&](){if(run.size()&&(run.back().second-run.front().second+1)*z.cell>=z.min_run)
-  for(const auto&k:run)for(size_t id:band[k].ids)if(keep[id]){keep[id]=false;++local.shape;}run.clear();};
+  for(const auto&k:run)for(size_t id:band[k].ids)if(keep[id]&&(!verified||shape_after_surface||verified(id))){keep[id]=false;++local.shape;if(reasons)(*reasons)[id]=2;}run.clear();};
  for(const auto&e:band){if(e.second.hi-e.second.lo<z.min_extent||e.second.hi<z.min_top)continue;
   if(run.size()&&(run.back().first!=e.first.first||e.first.second-run.back().second>2))flush();run.push_back(e.first);}
- flush();if(stats)*stats=local;return keep;
+ flush();
+ const long reach=std::max(0L,long(std::ceil(z.inner_reach/z.cell)));
+ for(const auto&h:strip){if(!keep[h.id])continue;bool body=false;for(long d=-reach;d<=reach&&!body;++d)body=inner.count({h.side,h.cell+d})>0;
+  if(!body&&(!verified||shape_after_surface||verified(h.id))){keep[h.id]=false;++local.strip;if(reasons)(*reasons)[h.id]=3;}}
+ if(stats)*stats=local;return keep;
 }
 }

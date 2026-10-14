@@ -73,8 +73,10 @@ class SurfaceMotion:
 
 
 class StationaryHandoff:
-    def __init__(self, seconds=5., speed=.18, displacement=.3, max_gap=.35):
+    def __init__(self, seconds=3., speed=.18, displacement=.3, max_gap=.35, require_raw_dr=False, stable_owner=False):
         self.seconds, self.speed, self.displacement, self.max_gap = seconds, speed, displacement, max_gap
+        self.stable_owner=stable_owner
+        self.require_raw_dr=require_raw_dr
         self.states = {}
         self.version = None
 
@@ -86,13 +88,15 @@ class StationaryHandoff:
         objects = root.get('collision_objects', root.get('obstacles', []))
         seen = set()
         for o in objects:
-            oid = (o.get('source', 'lidar_only'), int(o.get('observed_track_id', o['id'])))
+            oid = ('shared',int(o['id'])) if self.stable_owner else (o.get('source', 'lidar_only'), int(o.get('observed_track_id', o['id'])))
             if oid in seen:
                 continue
             seen.add(oid)
-            pts = np.asarray(o.get('support_points_world', []), float)
+            planning_pts=np.asarray(o.get('support_points_world',[]),float)
+            dr_valid=bool(o.get('motion_dr_valid'))
+            pts = np.asarray(o.get('motion_support_xy',[]) if self.require_raw_dr else o.get('support_points_world', []), float)
             fresh = abs(float(o.get('last_seen', -1e9)) - stamp) < 1e-5
-            if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 3 or not fresh:
+            if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 3 or not fresh or (self.require_raw_dr and not dr_valid):
                 if oid in self.states:
                     self.states[oid]['since'] = None
                 continue
@@ -100,7 +104,9 @@ class StationaryHandoff:
             if not np.isfinite(pts).all():
                 continue
             state = self.states.setdefault(oid, dict(ever=False, since=None, last=-1e9, points=None,
-                                                     anchor=None, converted=False, moving=0))
+                                                     anchor=None, converted=False, moving=0, epoch=o.get('motion_epoch')))
+            if self.require_raw_dr and state['epoch']!=o.get('motion_epoch'):
+                state.update(since=None,last=-1e9,points=None,anchor=None,converted=False,moving=0,epoch=o.get('motion_epoch'))
             if stamp <= state['last']:
                 continue
             dt = stamp - state['last']
@@ -108,6 +114,19 @@ class StationaryHandoff:
             consistent = bool(o.get('observed_motion_valid', False)) and velocity.shape == (2,) and np.isfinite(velocity).all()
             moving = consistent and np.linalg.norm(velocity) > .3
             state['moving'] = state['moving'] + 1 if moving else 0
+            evidence=o.get('motion_evidence') or {}
+            if (self.stable_owner and moving and evidence.get('surface_translation_valid') and
+                not evidence.get('common_pose_shift') and abs(float(evidence.get('observation_stamp',-1e9))-stamp)<1e-5):
+                # The common tracker has already verified independent surfaces;
+                # do not add two more confirmation frames to a real restart.
+                state['moving']=max(2,state['moving'])
+            if (evidence.get('motion_retracted')=='stationary_extended_surface' and
+                not evidence.get('surface_translation_valid') and not evidence.get('common_pose_shift') and
+                abs(float(evidence.get('observation_stamp',-1e9))-stamp)<1e-5 and
+                o.get('motion_state')=='static' and dr_valid):
+                state.update(ever=False,converted=False,since=None,anchor=None,moving=0)
+                o['dynamic_confirmed']=False
+                o['motion_retraction_reason']='stationary_extended_surface'
             if o.get('dynamic_confirmed', False) or o.get('motion_state') == 'dynamic':
                 state['ever'] = True
             if state['moving'] >= 2:
@@ -132,7 +151,7 @@ class StationaryHandoff:
                     state['anchor'] = None
             o['ever_dynamic'] = state['ever']
             o['m8_stationary_seconds'] = 0. if state['since'] is None else stamp - state['since']
-            probe = dict(o, occupied_cells_world=pts.tolist())
+            probe = dict(o, occupied_cells_world=planning_pts[:,:2].tolist() if planning_pts.ndim==2 else [])
             tag_reference_corridor({'collision_objects': [probe]}, route)
             blocked = probe.get('in_trigger_corridor', False)
             if state['ever'] and o.get('confirmed',False) and stationary and blocked and o['m8_stationary_seconds'] >= self.seconds:
@@ -141,15 +160,15 @@ class StationaryHandoff:
                 o.update(m8_restatic=True, motion_state='static', is_dynamic=False, dynamic_confirmed=False,
                          static_certified=True, static_occupancy=True, observed_motion_valid=False,
                          velocity_valid=False, velocity=[0., 0.], observed_velocity=[0., 0.], speed=0.,
-                         dynamic_streak=0, m8_handoff_reason='observed_stationary_blocker_5s')
+                         dynamic_streak=0, m8_handoff_reason='observed_stationary_blocker_duration')
             else:
                 o['m8_restatic'] = False
-                # A previously moving blocker must complete the full five
-                # seconds; the detector's shorter stillness window is not an
+                # A previously moving blocker must complete the configured
+                # duration; the detector's shorter stillness window is not an
                 # independent handoff permission.
                 if state['ever'] and o.get('motion_state') == 'static':
                     o.update(motion_state='unknown', static_certified=False,
-                             static_occupancy=False, m8_handoff_reason='awaiting_stationary_blocker_5s')
+                             static_occupancy=False, m8_handoff_reason='awaiting_stationary_blocker_duration')
             state.update(last=stamp, points=pts.copy())
         for oid, state in list(self.states.items()):
             if stamp - state['last'] > self.max_gap:

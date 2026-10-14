@@ -57,8 +57,8 @@ cruise_hold_sec: 0.5
 # A straight measured wall must not be extrapolated into a curved entrance.
 live_boundary_distance_m: 6.0
 # 2026-10-07 터널 정지(21:05~21:08 백): 천장/벽 점이 integrate(44~272 ms/프레임)를 무겁게 해 엔진 잠금 -> stale -> 회피 실패 -> 긴급제동.
-ceiling_skip_height: 3.2        # 지면 위 이 높이 넘는 점은 누적·광선추적 제외 [m] (max_height 2.8 + 0.4)
-tunnel_wall_surface_band: 0.9   # 터널(3.csv)에서 벽 경계 이 거리 안쪽 점은 벽면(장애물 아님) [m] (10-07 0.6 -> 0.9: 15:11 백 벽 0.5~1.0 m 칸 9~36 개 남음. 차 중심은 경계 1.05 m 안)
+ceiling_skip_height: 3.2 # 지면 위 이 높이 넘는 점은 누적·광선추적 제외 [m] (max_height 2.8 + 0.4)
+tunnel_wall_surface_band: 0.9 # 터널(3.csv)에서 벽 경계 이 거리 안쪽 점은 벽면(장애물 아님) [m] (10-07 0.6 -> 0.9: 15:11 백 벽 0.5~1.0 m 칸 9~36 개 남음. 차 중심은 경계 1.05 m 안)
 live_boundary_heading_deg: 5.0
 tunnel_min_idx: 7000
 tunnel_max_idx: 9000
@@ -67,7 +67,7 @@ tunnel_max_idx: 9000
 trigger_enabled: true
 # 2026-10-05: 기준경로 코리도(2차) 정적/동적/음영 모두 1.3 m(반폭)
 trigger_corridor_half_width_m: 1.3
-trigger_distance_m: 30.0
+trigger_distance_m: 32.0
 trigger_hold_sec: 3.0
 tl_guard_range_m: 80.0
 tl_input_timeout_sec: 0.7
@@ -80,3 +80,11 @@ recovery_rear_observation_m: 15.0
 # 통로 안 목표를 허용 경계에서 더 띄우는 거리(최소 간격 obstacle_margin 과 별개). 2026-10-09: 터널 회피 경로가 넓어 0.15 m.
 corridor_target_extra_m: 0.4
 tunnel_corridor_target_extra_m: 0.15
+# 2026-10-14(13:00:31, 13:01:26 백) 터널 회피 경로 보강. 사고 현장 뒤 저상 장애물 위로 일찍 복귀 -> 늦게 보여 경로 무효 -> 재계획 실패.
+tunnel_return_observed_free: true # 복귀는 차체 범위 지면이 관측된 곳으로만(false: 이전 동작)
+tunnel_return_observed_ratio: 0.7 # 차체 범위 0.5 m 칸 중 관측 비율
+scene_visibility_memory_enabled: true # 2026-10-14 장면 수신 때 지면 관측 칸 누적(false: 매 장면 교체, 이전 동작)
+tunnel_hold_extra_clearance_m: 0.4 # 유지 경로(자차 앞 부분)가 보통 여유 + 이 값을 통과해야 유지, 아니면 재계획(실패 시 유지). 0: 끔
+tunnel_new_obstacle_margin_m: 0.3 # 새(처음 본 지 1.5 s 미만)·낮은(0.5 m 미만) 칸에 계획 전용 추가 여유. 통로 없으면 여유 없이 재계획. 0: 끔
+tunnel_new_obstacle_sec: 1.5
+tunnel_low_obstacle_height_m: 0.5

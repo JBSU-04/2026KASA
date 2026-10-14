@@ -66,7 +66,7 @@ struct RosAdapter::Impl {
   ros::Subscriber random_active_sub_,wall_offset_sub_,preslow_sub_;std::atomic<double>preslow_cap_{9999.},preslow_stamp_{-1e9};std::atomic<bool>random_active_{false};std::atomic<double>random_active_stamp_{-1};
   int tunnel_shadow_first_=7201;
   int tunnel_prepare_=100;
-  int lane_=-1,index_=-1,road_lane_=-1,min_idx_=2400,max_idx_=3700,tunnel_min_=7000,tunnel_max_=9000;
+  int lane_=-1,index_=-1,road_lane_=-1,min_idx_=2400,max_idx_=3700,tunnel_min_=7000,tunnel_max_=9000,tunnel_exit_hold_=100;
   bool previous_active_=false,stop_required_=false;double stop_dist_=-1,stop_stamp_=0,required_stamp_=0,coverage_=9999,coverage_stamp_=0;
   double recovery_rear_observation_=15.;
   double objects_stamp_=0,dynamic_state_stamp_=-1,front_axle_offset_=3.845,stop_buffer_=3.;
@@ -76,7 +76,7 @@ struct RosAdapter::Impl {
   //   이 노드는 누적 점유 장애물(footprint)과 후보 경로/상태만 준다.
   std::atomic<bool> common_m8_active_{false};
   bool native_scene_=true;double native_debug_stamp_=-1;ros::Publisher native_scene_pub_,scene_compute_pub_,scene_age_pub_,planning_age_pub_;ros::Subscriber native_scene_sub_,native_detector_sub_;
-  bool scene_only_=false,common_scene_=false;ros::Publisher scene_pub_;ros::Subscriber scene_sub_,gps_mode_sub_,frame_sub_,detector_sub_;Json::Value scene_input_,detector_input_;
+  bool object_scene_enabled_=true;bool scene_only_=false,common_scene_=false;ros::Publisher scene_pub_;ros::Subscriber scene_sub_,gps_mode_sub_,frame_sub_,detector_sub_;Json::Value scene_input_,detector_input_;
   SurfaceTracker surface_tracker_;std::vector<DynamicRegion> scene_dynamic_;std::vector<std::pair<double,double>> scene_measured_;std::set<std::pair<int,int>> scene_verified_cells_;std::map<int,bool> scene_verified_ids_;
   std::string gps_mode_;
   uint64_t coordinate_version_=0;double frame_x_=0,frame_y_=0,coordinate_stamp_=-1;
@@ -84,6 +84,15 @@ struct RosAdapter::Impl {
   bool service_mode_=false;ros::Publisher candidate_pub_,state_pub_,obstacles_pub_;
   ros::CallbackQueue escape_queue_;std::unique_ptr<ros::AsyncSpinner> escape_spinner_;
   ros::Publisher integrate_ms_pub_;ros::Subscriber classified_sub_;double classified_stamp_=-1;bool tunnel_map_enabled_=true;bool filtered_pipeline_=false;ros::Subscriber filtered_cloud_sub_;
+  // 2026-10-13(12:27:13, 12:29:44 백): 터널 입구 저상 장애물(0.36 m)을 원거리 검출은 23 m 에서 잡았지만 엔진은 GroundGrid
+  //   근거리 점만 받아 11 m 에서야 점유를 봤고, 회피 공간이 모자라 정지했다. 원거리 필터 점(/tunnel/filtered_far, 국소 지면 제거)을
+  //   최근 0.25 s 안이면 다음 근거리 스캔에 현재 자세로 옮겨 붙인다(앞 far_min_x 밖만). 지면 광선으로만 비우므로 근거리 점유를 지우지 않는다.
+  ros::Subscriber far_cloud_sub_;sensor_msgs::PointCloud2ConstPtr far_cloud_;Pose far_pose_;bool far_engine_input_=true;double far_min_x_=12.,far_max_age_=.25;
+  // 2026-10-13 터널 엔진 입력을 지도 분류 결과로(M2 처럼 일찍 확정). 1 배경 제외, 3(지도에 없음+2스캔) 즉시 확정.
+  //   M2 엔진은 원시 점 3회 적중으로 ~30 m 에서 확정하는데, 터널은 인지 인증(22~25 m)을 기다려 첫 회피 경로가 19~21 m 였다.
+  bool tunnel_classified_input_=true;double tunnel_near_memory_sec_=3.,tunnel_confirm_lateral_m_=2.;ros::Subscriber far_classified_sub_;
+  // 지도 확정 잔차 즉시 확정은 경로 횡 tunnel_confirm_lateral_m 안만(빈 터널 12:26 백: 원거리 잔차는 전부 횡 -3 m 밖/+5 m 밖).
+  double routeLateral(double x,double y)const{double best=1e18,lat=1e9;for(size_t i=0;i+1<route_.size();i+=2){const auto&a=route_[i];double dx=x-a.x,dy=y-a.y,d=dx*dx+dy*dy;if(d<best){best=d;lat=-std::sin(a.yaw)*dx+std::cos(a.yaw)*dy;}}return lat;}
   ros::Subscriber owner_feedback_sub_;
   ros::Subscriber escape_sub_,handoff_sub_;bool recovery_active_=false;ros::Publisher escape_pub_,divider_pub_,handoff_ack_pub_;
   bool dynamic_hold_=false;std::vector<Edge> divider_candidates_;
@@ -107,6 +116,7 @@ struct RosAdapter::Impl {
     pnh_.param("scene_only",scene_only_,false);
     nh_.param("/tunnel_recovery/native_scene_enabled",native_scene_,true);
     nh_.param("/tunnel_recovery/common_scene_enabled",common_scene_,true);
+    nh_.param("/tunnel_recovery/object_scene_enabled",object_scene_enabled_,true);
     pnh_.param("tunnel_cells_authoritative_enabled",tunnel_cells_authoritative_,true);
     pnh_.param("tunnel_replan_enabled",tunnel_replan_enabled_,true);
     pnh_.param("static_zone_min_idx",min_idx_,2400);pnh_.param("static_dynamic_split_idx",max_idx_,3700);
@@ -116,7 +126,7 @@ struct RosAdapter::Impl {
     pnh_.param("tunnel_min_idx",tunnel_min_,7000);pnh_.param("tunnel_max_idx",tunnel_max_,9000);
     // 2026-10-12: 공용 장면을 꺼도 M8 제어 경계(터널 벽 25 m 전)를 같은 정의로 읽는다. 기본값 7201 로 남으면
     //   7001~7200 에서 회피 노드는 터널 모드인데 엔진이 꺼져 정지했다.
-    {const auto region=TunnelRegion::load(nh_);tunnel_min_=region.first;tunnel_shadow_first_=region.shadow_first;tunnel_max_=region.last;tunnel_prepare_=region.preview;if(region.lane!=3)throw std::runtime_error("M8 must use csv3");}
+    {const auto region=TunnelRegion::load(nh_);tunnel_min_=region.first;tunnel_shadow_first_=region.shadow_first;tunnel_max_=region.last;tunnel_prepare_=region.preview;tunnel_exit_hold_=region.exit_hold;if(region.lane!=3)throw std::runtime_error("M8 must use csv3");}
     pnh_.param("tl_guard_enabled",tl_guard_,true);
     nh_.param("/lidar_extrinsic/x",cfg_.sensor_x,1.1);nh_.param("/lidar_extrinsic/y",cfg_.sensor_y,0.);
     nh_.param("/lidar_extrinsic/z",cfg_.sensor_z,1.33);nh_.param("/lidar_extrinsic/z_from_ground",cfg_.sensor_height,1.765);
@@ -143,6 +153,14 @@ struct RosAdapter::Impl {
     pnh_.param("recovery_rear_observation_m",recovery_rear_observation_,15.);
     pnh_.param("scan_timeout",cfg_.scan_timeout,.35);
     pnh_.param("return_min_distance_m",cfg_.return_min_distance,12.);
+    // 2026-10-14 터널 회피 경로 보강(각각 복귀 스위치): 관측된 곳으로만 복귀, 유지 경로 추가 여유, 새/낮은 칸 계획 여유.
+    pnh_.param("tunnel_return_observed_free",cfg_.tunnel_return_observed_free,true);
+    pnh_.param("tunnel_return_observed_ratio",cfg_.return_observed_ratio,.7);
+    pnh_.param("scene_visibility_memory_enabled",cfg_.scene_visibility_memory,true);
+    pnh_.param("tunnel_hold_extra_clearance_m",cfg_.tunnel_hold_extra_clearance,.4);
+    pnh_.param("tunnel_new_obstacle_margin_m",cfg_.tunnel_new_obstacle_margin,.3);
+    pnh_.param("tunnel_new_obstacle_sec",cfg_.tunnel_new_obstacle_sec,1.5);
+    pnh_.param("tunnel_low_obstacle_height_m",cfg_.tunnel_low_obstacle_height,.5);
     pnh_.param("return_min_time_sec",cfg_.return_min_time,2.);
     pnh_.param("return_offset_tolerance_m",cfg_.return_tolerance,.2);
     pnh_.param("return_center_weight",cfg_.return_center_weight,2.);
@@ -216,13 +234,15 @@ struct RosAdapter::Impl {
         "/perception/points_gravity",1,boost::bind(&Impl::cloud,this,_1),ros::VoidPtr(),&cloud_queue_);
       lidar_=nh_.subscribe(so);
       auto filtered=ros::SubscribeOptions::create<sensor_msgs::PointCloud2>("/tunnel/filtered_points",1,boost::bind(&Impl::cloud,this,_1),ros::VoidPtr(),&cloud_queue_);filtered_cloud_sub_=nh_.subscribe(filtered);
+      pnh_.param("far_engine_input",far_engine_input_,true);pnh_.param("tunnel_classified_input",tunnel_classified_input_,true);pnh_.param("tunnel_near_memory_sec",tunnel_near_memory_sec_,3.);pnh_.param("tunnel_confirm_lateral_m",tunnel_confirm_lateral_m_,2.);pnh_.param("far_engine_min_x",far_min_x_,12.);pnh_.param("far_engine_max_age",far_max_age_,.25);
+      if(far_engine_input_){auto far=ros::SubscribeOptions::create<sensor_msgs::PointCloud2>(tunnel_classified_input_?"/tunnel/map_classified_far":"/tunnel/filtered_far",1,boost::bind(&Impl::farCloud,this,_1),ros::VoidPtr(),&cloud_queue_);far_cloud_sub_=nh_.subscribe(far);}
       auto classified=ros::SubscribeOptions::create<sensor_msgs::PointCloud2>("/tunnel/map_classified",1,boost::bind(&Impl::classified,this,_1),ros::VoidPtr(),&cloud_queue_);classified_sub_=nh_.subscribe(classified);}
       cloud_spinner_.reset(new ros::AsyncSpinner(1,&cloud_queue_));cloud_spinner_->start();}
     bool transition=true;nh_.param("/tunnel_recovery/continuous_transition_enabled",transition,true);engine_->setContinuousTransition(transition);
     frame_sub_=nh_.subscribe<std_msgs::String>("/localization/frame_update",20,[this](const std_msgs::String::ConstPtr&m){
       Json::Value v;Json::Reader rd;if(!rd.parse(m->data,v))return;
       std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
-      if(!common_scene_)return;
+      if(!common_scene_&&!object_scene_enabled_)return;
       auto version=v.get("coordinate_version",0).asUInt64();if(version<=coordinate_version_)return;
       const double x=v.get("offset_x",0).asDouble(),y=v.get("offset_y",0).asDouble();
       if(coordinate_version_==0&&engine_->lastScan()<0){frame_x_=x;frame_y_=y;coordinate_version_=version;coordinate_stamp_=v.get("stamp",-1).asDouble();return;}
@@ -245,8 +265,8 @@ struct RosAdapter::Impl {
       ROS_INFO("[tunnel scene] independent perception, no path/control/escape publishers");return;
     }
     integrate_ms_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/engine_integrate_ms",1);
-    if(native_scene_||filtered_pipeline_)planning_age_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/planning_input_age_ms",1);
-    if(native_scene_)native_scene_sub_=nh_.subscribe<occupancy_avoidance::TunnelScene>("/tunnel/perception_scene_native",1,&Impl::nativeScene,this,ros::TransportHints().tcpNoDelay());
+    if(native_scene_||filtered_pipeline_||object_scene_enabled_)planning_age_pub_=nh_.advertise<std_msgs::Float64>("/tunnel/planning_input_age_ms",1);
+    if(native_scene_||object_scene_enabled_)native_scene_sub_=nh_.subscribe<occupancy_avoidance::TunnelScene>(object_scene_enabled_?"/tunnel/obstacle_scene":"/tunnel/perception_scene_native",1,&Impl::nativeScene,this,ros::TransportHints().tcpNoDelay());
     else scene_sub_=nh_.subscribe<std_msgs::String>("/tunnel/perception_scene",1,&Impl::scene,this);
     gps_mode_sub_=nh_.subscribe<std_msgs::String>("/localization/gps_mode",1,[this](const std_msgs::String::ConstPtr&m){std::lock_guard<std::recursive_mutex>lock(engine_mutex_);if(m->data!=gps_mode_){gps_mode_=m->data;if(lane_==3)++route_generation_;}engine_->setReacquiring(lane_==3&&m->data=="reacquiring");});
     admission_sub_=nh_.subscribe<std_msgs::String>("/obstacle_info",1,[this](const std_msgs::String::ConstPtr& m){
@@ -264,8 +284,8 @@ struct RosAdapter::Impl {
         for(const auto& p:poly)if(p.size()>=2&&std::isfinite(p[0].asDouble()+p[1].asDouble()))hint.footprint.push_back({p[0].asDouble(),p[1].asDouble(),0});
         if(hint.footprint.size()>=3)hints.push_back(std::move(hint));
       }
-      if(lane_==3&&tunnel_cells_authoritative_)return; // native cells supply admission, never diagnostic boxes
-      if((common_scene_||filtered_pipeline_)&&lane_==3){latest_objects_=root;objects_stamp_=root.get("stamp",now).asDouble();}
+      if(lane_==3&&(tunnel_cells_authoritative_||object_scene_enabled_))return; // native cells supply admission, never diagnostic boxes
+      if((common_scene_||object_scene_enabled_||filtered_pipeline_)&&lane_==3){latest_objects_=root;objects_stamp_=root.get("stamp",now).asDouble();}
       engine_->setCertifiedTriggers(std::move(hints));
     });
     near_=nh_.subscribe("/obstacle_info_near",1,&Impl::objects,this);
@@ -275,7 +295,7 @@ struct RosAdapter::Impl {
     wall_offset_sub_=nh_.subscribe<std_msgs::Float64>("/tunnel/wall_offset",1,[this](const std_msgs::Float64::ConstPtr&m){
       std::lock_guard<std::recursive_mutex> lock(engine_mutex_);engine_->setProfileOffset(lane_==3?m->data:0.);});
     wall_sub_=nh_.subscribe<std_msgs::Float64MultiArray>("/tunnel/wall_limits",1,[this](const std_msgs::Float64MultiArray::ConstPtr&m){
-      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();LiveEdges e;if(lane_==3&&m->data.size()>=5&&m->data[0]>0&&m->data[1]>0&&m->data[2]>0){
+      std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();LiveEdges e;if(lane_==3&&object_scene_enabled_){engine_->setLiveEdges(e);return;}if(lane_==3&&m->data.size()>=5&&m->data[0]>0&&m->data[1]>0&&m->data[2]>0){
         e.pose=pose_;e.pose.stamp=ros::Time::now().toSec();e.right=m->data[1];e.left=m->data[2];e.right_slope=m->data[3];e.left_slope=m->data[4];e.valid=true;
       }engine_->setLiveEdges(e);
     });
@@ -328,8 +348,8 @@ struct RosAdapter::Impl {
   }
   ~Impl(){plan_timer_.stop();publish_timer_.stop();if(plan_spinner_)plan_spinner_->stop();if(escape_spinner_)escape_spinner_->stop();if(cloud_spinner_)cloud_spinner_->stop();if(input_spinner_)input_spinner_->stop();}
   bool entryArmed()const{return index_>=tunnel_shadow_first_||(random_active_&&ros::Time::now().toSec()-random_active_stamp_<.5);}
-  bool active()const{return(recovery_active_&&lane_==0&&index_>max_idx_&&index_<=4900)||(lane_==0&&index_>=cfg_.static_planning_start_idx&&index_<=max_idx_)||(lane_==3&&entryArmed()&&index_>=tunnel_min_&&(index_<=tunnel_max_||(tunnel_owner_active_&&index_<=tunnel_max_+100)));}
-  bool warm()const{return(lane_==0&&index_>=cfg_.static_planning_start_idx-200&&index_<=4900)||(lane_==3&&index_>=tunnel_min_-std::max(100,tunnel_prepare_)&&index_<=tunnel_max_+100);}
+  bool active()const{return(recovery_active_&&lane_==0&&index_>max_idx_&&index_<=4900)||(lane_==0&&index_>=cfg_.static_planning_start_idx&&index_<=max_idx_)||(lane_==3&&entryArmed()&&index_>=tunnel_min_&&(index_<=tunnel_max_||(tunnel_owner_active_&&index_<=tunnel_max_+tunnel_exit_hold_)));}
+  bool warm()const{return(lane_==0&&index_>=cfg_.static_planning_start_idx-200&&index_<=4900)||(lane_==3&&index_>=tunnel_min_-std::max(100,tunnel_prepare_)&&index_<=tunnel_max_+tunnel_exit_hold_);}
   // 2026-10-07: odom 은 엔진 잠금을 잡지 않는다. 터널에서 integrate/plan 이 잠금을 길게 잡아 /odom 이 밀리면
   //   pose_ 가 0.25 s 넘게 늦어 stale_pose -> 회피 실패 -> 긴급제동(21:05~21:08 백). 받은 자세는 버퍼에 쌓고,
   //   엔진 잠금을 잡은 쪽이 syncPoses() 로 반영한다(판단 시점에 항상 최신 자세).
@@ -368,7 +388,7 @@ struct RosAdapter::Impl {
     int lane=m->waypoints.front().lane_number;index_=m->waypoints.front().waypoint_index;
     if(lane!=road_lane_){engine_->reset();engine_->setRoad(lane==3?road3_:road0_,lane==3?edges3_:edges0_);
       engine_->setCertifiedAdmissionOnly(false); // Shared M2 temporal cell admission; no extra M8 certificate gate.
-      engine_->setNearMemory(lane==3&&common_scene_?10.:0.);engine_->setStrictSceneMargins(lane==3&&common_scene_);engine_->setWallSurfaceBand(lane==3?tunnel_wall_surface_band_:0.);
+      engine_->setNearMemory(lane==3?(object_scene_enabled_?0.:(common_scene_?10.:(filtered_pipeline_?tunnel_near_memory_sec_:0.))):0.);engine_->setStrictSceneMargins(lane==3&&(common_scene_||object_scene_enabled_));engine_->setWallSurfaceBand(lane==3?tunnel_wall_surface_band_:0.);
       engine_->setCorridorTargetExtra(lane==3?tunnel_corridor_target_extra_:corridor_target_extra_);road_lane_=lane;replan_pending_=false;joint_forward_latched_.clear();result_=Result();last_good_=Result();++route_generation_;}
     lane_=lane;common_m8_active_=common_scene_&&lane==3&&index_>=tunnel_min_&&index_<=tunnel_max_;route_.clear();for(const auto&w:m->waypoints)route_.push_back({w.pose.pose.position.x,w.pose.pose.position.y,w.ryaw,w.waypoint_index});
     for(size_t i=0;i+1<route_.size();++i)route_[i].yaw=std::atan2(route_[i+1].y-route_[i].y,route_[i+1].x-route_[i].x);
@@ -378,16 +398,39 @@ struct RosAdapter::Impl {
   void ground(const sensor_msgs::PointCloud2::ConstPtr&m){if(m->header.frame_id!="velodyne_ground"&&m->header.frame_id!="velodyne")return;
     try{auto g=points(*m);std::lock_guard<std::mutex> lock(pose_in_mutex_);ground_in_.swap(g);ground_in_stamp_=m->header.stamp.toSec();ground_in_new_=true;}
     catch(const std::exception&e){ROS_WARN_THROTTLE(1,"ground: %s",e.what());}}
+  void farCloud(const sensor_msgs::PointCloud2::ConstPtr&m){std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
+    if(m->header.frame_id!="velodyne_ground"||lane_!=3)return;Pose p;if(!interpolate(m->header.stamp.toSec(),p))return;far_cloud_=m;far_pose_=p;}
+  void appendFar(std::vector<Point>&raw,const Pose&p){
+    if(!far_cloud_||std::abs(far_pose_.stamp-p.stamp)>far_max_age_)return;
+    auto far=points(*far_cloud_);std::vector<float>rel,lab;{sensor_msgs::PointCloud2ConstIterator<float>h(*far_cloud_,"ground_relative"),x(*far_cloud_,"x"),y(*far_cloud_,"y"),z(*far_cloud_,"z");
+      for(;x!=x.end();++x,++y,++z,++h)if(std::isfinite(*x+*y+*z))rel.push_back(*h);}
+    const bool labelled=std::any_of(far_cloud_->fields.begin(),far_cloud_->fields.end(),[](const auto&f){return f.name=="map_label";});
+    if(labelled){sensor_msgs::PointCloud2ConstIterator<float>l(*far_cloud_,"map_label"),x(*far_cloud_,"x"),y(*far_cloud_,"y"),z(*far_cloud_,"z");
+      for(;x!=x.end();++x,++y,++z,++l)if(std::isfinite(*x+*y+*z))lab.push_back(*l);}
+    if(rel.size()!=far.size()||(labelled&&lab.size()!=far.size()))return;
+    const double cf=std::cos(far_pose_.yaw),sf=std::sin(far_pose_.yaw),cp=std::cos(p.yaw),sp=std::sin(p.yaw);
+    for(size_t i=0;i<far.size();++i){const auto&q=far[i];if(!std::isfinite(rel[i]))continue;
+      double bx=q.x+cfg_.sensor_x,by=q.y+cfg_.sensor_y,wx=far_pose_.x+cf*bx-sf*by,wy=far_pose_.y+sf*bx+cf*by,dx=wx-p.x,dy=wy-p.y;
+      Point n;n.x=cp*dx+sp*dy-cfg_.sensor_x;n.y=-sp*dx+cp*dy-cfg_.sensor_y;n.z=q.z+far_pose_.z-p.z;if(n.x<far_min_x_)continue;
+      n.map_ground=n.z-rel[i];
+      // 원거리 지도 분류: 배경(1) 제외, 지도에 없음+2스캔(3) 즉시 확정, 그 밖은 인증 영역이면 3 아니면 일시(0).
+      const int fl=labelled?int(lab[i]):0;if(fl==1)continue;
+      n.map_label=((fl==3&&std::abs(routeLateral(wx,wy))<=tunnel_confirm_lateral_m_)||engine_->nearCertified(wx,wy,p.stamp))?3:0;raw.push_back(n);}
+  }
   void classified(const sensor_msgs::PointCloud2::ConstPtr&m){
     std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
-    if(!filtered_pipeline_&&(scene_only_||!common_scene_)&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_){classified_stamp_=m->header.stamp.toSec();cloud(m);}
+    if(!filtered_pipeline_&&(scene_only_||!common_scene_)&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_+tunnel_exit_hold_){classified_stamp_=m->header.stamp.toSec();cloud(m);}
+    // 필터 점 경로: 지도 분류(같은 필터 점 + 라벨)를 엔진 입력으로 쓴다. 분류가 신선하면 /tunnel/filtered_points 는 건너뛴다(아래 cloud).
+    else if(filtered_pipeline_&&tunnel_classified_input_&&!scene_only_&&!common_scene_&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-tunnel_prepare_&&index_<=tunnel_max_+tunnel_exit_hold_){classified_stamp_=m->header.stamp.toSec();cloud(m);}
   }
   void cloud(const sensor_msgs::PointCloud2::ConstPtr&m){auto cloud_begin=std::chrono::steady_clock::now();std::lock_guard<std::recursive_mutex> input_lock(engine_mutex_);syncPoses();if(!warm())return;
-    const bool filtered=std::any_of(m->fields.begin(),m->fields.end(),[](const auto&f){return f.name=="m2_filtered";});
+    const bool has_label=std::any_of(m->fields.begin(),m->fields.end(),[](const auto&f){return f.name=="map_label";});
+    const bool classified_input=filtered_pipeline_&&tunnel_classified_input_&&lane_==3&&has_label;
+    const bool filtered=classified_input||std::any_of(m->fields.begin(),m->fields.end(),[](const auto&f){return f.name=="m2_filtered";});
     if(filtered_pipeline_&&((lane_==3&&!filtered)||(lane_!=3&&filtered)))return;
     if(scene_only_)return; // Final M8 objects come from the shared nonground detector.
-    if(scene_only_&&(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_))return;
-    if(!scene_only_&&common_scene_&&lane_==3&&index_>=tunnel_min_-tunnel_prepare_&&index_<=tunnel_max_)return;
+    if(scene_only_&&(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_+tunnel_exit_hold_))return;
+    if(!scene_only_&&(common_scene_||object_scene_enabled_)&&lane_==3&&index_>=tunnel_min_-tunnel_prepare_&&index_<=tunnel_max_+tunnel_exit_hold_)return;
     if(m->header.frame_id!="velodyne_ground"){ROS_ERROR_THROTTLE(1,"occupancy expects gravity-aligned sensor frame, got %s",m->header.frame_id.c_str());return;}
     Pose p;if(!interpolate(m->header.stamp.toSec(),p))return;
     if(scene_only_&&p.stamp<=coordinate_stamp_)return;
@@ -405,12 +448,18 @@ struct RosAdapter::Impl {
       refreshDynamic(ros::Time::now().toSec());
       engine_->setRearObservation((lane_==3||(lane_==0&&index_>max_idx_))?recovery_rear_observation_:5.);
       bool annotated=std::any_of(m->fields.begin(),m->fields.end(),[](const auto&f){return f.name=="map_label";});
-      if(!annotated&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_&&(scene_only_||ros::Time::now().toSec()-classified_stamp_<.35))return;
+      if(!annotated&&tunnel_map_enabled_&&lane_==3&&index_>=tunnel_min_-(scene_only_?tunnel_prepare_:0)&&index_<=tunnel_max_+tunnel_exit_hold_&&(scene_only_||ros::Time::now().toSec()-classified_stamp_<.35))return;
       auto raw=points(*m);
       if(!filtered&&!annotated&&lane_==3&&tunnel_map_enabled_)for(auto& p:raw){p.map_label=0;p.map_ground=std::numeric_limits<double>::quiet_NaN();}
-      if(filtered){sensor_msgs::PointCloud2ConstIterator<float> h(*m,"ground_relative");size_t i=0;for(;h!=h.end();++h)if(i<raw.size()){raw[i].map_ground=raw[i].z-*h;double c=std::cos(p.yaw),sn=std::sin(p.yaw),bx=raw[i].x+cfg_.sensor_x,by=raw[i].y+cfg_.sensor_y;raw[i].map_label=engine_->nearCertified(p.x+c*bx-sn*by,p.y+sn*bx+c*by,p.stamp)?3:0;++i;}}
+      if(filtered){sensor_msgs::PointCloud2ConstIterator<float> h(*m,"ground_relative");size_t i=0;for(;h!=h.end();++h)if(i<raw.size()){raw[i].map_ground=raw[i].z-*h;double c=std::cos(p.yaw),sn=std::sin(p.yaw),bx=raw[i].x+cfg_.sensor_x,by=raw[i].y+cfg_.sensor_y;raw[i].map_label=engine_->nearCertified(p.x+c*bx-sn*by,p.y+sn*bx+c*by,p.stamp)?3:0;++i;}
+        if(far_engine_input_&&lane_==3)appendFar(raw,p);}
       if(annotated){sensor_msgs::PointCloud2ConstIterator<float> g(*m,"map_ground"),l(*m,"map_label"),x(*m,"x"),y(*m,"y"),z(*m,"z");size_t j=0;
-        for(;x!=x.end();++x,++y,++z,++g,++l)if(std::isfinite(*x+*y+*z)){raw[j].map_ground=*g;raw[j].map_label=*l;++j;}}
+        for(;x!=x.end();++x,++y,++z,++g,++l)if(std::isfinite(*x+*y+*z)){raw[j].map_ground=*g;raw[j].map_label=*l;++j;}
+        // 지도 분류 입력: 인지 인증 영역 안 점은 배경(1)이 아니면 확정(3)으로 올린다(기존 필터 경로와 같은 인증 규칙).
+        if(classified_input){const double c=std::cos(p.yaw),sn=std::sin(p.yaw);
+          for(size_t k=0;k<j;++k)if(raw[k].map_label!=1){const double bx=raw[k].x+cfg_.sensor_x,by=raw[k].y+cfg_.sensor_y,wx=p.x+c*bx-sn*by,wy=p.y+sn*bx+c*by;
+            if(engine_->nearCertified(wx,wy,p.stamp))raw[k].map_label=3;
+            else if(raw[k].map_label==3&&std::abs(routeLateral(wx,wy))>tunnel_confirm_lateral_m_)raw[k].map_label=0;}}}
       if(scene_only_){
         std::map<std::pair<int,int>,int> support;
         for(const auto&q:raw)if(q.map_label==2)++support[{int(std::floor(q.x/.5)),int(std::floor(q.y/.5))}];
@@ -447,7 +496,7 @@ struct RosAdapter::Impl {
   void scene(const std_msgs::String::ConstPtr&m){
     Json::Value v;Json::Reader rd;if(!rd.parse(m->data,v)||v.get("state","").asString()!="valid")return;
     std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
-    if(!common_scene_||lane_!=3)return;
+    if((!common_scene_&&!object_scene_enabled_)||lane_!=3)return;
     double stamp=v.get("geometry_stamp",-1).asDouble(),now=ros::Time::now().toSec();if(now-stamp>cfg_.scan_timeout||now<stamp-.05)return;
     SceneSnapshot snap;const auto&p=v["scan_pose"];if(p.size()!=7)return;
     snap.pose={stamp,p[0].asDouble(),p[1].asDouble(),p[2].asDouble(),p[3].asDouble(),p[4].asDouble()};snap.curvature=p[5].asDouble();
@@ -458,7 +507,7 @@ struct RosAdapter::Impl {
     if(version<coordinate_version_)return;
     if(version>coordinate_version_){
       double x=v.get("offset_x",0).asDouble(),y=v.get("offset_y",0).asDouble(),dx=x-frame_x_,dy=y-frame_y_;
-      engine_->rebasePlanning(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}
+      engine_->rebasePlanning(dx,dy);engine_->rebaseVisibility(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}
       frame_x_=x;frame_y_=y;++route_generation_;
     }
     if(engine_->importScene(snap)){scene_input_=v;scene_id_=v.get("scene_id",0).asUInt64();coordinate_version_=v.get("coordinate_version",0).asUInt64();scene_recv_=now;}
@@ -493,14 +542,14 @@ struct RosAdapter::Impl {
       if(m.fixed[i]&&!statics.count(m.owner_ids[i]))return false;
       // Fresh measured unknown occupancy is a transient constraint, not static
       // admission. Otherwise the final node sees cells the planner never saw.
-      if(m.fixed[i]||moving.count(m.owner_ids[i])||(m.observed[i]&&confirmed.count(m.owner_ids[i])))snap.voxels.push_back({{p.x,p.y,p.z},bool(m.fixed[i]),m.seen[i]});}
+      if(m.fixed[i]||moving.count(m.owner_ids[i])||(confirmed.count(m.owner_ids[i])&&stamp>=m.seen[i]-.05&&stamp-m.seen[i]<=cfg_.scan_timeout))snap.voxels.push_back({{p.x,p.y,p.z},bool(m.fixed[i]),m.seen[i]});}
     for(size_t i=0;i<m.visibility.size();i+=3){snap.visibility.push_back({m.visibility[i],m.visibility[i+1],m.visibility[i+2]});}
     return true;
   }
   void detectorNative(const occupancy_avoidance::TunnelScene::ConstPtr& input){
     const double begin=ros::WallTime::now().toSec();
     std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
-    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_+tunnel_exit_hold_)return;
     double stamp=input->header.stamp.toSec();Pose p;if(!interpolate(stamp,p)||stamp<=coordinate_stamp_||input->coordinate_version<coordinate_version_)return;
     auto out=*input;out.ego_pose.position.x=p.x;out.ego_pose.position.y=p.y;out.ego_pose.position.z=p.z;
     out.ego_pose.orientation.x=out.ego_pose.orientation.y=0;out.ego_pose.orientation.z=std::sin(p.yaw/2);out.ego_pose.orientation.w=std::cos(p.yaw/2);out.speed=p.speed;out.map_version=map_version_;
@@ -522,9 +571,9 @@ struct RosAdapter::Impl {
         for(size_t i=0;i<out.cells.size();++i){int category=out.fixed[i]?(out.observed[i]?0:1):2;if(category==k)v.points.push_back(out.cells[i]);}a.markers.push_back(v);}marker_pub_.publish(a);}
   }
   void nativeScene(const occupancy_avoidance::TunnelScene::ConstPtr&m){
-    std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();if(!common_scene_||lane_!=3||m->coordinate_version<coordinate_version_)return;
+    std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();if((!common_scene_&&!object_scene_enabled_)||lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_+tunnel_exit_hold_||m->coordinate_version<coordinate_version_)return;
     SceneSnapshot snap;Json::Value meta;if(!nativeSnapshot(*m,snap,meta))return;
-    if(m->coordinate_version>coordinate_version_){double dx=m->offset_x-frame_x_,dy=m->offset_y-frame_y_;engine_->rebasePlanning(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}frame_x_=m->offset_x;frame_y_=m->offset_y;++route_generation_;}
+    if(m->coordinate_version>coordinate_version_){double dx=m->offset_x-frame_x_,dy=m->offset_y-frame_y_;engine_->rebasePlanning(dx,dy);engine_->rebaseVisibility(dx,dy);for(auto&p:result_.path){p.x+=dx;p.y+=dy;}for(auto&p:last_good_.path){p.x+=dx;p.y+=dy;}for(auto&p:joint_forward_latched_){p.x+=dx;p.y+=dy;}frame_x_=m->offset_x;frame_y_=m->offset_y;++route_generation_;}
     if(engine_->importScene(snap)){
       // The detector's static certificate also admits sparse observed cells.
       // Do not require each new voxel to acquire a second certificate, while
@@ -532,14 +581,22 @@ struct RosAdapter::Impl {
       std::set<int64_t> certified;
       for(const auto&o:m->objects)if(o.confirmed&&o.static_certified&&!o.dynamic_confirmed&&o.motion_state!=o.DYNAMIC)certified.insert(o.id);
       CertifiedTrigger cells;cells.measured_cells=true;cells.stamp=m->header.stamp.toSec();
-      for(size_t i=0;i<m->cells.size();++i)if(certified.count(m->owner_ids[i])&&m->observed[i]&&
-          cells.stamp>=m->seen[i]-.05&&cells.stamp-m->seen[i]<=cfg_.scan_timeout)
+      for(size_t i=0;i<m->cells.size();++i)if(certified.count(m->owner_ids[i])&&
+          (m->fixed[i]||(cells.stamp>=m->seen[i]-.05&&cells.stamp-m->seen[i]<=cfg_.scan_timeout)))
         cells.footprint.push_back({m->cells[i].x,m->cells[i].y,m->cells[i].z});
       engine_->setCertifiedTriggers(cells.footprint.empty()?std::vector<CertifiedTrigger>{}:std::vector<CertifiedTrigger>{cells});
       const double stamp=m->header.stamp.toSec();scene_id_=m->scene_id;coordinate_version_=m->coordinate_version;scene_recv_=ros::Time::now().toSec();scene_input_=meta;
       scene_input_["geometry_digest"]=Json::UInt64(engine_->geometryDigest());scene_input_["geometry_stamp"]=stamp;scene_input_["stamp"]=stamp;scene_input_["scene_id"]=Json::UInt64(m->scene_id);scene_input_["coordinate_version"]=Json::UInt64(m->coordinate_version);scene_input_["mission_mode"]="tunnel";scene_input_["perception_source"]="common_scene";scene_input_["map_version"]=m->map_version;scene_input_["cell_resolution"]=.1;
       std::map<int64_t,unsigned> owner;for(unsigned i=0;i<scene_input_["obstacles"].size();++i){auto&o=scene_input_["obstacles"][i];owner[o["id"].asInt64()]=i;o["occupied_cells_world"]=Json::Value(Json::arrayValue);o["observed_cells_world"]=Json::Value(Json::arrayValue);o["perception_source"]="common_scene";o["collision_geometry_valid"]=true;o["collision_geometry_stamp"]=stamp;o["scene_id"]=Json::UInt64(m->scene_id);o["coordinate_version"]=Json::UInt64(m->coordinate_version);}
       for(size_t i=0;i<m->cells.size();++i){Json::Value xy(Json::arrayValue);xy.append(m->cells[i].x);xy.append(m->cells[i].y);auto&o=scene_input_["obstacles"][owner.at(m->owner_ids[i])];o["occupied_cells_world"].append(xy);if(m->observed[i])o["observed_cells_world"].append(xy);}
+      dynamic_.clear();
+      for(const auto&o:scene_input_["obstacles"]){
+        bool moving=o.get("motion_state","").asString()=="dynamic"||(o.get("dynamic_candidate",false).asBool()&&o.get("observed_motion_valid",false).asBool());
+        double seen=o.get("last_seen",-1e9).asDouble();if(!moving||stamp-seen>.35||stamp<seen-.05)continue;
+        const auto&v=o["velocity_world"];if(!v.isArray()||v.size()<2)continue;
+        for(const auto&q:o["occupied_cells_world"])dynamic_.push_back({q[0].asDouble(),q[1].asDouble(),0,.1,.1,v[0].asDouble(),v[1].asDouble(),.2});
+      }
+      objects_stamp_=stamp;
       scene_input_["collision_objects"]=scene_input_["obstacles"];
       std_msgs::Float64 metric;metric.data=(ros::Time::now().toSec()-stamp)*1000.;planning_age_pub_.publish(metric);
     }
@@ -549,7 +606,7 @@ struct RosAdapter::Impl {
     const auto& scan=root["geometry_scan"];double stamp=scan.get("stamp",-1).asDouble(),now=ros::Time::now().toSec();
     if(now-stamp>cfg_.scan_timeout||stamp>now+.05||!scan["endpoints"].isArray())return;
     std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();
-    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_+tunnel_exit_hold_)return;
     Pose p;if(!interpolate(stamp,p)||stamp<=coordinate_stamp_)return;
     std::vector<Point> returns;double c=std::cos(p.yaw),s=std::sin(p.yaw);
     scene_measured_.clear();scene_verified_cells_.clear();scene_dynamic_.clear();
@@ -580,7 +637,7 @@ struct RosAdapter::Impl {
   }
   void sceneHeartbeat(const ros::TimerEvent&){
     std::lock_guard<std::recursive_mutex>lock(engine_mutex_);syncPoses();
-    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_)return;
+    if(lane_!=3||index_<tunnel_min_-tunnel_prepare_||index_>tunnel_max_+tunnel_exit_hold_)return;
     if(ros::Time::now().toSec()-engine_->lastScan()<=cfg_.scan_timeout)return;
     Json::Value v;v["schema_version"]=1;v["state"]="expired";v["scene_id"]=Json::UInt64(scene_id_);v["geometry_stamp"]=engine_->lastScan();v["map_version"]=map_version_;std_msgs::String m;m.data=Json::FastWriter().write(v);scene_pub_.publish(m);
   }
@@ -624,7 +681,7 @@ struct RosAdapter::Impl {
   // 근거리 JSON(250~870 KB, geometry_scan 포함)은 잠금 밖에서 파싱한다. 점은 안 쓰므로 버린다.
   void objects(const std_msgs::String::ConstPtr&m){if(common_m8_active_)return;Json::Value root;Json::Reader reader;if(!reader.parse(m->data,root))return;
     root.removeMember("geometry_scan");const double stamp=root.get("stamp",ros::Time::now().toSec()).asDouble();
-    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);if((common_scene_||filtered_pipeline_)&&lane_==3)return;latest_objects_.swap(root);objects_stamp_=stamp;
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);if((common_scene_||object_scene_enabled_||filtered_pipeline_)&&lane_==3)return;latest_objects_.swap(root);objects_stamp_=stamp;
   }
   void refreshDynamic(double now){
     dynamic_.clear();if((lane_!=3&&!(lane_==0&&index_>max_idx_))||std::abs(objects_stamp_-now)>.35)return;
@@ -685,7 +742,7 @@ struct RosAdapter::Impl {
       joint_forward_latched_.clear();
     }
     const uint64_t generation=route_generation_,traffic_generation=traffic_revision_;const double scan=engine_->lastScan();
-    engine_->setTunnelConnectedHold(lane_==3&&tunnel_cells_authoritative_);
+    engine_->setTunnelConnectedHold(lane_==3&&(tunnel_cells_authoritative_||object_scene_enabled_));
     auto snapshot=engine_->planningSnapshot();const auto route=route_;Pose current=pose_;current.stamp=now;
     lock.unlock();
     // QP and candidate search must not occupy the safety callback queue/map lock.
@@ -711,7 +768,7 @@ struct RosAdapter::Impl {
     //   회피 노드 consume() 가 0.4~0.8 s 씩 막혔다 -> /local_path 끊김 -> 정지 노드 커버리지 0 -> 순간 서행.
     //   시각화는 구독자가 있을 때만 2 Hz 로.
     if(lane_==3&&service_mode_&&(engine_->lastScan()!=obstacles_encoded_stamp_||engine_->geometryDigest()!=obstacles_encoded_digest_)){
-      obstacles_json_=(common_scene_&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();
+      obstacles_json_=((common_scene_||object_scene_enabled_)&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();
     }
     const double vis_now=ros::Time::now().toSec();
     if(vis_now-last_vis_stamp_>=.5){last_vis_stamp_=vis_now;
@@ -725,7 +782,7 @@ struct RosAdapter::Impl {
     if(lane_==0&&index_>max_idx_&&index_<=4900)recovery_active_=recovery;
     RosAdapter::Output out;out.result=result_;out.recovery=recovery_active_;
     out.plan_stamp=result_stamp_;out.geometry_stamp=engine_->lastScan();
-    out.plan_id=candidate_sequence_;out.geometry_digest=common_scene_&&lane_==3?scene_input_.get("geometry_digest",0).asUInt64():engine_->geometryDigest();out.scene_id=scene_id_;out.coordinate_version=coordinate_version_;
+    out.plan_id=candidate_sequence_;out.geometry_digest=(common_scene_||object_scene_enabled_)&&lane_==3?scene_input_.get("geometry_digest",0).asUInt64():engine_->geometryDigest();out.scene_id=scene_id_;out.coordinate_version=coordinate_version_;
     bool fresh=active()&&now-pose_.stamp<=.25&&now-waypoint_stamp_<=.5&&
       now-engine_->lastScan()<=cfg_.scan_timeout&&now>=engine_->lastScan()-.05;
     if(!fresh){out.rejection="stale_pose_reference_or_geometry";return out;}
@@ -770,6 +827,21 @@ struct RosAdapter::Impl {
         q.pose.position.x=p.x;q.pose.position.y=p.y;q.pose.orientation.z=std::sin(p.yaw/2);q.pose.orientation.w=std::cos(p.yaw/2);out.path.poses.push_back(q);}
     }
     return out;
+  }
+  uint32_t rejected_sequence_=uint32_t(-1);
+  void rejected(uint32_t id,const std::string& reason){
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex_);
+    if(lane_!=3||id!=candidate_sequence_||id==rejected_sequence_)return;
+    bool enabled=true;nh_.param("/tunnel_recovery/repair_path_policy_enabled",enabled,true);
+    if(!enabled)return;
+    if(reason!="occupancy"&&reason!="collision"&&reason!="curvature"&&reason!="no_valid_connector"&&reason!="final_owner_occupancy")return;
+    rejected_sequence_=id;
+    // The rejected geometry is still occupied: the engine must not re-propose it as its held path.
+    // last_good_ stays: consume() re-validates it every cycle (connect) and only a free braking
+    // prefix of it can be published (validated_braking_prefix). Clearing it removed that safe decel.
+    engine_->invalidateHeldPath();
+    result_.clear=false;result_.reason="final_rejected_"+reason;
+    ++route_generation_;replan_pending_=true;
   }
   void published(uint32_t id){
     std::lock_guard<std::recursive_mutex> lock(engine_mutex_);
@@ -817,8 +889,9 @@ struct RosAdapter::Impl {
     Json::Value req,res;Json::Reader reader;if(!reader.parse(msg->data,req))return;
     std::unique_lock<std::recursive_mutex> lock(engine_mutex_);syncPoses();
     double now=ros::Time::now().toSec();res["id"]=req["id"];res["valid"]=false;
-    res["geometry_stamp"]=engine_->lastScan();res["stamp"]=now;
+    res["geometry_stamp"]=engine_->lastScan();res["stamp"]=now;res["scene_id"]=Json::UInt64(scene_id_);res["coordinate_version"]=Json::UInt64(coordinate_version_);
     res["reason"]="stale_geometry_or_pose";
+    if(lane_==3&&object_scene_enabled_&&req.get("coordinate_version",0).asUInt64()!=coordinate_version_){res["reason"]="escape_coordinate_version_changed";std_msgs::String out;out.data=Json::FastWriter().write(res);escape_pub_.publish(out);return;}
     bool zone=(lane_==3&&index_>=tunnel_min_&&index_<=tunnel_max_)||(lane_==0&&index_>max_idx_&&index_<=4900);
     if(zone&&now-pose_.stamp<=.25&&now-engine_->lastScan()<=cfg_.scan_timeout&&now-req.get("stamp",0).asDouble()<.5&&
        !(dynamic_hold_&&now-dynamic_state_stamp_<.5)){
@@ -935,7 +1008,7 @@ struct RosAdapter::Impl {
   double preslowScale(double now)const{double age=now-preslow_stamp_,cap=preslow_cap_;return lane_==3&&age>=-.05&&age<=.35&&std::isfinite(cap)&&cap<9999.?std::max(4.,cap):9999.;}
   void publish(const ros::TimerEvent&){std::lock_guard<std::recursive_mutex> publish_lock(engine_mutex_);syncPoses();
     if(lane_==3&&service_mode_&&(engine_->lastScan()!=obstacles_encoded_stamp_||engine_->geometryDigest()!=obstacles_encoded_digest_)){
-      obstacles_json_=(common_scene_&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();}
+      obstacles_json_=((common_scene_||object_scene_enabled_)&&lane_==3&&!scene_input_.isNull())?compatibilityScene():extractObstacles();obstacles_encoded_stamp_=engine_->lastScan();obstacles_encoded_digest_=engine_->geometryDigest();}
     bool on=active();std_msgs::Bool enabled;enabled.data=on;active_pub_.publish(enabled);
     if(service_mode_){std::lock_guard<std::recursive_mutex> lock(engine_mutex_);syncPoses();publishService(on,ros::Time::now().toSec());return;}
     if(!on){if(previous_active_){std_msgs::Bool fail;fail.data=false;failed_pub_.publish(fail);std_msgs::Float64 release;release.data=9999;speed_pub_.publish(release);scale_pub_.publish(release);}
@@ -1051,3 +1124,5 @@ RosAdapter::RosAdapter(ros::NodeHandle params,bool embedded):impl_(new Impl(para
 RosAdapter::~RosAdapter()=default;
 RosAdapter::Output RosAdapter::consume(const Pose& pose,bool recovery,bool tunnel){return impl_->consume(pose,recovery,tunnel);}
 void RosAdapter::published(uint32_t id){impl_->published(id);}
+
+void occupancy_avoidance::RosAdapter::rejected(uint32_t id,const std::string& reason){impl_->rejected(id,reason);}

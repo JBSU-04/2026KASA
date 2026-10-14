@@ -9,7 +9,7 @@
 #include <vector>
 
 namespace occupancy_avoidance {
-struct Point { double x=0,y=0,z=0; double map_ground=0,map_label=-1; };
+struct Point { double x=0,y=0,z=0; double map_ground=0,map_label=-1; double plan_extra=0; };  // plan_extra: 계획 전용 추가 여유(엔진 내부)
 struct Pose { double stamp=0,x=0,y=0,z=0,yaw=0,speed=0; };
 struct Reference { double x=0,y=0,yaw=0; int idx=0; };
 struct Edge { int first=0,last=0; double right=-1,left=-1; };
@@ -60,6 +60,19 @@ struct Config {
   //   wall_surface_band: 벽 경계 이 거리 안쪽 점은 벽면으로 보고 장애물에서 뺀다(setWallSurfaceBand 로 터널만).
   double ceiling_skip_height=3.2;
   double wall_surface_band=0.0;
+  // 2026-10-14(13:00:31, 13:01:26 백) 터널 회피 경로 보강.
+  //   tunnel_return_observed_free: 복귀(기준경로로 돌아오기)는 차체 범위의 지면이 실제로 관측된 곳으로만.
+  //     확정 전 저상 장애물 자리를 '비어 있음'으로 보고 그 위로 복귀 경로를 그렸다(13:01 정면 관통).
+  //   tunnel_hold_extra_clearance: 유지 경로는 보통 여유 + 이 값(자차 앞 부분)까지 통과할 때만 그대로 쓴다.
+  //     새 장애물이 0.2 m 옆에 생겨도 유지하다 칸이 커져 갑자기 무효가 됐다(13:00). 재계획 실패 시엔 유지 경로를 쓴다.
+  //   tunnel_new_obstacle_margin: 처음 본 지 tunnel_new_obstacle_sec 안 된 칸·낮은(tunnel_low_obstacle_height 미만) 칸에
+  //     계획할 때만 더 띄운다(충돌 판정 여유는 그대로). 이 여유로 통로가 없으면 여유 없이 다시 계획한다.
+  bool tunnel_return_observed_free=true;double return_observed_ratio=.7;
+  // 2026-10-14(18:16 백): 장면 수신(importScene) 때 지면 관측 칸을 지우지 않고 누적한다(visibilityHorizon 동안).
+  //   병합 노드 장면은 그 스캔의 지면만 실어 차 주변 사각지대가 늘 미관측 -> 복귀·후진 관측 조건이 항상 거짓이었다.
+  bool scene_visibility_memory=true;
+  double tunnel_hold_extra_clearance=.4;
+  double tunnel_new_obstacle_margin=.3,tunnel_new_obstacle_sec=1.5,tunnel_low_obstacle_height=.5;
   // 통로 안 목표를 '허용 경계 + corridor_target_extra' 로 장애물에서 더 띄운다(최소 간격과 별개).
   //   2026-10-09(14:57:05 백): 0.4 m 라 회피 경로가 장애물 크기에 비해 넓었다. 터널은 0.15 m.
   double corridor_target_extra=0.4;
@@ -107,6 +120,7 @@ class Engine {
   bool importScene(const SceneSnapshot&);
   void rebasePlanning(double dx,double dy);
   void rebaseEvidence(double dx,double dy);
+  void rebaseVisibility(double dx,double dy);
   void setNearMemory(double seconds){cfg_.near_memory_sec=seconds;}
   void setStrictSceneMargins(bool enabled){strict_scene_margins_=enabled;}
   void setContinuousTransition(bool enabled){continuous_transition_=enabled;}
@@ -170,7 +184,7 @@ class Engine {
   double visibility_shift_x_=0,visibility_shift_y_=0;
   std::map<uint64_t,std::pair<Point,double>> ray_clear_receipts_;
   mutable std::array<double,2> collision_location_{{NAN,NAN}};
-  struct Evidence { Point p; int hits=0,misses=0; double first=0,last=0,last_clear=0; bool fixed=false; };
+  struct Evidence { Point p; int hits=0,misses=0; double first=0,last=0,last_clear=0; bool fixed=false; double height=0; };
   Config cfg_;
   std::unique_ptr<octomap::OcTree> tree_;
   std::map<uint64_t,Evidence> evidence_;
@@ -217,6 +231,9 @@ class Engine {
   const Reference* nearestRoad(double x,double y) const;
   bool roadInside(double x,double y,double inset,double* clearance=nullptr) const;
   bool bodyClear(const Reference&,double now,std::string* reason=nullptr) const;
+  bool observedFree(const Reference&,double now) const;
+  double observedFraction(const Reference&,double now) const;
+  mutable bool plan_extra_active_=false;
   bool liveBoundaryApplies(int idx) const;
   void updateMotion(Result&,const Pose&,const std::vector<Reference>&);
   void rebuild(double now);

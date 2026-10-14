@@ -576,3 +576,74 @@ TEST(Admission,FilteredTunnelCellsCannotApproveWithoutMissionCertificate){
   CertifiedTrigger h;h.stamp=1.2;h.footprint={{302521.,4123999.6,0},{302522.,4123999.6,0},{302522.,4124000.5,0},{302521.,4124000.5,0}};
   e.setCertifiedTriggers({h});auto approved=e.planningSnapshot()->plan(pose(1.2),road());EXPECT_GT(approved.trigger_count,0);
 }
+
+// 2026-10-14(13:00:31, 13:01:26 백) 터널: 사고 현장(A)을 왼쪽으로 지난 뒤, 15 m 뒤 아직 확정 안 된 저상 장애물(B) 자리로
+//   일찍 복귀하는 경로 -> B 가 늦게 보여 무효 -> 재계획 실패. 관측된 빈 곳으로만 복귀, 유지 경로 추가 여유.
+namespace {
+const double OFF=3.8;  // 자차 횡위치(왼쪽 우회 중, 실제 백 +3.8)
+std::vector<Reference> tunnelRoad(){std::vector<Reference> r;for(int i=0;i<=800;++i)r.push_back({302500.+i*.1,4124000.,0,7400+i});return r;}
+Pose tpose(double stamp){return {stamp,302500.,4124000.+OFF,0,0,4};}
+// 센서 좌표(자차 기준) 장면: 지면(가려진 칸 제외) + A(차량) + 선택적 B(저상 장애물, 지면 위 0.35 m)
+std::vector<Point> scene(bool b_visible,double b_lat_lo,double b_lat_hi,bool hide_b_ground){
+  std::vector<Point> p;
+  for(double x=4;x<40;x+=.5)for(double y=-8;y<=4;y+=.5){
+    double lat=y+OFF;
+    if(hide_b_ground&&x>=20&&x<=30&&lat>=-1.&&lat<=2.)continue;  // B 자리와 그 뒤 그림자: 지면 미관측
+    p.push_back({x,y,-1.765});}
+  for(double x=6;x<=10;x+=.1)for(double lat=-1.;lat<=1.8;lat+=.1)p.push_back({x,lat-OFF,-1.0});          // A: 차량 높이(왼쪽 끝 +1.8)
+  if(b_visible)for(double x=24;x<=25.2;x+=.1)for(double lat=b_lat_lo;lat<=b_lat_hi;lat+=.1)p.push_back({x,lat-OFF,-1.765+.35});
+  return p;
+}
+double latAt(const std::vector<Reference>& path,double x){double best=1e9,lat=0;
+  for(const auto&q:path){double d=std::abs(q.x-(302500.+x));if(d<best){best=d;lat=q.y-4124000.;}}return lat;}
+}
+TEST(TunnelReturn,UnobservedLowObstacleSpotIsNotAReturnTarget){
+  for(bool gate:{false,true}){SCOPED_TRACE(gate?"gate":"legacy");
+    Config c;c.trigger_enabled=false;c.tunnel_return_observed_free=gate;c.tunnel_hold_extra_clearance=0;c.tunnel_new_obstacle_margin=0;
+    Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+    auto p=scene(false,0,0,true);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);
+    auto r=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(r.clear)<<r.reason;
+    const double lat=latAt(r.path,24.5);
+    if(gate)EXPECT_GT(lat,2.5)<<"관측 안 된 B 자리로 복귀하면 안 된다";
+    else EXPECT_LT(lat,2.0)<<"이전 동작: A 뒤로 바로 복귀(회귀 기준)";
+  }
+}
+TEST(TunnelReturn,ObservedFreeStretchStillReturns){
+  Config c;c.trigger_enabled=false;c.tunnel_hold_extra_clearance=0;c.tunnel_new_obstacle_margin=0;
+  Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+  auto p=scene(false,0,0,false);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);
+  auto r=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(r.clear)<<r.reason;
+  EXPECT_LT(std::abs(latAt(r.path,32.)),2.0)<<"지면이 보이는 빈 구간에서는 지금처럼 복귀";
+}
+TEST(TunnelHold,NewObstacleBesideHeldPathTriggersReplan){
+  for(double extra:{0.,.4}){SCOPED_TRACE(extra);
+    Config c;c.trigger_enabled=false;c.tunnel_hold_extra_clearance=extra;c.tunnel_new_obstacle_margin=0;
+    Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+    auto p=scene(false,0,0,true);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);  // B 자리 미관측 -> 첫 경로는 옆 유지
+    auto first=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(first.clear)<<first.reason;
+    // 유지 경로 오른쪽 0.35 m 에 B 가 나타남(보통 여유 0.27 은 통과, 추가 여유 포함 0.67 은 미통과)
+    double lo=1e9;for(double x=23.;x<=27.;x+=.2)lo=std::min(lo,latAt(first.path,x));
+    const double edge=lo-.95-.35;ASSERT_GT(edge,.5);
+    auto q=scene(true,edge-1.2,edge,true);for(int i=0;i<4;++i)e.integrate(tpose(1.3+i*.1),q);
+    auto second=e.plan(tpose(1.65),tunnelRoad());ASSERT_TRUE(second.clear)<<second.reason;
+    if(extra>0){EXPECT_NE(second.reason,"held_valid_path");EXPECT_GT(latAt(second.path,24.6)-.95-edge,.35);}
+    else EXPECT_EQ(second.reason,"held_valid_path");
+  }
+}
+
+// 2026-10-14(18:16 백): 병합 노드 장면은 그 스캔 지면만 싣는다. 장면을 다시 받아도 앞서 관측한 지면 칸은
+//   visibilityHorizon 동안 남아야 복귀·후진 관측 조건이 실제로 쓸 수 있다. 끄면 이전처럼 매 장면 교체.
+TEST(SceneVisibility,AccumulatesAcrossImportsAndRebases){
+ auto make=[](double stamp,std::vector<std::array<double,3>> vis){SceneSnapshot s;s.pose=pose(stamp);s.visibility=std::move(vis);return s;};
+ auto has=[](const Engine&e,int x,int y){for(const auto&v:e.exportScene().visibility)if(int(v[0])==x&&int(v[1])==y)return true;return false;};
+ Engine e;ASSERT_TRUE(e.importScene(make(1.,{{605000,8248000,1.}})));
+ ASSERT_TRUE(e.importScene(make(1.1,{{605004,8248000,1.1}})));
+ EXPECT_TRUE(has(e,605000,8248000));EXPECT_TRUE(has(e,605004,8248000));
+ ASSERT_TRUE(e.importScene(make(200.,{})));
+ EXPECT_FALSE(has(e,605000,8248000))<<"older than the visibility horizon";
+ Engine r;ASSERT_TRUE(r.importScene(make(1.,{{605000,8248000,1.}})));r.rebaseVisibility(1.,0.);
+ EXPECT_TRUE(has(r,605002,8248000));EXPECT_FALSE(has(r,605000,8248000));
+ Config c;c.scene_visibility_memory=false;Engine old(c);
+ ASSERT_TRUE(old.importScene(make(1.,{{605000,8248000,1.}})));ASSERT_TRUE(old.importScene(make(1.1,{{605004,8248000,1.1}})));
+ EXPECT_FALSE(has(old,605000,8248000));EXPECT_TRUE(has(old,605004,8248000));
+}

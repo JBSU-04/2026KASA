@@ -1,0 +1,89 @@
+# Curb constraints participate in connected-corridor search AND QP bounds.
+# A path center cannot enter the 0.95 + 0.10 = 1.05m strip inside the curb.
+vehicle_half_width: 0.95
+curb_margin: 0.10
+obstacle_margin: 0.20
+resolution: 0.10
+# 2026-10-05(20:22 백): 0.06 은 노면 잡음(0.01~0.07 m, 교차로 경사 +0.09 m)을 장애물로 잡아
+#   첫 장애물에서 우측이 막힌 것으로 보고 좌측 회피, idx 3305/3345 에 도로 가로 '벽'(no_connected_corridor).
+#   코스 장애물 최저 0.30 m, 기존 인지 하한 ~0.25 m. 이전 값은 avoidance.yaml.bak_embedhold_20261005.
+min_height: 0.15
+# 2026-10-06(13:00/13:01 백): 0.15 만 쓰면 저상 장애물(0.2~0.5 m)을 13~15 m 에서야 잡았다(0.06 일 때 24 m).
+#   인지가 확정한 정적 물체 footprint(+0.3 m) 안의 실측 점만 0.06 부터 점유로 본다(노면 잡음은 계속 0.15 로 거름).
+certified_min_height: 0.06
+certified_margin: 0.3
+# 인지 확정 외곽을 실측 전 임시 장애물로 쓰기: 재생에서 효과 2 m, 원거리 외곽 흔들림으로 실패 9 -> 27 이라 끈다.
+certified_far_proxy: false
+max_height: 2.8
+target_speed_mps: 8.333 # 30km/h; existing MPC/mission caps still apply
+max_curvature: 0.18
+# 2026-10-06: 2.5 -> 3.0 (MPC avoidance_control/lateral_accel_limit_mps2 3.0 과 일치, 랩타임)
+max_lateral_accel: 3.0
+# 회피 중 속도 상한(경로 모양용 target_speed=8.33 과 분리). 30 = 고정 8.33 대신 곡률/MPC 회피 곡률 상한에 맡김.
+#   MPC 는 상한 < 500 일 때 회피 모드(횡가속 3.0 곡률 상한)로 동작한다.
+avoid_speed_ceiling_mps: 30.0
+# Start the first avoidance approach before M2; mission labels stay unchanged.
+static_planning_start_idx: 2100
+map_length_m: 80.0 # forward occupancy coverage 60m, including vehicle front
+approach_horizon_m: 50.0 # idx 2100..2399 only; reference length may clip this
+approach_obstacle_margin_m: 0.20 # admission corridor handles early relevance, geometry stays unchanged
+horizon_m: 40.0 # same effective 40 knots as before for the second obstacle/M8
+scan_timeout: 0.35
+# After obstacles: release offset history only in a body-clear reference tail.
+return_min_distance_m: 12.0
+return_min_time_sec: 2.0
+return_offset_tolerance_m: 0.20
+return_center_weight: 2.0
+# 2026-10-06(16:41:24 백): 장애물 직후 목표가 바로 0 이라 12~13 m 만에 복귀, MPC 가 반대쪽으로 +0.3 m 넘어감.
+#   복귀 앞부분 max(10 m, 속도 x 3 s) 동안 목표·중앙 가중을 서서히 0 으로(재생: 13:01 7.8 -> 15~19 m, 실패 증가 없음).
+return_ramp_time_sec: 3.0
+# corridor 경로 끝단 5차 연결 실험(재생에서 이득 없음) - 기본 끔. 실제 복귀는 위 spatial_return 이 담당.
+return_quintic_enabled: false
+return_overshoot_m: 0.10
+# Legacy new_lane spatial return defaults, independent of MPC fitting.
+spatial_return_max_lat_accel: 1.5
+# 2026-10-06(17:09:45 백): 8.0 이면 장애물 직후 차가 이미 중앙 쪽으로 기운 상태라 5차 복귀가 모두 탈락(return_dynamics),
+#   장애물 끝 +10 m 까지 장애물 옆에서 만든 오래된 경로를 유지해 차가 바깥으로 나갔다 급하게 복귀했다.
+#   12 면 4 개 백 모두 장애물 끝 +2.4~3.5 m 에서 실제 상태 기준 5차 복귀(코리도 검증 포함)가 시작된다(실패 증가 없음).
+spatial_return_max_lat_jerk: 12.0
+spatial_return_min_speed: 4.5
+spatial_return_min_transition_m: 6.0
+spatial_return_max_transition_m: 32.0
+cruise_offset_m: 0.15
+cruise_heading_deg: 3.0
+cruise_path_offset_m: 0.20
+cruise_preview_m: 8.0
+cruise_hold_sec: 0.5
+# A straight measured wall must not be extrapolated into a curved entrance.
+live_boundary_distance_m: 6.0
+# 2026-10-07 터널 정지(21:05~21:08 백): 천장/벽 점이 integrate(44~272 ms/프레임)를 무겁게 해 엔진 잠금 -> stale -> 회피 실패 -> 긴급제동.
+ceiling_skip_height: 3.2 # 지면 위 이 높이 넘는 점은 누적·광선추적 제외 [m] (max_height 2.8 + 0.4)
+tunnel_wall_surface_band: 0.9 # 터널(3.csv)에서 벽 경계 이 거리 안쪽 점은 벽면(장애물 아님) [m] (10-07 0.6 -> 0.9: 15:11 백 벽 0.5~1.0 m 칸 9~36 개 남음. 차 중심은 경계 1.05 m 안)
+live_boundary_heading_deg: 5.0
+tunnel_min_idx: 7000
+tunnel_max_idx: 9000
+
+# Admission only; never crop stored occupancy or candidate collision checks.
+trigger_enabled: true
+# 2026-10-05: 기준경로 코리도(2차) 정적/동적/음영 모두 1.3 m(반폭)
+trigger_corridor_half_width_m: 1.3
+trigger_distance_m: 32.0
+trigger_hold_sec: 3.0
+tl_guard_range_m: 80.0
+tl_input_timeout_sec: 0.7
+tl_hold_gap_min_m: 10.0
+tl_hold_gap_m: 20.0
+tl_hold_decel_mps2: 1.5
+
+# Recovery-only rear map coverage; M2 retains its existing 5m rear observation.
+recovery_rear_observation_m: 15.0
+# 통로 안 목표를 허용 경계에서 더 띄우는 거리(최소 간격 obstacle_margin 과 별개). 2026-10-09: 터널 회피 경로가 넓어 0.15 m.
+corridor_target_extra_m: 0.4
+tunnel_corridor_target_extra_m: 0.15
+# 2026-10-14(13:00:31, 13:01:26 백) 터널 회피 경로 보강. 사고 현장 뒤 저상 장애물 위로 일찍 복귀 -> 늦게 보여 경로 무효 -> 재계획 실패.
+tunnel_return_observed_free: true # 복귀는 차체 범위 지면이 관측된 곳으로만(false: 이전 동작)
+tunnel_return_observed_ratio: 0.7 # 차체 범위 0.5 m 칸 중 관측 비율
+tunnel_hold_extra_clearance_m: 0.4 # 유지 경로(자차 앞 부분)가 보통 여유 + 이 값을 통과해야 유지, 아니면 재계획(실패 시 유지). 0: 끔
+tunnel_new_obstacle_margin_m: 0.3 # 새(처음 본 지 1.5 s 미만)·낮은(0.5 m 미만) 칸에 계획 전용 추가 여유. 통로 없으면 여유 없이 재계획. 0: 끔
+tunnel_new_obstacle_sec: 1.5
+tunnel_low_obstacle_height_m: 0.5

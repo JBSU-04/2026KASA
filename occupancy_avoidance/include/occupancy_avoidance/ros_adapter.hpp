@@ -18,6 +18,7 @@ class RosAdapter {
   ~RosAdapter();
   Output consume(const Pose&,bool recovery,bool tunnel=false);
   void published(uint32_t plan_id);
+  void rejected(uint32_t plan_id,const std::string& reason);
  private:
   struct Impl;std::unique_ptr<Impl> impl_;
 };

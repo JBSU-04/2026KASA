@@ -18,6 +18,9 @@
 #include <thread>
 using namespace tunnel_map;
 class Filter {
+  ros::Subscriber preslow_sub_;ros::Publisher preslow_pub_,preslow_ms_;sensor_msgs::PointCloud2ConstPtr pending_preslow_;Confirmation preslow_confirmation_;bool repaired_preslow_=true;
+  // 2026-10-13: 본 처리의 배경 조회 보정(X-ICP 정합 + 벽 정렬)을 선서행 비교에도 같은 스캔 기준으로 쓴다.
+  double lookup_dx_=0,lookup_dy_=0,lookup_stamp_=-1e9;
   ros::NodeHandle nh_,pnh_{"~"};ros::Subscriber odom_,cloud_,nonground_,section_,registration_,near_filtered_,far_filtered_;ros::Publisher classified_,foreground_,background_,state_,map_pub_,filtered_,filter_state_;ros::Timer map_timer_;
   occupancy_avoidance::TunnelRegion region_;
   Map map_;bool map_valid_=false,enabled_=true;Confirmation confirmation_;V sensor_{1.1,0,1.33};double sensor_height_=1.765,max_age_=.35,min_height_=.08;
@@ -120,13 +123,13 @@ class Filter {
           V b=q+sensor_,w(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
           before+=map_.matches(w,map_.distance);w.x()+=trial.x-lookup.x;w.y()+=trial.y-lookup.y;after+=map_.matches(w,map_.distance);++counts[q.y()>0?0:1];}
         if(after>before+.10*(counts[0]+counts[1]))lookup=trial;else wall_alignment_.valid=false;
-      }}std::vector<Row> rows;
+      }}lookup_dx_=lookup.x-pose.x;lookup_dy_=lookup.y-pose.y;lookup_stamp_=stamp;std::vector<Row> rows;
     if(filtered_pipeline_){
       const double c=std::cos(lookup.yaw),sn=std::sin(lookup.yaw);rows.reserve(points.size());
       for(size_t i=0;i<points.size();++i){Row v;v.sensor=points[i];float h;std::memcpy(&h,m->data.data()+i*m->point_step+12,4);
         v.height=h;v.valid=std::isfinite(h);v.ground=v.sensor.z()-h;V b=v.sensor+sensor_;
         v.world=V(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
-        v.bg=map_valid_&&map_.matches(v.world,map_.distance);
+        v.bg=map_valid_&&(map_.wall_surface_background?map_.backgroundMatches(v.world,h,v.valid):map_.matches(v.world,map_.distance));
         v.candidate=map_valid_&&v.valid&&!v.bg&&h>=min_height_&&h<=2.8;
         v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);
       }
@@ -137,6 +140,30 @@ class Filter {
     lookup_cache_.push_back(lookup);while(lookup_cache_.size()>10)lookup_cache_.pop_front();
     if(ros::Time::now().toSec()-stamp>max_age_||!active_)return;publishCloud(classified_,m->header,rows,0);publishCloud(foreground_,m->header,rows,1);if(background_.getNumSubscribers())publishCloud(background_,m->header,rows,2);
     Json::Value st;st["backend"]="cpp";st["input_contract"]=filtered_pipeline_?"m2_filtered_near_far":"legacy_raw";st["map_version"]=map_path_;st["stamp"]=stamp;st["map_valid"]=map_valid_;int bg=0,cand=0,confirmed=0,unknown=0,cgu=0;for(const auto&r:rows){bg+=r.bg;cand+=r.candidate;confirmed+=r.label>=3;unknown+=!r.bg&&!r.valid;cgu+=r.label==4;}st["background"]=bg;st["candidate"]=cand;st["confirmed"]=confirmed;st["confirmed_ground_unknown"]=cgu;st["unknown"]=unknown;st["registration_age_sec"]=std::isfinite(registration_age)?Json::Value(registration_age):Json::Value();st["wall_alignment_valid"]=wall_alignment_.valid;st["wall_alignment_lateral_m"]=wall_alignment_.lateral;st["wall_alignment_left_support"]=wall_alignment_.left;st["wall_alignment_right_support"]=wall_alignment_.right;st["lookup_delta_xy"].append(lookup.x-pose.x);st["lookup_delta_xy"].append(lookup.y-pose.y);st["compute_ms"]=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();raw_compute_ms_=st["compute_ms"].asDouble();raw_compute_stamp_=stamp;std_msgs::String msg;msg.data=Json::FastWriter().write(st);state_.publish(msg);}
+  void processPreslow(const sensor_msgs::PointCloud2ConstPtr&m){
+    auto begin=std::chrono::steady_clock::now();double stamp=m->header.stamp.toSec();Pose pose;
+    const double age=ros::Time::now().toSec()-stamp;
+    if(!map_valid_||m->header.frame_id!="velodyne_ground"||!poseAt(stamp,pose)||!active_||age<-.05||age>max_age_)return;
+    int ho=-1;for(const auto&f:m->fields)if(f.name=="ground_relative"&&f.datatype==sensor_msgs::PointField::FLOAT32)ho=f.offset;
+    if(ho<0||ho+4>int(m->point_step))return;
+    auto points=xyz(*m);if(points.size()!=size_t(m->width)*m->height)return;
+    // Background lookup only (same registration/wall alignment as the main scan); without it an empty wall
+    // under DR lateral drift mismatches the map and becomes a preslow candidate.
+    Pose lookup=pose;if(std::abs(stamp-lookup_stamp_)<=.2){lookup.x+=lookup_dx_;lookup.y+=lookup_dy_;}
+    map_.beginScan();double c=std::cos(lookup.yaw),sn=std::sin(lookup.yaw);std::vector<Row>rows;rows.reserve(points.size());
+    for(size_t i=0;i<points.size();++i){Row v;v.sensor=points[i];float h;size_t row=i/m->width,col=i%m->width;std::memcpy(&h,m->data.data()+row*m->row_step+col*m->point_step+ho,4);
+      v.height=h;v.valid=std::isfinite(h);v.ground=v.sensor.z()-h;V b=v.sensor+sensor_;
+      v.world=V(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
+      // Preserve the existing floor-specific tolerance; a 9cm object
+      // must not match road merely because wall tolerance is 12cm.
+      v.bg=map_.backgroundMatches(v.world,h,v.valid);v.candidate=v.valid&&!v.bg&&h>=min_height_&&h<=2.8;
+      v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);}
+    for(auto&r:rows){r.world.x()+=pose.x-lookup.x;r.world.y()+=pose.y-lookup.y;}  // 확인 이력은 본 처리처럼 자세 좌표
+    preslow_confirmation_.update(rows,stamp);
+    if(ros::Time::now().toSec()-stamp>max_age_||!active_)return;
+    publishCloud(preslow_pub_,m->header,rows,0);
+    std_msgs::Float64 ms;ms.data=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();preslow_ms_.publish(ms);
+  }
   void farCloud(const sensor_msgs::PointCloud2::ConstPtr&m){if(!enabled_||!active_||ros::Time::now().toSec()-section_time_>1)return;{std::lock_guard<std::mutex>lock(queue_mutex_);pending_far_=m;}cv_.notify_one();}
   void processFar(const sensor_msgs::PointCloud2ConstPtr&m){double stamp=m->header.stamp.toSec(),age=ros::Time::now().toSec()-stamp;
     if(age<-.05||age>max_age_||m->header.frame_id!="velodyne_ground"||!active_||!map_valid_||m->is_bigendian)return;
@@ -148,13 +175,13 @@ class Filter {
     for(size_t i=0;i<points.size();++i){size_t row=i/m->width,col=i%m->width;Row v;v.sensor=points[i];float h;std::memcpy(&h,m->data.data()+row*m->row_step+col*m->point_step+ho,4);
       v.height=h;v.valid=std::isfinite(h);v.ground=v.sensor.z()-h;V b=v.sensor+sensor_;
       v.world=V(lookup.x+c*b.x()-sn*b.y(),lookup.y+sn*b.x()+c*b.y(),lookup.z+b.z());
-      v.bg=map_.matches(v.world,map_.distance);v.candidate=v.valid&&!v.bg&&h>=min_height_&&h<=2.8;v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);}
+      v.bg=map_.backgroundMatches(v.world,h,v.valid);v.candidate=v.valid&&!v.bg&&h>=min_height_&&h<=2.8;v.label=v.bg?1:(v.candidate?2:0);rows.push_back(v);}
     for(auto&r:rows){r.world.x()+=pose.x-lookup.x;r.world.y()+=pose.y-lookup.y;}far_confirmation_.update(rows,stamp);
     if(ros::Time::now().toSec()-stamp>max_age_)return;publishCloud(classified_far_,m->header,rows,0);}
   void mapView(const ros::TimerEvent&){if(!active_||!map_valid_||!map_pub_.getNumSubscribers())return;Pose pose;{std::lock_guard<std::mutex>lock(pose_mutex_);if(poses_.empty())return;pose=poses_.back();}visualization_msgs::Marker m;m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns="active_gps_3d_map";m.id=0;m.type=m.POINTS;m.action=m.ADD;m.pose.orientation.w=1;m.scale.x=m.scale.y=.12;m.color.r=.15;m.color.g=.45;m.color.b=1;m.color.a=.45;m.lifetime=ros::Duration(2.);std::set<std::array<int,3>>seen;
     for(const auto&p:*map_.points){double x=p.x+map_.origin.x(),y=p.y+map_.origin.y();if(std::abs(x-pose.x)>45||std::abs(y-pose.y)>45)continue;std::array<int,3>key{int(std::floor(p.x/.3)),int(std::floor(p.y/.3)),int(std::floor(p.z/.3))};if(!seen.insert(key).second)continue;geometry_msgs::Point q;q.x=x;q.y=y;q.z=p.z+map_.origin.z();m.points.push_back(q);if(m.points.size()>=30000)break;}visualization_msgs::MarkerArray a;a.markers.push_back(m);map_pub_.publish(a);}
  public:
-  Filter(){pnh_.param("join_only",join_only_,false);nh_.param("/tunnel_recovery/filtered_pipeline_enabled",filtered_pipeline_,false);nh_.param("/tunnel_recovery/raw_detection_residual_enabled",legacy_raw_detection_,false);nh_.param<std::string>("/tunnel_recovery/heading_mode",heading_mode_,"existing");region_=occupancy_avoidance::TunnelRegion::load(nh_);bool master=true;nh_.param("/tunnel_recovery/enabled",master,true);pnh_.param("enabled",enabled_,true);enabled_&=master;pnh_.param<std::string>("map_binary",map_path_,"");pnh_.param("background_distance_m",map_.distance,.12);pnh_.param("floor_distance_m",map_.floor_distance,.055);pnh_.param("min_height_m",min_height_,.08);pnh_.param("max_scan_age_sec",max_age_,.35);pnh_.param("min_points",confirmation_.min_points,3);pnh_.param("confirm_scans",confirmation_.scans,2);pnh_.param("observation_memory_sec",confirmation_.memory,.35);pnh_.param("common_wall_alignment",common_wall_alignment_,true);nh_.param("/tunnel_recovery/unified_detection_input_enabled",unified_input_,true);nh_.param("/tunnel_recovery/verified_background_filter_enabled",detector_mask_,true);pnh_.param("allow_unknown_ground_confirmation",confirmation_.allow_unknown_ground,false);nh_.param("/lidar_extrinsic/z_from_ground",sensor_height_,1.765);pnh_.param("sensor_x",sensor_.x(),1.1);nh_.param("/lidar_extrinsic/y",sensor_.y(),0.);pnh_.param("sensor_z",sensor_.z(),1.33);
+  Filter(){pnh_.param("join_only",join_only_,false);nh_.param("/tunnel_recovery/filtered_pipeline_enabled",filtered_pipeline_,false);nh_.param("/tunnel_recovery/wall_surface_background_enabled",map_.wall_surface_background,true);nh_.param("/tunnel_recovery/raw_detection_residual_enabled",legacy_raw_detection_,false);nh_.param<std::string>("/tunnel_recovery/heading_mode",heading_mode_,"existing");region_=occupancy_avoidance::TunnelRegion::load(nh_);bool master=true;nh_.param("/tunnel_recovery/enabled",master,true);pnh_.param("enabled",enabled_,true);enabled_&=master;pnh_.param<std::string>("map_binary",map_path_,"");pnh_.param("background_distance_m",map_.distance,.12);pnh_.param("floor_distance_m",map_.floor_distance,.055);pnh_.param("min_height_m",min_height_,.08);pnh_.param("max_scan_age_sec",max_age_,.35);pnh_.param("min_points",confirmation_.min_points,3);pnh_.param("confirm_scans",confirmation_.scans,2);pnh_.param("observation_memory_sec",confirmation_.memory,.35);pnh_.param("common_wall_alignment",common_wall_alignment_,true);nh_.param("/tunnel_recovery/unified_detection_input_enabled",unified_input_,true);nh_.param("/tunnel_recovery/verified_background_filter_enabled",detector_mask_,true);pnh_.param("allow_unknown_ground_confirmation",confirmation_.allow_unknown_ground,false);nh_.param("/lidar_extrinsic/z_from_ground",sensor_height_,1.765);pnh_.param("sensor_x",sensor_.x(),1.1);nh_.param("/lidar_extrinsic/y",sensor_.y(),0.);pnh_.param("sensor_z",sensor_.z(),1.33);
     pnh_.param("voxel_search_enabled",map_.voxel_search,true);
     total_ms_=nh_.advertise<std_msgs::Float64>("/tunnel/map_total_processing_ms",1);queue_ms_=nh_.advertise<std_msgs::Float64>("/tunnel/map_input_age_ms",1);
     try{if(enabled_&&!join_only_){map_.load(map_path_);map_valid_=true;}}catch(const std::exception&e){ROS_ERROR("[tunnel_map_filter] %s; UNKNOWN retained",e.what());}
@@ -163,11 +190,17 @@ class Filter {
     filtered_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/nonground_filtered",1);filter_state_=nh_.advertise<std_msgs::String>("/tunnel/nonground_filter_state",1);if(!filtered_pipeline_&&!join_only_)nonground_=nh_.subscribe(nonground_input,1,&Filter::nonground,this);
     if(join_only_)mission_points_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/filtered_points",1);
     if(join_only_&&filtered_pipeline_){near_filtered_=nh_.subscribe<sensor_msgs::PointCloud2>("/tunnel/filtered_near",1,[this](const sensor_msgs::PointCloud2ConstPtr&m){filteredInput(m,true);});far_filtered_=nh_.subscribe<sensor_msgs::PointCloud2>("/tunnel/filtered_far",1,[this](const sensor_msgs::PointCloud2ConstPtr&m){filteredInput(m,false);});}
-    odom_=nh_.subscribe("/odom",100,&Filter::odom,this);if(!join_only_)cloud_=nh_.subscribe(filtered_pipeline_?"/tunnel/filtered_points":"/perception/points_gravity",1,&Filter::cloud,this);registration_=nh_.subscribe("/tunnel/xicp/yaw_measurement",1,&Filter::registration,this);section_=nh_.subscribe<mission_supervisor::SectionState>("/mission/active_section",1,[this](const mission_supervisor::SectionState::ConstPtr&m){active_=m->index_valid&&region_.prepares(m->csv,m->index);section_time_=ros::Time::now().toSec();});map_timer_=nh_.createTimer(ros::Duration(1.),&Filter::mapView,this);
+    odom_=nh_.subscribe("/odom",100,&Filter::odom,this);if(!join_only_)cloud_=nh_.subscribe(filtered_pipeline_?"/tunnel/filtered_points":"/perception/points_gravity",1,&Filter::cloud,this);registration_=nh_.subscribe("/tunnel/xicp/yaw_measurement",1,&Filter::registration,this);section_=nh_.subscribe<mission_supervisor::SectionState>("/mission/active_section",1,[this](const mission_supervisor::SectionState::ConstPtr&m){active_=m->index_valid&&region_.serves(m->csv,m->index);section_time_=ros::Time::now().toSec();});map_timer_=nh_.createTimer(ros::Duration(1.),&Filter::mapView,this);
     pnh_.param("far_classification",far_classification_,true);far_confirmation_=confirmation_;
-    if(filtered_pipeline_&&!join_only_&&far_classification_){classified_far_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_classified_far",1);far_cloud_=nh_.subscribe("/tunnel/filtered_far",1,&Filter::farCloud,this);}
-    worker_=std::thread([this](){while(!quit_){sensor_msgs::PointCloud2ConstPtr msg,ng,far;{std::unique_lock<std::mutex>lock(queue_mutex_);cv_.wait_for(lock,std::chrono::milliseconds(10),[this](){return pending_||pending_far_||quit_||(pending_ng_&&(ros::Time::now().toSec()-pending_ng_->header.stamp.toSec()>max_age_||std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[this](const Pose&p){return std::abs(p.stamp-pending_ng_->header.stamp.toSec())<1e-6;})));});if(quit_)break;msg=pending_;pending_.reset();far=pending_far_;pending_far_.reset();}
+    if(filtered_pipeline_&&!join_only_&&far_classification_){classified_far_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/map_classified_far",1);bool verified=false;nh_.param("/tunnel_recovery/verified_wall_surface_only_enabled",verified,false);far_cloud_=nh_.subscribe(verified?"/tunnel/filtered_background_input":"/tunnel/filtered_far",1,&Filter::farCloud,this);}
+    nh_.param("/tunnel_recovery/repair_preslow_policy_enabled",repaired_preslow_,true);
+    if(!join_only_&&repaired_preslow_){preslow_confirmation_=confirmation_;preslow_confirmation_.allow_unknown_ground=false;
+      preslow_pub_=nh_.advertise<sensor_msgs::PointCloud2>("/tunnel/preslow_classified",1);
+      preslow_ms_=nh_.advertise<std_msgs::Float64>("/tunnel/preslow_map_processing_ms",1);
+      preslow_sub_=nh_.subscribe<sensor_msgs::PointCloud2>("/tunnel/preslow_input",1,[this](const sensor_msgs::PointCloud2ConstPtr&m){if(!active_)return;{std::lock_guard<std::mutex>lock(queue_mutex_);pending_preslow_=m;}cv_.notify_one();});}
+    worker_=std::thread([this](){while(!quit_){sensor_msgs::PointCloud2ConstPtr msg,ng,far,pre;{std::unique_lock<std::mutex>lock(queue_mutex_);cv_.wait_for(lock,std::chrono::milliseconds(10),[this](){return pending_||pending_far_||pending_preslow_||quit_||(pending_ng_&&(ros::Time::now().toSec()-pending_ng_->header.stamp.toSec()>max_age_||std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[this](const Pose&p){return std::abs(p.stamp-pending_ng_->header.stamp.toSec())<1e-6;})));});if(quit_)break;msg=pending_;pending_.reset();far=pending_far_;pending_far_.reset();pre=pending_preslow_;pending_preslow_.reset();}
       if(msg)try{process(msg);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_map_filter] %s",e.what());}
+      if(pre)try{processPreslow(pre);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[M8 preslow] %s",e.what());}
       if(far)try{processFar(far);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_map_filter far] %s",e.what());}
       {std::lock_guard<std::mutex>lock(queue_mutex_);if(pending_ng_){double stamp=pending_ng_->header.stamp.toSec();bool ready=std::any_of(lookup_cache_.begin(),lookup_cache_.end(),[stamp](const Pose&p){return std::abs(p.stamp-stamp)<1e-6;});if(ready||ros::Time::now().toSec()-stamp>max_age_){ng=pending_ng_;pending_ng_.reset();}}}
       if(ng)try{filterNonground(ng);}catch(const std::exception&e){ROS_WARN_THROTTLE(2,"[tunnel_nonground_filter] %s",e.what());}

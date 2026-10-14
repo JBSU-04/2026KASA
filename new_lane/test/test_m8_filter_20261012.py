@@ -44,6 +44,31 @@ class CoMovingWallTrackTests(unittest.TestCase):
         self.assertIsNone(self.m.co_moving_wall_track(dict(length=22., width=.8, observed_velocity=[2., 0.])))
 
 
+class WallHuggingCoMovingTests(unittest.TestCase):
+    """2026-10-13(21:55:44 백): 벽 밑 0.35 m 조각이 자차 속도로 따라오면 벽 잔상."""
+    def setUp(self):
+        m = Merger.__new__(Merger)
+        m.route = [(x, 0., 8000 + int(x * 10), 3) for x in np.arange(0., 50., .5)]
+        m.tunnel_wall_rows = [[7990., -3.8, 6.9], [8600., -3.8, 6.9]]
+        m.tunnel_wall_offset, m.tunnel_wall_offset_stamp = 0., -1e9
+        m.pose = (0., 0., 0.)
+        m.ego_speed = 5.
+        self.m = m
+
+    def box(self, x, y, v, h=.175):
+        return dict(footprint_world=[[x - h, y - h], [x + h, y - h], [x + h, y + h], [x - h, y + h]],
+                    position_world=[x, y], length=.35, width=.35, observed_velocity=v)
+
+    def test_small_wall_base_fragment_moving_with_ego(self):
+        self.assertEqual(self.m.co_moving_wall_track(self.box(14., -3.67, [4.6, 0.]), 10.), 'tunnel_wall_co_moving_track')
+
+    def test_vehicle_in_lane_moving_with_ego_kept(self):
+        self.assertIsNone(self.m.co_moving_wall_track(self.box(14., -1., [4.6, 0.]), 10.))
+
+    def test_static_object_at_wall_kept(self):
+        self.assertIsNone(self.m.co_moving_wall_track(self.box(14., -3.67, [0., 0.]), 10.))
+
+
 class DynamicStopMinimumTests(unittest.TestCase):
     def setUp(self):
         self.n = stop.ObstacleStopNode.__new__(stop.ObstacleStopNode)

@@ -22,12 +22,27 @@ from tunnel_region import read_region, contains
 from obstacle_geometry import regional_plane_heights
 from tunnel_scene_policy import preslow
 from m8_filtered_input import cloud_rows, preslow_speed_cap
+from m8_repair_policy import fresh, owned_risk, static_certificate, early_risk
+from tunnel_occupancy_geometry import swept_owned_cells
+from occupancy_avoidance.msg import M8ApprovedPath, TunnelScene
 from scipy.spatial import cKDTree
 from tunnel_map_geometry import fields_array
 import rospy
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+def footprint_samples(polygon, step=.1):
+    """외곽선(닫힌 다각형) 꼭짓점·변을 step 간격 점으로. 잘못된 입력은 빈 배열."""
+    try:p=np.asarray(polygon or [],float).reshape((-1,2))
+    except (ValueError,TypeError):return np.empty((0,2))
+    if not len(p) or not np.isfinite(p).all():return np.empty((0,2))
+    out=[p]
+    for a,b in zip(p,np.roll(p,-1,axis=0)):
+        n=int(np.ceil(np.linalg.norm(b-a)/step))
+        if n>1:out.append(a+(b-a)*np.linspace(0,1,n,endpoint=False)[1:,None])
+    return np.vstack(out)
 
 
 def pointcloud2_to_xyz_array(msg):
@@ -389,6 +404,19 @@ class TunnelWallDetector:
         self.tunnel_region=read_region(rospy.get_param)
         self.common_scene_enabled=bool(rospy.get_param("/tunnel_recovery/common_scene_enabled",True))
         self.common_scene={}
+        self.object_scene_enabled=bool(rospy.get_param('/tunnel_recovery/object_scene_enabled',True))
+        self.repaired_preslow=bool(rospy.get_param('/tunnel_recovery/repair_preslow_policy_enabled',True))
+        self.preslow_approved=None;self.preslow_scene={};self.preslow_releases=[]
+        self.preslow_side_speed=float(rospy.get_param('~preslow_unconfirmed_crossing_speed_mps',3.))
+        self.preslow_crossing_window=float(rospy.get_param('~preslow_unconfirmed_crossing_window_sec',1.5))
+        # 벽면(프로파일 경계 + /tunnel/wall_offset) 이 거리 안쪽 점은 벽 표면으로 본다. 그보다 안쪽 저상·돌출점은 후보.
+        self.preslow_wall_margin=float(rospy.get_param('~preslow_wall_surface_margin_m',.15))
+        # 2026-10-14(18:56, 18:57 백): 선서행 = 회피 가능 영역(벽선 안쪽 area_margin) 안의 확정 물체 전부.
+        #   벽선 0.45 m 안 벽 밑동·아치 조각이 앞쪽 오탐(99%), 벽 옆 실제 물체는 0.87~1.95 m. 경로를 막지 않는 벽 옆 물체도
+        #   선서행한다(엔진 경로 통과 해제·진행 범위 제외를 쓰지 않음). false: 이전 동작(경로 위험만).
+        self.preslow_whole_area=bool(rospy.get_param('/tunnel_recovery/preslow_whole_area_enabled',True))
+        self.preslow_area_margin=float(rospy.get_param('/tunnel_recovery/preslow_area_margin_m',.6))
+        self.preslow_footprint_release=bool(rospy.get_param('~preslow_footprint_release_enabled',True))
         self.independent_preslow=bool(rospy.get_param("/tunnel_recovery/independent_preslow_enabled",False))
         self.preslow_root={};self.preslow_root_stamp=-1e9;self.preslow_input_stamp=-1e9
         self.preslow_cap_pub=rospy.Publisher("/tunnel/preslow_speed_cap_mps",Float64,queue_size=1)
@@ -397,13 +425,17 @@ class TunnelWallDetector:
         # 2026-10-12 시작 속도 = M8 구간 속도 상한(mpc_params speed_limit.sections.M8, 지금 5.0).
         #   전에는 6.0 이라 구간 상한 5.0 아래로 내려가는 15 m 안쪽에서야 실제 감속이 시작됐다.
         self.preslow_initial=float(rospy.get_param("/speed_limit/sections/M8",rospy.get_param("~preslow_initial_speed_mps",5.)))
+        # 2026-10-13: M8 11 m/s 에서 30 m 시작값을 구간 속도로 두면 20 m 앞에서도 8 m/s 라 선서행이 늦었다.
+        #   걸리는 순간 상한을 preslow_entry_cap_mps 로 낮추고 거리에 따라 최소값까지 줄인다.
+        self.preslow_entry_cap=float(rospy.get_param("~preslow_entry_cap_mps",7.0))
+        self.preslow_initial=min(self.preslow_initial,self.preslow_entry_cap)
+        self.preslow_hold_sec=float(rospy.get_param("~preslow_hold_sec",0.6))
         self.preslow_marker_pub=rospy.Publisher("/tunnel/preslow_markers",MarkerArray,queue_size=1)
         self.preslow_state_pub=rospy.Publisher("/tunnel/preslow_state",String,queue_size=1)
         self.accepted_selection={}
         self.accepted_selections={}
         self.selection_sub=rospy.Subscriber("/obstacle_avoidance/selection_state",String,self.selection_cb,queue_size=1)
         if rospy.get_param('/tunnel_recovery/native_scene_enabled',True):
-            from occupancy_avoidance.msg import TunnelScene
             from tunnel_native_scene import scene_dict
             self.scene_sub=rospy.Subscriber('/tunnel/perception_scene_native',TunnelScene,lambda m:self.common_scene_cb(scene_dict(m)),queue_size=1,buff_size=2**24,tcp_nodelay=True)
         else:
@@ -566,6 +598,9 @@ class TunnelWallDetector:
         # 2026-10-12 원거리 필터 점의 지도 분류(12~40 m). GroundGrid 는 터널에서 약 14 m 밖 저상 물체를 놓쳐
         #   25 m 선서행이 15 m 안쪽에서만 걸렸다. 최근 0.35 s 안의 원거리 결과를 근거리 결과와 합친다.
         self.preslow_far=([],-1e9)
+        # 2026-10-13 원거리 검출기 확정 물체도 선서행 보조 근거(원거리 필터 점이 프레임마다 띄엄띄엄 잡혀 끊기는 것 방지).
+        self.far_detector_objects=([],-1e9)
+        rospy.Subscriber("/obstacle_info_far",String,self.far_detector_cb,queue_size=1,buff_size=2**22)
         rospy.Subscriber("/tunnel/map_classified_far",PointCloud2,self.far_preslow_cb,queue_size=1,buff_size=2**24)
         # 2026-10-12 벽선 측정은 벽 점 제거 전 입력(/perception/points_gravity, 벽 높이 띠)으로 한다.
         #   사전 필터가 벽·연석 점을 지우므로 필터 점 기반 /tunnel/map_background 에는 벽이 남지 않는다.
@@ -602,6 +637,10 @@ class TunnelWallDetector:
         if self.kick_use_raw and not self.independent_preslow:
             rospy.Subscriber(self.kick_cloud_topic, PointCloud2, self.raw_kick_cb, queue_size=1,
                              buff_size=2 ** 24)
+        if self.repaired_preslow:
+            rospy.Subscriber('/tunnel/preslow_classified',PointCloud2,self.repaired_preslow_cb,queue_size=1,buff_size=2**24)
+            rospy.Subscriber('/obstacle_avoidance/m8_approved_path',M8ApprovedPath,self.preslow_approved_cb,queue_size=1)
+            rospy.Subscriber('/tunnel/obstacle_scene' if self.object_scene_enabled else '/tunnel/perception_scene_native',TunnelScene,self.preslow_scene_cb,queue_size=1)
         self.scene_timer=rospy.Timer(rospy.Duration(.1),self.common_scene_tick)
         rospy.loginfo('[tunnel_wall_detector] width=%.2f target=%.2f (auto=%s) curb_inset=%.2f kick=%s %.0fm',
                       self.nominal_tunnel_width, self.target_wall_dist, self.auto_target,
@@ -620,6 +659,7 @@ class TunnelWallDetector:
             self.filtered_shift = 0.0
 
     def odom_cb(self, msg):
+        self.preslow_ego_speed=float(msg.twist.twist.linear.x)
         q = msg.pose.pose.orientation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
         self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
@@ -1389,7 +1429,123 @@ class TunnelWallDetector:
         self.kick_inpath_pub.publish(Float64(data=distance));self.preslow_cap_pub.publish(Float64(data=cap))
         self.preslow_state_pub.publish(String(data=json.dumps(dict(stamp=self.preslow_input_stamp,
             present=present,distance=distance,speed_cap_mps=cap,reason=reason,objects=objects,
-            input="m2_filtered_near_far",mission_control=False),separators=(',',':'))))
+            input=("prewall_m2_filtered_map" if getattr(self,"repaired_preslow",False) else "m2_filtered_near_far"),mission_control=False, releases=getattr(self,"preslow_releases",[]), exclusions=getattr(self,"preslow_exclusions",[])),separators=(',',':'))))
+
+    def in_drivable_area(self,wx,wy,margin=.15):
+        """벽·연석 안쪽(회피 가능 영역): 우측 경계 + margin <= 기준경로 횡거리 <= 좌측 경계 - margin.
+
+        경계 0(없음) 칸은 +-4 m 같은 고정값이 아니라 그쪽의 가장 가까운 실측 경계를 쓴다.
+        """
+        route=getattr(self,'route',None)
+        if route is None or len(route[0])<2:return False
+        xy,idx,tan=route;xy=np.asarray(xy)
+        j=int(np.argmin((xy[:,0]-wx)**2+(xy[:,1]-wy)**2))
+        lat=-tan[j,1]*(wx-xy[j,0])+tan[j,0]*(wy-xy[j,1])-getattr(self,'filtered_shift',0.)
+        wp=getattr(self,'wprof',None)
+        if getattr(self,'object_scene_enabled',False):
+            if wp is None:return True # unknown/open boundary is not a measured wall
+            ik,rk,lk=(np.asarray(v,float) for v in wp);at=idx[j]
+            if at<ik[0] or at>ik[-1]:return True
+            hi=min(len(ik)-1,max(1,int(np.searchsorted(ik,at))));lo=hi-1
+            right=float(np.interp(at,ik,rk)) if rk[lo]<0 and rk[hi]<0 else -float('inf')
+            left=float(np.interp(at,ik,lk)) if lk[lo]>0 and lk[hi]>0 else float('inf')
+            return right+margin<=lat<=left-margin
+        if wp is None:return abs(lat)<=4.-margin
+        ik,rk,lk=(np.asarray(v,float) for v in wp);r_ok,l_ok=rk<0,lk>0
+        right=float(np.interp(idx[j],ik[r_ok],rk[r_ok])) if r_ok.any() else -4.
+        left=float(np.interp(idx[j],ik[l_ok],lk[l_ok])) if l_ok.any() else 4.
+        return right+margin<=lat<=left-margin
+
+    def preslow_approved_cb(self,msg):
+        stamp=msg.header.stamp.to_sec()
+        if (not msg.valid or msg.path.header.seq!=int(msg.plan_id) or msg.header.frame_id!='map' or
+            msg.path.header.stamp.to_sec()!=stamp or not fresh(stamp,rospy.Time.now().to_sec(),.5)):return
+        xy=np.array([[q.pose.position.x,q.pose.position.y]for q in msg.path.poses])
+        if len(xy)>=2 and np.isfinite(xy).all():self.preslow_approved=(xy,stamp,int(msg.plan_id),int(msg.coordinate_version),int(getattr(msg,'scene_id',0)))
+
+    def preslow_scene_cb(self,msg):
+        from tunnel_native_scene import scene_dict,final_root
+        try:self.preslow_scene=final_root(scene_dict(msg))
+        except (ValueError,TypeError):pass
+
+    def repaired_preslow_cb(self,msg,stream='near'):
+        if not hasattr(self,'preslow_compute_lock'):
+            import threading
+            self.preslow_compute_lock=threading.RLock()
+        with self.preslow_compute_lock:self._repaired_preslow_cb(msg,stream)
+
+    def _repaired_preslow_cb(self,msg,stream='near'):
+        stamp=msg.header.stamp.to_sec();now=rospy.Time.now().to_sec()
+        if not self.is_tunnel_zone() or not fresh(stamp,now):return
+        pose=self.kick_pose_at(stamp);route=getattr(self,'route',None)
+        if pose is None or route is None or len(route[0])<2:
+            self.emit_preslow(False,-1.,9999.,[],'preslow_pose_or_reference_unknown');return
+        # Keep the two filtered streams independent through map confirmation,
+        # then merge only their fresh world-space evidence for preslow.
+        if not hasattr(self,'preslow_clouds'):self.preslow_clouds={}
+        self.preslow_clouds[stream]=msg
+        parts=[]
+        for packet in list(self.preslow_clouds.values()):
+            t=packet.header.stamp.to_sec();sp=self.kick_pose_at(t)
+            if not fresh(t,now) or sp is None:continue
+            a=fields_array(packet,['x','y','z','map_label']);a=a[(a[:,3]==3)&np.isfinite(a).all(axis=1)] if len(a) else a
+            c,s=math.cos(sp[2]),math.sin(sp[2]);xy=a[:,:2].copy();xy[:,0]+=self.sensor_x
+            parts.append(xy@np.array([[c,s],[-s,c]])+np.asarray(sp[:2]))
+        world=np.vstack(parts) if parts else np.empty((0,2))
+        c,s=math.cos(pose[2]),math.sin(pose[2]);delta=world-np.asarray(pose[:2]);b=delta@np.array([[c,-s],[s,c]])
+        self.preslow_input_stamp=stamp;self.preslow_releases=[]
+        root=self.preslow_scene if fresh(self.preslow_scene.get('stamp'),now) else ({} if getattr(self,'object_scene_enabled',False) else self.preslow_root)
+        objects=root.get('collision_objects',root.get('obstacles',[])) if fresh(root.get('stamp'),now) else []
+        approval=self.preslow_approved
+        approved=approval is not None and fresh(approval[1],now,.5) and approval[3]==root.get('coordinate_version',0)
+        monitor=approval[0] if approved else np.asarray(route[0])[:,:2]
+        risk=early_risk(world,monitor,pose,float(getattr(self,'preslow_ego_speed',0.)),b[:,0],self.preslow_side_speed,self.preslow_crossing_window)
+        supports=[];owners=[]
+        for o in objects:
+            pts=np.asarray((o.get('observed_cells_world') or o.get('occupied_cells_world') or []) if getattr(self,'object_scene_enabled',False) else (o.get('observed_cells_world') or o.get('occupied_cells_world') or o.get('observed_footprint_world') or footprint_samples(o.get('footprint_world'))),float).reshape((-1,2))
+            if len(pts):supports.extend(pts);owners.extend([o]*len(pts))
+        tree=cKDTree(supports) if supports else None
+        dist,ind=tree.query(world) if tree is not None and len(world) else (np.full(len(world),np.inf),np.zeros(len(world),int))
+        active=[];decisions=[];cache={};seen=set()
+        order=np.argsort(b[:,0]);_,take=np.unique(np.floor(world[order]/.5).astype(np.int64),axis=0,return_index=True)
+        for j in order[take]:
+            whole=getattr(self,'preslow_whole_area',False)
+            area_margin=getattr(self,'preslow_area_margin',.6) if whole else (0. if getattr(self,'object_scene_enabled',False) else self.preslow_wall_margin)
+            if not 3.<=b[j,0]<=self.preslow_start or not self.in_drivable_area(*world[j],margin=area_margin):continue
+            o=owners[ind[j]] if dist[j]<=.8 else None;oid=o.get('id') if o is not None else None
+            if not whole and o is not None and approved and static_certificate(o,now,approval[3]):
+                if oid not in cache:
+                    cache[oid]=owned_risk(o,approval[0],pose,now,approval[3],self.preslow_start+4.)
+                    if cache[oid] is None and not getattr(self,'object_scene_enabled',False) and getattr(self,'preslow_footprint_release',True):
+                        # 물체별 점유 셀이 없는 입력(근거리 lidar_only): 외곽선 0.1 m 표본으로 같은 차체 스윕 검사.
+                        #   스윕 불가(경로 끝 너머 등)는 None -> 해제하지 않는다.
+                        samples=footprint_samples(o.get('footprint_world'))
+                        cache[oid]=swept_owned_cells(samples,approval[0],pose[:2],pose[2],horizon=self.preslow_start+4.) if len(samples) else None
+                if cache[oid] is False:
+                    if oid not in seen:self.preslow_releases.append(dict(id=oid,reason='approved_static_body_clear'))
+                    seen.add(oid);continue
+            moving=bool(o is not None and (o.get('motion_state')=='dynamic' or o.get('dynamic_candidate')))
+            dangerous=whole or risk is None or bool(risk[j])
+            if moving:
+                v=np.asarray(o.get('observed_velocity') or o.get('velocity_world') or [0.,0.],float)
+                if len(v)==2 and np.isfinite(v).all():
+                    for t in np.arange(.2,3.01,.2):
+                        hit=early_risk(world[j:j+1]+v*t,monitor,pose,0.,[0.],0.,0.)
+                        if hit is not None and hit[0]:dangerous=True;break
+            if not dangerous:
+                if len(decisions)<20:decisions.append(dict(id=oid,reason='outside_progress_and_crossing_envelope'))
+                continue
+            active.append(dict(id=oid,candidate_key=tuple(np.floor(world[j]/.5).astype(int).tolist()),distance_m=float(b[j,0]),reason='filtered_map_progress_or_crossing_risk'))
+        self.preslow_exclusions=decisions
+        distance=min((o['distance_m'] for o in active),default=-1.)
+        cap=preslow_speed_cap(distance,self.preslow_start,self.preslow_min,self.preslow_initial) if active else 9999.
+        held_cap,held_t=getattr(self,'preslow_held',(9999.,-1e9))
+        if active:self.preslow_held=(cap,now)
+        elif (now-held_t<=self.__dict__.get('preslow_hold_sec',.6) and held_cap<9999. and
+              not getattr(self,'preslow_releases',[])):
+            # 확정 라벨이 한 프레임 비어도 상한을 바로 풀지 않는다(예전 선서행과 같은 0.6 s). 해제 판정이 있으면 즉시 푼다.
+            self.emit_preslow(True,-1.,float(held_cap),[],'object_risk_hold');return
+        self.emit_preslow(bool(active),distance,cap,active,'object_risk' if active else 'progress_clear')
 
     def preslow_residuals(self,msg):
         """필터 점 중 지도에 없는 점(2스캔 확인, label 3)으로 기준경로 횡 1.3 m 안, 앞 3~start m 의 위험 목록. 실패 시 이유 문자열."""
@@ -1424,22 +1580,55 @@ class TunnelWallDetector:
             active.append(dict(id=oid,distance_m=float(b[j,0]),reason="filtered_map_residual_in_progress_region"))
         return active
 
+    def far_detector_cb(self,msg):
+        try:d=json.loads(msg.data)
+        except (ValueError,TypeError):return
+        self.far_detector_objects=([o for o in d.get('collision_objects',[]) if o.get('confirmed')],rospy.Time.now().to_sec())
+
+    def far_detector_residuals(self,now):
+        """원거리 검출기 확정 물체 중 외곽선이 기준경로 횡 1.3 m 안이고 앞 3~start m 인 것."""
+        objs,stamp=getattr(self,'far_detector_objects',([],-1e9))
+        route=getattr(self,'route',None)
+        if not objs or not -.05<=now-stamp<=.35 or route is None or len(route[0])<2:return []
+        pose=self.kick_pose_at(now)
+        h=getattr(self,'pose_hist',None)
+        if pose is None and h and 0<=now-h[-1][0]<=.2:pose=h[-1][1:]
+        if pose is None:return []
+        ref=np.asarray(route[0])[:,:2];tree=cKDTree(ref);tangent=np.gradient(ref,axis=0);tangent/=np.maximum(1e-9,np.linalg.norm(tangent,axis=1))[:,None]
+        c,s=math.cos(pose[2]),math.sin(pose[2]);out=[]
+        for o in objs:
+            if now-float(o.get('last_seen',now))>.5:continue
+            pts=np.asarray(o.get('footprint_world') or [o.get('position_world',[1e12,1e12])],float).reshape(-1,2)[:,:2]
+            _,ri=tree.query(pts);d=pts-ref[ri];lat=-tangent[ri,1]*d[:,0]+tangent[ri,0]*d[:,1]
+            ahead=(pts[:,0]-pose[0])*c+(pts[:,1]-pose[1])*s
+            m=(np.abs(lat)<=1.3)&(ahead>=3.)&(ahead<=self.preslow_start)
+            if m.any():out.append(dict(id=o.get('id'),distance_m=float(ahead[m].min()),reason="far_detector_object"))
+        return out
+
     def far_preslow_cb(self,msg):
+        if getattr(self,'repaired_preslow',False):
+            self.repaired_preslow_cb(msg,stream='far');return
         found=self.preslow_residuals(msg)
         if isinstance(found,list):
             for o in found:o['reason']="filtered_far_map_residual"
             self.preslow_far=(found,msg.header.stamp.to_sec())
 
     def filtered_preslow_cb(self,msg):
+        if getattr(self,'repaired_preslow',False):return
         found=self.preslow_residuals(msg)
         if not isinstance(found,list):
             self.emit_preslow(False,-1.,9999.,[],found);return
         self.preslow_input_stamp=msg.header.stamp.to_sec()
         far,far_stamp=getattr(self,'preslow_far',([],-1e9))
-        active=found+(far if -.05<=rospy.Time.now().to_sec()-far_stamp<=.35 else [])
+        active=found+(far if -.05<=rospy.Time.now().to_sec()-far_stamp<=.35 else [])+self.far_detector_residuals(rospy.Time.now().to_sec())
         distance=min((o['distance_m'] for o in active),default=-1.)
-        # 거리 연속 곡선: 25 m 에서 구간 속도(M8 5.0), 5 m 에서 4.0 m/s. 정지는 내지 않는다.
+        # 거리 연속 곡선: 25 m 에서 구간 속도(/speed_limit/sections/M8), 5 m 에서 4.0 m/s. 정지는 내지 않는다.
         cap=preslow_speed_cap(distance,self.preslow_start,self.preslow_min,self.preslow_initial) if active else 9999.
+        # 2026-10-13(12:29:44 백): 원거리 잔차가 프레임마다 비어 23 m 부터 걸린 선서행이 세 번 풀렸다. 마지막 상한을 hold 초 유지.
+        now=rospy.Time.now().to_sec();held_cap,held_t=getattr(self,'preslow_held',(9999.,-1e9))
+        if active:self.preslow_held=(cap,now)
+        elif now-held_t<=self.__dict__.get('preslow_hold_sec',.6) and held_cap<9999.:
+            self.emit_preslow(True,distance,float(held_cap),[],"residual_hold");return
         self.emit_preslow(bool(active),distance,float(cap),active,"residual_risk" if active else "clear")
 
     def classified_kick_cb(self,msg):

@@ -1,0 +1,102 @@
+"""2026-10-13 M8 정적·동적 판정: 세계 좌표 외곽 강체 이동 근거.
+
+군집 중심·칼만 속도는 보는 각도에 따라 흔들린다(사고 차량 0.6~1.2 m/s 가짜 속도). 여기서는 물체 외곽
+(x/y 각 축 min·max)이 '같은 방향으로 함께' 움직인 양만 이동으로 본다. 커지거나 쪼개지는 변화는 0.
+
+  - dynamic   : 창(≥ window_min) 강체 이동 ≥ dyn_m 이 같은 방향으로 confirm 회 연속
+                (외곽 길이+폭 ≥ large_extent 이면 dyn_m 2배)
+  - candidate : 아직 dynamic 은 아니지만 짧은 창(≥ candidate_window)에서 강체 속도 ≥ candidate_mps
+  - static    : static_window 이상 창에서 강체 이동 < static_m
+  - unknown   : 그 밖
+속도 분산(KF vel_std)은 쓰지 않는다(12:38:06 백 id 20: 분산이 커 끝까지 unknown).
+"""
+import math
+
+import numpy as np
+
+
+class RigidMotion(object):
+    def __init__(self, dyn_m=.4, static_m=.15, large_extent=3., window_min=.3, static_window=.8,
+                 candidate_window=.2, candidate_mps=1., confirm=2, release_sec=1., history_sec=1.5,
+                 reveal_ratio=1.8, reveal_extent=.3, candidate_confirm=1):
+        self.dyn_m, self.static_m, self.large_extent = dyn_m, static_m, large_extent
+        self.window_min, self.static_window = window_min, static_window
+        self.candidate_window, self.candidate_mps = candidate_window, candidate_mps
+        self.confirm, self.release_sec, self.history_sec = confirm, release_sec, history_sec
+        self.reveal_ratio, self.reveal_extent = reveal_ratio, reveal_extent
+        self.candidate_confirm, self.candidate_hits = candidate_confirm, 0
+        self.bounds = []
+        self.hits = 0
+        self.last_dir = None
+        self.state = 'unknown'
+        self.last_moving = -1e9
+        self.velocity = np.zeros(2)
+        self.evidence = {}
+
+    @staticmethod
+    def _axis(d0, d1):
+        return math.copysign(min(abs(d0), abs(d1)), d0) if d0 * d1 > 0 else 0.
+
+    def _shift(self, old, new):
+        return np.array([self._axis(new[1] - old[1], new[2] - old[2]), self._axis(new[3] - old[3], new[4] - old[4])])
+
+    def _revealing(self, old, new):
+        """멀리서 일부만 보이던 물체가 드러나며 점 수·외곽이 커지는 변화(12:38:06 백 id 5)는 이동 근거가 아니다."""
+        ext_old = (old[2] - old[1]) + (old[4] - old[3])
+        ext_new = (new[2] - new[1]) + (new[4] - new[3])
+        return new[5] > self.reveal_ratio * max(old[5], 1) or ext_new > ext_old + self.reveal_extent
+
+    def update(self, points_xy, now):
+        """points_xy: (N,2) 세계 좌표. 반환 (state, candidate, velocity)."""
+        p = np.asarray(points_xy, float).reshape(-1, 2)
+        if len(p) < 3:
+            return self.state, False, self.velocity
+        b = (now, p[:, 0].min(), p[:, 0].max(), p[:, 1].min(), p[:, 1].max(), len(p))
+        self.bounds = [q for q in self.bounds if now - q[0] <= self.history_sec] + [b]
+        extent = (b[2] - b[1]) + (b[4] - b[3])
+        dyn_m = self.dyn_m * (2. if extent >= self.large_extent else 1.)
+        candidate = False
+        old = [q for q in self.bounds if now - q[0] >= self.window_min]
+        if old:
+            o = old[-1]
+            dt = now - o[0]
+            disp = self._shift(o, b)
+            mag = float(np.linalg.norm(disp))
+            revealing = self._revealing(o, b)
+            if mag >= dyn_m and not revealing:
+                direction = disp / mag
+                same = self.last_dir is None or float(direction @ self.last_dir) >= math.cos(math.radians(45.))
+                self.hits = self.hits + 1 if same else 1
+                self.last_dir = direction
+                self.last_moving = now
+                if self.hits >= self.confirm:
+                    self.state = 'dynamic'
+                    self.velocity = disp / max(dt, 1e-3)
+            else:
+                self.hits = 0
+                # 정적: static_window 이전 샘플과 비교해도 함께 움직인 양이 static_m 미만.
+                far = [q for q in self.bounds if now - q[0] >= self.static_window]
+                still = bool(far) and float(np.linalg.norm(self._shift(far[-1], b))) < self.static_m
+                if still and now - self.last_moving >= self.release_sec:
+                    self.state = 'static'
+                    self.velocity = np.zeros(2)
+                    self.last_dir = None
+                elif self.state == 'dynamic' and not revealing and now - self.last_moving >= self.release_sec:
+                    self.state = 'unknown'
+                    self.velocity = np.zeros(2)
+            self.evidence = dict(rigid_disp_m=round(mag, 3), window_s=round(dt, 3), extent_m=round(extent, 2),
+                                 hits=self.hits, threshold_m=dyn_m, revealing=bool(revealing))
+        short = [q for q in self.bounds if now - q[0] >= self.candidate_window]
+        if self.state != 'dynamic' and short:
+            o = short[-1]
+            dt = now - o[0]
+            disp = self._shift(o, b)
+            speed = float(np.linalg.norm(disp)) / max(dt, 1e-3)
+            if speed >= self.candidate_mps * (2. if extent >= self.large_extent else 1.) and not self._revealing(o, b):
+                self.candidate_hits += 1
+                if self.candidate_hits >= self.candidate_confirm:
+                    candidate = True
+                    self.velocity = disp / max(dt, 1e-3)
+            else:
+                self.candidate_hits = 0
+        return self.state, candidate, self.velocity

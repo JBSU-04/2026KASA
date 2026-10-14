@@ -10,9 +10,9 @@
     <param name="join_only" value="true"/>
   </node>
   <arg name="tunnel_map_enabled" default="true"/>
-  <arg name="tunnel_static_map" default="$(find new_lane)/config/tunnel_static_gps_20261009.npz"/>
+  <arg name="tunnel_static_map" default="$(find new_lane)/config/tunnel_static_shared_20261013.npz"/>
   <arg name="tunnel_map_backend" default="cpp"/>
-  <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_gps_20261009.bin"/>
+  <arg name="tunnel_static_map_binary" default="$(find new_lane)/config/tunnel_static_shared_20261013.bin"/>
   <node if="$(eval arg('tunnel_map_enabled') and arg('tunnel_map_backend') == 'cpp')" pkg="new_lane" type="tunnel_map_filter_node" name="tunnel_map_filter" output="screen">
     <param name="map_binary" value="$(arg tunnel_static_map_binary)"/>
   </node>

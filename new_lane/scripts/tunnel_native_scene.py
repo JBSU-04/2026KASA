@@ -53,6 +53,7 @@ def scene_dict(m):
         else:o.pop('top_elevation',None)
         d['obstacles'].append(o)
     stamp=m.header.stamp.to_sec();q=m.ego_pose.orientation;p=m.ego_pose.position;yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
+    d['mission_mode']=m.mission_mode
     d.update(schema_version=2,geometry_stamp=stamp,stamp=stamp,scene_id=m.scene_id,coordinate_version=m.coordinate_version,map_version=m.map_version,offset_x=m.offset_x,offset_y=m.offset_y,scan_pose=[p.x,p.y,p.z,yaw,m.speed,m.curvature,0.],pose_world=[p.x,p.y,yaw],cell_resolution=.1,collision_cells_world=[],voxels=[],visibility=[list(m.visibility[i:i+3]) for i in range(0,len(m.visibility),3)],measured_ray_cleared_world=[])
     owners={int(o['id']):o for o in d.get('obstacles',[])}
     for o in owners.values():o['occupied_cells_world']=[];o['observed_cells_world']=[]
@@ -65,15 +66,15 @@ def scene_dict(m):
         if observed:o['observed_cells_world'].append(xy)
         # Confirmed unknown surfaces constrain planning transiently, without
         # certifying static admission; consumers use the same observed occupancy.
-        if fixed or o.get('dynamic_confirmed',False) or (observed and o.get('confirmed_obstacle',False)):
+        if fixed or o.get('dynamic_confirmed',False) or (o.get('confirmed_obstacle',False) and -.05<=stamp-seen<=.35):
             d['collision_cells_world'].append(xy);d['voxels'].append([p.x,p.y,p.z,bool(fixed),seen])
     return d
 
 def final_root(scene):
-    root={k:scene.get(k) for k in ['scene_id','coordinate_version','map_version','geometry_digest']};root.update(stamp=scene['geometry_stamp'],mission_mode='tunnel',perception_source='common_scene',final_detector_source='shared_nonground_detector',collision_geometry_source='native_owned_cells',scene_state=scene.get('state','valid'))
+    root={k:scene.get(k) for k in ['scene_id','coordinate_version','map_version','geometry_digest']};root.update(stamp=scene['geometry_stamp'],mission_mode=scene.get('mission_mode','tunnel'),perception_source='common_scene',final_detector_source='shared_nonground_detector',collision_geometry_source='native_owned_cells',scene_state=scene.get('state','valid'))
     objects=copy.deepcopy(scene.get('obstacles',[]))
     for o in objects:
-        o.update(perception_source='common_scene',final_detector_source='shared_nonground_detector',collision_geometry_valid=True,collision_geometry_stamp=scene['geometry_stamp'],collision_geometry_reason='native_owned_cells',scene_id=scene['scene_id'],coordinate_version=scene['coordinate_version'])
+        o.update(perception_source='common_scene',final_detector_source='shared_nonground_detector',collision_geometry_valid=bool(o.get('occupied_cells_world')),collision_geometry_owner_id=int(o['id']),collision_geometry_coordinate_version=scene['coordinate_version'],collision_geometry_stamp=scene['geometry_stamp'],collision_geometry_reason='native_owned_cells',scene_id=scene['scene_id'],coordinate_version=scene['coordinate_version'])
     root['collision_objects']=objects;root['obstacles']=[o for o in objects if o.get('in_trigger_corridor',False)];return root
 
 def detector_root(m):

@@ -1,0 +1,1278 @@
+#include "occupancy_avoidance/core.hpp"
+#include "occupancy_avoidance/joint_escape.hpp"
+#include "solver.hpp"
+#include <Eigen/Dense>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <set>
+
+namespace occupancy_avoidance {
+namespace {
+constexpr double INF=1e20;
+double wrap(double a) { return std::atan2(std::sin(a),std::cos(a)); }
+double distance(const Reference&a,const Reference&b){return std::hypot(a.x-b.x,a.y-b.y);}
+Reference offset(Reference p,double d){p.x-=std::sin(p.yaw)*d;p.y+=std::cos(p.yaw)*d;return p;}
+void headings(std::vector<Reference>& p){
+  for(size_t i=0;i+1<p.size();++i)p[i].yaw=std::atan2(p[i+1].y-p[i].y,p[i+1].x-p[i].x);
+  if(p.size()>1)p.back().yaw=p[p.size()-2].yaw;
+}
+double curvature(const std::vector<Reference>& p){
+  double k=0;for(size_t i=1;i+1<p.size();++i){double ds=.5*(distance(p[i-1],p[i])+distance(p[i],p[i+1]));
+    if(ds>1e-4)k=std::max(k,std::abs(wrap(p[i+1].yaw-p[i-1].yaw))/(2*ds));}return k;
+}
+// The same continuous nominal geometry used by the corridor optimizer. Raw
+// 0.1m CSV chords can create artificial curvature spikes at their vertices.
+Reference referenceAt(const std::vector<Reference>& ref,size_t i,double u){
+  const size_t N=ref.size();double u2=u*u,u3=u2*u;
+  const auto&a=ref[i];const auto&b=ref[i+1];
+  auto prev=ref[i?i-1:i],next=ref[std::min(N-1,i+2)];
+  double ax=i?(b.x-prev.x)/2:b.x-a.x,ay=i?(b.y-prev.y)/2:b.y-a.y;
+  double bx=i+2<N?(next.x-a.x)/2:b.x-a.x,by=i+2<N?(next.y-a.y)/2:b.y-a.y;
+  Reference base;
+  base.x=(2*u3-3*u2+1)*a.x+(u3-2*u2+u)*ax+(-2*u3+3*u2)*b.x+(u3-u2)*bx;
+  base.y=(2*u3-3*u2+1)*a.y+(u3-2*u2+u)*ay+(-2*u3+3*u2)*b.y+(u3-u2)*by;
+  double tx=(6*u2-6*u)*a.x+(3*u2-4*u+1)*ax+(-6*u2+6*u)*b.x+(3*u2-2*u)*bx;
+  double ty=(6*u2-6*u)*a.y+(3*u2-4*u+1)*ay+(-6*u2+6*u)*b.y+(3*u2-2*u)*by;
+  base.yaw=std::atan2(ty,tx);base.idx=int(std::lround(a.idx+u*(b.idx-a.idx)));
+  return base;
+}
+std::vector<Reference> trimProgress(const std::vector<Reference>& path,const Pose& pose,double* error=nullptr){
+  if(path.size()<2)return path;size_t best_i=0;double best=INF,best_u=0;
+  for(size_t i=0;i+1<path.size();++i){double dx=path[i+1].x-path[i].x,dy=path[i+1].y-path[i].y,l2=dx*dx+dy*dy;
+    double u=l2>1e-9?std::max(0.,std::min(1.,((pose.x-path[i].x)*dx+(pose.y-path[i].y)*dy)/l2)):0;
+    double d=std::hypot(pose.x-path[i].x-u*dx,pose.y-path[i].y-u*dy);if(d<best){best=d;best_i=i;best_u=u;}}
+  Reference front=path[best_i];front.x+=best_u*(path[best_i+1].x-front.x);front.y+=best_u*(path[best_i+1].y-front.y);front.yaw+=best_u*wrap(path[best_i+1].yaw-front.yaw);
+  std::vector<Reference> out{front};for(size_t i=best_i+1;i<path.size();++i)if(distance(out.back(),path[i])>1e-6)out.push_back(path[i]);
+  if(error)*error=best;return out;
+}
+std::pair<int,int> bin(double x,double y){return {int(std::floor(x)),int(std::floor(y))};}
+}
+Engine::Engine(Config c):cfg_(c),grid_({"static","transient","observed"}){reset();}
+void Engine::reset(){
+  visibility_shift_x_=visibility_shift_y_=0;ray_clear_receipts_.clear();collision_location_={{NAN,NAN}};
+  tree_.reset(new octomap::OcTree(cfg_.resolution));tree_->setProbHit(.7);tree_->setProbMiss(.4);
+  divider_hits_=0;divider_seen_=-1;
+  evidence_.clear();ground_visibility_.clear();last_moving_stamp_=-1;obstacle_bins_.clear();last_path_.clear();live_.valid=false;initialized_=false;last_scan_=-1;last_pose_stamp_=-1;measured_curvature_=0;
+  aligned_since_=-1;avoidance_session_=false;spatial_return_active_=false;held_trigger_.clear();certified_triggers_.clear();trigger_seen_=-1;traffic_=TrafficState();
+  grid_.setFrameId("map");grid_.setGeometry(grid_map::Length(cfg_.length,cfg_.width),cfg_.resolution);
+}
+void Engine::rebasePlanning(double dx,double dy){for(auto&p:last_path_){p.x+=dx;p.y+=dy;}for(auto&p:held_trigger_){p.x+=dx;p.y+=dy;}}
+void Engine::rebaseEvidence(double dx,double dy){
+  if(!initialized_||!std::isfinite(dx+dy))return;
+  // Preserve hit/miss receipts across GPS correction; correction is not a new
+  // measurement and must not restart the three-independent-ray clearing gate.
+  auto previous=std::move(evidence_);evidence_.clear();
+  tree_.reset(new octomap::OcTree(cfg_.resolution));tree_->setProbHit(.7);tree_->setProbMiss(.4);
+  for(auto&kv:previous){auto e=kv.second;e.p.x+=dx;e.p.y+=dy;octomap::OcTreeKey k;
+    if(tree_->coordToKeyChecked(octomap::point3d(e.p.x-origin_x_,e.p.y-origin_y_,e.p.z-origin_z_),k)){evidence_[key(k)]=e;tree_->updateNode(k,true,true);}}
+  visibility_shift_x_+=dx;visibility_shift_y_+=dy;
+  const int ix=std::lround(visibility_shift_x_/.5),iy=std::lround(visibility_shift_y_/.5);
+  if(ix||iy){auto old=std::move(ground_visibility_);ground_visibility_.clear();for(auto&kv:old)ground_visibility_[{kv.first.first+ix,kv.first.second+iy}]=kv.second;visibility_shift_x_-=ix*.5;visibility_shift_y_-=iy*.5;}
+  auto receipts=std::move(ray_clear_receipts_);ray_clear_receipts_.clear();
+  for(auto&kv:receipts){auto q=kv.second;q.first.x+=dx;q.first.y+=dy;octomap::OcTreeKey k;if(tree_->coordToKeyChecked(octomap::point3d(q.first.x-origin_x_,q.first.y-origin_y_,q.first.z-origin_z_),k))ray_clear_receipts_[key(k)]=q;}
+  scan_pose_.x+=dx;scan_pose_.y+=dy;rebuild(last_scan_);
+}
+SceneSnapshot Engine::exportScene() const {
+  SceneSnapshot out;out.pose=scan_pose_;out.curvature=measured_curvature_;
+  for(const auto&kv:evidence_)out.voxels.push_back({kv.second.p,kv.second.fixed,kv.second.last});
+  for(const auto&kv:ground_visibility_)out.visibility.push_back({double(kv.first.first),double(kv.first.second),kv.second});
+  out.cleared=measuredRayCleared();return out;
+}
+bool Engine::importScene(const SceneSnapshot& scene){
+  const auto&p=scene.pose;
+  if(!std::isfinite(p.stamp+p.x+p.y+p.z+p.yaw)||p.stamp<=last_scan_)return false;
+  for(const auto&v:scene.voxels)if(!std::isfinite(v.point.x+v.point.y+v.point.z+v.seen))return false;
+  for(const auto&v:scene.visibility)if(!std::isfinite(v[0]+v[1]+v[2]))return false;
+  // Scene owns measurement history. Planning state stays local; no ray casting,
+  // classification or second confirmation is performed by a consumer.
+  if(!initialized_){origin_x_=p.x;origin_y_=p.y;origin_z_=p.z;initialized_=true;}
+  evidence_.clear();ground_visibility_.clear();ray_clear_receipts_.clear();
+  for(const auto&v:scene.voxels){
+    if(!std::isfinite(v.point.x+v.point.y+v.point.z+v.seen))return false;
+    octomap::OcTreeKey k;if(!tree_->coordToKeyChecked(octomap::point3d(v.point.x-origin_x_,v.point.y-origin_y_,v.point.z-origin_z_),k))return false;
+    Evidence e;e.p=v.point;e.fixed=v.fixed;e.last=v.seen;e.first=v.seen;e.hits=v.fixed?cfg_.confirm_scans:1;evidence_[key(k)]=e;
+  }
+  for(const auto&v:scene.visibility)ground_visibility_[{int(v[0]),int(v[1])}]=v[2];
+  for(const auto&q:scene.cleared){octomap::OcTreeKey k;if(tree_->coordToKeyChecked(octomap::point3d(q.x-origin_x_,q.y-origin_y_,q.z-origin_z_),k))ray_clear_receipts_[key(k)]={q,p.stamp};}
+  scan_pose_=p;last_scan_=last_pose_stamp_=p.stamp;measured_curvature_=scene.curvature;rebuild(p.stamp);return true;
+}
+uint64_t Engine::key(const octomap::OcTreeKey& k) const {
+  return (uint64_t(k[0])<<32)|(uint64_t(k[1])<<16)|k[2];
+}
+void Engine::setRoad(std::vector<Reference> road,std::vector<Edge> edges){
+  road_=std::move(road);edges_=std::move(edges);base_edges_=edges_;road_tree_.clear();
+  divider_hits_=0;divider_seen_=-1;applyConditionalEdges(0);
+  std::vector<size_t> indices(road_.size());for(size_t i=0;i<indices.size();++i)indices[i]=i;
+  buildRoad(indices,0,indices.size(),0);
+}
+void Engine::setConditionalDividers(std::vector<Edge> candidates){
+  divider_candidates_=std::move(candidates);base_edges_=edges_;applyConditionalEdges(0);
+}
+std::vector<Edge> Engine::conditionalDividers(double now) const {
+  std::vector<Edge> active;
+  if(divider_hits_>=3&&now>=divider_seen_&&now-divider_seen_<=1.)
+    for(const auto& e:divider_candidates_)if(e.first<=divider_last_&&e.last>=divider_first_)active.push_back(e);
+  return active;
+}
+void Engine::applyConditionalEdges(double now){
+  if(divider_candidates_.empty())return;edges_=base_edges_;
+  for(auto& e:edges_)for(const auto& c:divider_candidates_)if(e.first==c.first)e.left=-1;
+  for(const auto& c:conditionalDividers(now))for(auto& e:edges_)if(e.first==c.first)e.left=c.left;
+}
+void Engine::observeDividers(const Pose& pose,const std::vector<Point>& returns){
+  if(divider_candidates_.empty())return;
+  double c=std::cos(pose.yaw),s=std::sin(pose.yaw);std::set<int> bins,tall;
+  for(const auto& q:returns){double h=q.z+cfg_.sensor_height;
+    if(h<.35||h>cfg_.max_height||q.x<0||q.x>35)continue;
+    double x=pose.x+c*(q.x+cfg_.sensor_x)-s*(q.y+cfg_.sensor_y),y=pose.y+s*(q.x+cfg_.sensor_x)+c*(q.y+cfg_.sensor_y);
+    const auto* r=nearestRoad(x,y);if(!r)continue;double lat=-(x-r->x)*std::sin(r->yaw)+(y-r->y)*std::cos(r->yaw);
+    for(const auto& e:divider_candidates_)if(r->idx>=e.first&&r->idx<=e.last&&std::abs(lat-(e.left+.1))<=.3){if(h>.95)tall.insert(r->idx/10);else if(h<=.9)bins.insert(r->idx/10);break;}
+  }
+  for(int b:tall)for(int db=-1;db<=1;++db)bins.erase(b+db);
+  int groups=0,last=-999;for(int b:bins){if(b>last+1)++groups;last=b;}
+  bool detected=bins.size()>=3&&groups>=3&&(*bins.rbegin()-*bins.begin())>=5;
+  if(detected){if(pose.stamp-divider_seen_>.25)divider_hits_=0;
+    ++divider_hits_;divider_seen_=pose.stamp;divider_first_=*bins.begin()*10;divider_last_=*bins.rbegin()*10+9;
+  }else if(divider_hits_<3)divider_hits_=0;
+  applyConditionalEdges(pose.stamp);
+}
+int Engine::buildRoad(std::vector<size_t>& ids,size_t a,size_t b,unsigned axis){
+  if(a>=b)return -1;
+  size_t mid=(a+b)/2;
+  std::nth_element(ids.begin()+a,ids.begin()+mid,ids.begin()+b,[&](size_t i,size_t j){return axis?road_[i].y<road_[j].y:road_[i].x<road_[j].x;});
+  int node=road_tree_.size();road_tree_.push_back({ids[mid],-1,-1,axis});
+  int left=buildRoad(ids,a,mid,1-axis),right=buildRoad(ids,mid+1,b,1-axis);
+  road_tree_[node].left=left;road_tree_[node].right=right;return node;
+}
+void Engine::queryRoad(int node,double x,double y,double& best,const Reference*& found) const{
+  if(node<0)return;
+  const auto&n=road_tree_[node];const auto&p=road_[n.point];
+  double dx=x-p.x,dy=y-p.y,dist=dx*dx+dy*dy;if(dist<best){best=dist;found=&p;}
+  double delta=n.axis?dy:dx;queryRoad(delta<0?n.left:n.right,x,y,best,found);
+  if(delta*delta<best)queryRoad(delta<0?n.right:n.left,x,y,best,found);
+}
+const Reference* Engine::nearestRoad(double x,double y) const {
+  const Reference* best=nullptr;double d=100.;if(!road_tree_.empty())queryRoad(0,x,y,d,best);return best;
+}
+bool Engine::liveBoundaryApplies(int idx) const {
+  if(!live_.valid||std::abs(last_scan_-live_.pose.stamp)>=.5||idx<0||size_t(idx)>=road_.size())return false;
+  const auto&r=road_[idx];double dx=r.x-live_.pose.x,dy=r.y-live_.pose.y;
+  double x=std::cos(live_.pose.yaw)*dx+std::sin(live_.pose.yaw)*dy;
+  double angle=wrap(r.yaw-live_.pose.yaw);
+  return x>-6&&x<cfg_.live_boundary_distance&&
+    std::abs(wrap(angle-std::atan(live_.right_slope)))<cfg_.live_boundary_heading&&
+    std::abs(wrap(angle-std::atan(live_.left_slope)))<cfg_.live_boundary_heading;
+}
+std::string Engine::boundarySource(int idx) const {
+  if(liveBoundaryApplies(idx))return "live_local";
+  for(const auto&e:edges_)if(idx>=e.first&&idx<=e.last&&(e.right>0||e.left>0))return "measured_profile";
+  return "open";
+}
+std::pair<double,double> Engine::bounds(int idx) const {
+  if(liveBoundaryApplies(idx)){
+    const auto&r=road_[idx];double dx=r.x-live_.pose.x,dy=r.y-live_.pose.y;
+    double x=std::cos(live_.pose.yaw)*dx+std::sin(live_.pose.yaw)*dy;
+    double y=-std::sin(live_.pose.yaw)*dx+std::cos(live_.pose.yaw)*dy;
+    double angle=r.yaw-live_.pose.yaw;
+    double cr=std::cos(angle)+live_.right_slope*std::sin(angle),cl=std::cos(angle)+live_.left_slope*std::sin(angle);
+    if(cr>.5 && cl>.5){
+      double br=-live_.right*std::sqrt(1+live_.right_slope*live_.right_slope);
+      double bl=live_.left*std::sqrt(1+live_.left_slope*live_.left_slope);
+      std::pair<double,double> result{(br-y+live_.right_slope*x)/cr,(bl-y+live_.left_slope*x)/cl};
+      // M8: a transient wall fit must not widen the measured physical tunnel.
+      // The half-width + curb margin is applied by the caller exactly once.
+      if(strict_scene_margins_)for(const auto&e:edges_)if(idx>=e.first&&idx<=e.last){
+        if(e.right>0)result.first=std::max(result.first,-e.right+profile_offset_);
+        if(e.left>0)result.second=std::min(result.second,e.left+profile_offset_);
+        break;
+      }
+      return result;
+    }
+  }
+  double inset=cfg_.half_width+cfg_.curb_margin;
+  for(const auto&e:edges_)if(idx>=e.first && idx<=e.last)
+    return {e.right>0?-e.right+profile_offset_:-cfg_.open_right-inset,e.left>0?e.left+profile_offset_:cfg_.open_left+inset};
+  return {-cfg_.open_right-inset,cfg_.open_left+inset};
+}
+bool Engine::boundaryKnown(int idx,bool left)const {
+  if(liveBoundaryApplies(idx))return true;
+  for(const auto&e:edges_)if(idx>=e.first&&idx<=e.last)return left?e.left>0:e.right>0;
+  return false;
+}
+bool Engine::roadInside(double x,double y,double inset,double* clearance) const {
+  const auto*r=nearestRoad(x,y);if(!r)return true;
+  auto b=bounds(r->idx);double d=-(x-r->x)*std::sin(r->yaw)+(y-r->y)*std::cos(r->yaw);
+  bool right=boundaryKnown(r->idx,false),left=boundaryKnown(r->idx,true);
+  if(clearance)*clearance=std::min(right?d-b.first:INF,left?b.second-d:INF);
+  return (!right||d>=b.first+inset-1e-6) && (!left||d<=b.second-inset+1e-6);
+}
+bool Engine::integrate(const Pose& pose,const std::vector<Point>& returns,const std::vector<Point>& ground,
+                       const std::vector<DynamicRegion>& dynamic){
+  if(!std::isfinite(pose.stamp+pose.x+pose.y+pose.z+pose.yaw)||returns.empty())return false;
+  if(last_scan_>=0 && pose.stamp<last_scan_-.05)reset();
+  if(last_scan_>=0 && pose.stamp<=last_scan_+.06)return false; // independent 10 Hz scans only
+  if(initialized_ && last_pose_stamp_>=0){double dt=pose.stamp-last_pose_stamp_;
+    double max_step=std::max(2.0,(std::abs(pose.speed)+5)*dt);
+    if(std::hypot(pose.x-scan_pose_.x,pose.y-scan_pose_.y)>max_step ||
+       std::abs(wrap(pose.yaw-scan_pose_.yaw))>std::max(.25,dt*1.5))reset();}
+  if(!initialized_){origin_x_=pose.x;origin_y_=pose.y;origin_z_=pose.z;initialized_=true;}
+  if(last_pose_stamp_>=0){
+    const double travelled=std::hypot(pose.x-scan_pose_.x,pose.y-scan_pose_.y);
+    if(travelled>.05){
+      double observed=wrap(pose.yaw-scan_pose_.yaw)/travelled;
+      measured_curvature_=.5*measured_curvature_+.5*std::max(-cfg_.max_curvature,std::min(cfg_.max_curvature,observed));
+    }else if(std::abs(pose.speed)<.2)measured_curvature_=0;
+  }
+  for(auto it=ray_clear_receipts_.begin();it!=ray_clear_receipts_.end();) {
+    if(pose.stamp-it->second.second>.35)it=ray_clear_receipts_.erase(it);else ++it;
+  }
+  scan_pose_=pose;last_pose_stamp_=pose.stamp;observeDividers(pose,returns);
+  const double c=std::cos(pose.yaw),s=std::sin(pose.yaw);
+  // GroundGrid ground samples are authoritative. Fit residual road slope in
+  // gravity-aligned sensor coordinates; fallback uses only the expected road band.
+  std::vector<Point> candidates;
+  const auto& source=ground.empty()?returns:ground;
+  for(const auto&p:source)if(p.x>-8&&p.x<20&&std::abs(p.y)<3.5&&
+      std::isfinite(p.z)&&std::abs(p.z+cfg_.sensor_height)<.25)candidates.push_back(p);
+  Eigen::Vector3d plane(0,0,-cfg_.sensor_height);
+  if(candidates.size()>=30){
+    for(int iteration=0;iteration<3;++iteration){Eigen::Matrix3d A=Eigen::Matrix3d::Zero();Eigen::Vector3d v=Eigen::Vector3d::Zero();int n=0;
+      for(const auto&p:candidates){Eigen::Vector3d row(p.x,p.y,1);
+        if(iteration && std::abs(row.dot(plane)-p.z)>.045)continue;
+        A+=row*row.transpose();v+=row*p.z;++n;}
+      if(n<20||std::abs(A.determinant())<1e-6)break;
+      auto fit=A.ldlt().solve(v).eval();if(fit.allFinite()&&std::abs(fit[0])<.08&&std::abs(fit[1])<.08&&std::abs(fit[2]+cfg_.sensor_height)<.15)plane=fit;
+    }
+  }
+  ground_plane_[0]=plane[0];ground_plane_[1]=plane[1];ground_plane_[2]=plane[2];
+  // GroundGrid is a measured surface, not one plane extrapolated over 40m.
+  std::map<std::pair<int,int>,std::vector<Point>> terrain_samples;
+  std::map<std::pair<int,int>,Eigen::Vector3d> terrain_planes;
+  for(const auto&p:ground){
+    if(!std::isfinite(p.x+p.y+p.z)||std::abs(p.z-(plane[0]*p.x+plane[1]*p.y+plane[2]))>.5)continue;
+    terrain_samples[{int(std::floor(p.x/2)),int(std::floor(p.y/2))}].push_back(p);
+  }
+  auto terrain=[&](double x,double y){
+    std::pair<int,int> cell{int(std::floor(x/2)),int(std::floor(y/2))};
+    auto found=terrain_planes.find(cell);if(found!=terrain_planes.end())return found->second;
+    std::vector<Point> samples;
+    for(int dx=-1;dx<=1;++dx)for(int dy=-1;dy<=1;++dy){
+      auto it=terrain_samples.find({cell.first+dx,cell.second+dy});
+      if(it!=terrain_samples.end())samples.insert(samples.end(),it->second.begin(),it->second.end());
+    }
+    Eigen::Vector3d local=plane;
+    for(int iteration=0;iteration<3;++iteration){
+      Eigen::Matrix3d A=Eigen::Matrix3d::Zero();Eigen::Vector3d v=Eigen::Vector3d::Zero();int n=0;
+      for(const auto&p:samples){Eigen::Vector3d row(p.x,p.y,1);double residual=p.z-row.dot(local);
+        if(iteration&&(residual>.03||residual<-.06))continue;
+        A+=row*row.transpose();v+=row*p.z;++n;
+      }
+      if(n<6||std::abs(A.determinant())<1e-6)break;
+      Eigen::Vector3d fit=A.ldlt().solve(v);
+      if(!fit.allFinite()||std::abs(fit[0])>.2||std::abs(fit[1])>.2||std::abs(Eigen::Vector3d(x,y,1).dot(fit-plane))>.5)break;
+      local=fit;
+    }
+    terrain_planes[cell]=local;return local;
+  };
+  std::map<uint64_t,Point> occupied;std::set<uint64_t> free_keys;octomap::KeyRay ray;
+  octomap::point3d origin(float(pose.x-origin_x_+c*cfg_.sensor_x-s*cfg_.sensor_y),
+    float(pose.y-origin_y_+s*cfg_.sensor_x+c*cfg_.sensor_y),float(pose.z-origin_z_+cfg_.sensor_z));
+  std::set<uint64_t> endpoint_keys;
+  std::vector<std::pair<octomap::point3d,bool>> endpoints;endpoints.reserve(returns.size());
+  for(const auto&p:returns){
+    if(!std::isfinite(p.x+p.y+p.z))continue;
+    double bx=p.x+cfg_.sensor_x,by=p.y+cfg_.sensor_y;
+    // Entire nearby road width; curb exterior is excluded geometrically, not by a detector box.
+    if(bx< -cfg_.rear-cfg_.rear_observation_distance||bx>cfg_.length*.75||std::abs(by)>cfg_.width*.5)continue;
+    if(bx>-cfg_.rear&&bx<cfg_.front&&std::abs(by)<cfg_.half_width)continue;
+    // 천장(터널) 점: 차 높이 장애물 칸을 지나지 않으므로 누적·광선추적 모두 뺀다.
+    if(cfg_.ceiling_skip_height>0&&p.z+cfg_.sensor_height>cfg_.ceiling_skip_height)continue;
+    Point w{pose.x+c*bx-s*by,pose.y+s*bx+c*by,p.z+pose.z+cfg_.sensor_z};
+    octomap::point3d end(float(w.x-origin_x_),float(w.y-origin_y_),float(w.z-origin_z_));
+    octomap::OcTreeKey k;if(!tree_->coordToKeyChecked(end,k))continue;
+    uint64_t code=key(k);if(p.map_label==1&&evidence_.count(code))free_keys.insert(code);if(!endpoint_keys.insert(code).second)continue;
+    Eigen::Vector3d local=ground.empty()?plane:terrain(p.x,p.y);
+    // Local GroundGrid support may correct a rising road, but must never lower
+    // the established road plane and manufacture new obstacle cells.
+    double global_height=plane[0]*p.x+plane[1]*p.y+plane[2];
+    double surface_height=std::isfinite(p.map_ground)&&p.map_label>=0?p.map_ground:std::max(global_height,local[0]*p.x+local[1]*p.y+local[2]);
+    double h=p.map_label==4?p.z+cfg_.sensor_height:p.z-surface_height;
+    if(std::abs(h)<.045)ground_visibility_[{int(std::floor(w.x/.5)),int(std::floor(w.y/.5))}]=pose.stamp;
+    double edge_clearance=1e9;bool inside=roadInside(w.x,w.y,0,&edge_clearance);
+    bool curb_surface=(edge_clearance<=.12 && h<=.65&&(p.map_label<0||p.map_label==1))||
+      (cfg_.wall_surface_band>0&&edge_clearance<=cfg_.wall_surface_band&&
+       (p.map_label<0||p.map_label==1));  // 터널 벽면(벽 밑동 산포 + DR 횡오차)
+    bool low_certified=(p.map_label>=3&&h>=.08)||cfg_.certified_min_height>0&&h>=cfg_.certified_min_height&&h<cfg_.min_height&&
+      nearCertified(w.x,w.y,pose.stamp);
+    bool obstacle=(h>=cfg_.min_height||low_certified)&&h<=cfg_.max_height&&inside&&!curb_surface&&p.map_label!=1;
+    // The scene's unsupported far residual is uncertainty, not a filled obstacle.
+    // Keep the same physical point as a transient near-body risk; never promote it.
+    if(p.map_label==5&&(bx>cfg_.front+2.||bx<-cfg_.rear-2.||std::abs(by)>cfg_.half_width+1.))obstacle=false;
+    if(obstacle){w.map_label=p.map_label;w.map_ground=h;occupied.emplace(code,w);}  // map_ground: 이 점의 지면 위 높이
+    endpoints.push_back({end,obstacle});
+  }
+  // 2026-10-07(20:08:55 백): 정지 8 s 뒤 후진을 시도할 때 차 바로 뒤 바닥(근거리 사각)은 11 s 전에 본 것이라
+  //   10 s 창에서 지워져 reverse_unobserved 로 영구 정지했다. 서 있는 시간은 나이에 넣지 않는다(최대 60 s).
+  if(std::abs(pose.speed)>.2||last_moving_stamp_<0||pose.stamp<last_moving_stamp_)last_moving_stamp_=pose.stamp;
+  const double horizon=visibilityHorizon(pose.stamp);
+  for(auto it=ground_visibility_.begin();it!=ground_visibility_.end();)
+    if(pose.stamp-it->second>horizon)it=ground_visibility_.erase(it);else ++it;
+  // Raycast all returns, including ground. A beam at a different elevation cannot
+  // clear a previous obstacle voxel. No-return rays are never manufactured.
+  for(const auto&e:endpoints){if(tree_->computeRayKeys(origin,e.first,ray))
+    for(const auto&k:ray)if(evidence_.count(key(k)))free_keys.insert(key(k));}
+  for(uint64_t code:free_keys){if(occupied.count(code))continue;auto it=evidence_.find(code);if(it==evidence_.end())continue;
+    auto&e=it->second;if(pose.stamp-e.last_clear<.06)continue;
+    if(pose.stamp-e.last_clear>.6)e.misses=0;
+    e.last_clear=pose.stamp;
+    ++e.misses;
+    if((!e.fixed && cfg_.near_memory_sec<=0 && e.misses>=1)||e.misses>=cfg_.clear_scans){octomap::OcTreeKey k;k[0]=code>>32;k[1]=code>>16;k[2]=code;
+      if(e.fixed&&e.misses>=cfg_.clear_scans)ray_clear_receipts_[code]={e.p,pose.stamp};
+      tree_->deleteNode(k);evidence_.erase(it);}
+  }
+  auto is_dynamic=[&dynamic](const Point&p){for(const auto&r:dynamic){double dx=p.x-r.x,dy=p.y-r.y;
+    if(std::abs(dx*std::cos(r.yaw)+dy*std::sin(r.yaw))<=r.length/2+.3&&
+       std::abs(-dx*std::sin(r.yaw)+dy*std::cos(r.yaw))<=r.width/2+.3)return true;}return false;};
+  // A verified moving track also clears its previous occupied region from the
+  // persistent layer. Its current returns remain immediate transient hazards.
+  for(auto&kv:evidence_)if(is_dynamic(kv.second.p)){kv.second.fixed=false;kv.second.hits=0;}
+  for(const auto&kv:occupied){auto&e=evidence_[kv.first];bool moving=is_dynamic(kv.second);
+    if(e.hits==0||pose.stamp-e.last>cfg_.transient_sec){e.hits=0;e.first=pose.stamp;e.height=0;}
+    ++e.hits;e.last=pose.stamp;e.misses=0;e.height=std::max(e.height,kv.second.map_ground);
+    octomap::OcTreeKey voxel_key;voxel_key[0]=kv.first>>32;voxel_key[1]=kv.first>>16;voxel_key[2]=kv.first;
+    auto center=tree_->keyToCoord(voxel_key);e.p={origin_x_+center.x(),origin_y_+center.y(),origin_z_+center.z()};
+    // Raw fallback and pending map evidence remain transient even after many scans.
+    // Legacy missions (label -1) retain their existing confirmation policy.
+    if(!moving&&(kv.second.map_label<0||kv.second.map_label==3)&&
+       ((e.hits>=cfg_.confirm_scans&&pose.stamp-e.first>=.14)||kv.second.map_label==3))e.fixed=true;
+    octomap::OcTreeKey k;k[0]=kv.first>>32;k[1]=kv.first>>16;k[2]=kv.first;tree_->updateNode(k,true,true);
+  }
+  last_scan_=pose.stamp;rebuild(pose.stamp);return true;
+}
+void Engine::rebuild(double now){
+  obstacle_bins_.clear();
+  const double c=std::cos(scan_pose_.yaw),s=std::sin(scan_pose_.yaw);
+  grid_.setGeometry(grid_map::Length(std::abs(c)*cfg_.length+std::abs(s)*cfg_.width,
+    std::abs(s)*cfg_.length+std::abs(c)*cfg_.width),cfg_.resolution,
+    grid_map::Position(scan_pose_.x+c*cfg_.length*.25,scan_pose_.y+s*cfg_.length*.25));
+  for(const auto& layer:grid_.getLayers())grid_[layer].setConstant(0);
+  std::vector<octomap::OcTreeKey> erase_keys;
+  for(auto it=evidence_.begin();it!=evidence_.end();){auto&e=it->second;
+    double dx=e.p.x-scan_pose_.x,dy=e.p.y-scan_pose_.y;
+    double forward=c*dx+s*dy,lateral=-s*dx+c*dy;
+    bool outside=forward < -cfg_.length*.25||forward>cfg_.length*.75||std::abs(lateral)>cfg_.width/2;
+    bool near_memory=cfg_.near_memory_sec>0&&forward>=-cfg_.rear-2.&&forward<=cfg_.front+2.&&std::abs(lateral)<=cfg_.half_width+1.&&(now-e.last<=cfg_.near_memory_sec||std::abs(scan_pose_.speed)<.2);
+    if(outside||(!e.fixed&&!near_memory&&now-e.last>cfg_.transient_sec)){
+      octomap::OcTreeKey k;k[0]=it->first>>32;k[1]=it->first>>16;k[2]=it->first;tree_->deleteNode(k);it=evidence_.erase(it);continue;}
+    // Preserve accumulated geometry; conditional boundaries only mask collision admission.
+    if(!roadInside(e.p.x,e.p.y,0)){++it;continue;}
+    Point q=e.p;
+    if(cfg_.tunnel_new_obstacle_margin>0&&(now-e.first<cfg_.tunnel_new_obstacle_sec||e.height<cfg_.tunnel_low_obstacle_height))
+      q.plan_extra=cfg_.tunnel_new_obstacle_margin;
+    obstacle_bins_[bin(e.p.x,e.p.y)].push_back(q);
+    grid_map::Index index;if(grid_.getIndex(grid_map::Position(e.p.x,e.p.y),index)){
+      grid_.at(e.fixed?"static":"transient",index)=1;grid_.at("observed",index)=float(now-e.last);}
+    ++it;
+  }
+  if(cfg_.certified_far_proxy)addCertifiedProxies(now);
+  static FILE* dump=std::getenv("OCC_DUMP_BINS")?std::fopen(std::getenv("OCC_DUMP_BINS"),"w"):nullptr;
+  if(dump){for(const auto&kv:obstacle_bins_)for(const auto&q:kv.second)std::fprintf(dump,"%.3f %.2f %.2f %.2f\n",now,q.x,q.y,q.z);std::fflush(dump);}
+}
+static bool nearPolygon(const std::vector<Point>& f,double x,double y,double m){
+  bool in=false;
+  for(size_t i=0,j=f.size()-1;i<f.size();j=i++){
+    if(((f[i].y>y)!=(f[j].y>y))&&(x<(f[j].x-f[i].x)*(y-f[i].y)/(f[j].y-f[i].y+1e-12)+f[i].x))in=!in;
+    const double ex=f[i].x-f[j].x,ey=f[i].y-f[j].y,l2=ex*ex+ey*ey;
+    double u=l2>1e-12?((x-f[j].x)*ex+(y-f[j].y)*ey)/l2:0.;u=std::max(0.,std::min(1.,u));
+    if(std::hypot(x-f[j].x-u*ex,y-f[j].y-u*ey)<=m)return true;
+  }
+  return in;
+}
+void Engine::addCertifiedProxies(double now){
+  const double m=cfg_.certified_margin;
+  for(const auto& object:certified_triggers_){
+    const auto& f=object.footprint;
+    if(f.size()<3||now<object.stamp-.05||now-object.stamp>cfg_.trigger_hold)continue;
+    double x0=INF,x1=-INF,y0=INF,y1=-INF;
+    for(const auto& p:f){x0=std::min(x0,p.x);x1=std::max(x1,p.x);y0=std::min(y0,p.y);y1=std::max(y1,p.y);}
+    if(x1-x0>8.||y1-y0>8.)continue;   // 합쳐진 거대 외곽은 쓰지 않는다
+    int real=0;auto b0=bin(x0-m,y0-m),b1=bin(x1+m,y1+m);
+    for(int bx=std::min(b0.first,b1.first);bx<=std::max(b0.first,b1.first);++bx)
+      for(int by=std::min(b0.second,b1.second);by<=std::max(b0.second,b1.second);++by){
+        auto it=obstacle_bins_.find({bx,by});if(it==obstacle_bins_.end())continue;
+        for(const auto& q:it->second)if(nearPolygon(f,q.x,q.y,m))++real;}
+    if(real>=cfg_.certified_far_min_cells)continue;
+    std::vector<Point> proxy;
+    for(size_t i=0,j=f.size()-1;i<f.size();j=i++){
+      const double ex=f[i].x-f[j].x,ey=f[i].y-f[j].y;int n=std::max(1,int(std::ceil(std::hypot(ex,ey)/.2)));
+      for(int k=0;k<n;++k)proxy.push_back({f[j].x+ex*k/n,f[j].y+ey*k/n,0});}
+    for(double x=x0;x<=x1;x+=.3)for(double y=y0;y<=y1;y+=.3)if(nearPolygon(f,x,y,0.))proxy.push_back({x,y,0});
+    for(const auto& p:proxy)if(roadInside(p.x,p.y,0))obstacle_bins_[bin(p.x,p.y)].push_back(p);
+  }
+}
+size_t Engine::staticCount() const{size_t n=0;for(const auto&kv:evidence_)n+=kv.second.fixed;return n;}
+uint64_t Engine::geometryDigest() const{
+  // Include full 3D points and confirmation/clearing history, not just 2D boxes.
+  uint64_t h=1469598103934665603ULL;
+  auto bytes=[&](const void* ptr,size_t n){const auto*b=static_cast<const unsigned char*>(ptr);for(size_t i=0;i<n;++i){h^=b[i];h*=1099511628211ULL;}};
+  for(const auto&kv:evidence_){bytes(&kv.first,sizeof(kv.first));const auto&e=kv.second;
+    for(double v:{e.p.x,e.p.y,e.p.z,e.first,e.last,e.last_clear})bytes(&v,sizeof(v));
+    for(int v:{e.hits,e.misses,int(e.fixed)})bytes(&v,sizeof(v));}
+  return h;
+}
+bool Engine::nearCertified(double x,double y,double stamp) const {
+  // 측정점만 판정한다(상자/외곽선을 격자에 칠하지 않는다).
+  const double m=cfg_.certified_margin;
+  for(const auto& object:certified_triggers_){
+    const auto& f=object.footprint;
+    if(f.size()<3||stamp<object.stamp-.05||stamp-object.stamp>cfg_.trigger_hold)continue;
+    double x0=INF,x1=-INF,y0=INF,y1=-INF;
+    for(const auto& p:f){x0=std::min(x0,p.x);x1=std::max(x1,p.x);y0=std::min(y0,p.y);y1=std::max(y1,p.y);}
+    if(x<x0-m||x>x1+m||y<y0-m||y>y1+m)continue;
+    bool in=false;
+    for(size_t i=0,j=f.size()-1;i<f.size();j=i++){
+      if(((f[i].y>y)!=(f[j].y>y))&&(x<(f[j].x-f[i].x)*(y-f[i].y)/(f[j].y-f[i].y+1e-12)+f[i].x))in=!in;
+      const double ex=f[i].x-f[j].x,ey=f[i].y-f[j].y,l2=ex*ex+ey*ey;
+      double u=l2>1e-12?((x-f[j].x)*ex+(y-f[j].y)*ey)/l2:0.;u=std::max(0.,std::min(1.,u));
+      if(std::hypot(x-f[j].x-u*ex,y-f[j].y-u*ey)<=m)return true;
+    }
+    if(in)return true;
+  }
+  return false;
+}
+double Engine::bodyObstacleDistance(const Pose& pose) const {
+  const double c=std::cos(pose.yaw),s=std::sin(pose.yaw);double best=INF;
+  auto b=bin(pose.x,pose.y);int m=int(std::ceil(cfg_.front+2.));
+  for(int dx=-m;dx<=m;++dx)for(int dy=-m;dy<=m;++dy){auto it=obstacle_bins_.find({b.first+dx,b.second+dy});
+    if(it==obstacle_bins_.end())continue;
+    for(const auto&q:it->second){double qx=q.x-pose.x,qy=q.y-pose.y,a=c*qx+s*qy,d=-s*qx+c*qy;
+      double ea=std::max(0.,std::max(a-cfg_.front,-cfg_.rear-a)),ed=std::max(0.,std::abs(d)-cfg_.half_width);
+      best=std::min(best,std::hypot(ea,ed));}}
+  return best;
+}
+void Engine::relaxMarginForStart(const Pose& pose) const {
+  // 2026-10-07(20:41:06 백): 저상 장애물 옆을 0.15 m 로 지나다 멈추자 지금 자세부터 여유 위반이라 어떤 경로도
+  //   못 내고 영구정지. 지금 간격보다 0.03 m 작은 여유로만 출발을 허용(더 가까워지는 경로는 여전히 거절).
+  margin_override_=-1;if(strict_scene_margins_)return;
+  const double d=bodyObstacleDistance(pose),pad=cfg_.obstacle_margin+cfg_.resolution*.7072;
+  if(d<=pad&&d>.08)margin_override_=std::max(0.,d-cfg_.resolution*.7072-.03);
+}
+bool Engine::bodyClear(const Reference&p,double now,std::string* reason) const {
+  static const bool body_debug_c=std::getenv("OCC_BODY_DEBUG")!=nullptr;
+  if(!roadInside(p.x,p.y,cfg_.half_width+cfg_.curb_margin)){if(body_debug_c)std::fprintf(stderr,"BODY curb_center\n");if(reason)*reason="curb_center";return false;}
+  double c=std::cos(p.yaw),s=std::sin(p.yaw);
+  // Center has the requested 1.05m inset. Corners only check the physical curb;
+  // do NOT subtract half width a second time from the corner coordinates.
+  for(double x:{-cfg_.rear,0.,cfg_.front})for(double y:{-cfg_.half_width,cfg_.half_width})
+    if(!roadInside(p.x+c*x-s*y,p.y+s*x+c*y,0)){if(body_debug_c)std::fprintf(stderr,"BODY curb_body corner(%.1f,%.1f)\n",x,y);if(reason)*reason="curb_body";return false;}
+  const double margin=effectiveMargin();
+  const double extra_max=plan_extra_active_?std::max(0.,cfg_.tunnel_new_obstacle_margin):0.;
+  double rad=cfg_.front+margin+extra_max+.15;auto b=bin(p.x,p.y);int m=int(std::ceil(rad));
+  for(int dx=-m;dx<=m;++dx)for(int dy=-m;dy<=m;++dy){auto it=obstacle_bins_.find({b.first+dx,b.second+dy});
+    if(it==obstacle_bins_.end())continue;
+    for(const auto&q:it->second){double qx=q.x-p.x,qy=q.y-p.y;
+      double a=c*qx+s*qy,d=-s*qx+c*qy;
+      double pad=margin+(plan_extra_active_?q.plan_extra:0.)+cfg_.resolution*.7072;
+      if(a>=-cfg_.rear-pad&&a<=cfg_.front+pad&&std::abs(d)<=cfg_.half_width+pad){
+        static const bool body_debug=std::getenv("OCC_BODY_DEBUG")!=nullptr;
+        if(body_debug)std::fprintf(stderr,"BODY occ at body(%.2f,%.2f) z %.2f world(%.2f,%.2f)\n",a,d,q.z,q.x,q.y);
+        collision_location_={{q.x,q.y}};
+        if(reason)*reason="occupancy";
+        return false;}}}
+  (void)now;return true;
+}
+bool Engine::observedFree(const Reference&p,double now) const {return observedFraction(p,now)>=cfg_.return_observed_ratio;}
+double Engine::observedFraction(const Reference&p,double now) const {
+  // 차체 범위(뒤~앞, 폭)의 0.5 m 칸 중 지면이 관측된(가시 기록이 살아 있는) 비율. 장애물 자리·가려진 자리는 관측되지 않는다.
+  const double c=std::cos(p.yaw),s=std::sin(p.yaw),horizon=visibilityHorizon(now);int total=0,seen=0;
+  for(double a=-cfg_.rear;a<=cfg_.front+1e-6;a+=.5)for(double b=-cfg_.half_width;b<=cfg_.half_width+1e-6;b+=.5){
+    double x=p.x+c*a-s*b,y=p.y+s*a+c*b;++total;
+    auto it=ground_visibility_.find({int(std::floor(x/.5)),int(std::floor(y/.5))});
+    if(it!=ground_visibility_.end()&&now>=it->second-.05&&now-it->second<=horizon)++seen;}
+  return total>0?double(seen)/total:0.;
+}
+std::vector<Reference> Engine::resample(const std::vector<Reference>& in,double ds) const {
+  std::vector<Reference> out;if(in.size()<2)return in;out.push_back(in.front());double next=ds,total=0;
+  for(size_t i=1;i<in.size();++i){double len=distance(in[i-1],in[i]);if(len<1e-6)continue;
+    while(next<=total+len+1e-7){double u=(next-total)/len;Reference p;
+      p.x=in[i-1].x+u*(in[i].x-in[i-1].x);p.y=in[i-1].y+u*(in[i].y-in[i-1].y);
+      p.yaw=in[i-1].yaw+u*wrap(in[i].yaw-in[i-1].yaw);p.idx=int(std::lround(in[i-1].idx+u*(in[i].idx-in[i-1].idx)));
+      out.push_back(p);next+=ds;}total+=len;}
+  return out;
+}
+bool Engine::validate(const std::vector<Reference>& path,double now,std::string* reason,double* failure_distance) const {
+  collision_location_={{NAN,NAN}};
+  if(path.size()<2){if(reason)*reason="short_path";return false;}
+  auto dense=resample(path,.15);
+  // Check sweep between dense samples as well as their oriented rectangles.
+  headings(dense);double travelled=0;
+  for(size_t i=0;i<dense.size();++i){if(i)travelled+=distance(dense[i-1],dense[i]);
+    if(!bodyClear(dense[i],now,reason)){if(failure_distance)*failure_distance=travelled;return false;}}
+  if(curvature(dense)>cfg_.max_curvature){if(reason)*reason="curvature";return false;}return true;
+}
+void Engine::updateMotion(Result& out,const Pose& pose,const std::vector<Reference>& route){
+  if(!out.clear||out.path.size()<3||route.empty())return;
+  out.boundary_source=boundarySource(route.front().idx);
+  const auto&r0=route.front();double d0=-(pose.x-r0.x)*std::sin(r0.yaw)+(pose.y-r0.y)*std::cos(r0.yaw);
+  double travelled=0,near_offset=0,max_offset=0,first_avoid=INF,return_offset=std::abs(d0);
+  const double return_distance=std::max(cfg_.return_min_distance,std::abs(pose.speed)*cfg_.return_min_time);
+  bool return_sample=false;double limit=9999;
+  for(size_t i=0;i<out.path.size();++i){
+    if(i)travelled+=distance(out.path[i-1],out.path[i]);
+    const auto*r=nearestRoad(out.path[i].x,out.path[i].y);if(!r)continue;
+    double d=std::abs(-(out.path[i].x-r->x)*std::sin(r->yaw)+(out.path[i].y-r->y)*std::cos(r->yaw));
+    max_offset=std::max(max_offset,d);if(travelled<=cfg_.cruise_preview)near_offset=std::max(near_offset,d);
+    if(!return_sample&&travelled>=return_distance){return_offset=d;return_sample=true;}
+    if(d>cfg_.cruise_path_offset){
+      first_avoid=std::min(first_avoid,travelled);
+      size_t a=i?i-1:i,b=std::min(i+1,out.path.size()-1);
+      double ds=distance(out.path[a],out.path[b]);
+      double k=ds>1e-4?std::abs(wrap(out.path[b].yaw-out.path[a].yaw))/ds:0;
+      double local=std::min(cfg_.speedCeiling(),std::sqrt(cfg_.max_lateral_accel/std::max(.001,k)));
+      double available=std::max(0.,travelled-std::abs(pose.speed)*cfg_.reaction);
+      limit=std::min(limit,std::sqrt(local*local+2*cfg_.braking*available));
+    }
+  }
+  bool center_clear=true;auto reference=resample(route,.5);travelled=0;
+  for(size_t i=0;i<reference.size();++i){
+    if(i)travelled+=distance(reference[i-1],reference[i]);
+    if(travelled>cfg_.return_min_distance)break;
+    if(!bodyClear(reference[i],pose.stamp)){center_clear=false;break;}
+  }
+  bool aligned=std::abs(d0)<=cfg_.cruise_offset&&std::abs(wrap(pose.yaw-r0.yaw))<=cfg_.cruise_heading&&
+    near_offset<=cfg_.cruise_path_offset&&center_clear;
+  if(std::abs(d0)>cfg_.cruise_offset||near_offset>cfg_.cruise_path_offset)avoidance_session_=true;
+  if(aligned){if(aligned_since_<0)aligned_since_=pose.stamp;
+    if(pose.stamp-aligned_since_>=(tunnel_connected_hold_&&continuous_transition_?.3:cfg_.cruise_hold))avoidance_session_=false;
+  }else aligned_since_=-1;
+  out.avoiding=max_offset>cfg_.cruise_path_offset||avoidance_session_;
+  out.returning=avoidance_session_&&center_clear&&return_offset<std::abs(d0);
+  out.motion_state=out.returning?"RETURNING":avoidance_session_?"AVOIDING":first_avoid<INF?"APPROACH":"CRUISE";
+  // Nominal curves belong to the already-tuned MPC. Only avoidance geometry
+  // produces a second curvature cap; propagate future caps back by braking distance.
+  if(avoidance_session_)limit=std::min(limit,cfg_.speedCeiling());
+  out.speed_cap=limit;out.speed_limit_reason=limit>=500?"released_to_mpc":first_avoid<INF?"avoidance_distance_profile":"alignment_hold";
+}
+// Admission is deliberately read-only with respect to evidence and geometry.
+void Engine::selectTrigger(const Pose& pose,const std::vector<Reference>& ref,Result& out){
+  if(!cfg_.trigger_enabled){out.trigger_reason="disabled";return;}
+  std::vector<double> arc(ref.size(),0);
+  for(size_t i=1;i<ref.size();++i)arc[i]=arc[i-1]+distance(ref[i-1],ref[i]);
+  auto location=[&](const Point& p,double* signed_d=nullptr){
+    double best=INF,best_u=0;size_t best_i=0;
+    // Query the supplied active reference, not a nearest index on the entire
+    // CSV: a nearby parallel road or crossing must not steal object ownership.
+    for(size_t i=0;i+1<ref.size();++i){
+      double dx=ref[i+1].x-ref[i].x,dy=ref[i+1].y-ref[i].y,l2=dx*dx+dy*dy;
+      if(l2<1e-10)continue;
+      double u=((p.x-ref[i].x)*dx+(p.y-ref[i].y)*dy)/l2;
+      if(i>0)u=std::max(0.,u);
+      if(i+2<ref.size())u=std::min(1.,u);
+      double x=p.x-ref[i].x-u*dx,y=p.y-ref[i].y-u*dy,d2=x*x+y*y;
+      if(d2<best){best=d2;best_i=i;best_u=u;}
+    }
+    double ds=distance(ref[best_i],ref[best_i+1]);
+    if(signed_d){double dx=ref[best_i+1].x-ref[best_i].x,dy=ref[best_i+1].y-ref[best_i].y;
+      *signed_d=(dx*(p.y-ref[best_i].y)-dy*(p.x-ref[best_i].x))/std::max(1e-9,ds);}
+    return std::make_pair(arc[best_i]+best_u*ds,std::sqrt(best));
+  };
+  double pad=cfg_.resolution*.7072,nearest=INF;
+  std::vector<Point> current;int outside=0,far=0,unconfirmed=0,passed=0;
+  double seen=trigger_seen_;
+  for(const auto& kv:evidence_){if(certified_admission_only_)break;const auto&e=kv.second;auto l=location(e.p);
+    if(l.first+pad < -cfg_.rear-cfg_.obstacle_margin){++passed;continue;}
+    if(l.second-pad>cfg_.trigger_half_width){++outside;continue;}
+    if(l.first-pad>cfg_.trigger_distance){++far;continue;}
+    if(!e.fixed){++unconfirmed;continue;}
+    // Fixed cells survive occlusion, but that must not refresh admission time.
+    if(pose.stamp-e.last>cfg_.scan_timeout)continue;
+    current.push_back(e.p);nearest=std::min(nearest,l.first-pad);seen=std::max(seen,e.last);
+  }
+  bool certified=false;
+  // Sparse 16-channel returns can visit different 0.1m voxels every scan. Reuse
+  // the original object's independent temporal verification for admission; do
+  // not paint its box/hull into the collision map or alter any measured point.
+  for(const auto& object:certified_triggers_){
+    if(object.footprint.size()<(object.measured_cells?1u:3u)||pose.stamp<object.stamp-.05||pose.stamp-object.stamp>cfg_.trigger_hold)continue;
+    if(object.measured_cells){
+      // No enclosing hull: separated side surfaces cannot bridge an empty
+      // reference corridor merely because their combined min/max spans it.
+      for(const auto&p:object.footprint){auto l=location(p);
+        if(!roadInside(p.x,p.y,0)||l.first+pad<-cfg_.rear-cfg_.obstacle_margin||
+           l.first-pad>cfg_.trigger_distance||l.second-pad>cfg_.trigger_half_width)continue;
+        current.push_back(p);nearest=std::min(nearest,l.first-pad);
+        seen=std::max(seen,object.stamp);certified=true;
+      }
+      continue;
+    }
+    double smin=INF,smax=-INF,dmin=INF,dmax=-INF;bool inside=false;
+    for(const auto& p:object.footprint){double d;auto l=location(p,&d);
+      smin=std::min(smin,l.first);smax=std::max(smax,l.first);
+      dmin=std::min(dmin,d);dmax=std::max(dmax,d);inside|=roadInside(p.x,p.y,0);}
+    if(!inside||smax<-cfg_.rear-cfg_.obstacle_margin||smin>cfg_.trigger_distance||
+       dmin>cfg_.trigger_half_width||dmax<-cfg_.trigger_half_width)continue;
+    current.insert(current.end(),object.footprint.begin(),object.footprint.end());
+    nearest=std::min(nearest,smin);seen=std::max(seen,object.stamp);certified=true;
+  }
+  if(!current.empty()){held_trigger_=current;trigger_seen_=seen;out.trigger_count=current.size();out.trigger_reason=certified?"certified_static_geometry":"confirmed_in_corridor";}
+  else if(trigger_seen_>=0&&pose.stamp-trigger_seen_<=cfg_.trigger_hold){
+    for(const auto&p:held_trigger_){auto l=location(p);if(l.first+pad>=-cfg_.rear-cfg_.obstacle_margin){
+      nearest=std::min(nearest,l.first-pad);++out.trigger_count;}}
+    out.trigger_held=out.trigger_count>0;out.trigger_reason=out.trigger_held?"held_trigger":"passed";
+  }else out.trigger_reason=unconfirmed?"unconfirmed":far?"outside_trigger_distance":outside?"outside_corridor":passed?"passed":"no_trigger";
+  if(!out.trigger_count)held_trigger_.clear();
+  out.trigger_nearest=nearest<INF?nearest:-1;
+}
+// Publish only a validated nominal prefix while admission is withheld.
+bool Engine::approvalPath(Result& out,const Pose& pose,const std::vector<Reference>& nominal,double stop,const std::string& reason){
+  out.path.clear();out.held=false;out.corridor.clear();double arc=0;
+  for(size_t i=0;i<nominal.size();++i){if(i)arc+=distance(nominal[i-1],nominal[i]);
+    if(arc>stop+1e-7||!bodyClear(nominal[i],pose.stamp))break;
+    out.path.push_back(nominal[i]);}
+  double covered=0;for(size_t i=1;i<out.path.size();++i)covered+=distance(out.path[i-1],out.path[i]);
+  out.clear=out.path.size()>2&&validate(out.path,pose.stamp);
+  out.reason=out.clear?reason:reason+"_collision_stop";
+  out.max_curvature=out.clear?curvature(out.path):0;
+  if(!out.clear){out.path.clear();last_path_.clear();spatial_return_active_=false;out.speed_cap=0;return false;}
+  last_path_=out.path;spatial_return_active_=false;
+  // A full reference needs no additional cap; a prefix stops before its end.
+  double full=0;for(size_t i=1;i<nominal.size();++i)full+=distance(nominal[i-1],nominal[i]);
+  if(reason=="admission_reference"&&covered+.15>=full)out.reason="reference_passthrough";
+  out.speed_cap=covered+0.15<full?std::sqrt(2*cfg_.braking*std::max(0.,covered-std::abs(pose.speed)*cfg_.reaction-.5)):9999;
+  return true;
+}
+bool Engine::locate(double x,double y,Reference& out) const {
+  const auto* r=nearestRoad(x,y);if(!r)return false;out=*r;return true;
+}
+std::unique_ptr<Engine> Engine::recoverySnapshot() const {
+  std::unique_ptr<Engine> trial(new Engine(cfg_));
+  trial->grid_=grid_;trial->evidence_=evidence_;trial->obstacle_bins_=obstacle_bins_;
+  trial->road_=road_;trial->edges_=edges_;trial->road_tree_=road_tree_;
+  trial->origin_x_=origin_x_;trial->origin_y_=origin_y_;trial->origin_z_=origin_z_;
+  trial->last_scan_=last_scan_;trial->last_pose_stamp_=last_pose_stamp_;
+  std::copy(ground_plane_,ground_plane_+3,trial->ground_plane_);
+  trial->scan_pose_=scan_pose_;trial->initialized_=initialized_;trial->live_=live_;trial->strict_scene_margins_=strict_scene_margins_;
+  trial->ground_visibility_=ground_visibility_;trial->last_moving_stamp_=last_moving_stamp_;trial->traffic_=TrafficState();
+  return trial;
+}
+std::unique_ptr<Engine> Engine::planningSnapshot() const {
+  auto trial=recoverySnapshot();
+  trial->base_edges_=base_edges_;trial->divider_candidates_=divider_candidates_;
+  trial->divider_seen_=divider_seen_;trial->divider_hits_=divider_hits_;
+  trial->divider_first_=divider_first_;trial->divider_last_=divider_last_;
+  trial->tunnel_connected_hold_=tunnel_connected_hold_;trial->reacquiring_=reacquiring_;trial->continuous_transition_=continuous_transition_;trial->strict_scene_margins_=strict_scene_margins_;
+  trial->last_path_=last_path_;trial->measured_curvature_=measured_curvature_;
+  trial->aligned_since_=aligned_since_;trial->avoidance_session_=avoidance_session_;
+  trial->spatial_return_active_=spatial_return_active_;trial->traffic_=traffic_;
+  trial->certified_admission_only_=certified_admission_only_;trial->held_trigger_=held_trigger_;trial->trigger_seen_=trigger_seen_;trial->certified_triggers_=certified_triggers_;
+  return trial;
+}
+void Engine::adoptPlanning(const Engine& p) {
+  // Never replace live evidence, scans, boundaries or measured vehicle state.
+  last_path_=p.last_path_;aligned_since_=p.aligned_since_;
+  avoidance_session_=p.avoidance_session_;spatial_return_active_=p.spatial_return_active_;
+  held_trigger_=p.held_trigger_;trigger_seen_=p.trigger_seen_;
+}
+bool Engine::connect(const Pose& pose,const std::vector<Reference>& path,double now,
+                     std::vector<Reference>& out,std::string* reason) const {
+  out.clear();
+  struct Restore{const Engine* e;~Restore(){e->margin_override_=-1;}} restore{this};relaxMarginForStart(pose);
+  if(path.size()<3||now-last_scan_>cfg_.scan_timeout||now<last_scan_-.05){
+    if(reason)*reason="connector_stale_or_short";return false;
+  }
+  size_t nearest=0;double best=INF;
+  for(size_t i=0;i<path.size();++i){double d=std::hypot(path[i].x-pose.x,path[i].y-pose.y);
+    if(d<best){best=d;nearest=i;}}
+  // Direct reuse is allowed only when it already starts at this pose and heading.
+  if(best<.015&&std::abs(wrap(path[nearest].yaw-pose.yaw))<.01){
+    out.assign(path.begin()+nearest,path.end());out.front().x=pose.x;out.front().y=pose.y;
+    if(validate(out,now,reason))return true;out.clear();
+  }
+  double arc=0,next_target=2.;
+  std::vector<std::pair<double,std::vector<Reference>>> pending;
+  static const bool conn_debug=std::getenv("OCC_CONNECT_DEBUG")!=nullptr;
+  if(conn_debug)std::fprintf(stderr,"CONNECT path %zu nearest %zu best %.3f pose(%.2f,%.2f,%.3f) path0(%.2f,%.2f,%.3f)\n",
+    path.size(),nearest,best,pose.x,pose.y,pose.yaw,path[0].x,path[0].y,path[0].yaw);
+  for(size_t j=nearest+1;j+2<path.size();++j){
+    arc+=distance(path[j-1],path[j]);if(arc<next_target)continue;
+    if(arc>10.)break;next_target=arc+1.;
+    const auto& end=path[j];double length=std::hypot(end.x-pose.x,end.y-pose.y);
+    if(length<1.||length>12.)continue;
+    double end_k=wrap(path[j+1].yaw-path[j-1].yaw)/std::max(.01,distance(path[j-1],path[j])+distance(path[j],path[j+1]));
+    auto coefficients=[&](double start,double finish,double v0,double v1,double a0,double a1){
+      std::array<double,6> c{{start,v0,a0/2,0,0,0}};
+      double d=finish-c[0]-c[1]-c[2],v=v1-c[1]-2*c[2],a=a1-2*c[2];
+      c[3]=10*d-4*v+a/2;c[4]=-15*d+7*v-a;c[5]=6*d-3*v+a/2;return c;
+    };
+    auto x=coefficients(pose.x,end.x,length*std::cos(pose.yaw),length*std::cos(end.yaw),
+      -length*length*measured_curvature_*std::sin(pose.yaw),-length*length*end_k*std::sin(end.yaw));
+    auto y=coefficients(pose.y,end.y,length*std::sin(pose.yaw),length*std::sin(end.yaw),
+      length*length*measured_curvature_*std::cos(pose.yaw),length*length*end_k*std::cos(end.yaw));
+    std::vector<Reference> candidate;int n=std::max(20,int(std::ceil(length/.1)));
+    bool forward=true;
+    for(int i=0;i<n;++i){double t=double(i)/n;
+      auto value=[&](const std::array<double,6>& c){double v=c[5];for(int k=4;k>=0;--k)v=v*t+c[k];return v;};
+      auto derivative=[&](const std::array<double,6>& c){double v=5*c[5];for(int k=4;k>=1;--k)v=v*t+k*c[k];return v;};
+      double dx=derivative(x),dy=derivative(y);
+      if(std::hypot(dx,dy)<.1||dx*std::cos(pose.yaw)+dy*std::sin(pose.yaw)<=0){forward=false;break;}
+      candidate.push_back({value(x),value(y),std::atan2(dy,dx),end.idx});
+    }
+    if(!forward){if(conn_debug)std::fprintf(stderr,"  cand j %zu len %.2f backward\n",j,length);continue;}
+    candidate.insert(candidate.end(),path.begin()+j,path.end());
+    if(cfg_.connector_smooth){
+      // 2026-10-06: 가장 짧은 연결은 추종 오차를 2~4 m 안에서 급히 꺾어 맞춘다. 후보를 모아 최대 곡률 순으로 검증한다.
+      double peak=0;size_t m=candidate.size()-(path.size()-j);
+      for(size_t i=1;i+1<m;++i)peak=std::max(peak,std::abs(wrap(candidate[i+1].yaw-candidate[i-1].yaw))/
+        std::max(.01,distance(candidate[i-1],candidate[i])+distance(candidate[i],candidate[i+1])));
+      pending.emplace_back(peak,std::move(candidate));continue;
+    }
+    if(validate(candidate,now,reason)){out=std::move(candidate);return true;}
+  }
+  std::stable_sort(pending.begin(),pending.end(),[](const auto& a,const auto& b){return a.first<b.first;});
+  for(auto& c:pending){if(validate(c.second,now,reason)){out=std::move(c.second);return true;}
+    if(conn_debug)std::fprintf(stderr,"  cand peak %.3f invalid: %s\n",c.first,reason?reason->c_str():"");}
+  if(conn_debug)std::fprintf(stderr,"  pending %zu arc_end %.2f\n",pending.size(),arc);
+  if(reason&&reason->empty())*reason="no_valid_connector";
+  return false;
+}
+Result Engine::evaluateEscape(const Pose& pose,const std::vector<Reference>& route) const {
+  auto trial=recoverySnapshot();trial->avoidance_session_=true;
+  trial->cfg_.trigger_enabled=false;trial->measured_curvature_=0;
+  return trial->plan(pose,route);
+}
+bool Engine::validateReverse(const std::vector<Reference>& path,double now,std::string* reason) const {
+  if(path.empty()||now-last_scan_>cfg_.scan_timeout||now<last_scan_){if(reason)*reason="stale_geometry";return false;}
+  Engine trial(cfg_);trial.obstacle_bins_=obstacle_bins_;trial.road_=road_;trial.edges_=edges_;
+  trial.road_tree_=road_tree_;trial.live_=live_;trial.last_scan_=last_scan_;
+  trial.cfg_.obstacle_margin=strict_scene_margins_?cfg_.obstacle_margin:.5;
+  // 2026-10-08(11:32:15 백): 차 옆/뒤 장애물에 이미 0.5 m 보다 가까이 붙어 서 있으면 시작 자세부터 occupancy 로
+  //   모든 후진 후보가 거절돼 32 s 정지. 그때만 여유를 '지금 간격 - 0.05 m'(최소 0.1 m)로 낮춘다.
+  //   지금보다 가까워지는 후진 경로는 여전히 거절된다.
+  {Pose start;start.x=path.front().x;start.y=path.front().y;start.yaw=path.front().yaw;
+   const double d=trial.bodyObstacleDistance(start),pad=.5+cfg_.resolution*.7072;
+   if(!strict_scene_margins_&&d<=pad)trial.cfg_.obstacle_margin=std::max(.1,d-cfg_.resolution*.7072-.05);}
+  // Keep vehicle headings; reversing a tangent must not flip the front/rear body.
+  for(const auto& p:resample(path,strict_scene_margins_?.1:.2)){
+    if(!trial.bodyClear(p,now,reason))return false;
+    // Occupancy is not evidence of visibility. Require ray-cleared cells behind
+    // the rear axle across the full swept width; unknown space cannot authorize R.
+    for(double lat:{-cfg_.half_width,0.,cfg_.half_width}){
+      double x=p.x-std::cos(p.yaw)*(cfg_.rear+.5)-std::sin(p.yaw)*lat;
+      double y=p.y-std::sin(p.yaw)*(cfg_.rear+.5)+std::cos(p.yaw)*lat;
+      bool known=false;int ix=int(std::floor(x/.5)),iy=int(std::floor(y/.5));
+      for(int dx=-1;dx<=1;++dx)for(int dy=-1;dy<=1;++dy){
+        auto it=ground_visibility_.find({ix+dx,iy+dy});
+        if(it!=ground_visibility_.end()&&now>=it->second&&now-it->second<=visibilityHorizon(now))known=true;
+      }
+      if(!known){if(reason)*reason="reverse_unobserved";return false;}
+    }
+  }
+  return true;
+}
+Result Engine::plan(const Pose& pose,const std::vector<Reference>& route){
+  struct Restore{const Engine* e;~Restore(){e->margin_override_=-1;e->plan_extra_active_=false;}} restore{this};relaxMarginForStart(pose);
+  applyConditionalEdges(pose.stamp);
+  auto begin=std::chrono::steady_clock::now();Result out;out.static_voxels=staticCount();out.transient_voxels=count()-out.static_voxels;
+  const bool tunnel=!route.empty()&&route.front().idx>=7000&&route.front().idx<=9000;
+  const bool approach=!route.empty()&&route.front().idx>=cfg_.static_planning_start_idx&&route.front().idx<cfg_.static_zone_min_idx;
+  // Additional clearance for partially observed first-obstacle surfaces only.
+  // Restore it on every exit: map evidence and later missions retain their size.
+  struct MarginGuard { double& value;double saved;~MarginGuard(){value=saved;} } guard{cfg_.obstacle_margin,cfg_.obstacle_margin};
+  if(approach)cfg_.obstacle_margin=std::max(cfg_.obstacle_margin,cfg_.approach_obstacle_margin);
+  std::string return_rejection="not_requested";
+  const bool actual_offset=!route.empty()&&(std::abs(-(pose.x-route.front().x)*std::sin(route.front().yaw)+(pose.y-route.front().y)*std::cos(route.front().yaw))>cfg_.cruise_offset||std::abs(wrap(pose.yaw-route.front().yaw))>cfg_.cruise_heading);
+  const double current_reference_curvature=route.size()>1?wrap(route[1].yaw-route[0].yaw)/std::max(.01,distance(route[0],route[1])):0;
+  const bool already_avoiding=avoidance_session_||actual_offset||std::abs(measured_curvature_-current_reference_curvature)>.003;
+  bool admission_limited=false;double admission_cap=9999;
+  bool partial_approach=false;
+  auto finish=[&](){
+    if(!out.clear&&(approach||tunnel)&&!approach_fallback_in_progress_&&out.reason=="no_connected_corridor"&&
+        out.failure_distance>cfg_.front+cfg_.obstacle_margin+(approach?14.:6.)){
+      const double blockage=out.failure_distance;
+      double& horizon=approach?cfg_.approach_horizon:cfg_.horizon;
+      const double saved_horizon=horizon;
+      horizon=std::min(cfg_.horizon,blockage-cfg_.front-cfg_.obstacle_margin-2.);
+      approach_fallback_in_progress_=true;auto prefix=plan(pose,route);
+      approach_fallback_in_progress_=false;horizon=saved_horizon;
+      if(prefix.clear){out=prefix;out.reason=(approach?"approach_safe_prefix_":"tunnel_safe_prefix_")+prefix.reason;
+        out.approach_blockage_distance=blockage;return_rejection=prefix.return_rejection_reason;partial_approach=true;}
+    }
+    out.return_rejection_reason=return_rejection;
+    // Turning-state continuity may invoke the solver while centered. It must
+    // not accidentally admit a remote/unconfirmed obstacle through that path.
+    if(out.clear&&cfg_.trigger_enabled&&!avoidance_session_&&!actual_offset&&out.trigger_count==0){
+      bool new_shift=false;
+      for(const auto&p:out.path){const auto*r=nearestRoad(p.x,p.y);if(!r)continue;
+        double d=std::abs(-(p.x-r->x)*std::sin(r->yaw)+(p.y-r->y)*std::cos(r->yaw));
+        if(d>cfg_.cruise_path_offset){new_shift=true;break;}}
+      if(new_shift){approvalPath(out,pose,resample(route,.1),INF,"admission_reference");
+        admission_limited=true;admission_cap=out.speed_cap;}
+    }
+    if(out.traffic_held){admission_limited=true;admission_cap=std::min(admission_cap,out.speed_cap);}
+    if(out.clear&&!out.traffic_held&&!actual_offset&&out.trigger_count>0&&traffic_.enabled&&traffic_.seen&&
+       traffic_.distance>=0&&traffic_.distance<=cfg_.traffic_range){
+      const bool fresh=pose.stamp-traffic_.distance_stamp<=cfg_.traffic_timeout&&pose.stamp-traffic_.required_stamp<=cfg_.traffic_timeout&&
+        pose.stamp>=traffic_.distance_stamp&&pose.stamp>=traffic_.required_stamp;
+      out.traffic_stop_target=traffic_.stop_target;
+      if(!fresh||traffic_.required){
+        double arc=0,last_shift=-1,full=0,need=0;
+        for(size_t i=0;i<out.path.size();++i){if(i)arc+=distance(out.path[i-1],out.path[i]);
+          const auto*r=nearestRoad(out.path[i].x,out.path[i].y);if(!r)continue;
+          double d=std::abs(-(out.path[i].x-r->x)*std::sin(r->yaw)+(out.path[i].y-r->y)*std::cos(r->yaw));
+          need=std::max(need,d);
+          if(d>cfg_.cruise_offset||std::abs(wrap(out.path[i].yaw-r->yaw))>cfg_.cruise_heading)last_shift=arc;
+        }full=arc;
+        double completion=last_shift>=0?last_shift+cfg_.return_min_distance:0;
+        out.return_complete_distance=completion;
+        bool completed=completion<=full&&completion<=traffic_.stop_target;
+        if(!fresh||!completed){
+          double ratio=std::max(0.,std::min(1.,(need-.35)/(1.85-.35)));
+          double gap=cfg_.traffic_gap_min+ratio*(cfg_.traffic_gap_max-cfg_.traffic_gap_min);
+          double stop=std::max(0.,std::min(traffic_.stop_target,out.trigger_nearest-gap));
+          auto reference=resample(route,.1);
+          approvalPath(out,pose,reference,stop,fresh?"traffic_return_space_hold":"traffic_input_stale_hold");
+          out.traffic_held=true;admission_limited=true;
+          admission_cap=std::min(out.speed_cap,std::sqrt(2*cfg_.traffic_decel*std::max(0.,stop-std::abs(pose.speed)*cfg_.reaction)));
+        }
+      }
+    }
+    if(out.clear)updateMotion(out,pose,route);
+    if(out.clear&&admission_limited){out.speed_cap=std::min(out.speed_cap,admission_cap);out.speed_limit_reason=out.traffic_held?"traffic_avoidance_hold":"admission_path_coverage";}
+
+    double coverage=0;for(size_t i=1;i<out.path.size();++i)coverage+=distance(out.path[i-1],out.path[i]);
+    if(out.clear&&(approach||tunnel)&&(partial_approach||coverage+5<out.planning_horizon)){
+      double cover=std::max(0.,coverage-std::abs(pose.speed)*cfg_.reaction-2.);
+      double cap=std::sqrt(2*cfg_.braking*cover);
+      if(cap<out.speed_cap){out.speed_cap=cap;out.speed_limit_reason=approach?"approach_visible_coverage":"tunnel_safe_prefix_coverage";}
+    }
+    out.compute_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();return out;
+  };
+  if(route.size()<2){out.reason="short_reference";return finish();}
+  if(!initialized_||pose.stamp-last_scan_>cfg_.scan_timeout||pose.stamp<last_scan_-.05){out.reason="stale_lidar";return finish();}
+  auto ref=resample(route,cfg_.knot_ds);if(ref.size()<6){out.reason="short_reference";return finish();}
+  double mapped_horizon=std::min(approach?cfg_.approach_horizon:cfg_.horizon,
+    cfg_.length*.75-cfg_.front-cfg_.obstacle_margin);
+  const size_t N=std::min(ref.size(),size_t(mapped_horizon/cfg_.knot_ds)+1);ref.resize(N);
+  out.planning_horizon=(N-1)*cfg_.knot_ds;
+  double d0=-(pose.x-ref[0].x)*std::sin(ref[0].yaw)+(pose.y-ref[0].y)*std::cos(ref[0].yaw);
+  const double max_heading=std::atan(cfg_.max_slope);
+  double slope=std::tan(std::max(-max_heading,std::min(max_heading,wrap(pose.yaw-ref[0].yaw))));
+  const double reference_curvature=wrap(ref[1].yaw-ref[0].yaw)/cfg_.knot_ds;
+  const double initial_bending=std::max(-cfg_.max_curvature*.7,std::min(cfg_.max_curvature*.7,
+    (measured_curvature_-reference_curvature)*std::pow(1+slope*slope,1.5)));
+  // Nominal clear runs guide future avoidance tails. Actual post-pass return
+  // is handled separately by the frozen spatial quintic below.
+  double return_distance=std::max(cfg_.return_min_distance,std::abs(pose.speed)*cfg_.return_min_time);
+  std::vector<bool> center_return(N,false),center_free(N,false);std::vector<double> return_ramp(N,1.);
+  const double ramp_len=cfg_.return_ramp_time>0?std::max(cfg_.return_ramp_min_m,std::abs(pose.speed)*cfg_.return_ramp_time):0.;
+  // 터널: 중심선이 확정 점유로 막히지 않았더라도, 차체 범위 지면이 관측되지 않았으면 '복귀 가능'으로 보지 않는다.
+  //   충돌 판정이 아니라 복귀 여부에만 쓴다(근거가 불확실한 곳 때문에 서지 않고, 지금 쪽 횡이동을 유지).
+  const bool observed_gate=tunnel&&cfg_.tunnel_return_observed_free;
+  std::vector<bool> center_observed(N,true);
+  for(size_t i=0;i<N;++i){center_free[i]=bodyClear(ref[i],pose.stamp);
+    if(observed_gate&&center_free[i]&&!observedFree(ref[i],pose.stamp)){center_free[i]=false;center_observed[i]=false;}}
+  bool return_available=false,prefix_return=false;size_t terminal_return=N,terminal_start=N;
+  for(size_t start=0;start<N;){
+    if(!center_free[start]){++start;continue;}
+    size_t end=start+1;while(end<N&&center_free[end])++end;
+    // 2026-10-07(20:38~20:41 백 3개): 두 장애물 사이 중앙이 12 m 정도 잠깐 비자 복귀를 켰다가 곧 다시 피해야 해서
+    //   좌/우 통과 쪽이 프레임마다 바뀌고 -20 도 넘게 꺾다 장애물 앞/옆에서 영구정지했다. 빈 구간 뒤에 또 막힌
+    //   중앙이 있으면(end<N) 복귀 거리 + 차 길이 + 5 m 가 비어 있을 때만 복귀한다. 아니면 지금 쪽에 머문다.
+    const double needed=end<N?return_distance+cfg_.front+cfg_.rear+5.:return_distance;
+    if((end-start-1)*cfg_.knot_ds>=needed){
+      return_available=true;if(start==0)prefix_return=true;
+      size_t begin=std::min(end,start+size_t(std::ceil(1./cfg_.knot_ds)));
+      for(size_t i=begin;i<end;++i){center_return[i]=true;
+        // 복귀 시작 직후부터 서서히(0 -> 1). 이미 중앙 근처에서 시작하는 구간(start==0)은 그대로.
+        if(ramp_len>0&&start>0)return_ramp[i]=std::min(1.,(double(i-begin)+1)*cfg_.knot_ds/ramp_len);}
+      if(end==N){terminal_return=begin;terminal_start=start;}
+    }start=end;
+  }
+  // A completed return hands control back to the exact nominal reference.
+  // Never keep a remote offset from an old corridor when the reference is clear.
+  std::vector<Reference> nominal;
+  for(size_t i=0;i+1<N;++i)for(double t=0;t<cfg_.knot_ds-1e-7;t+=.1)
+    nominal.push_back(referenceAt(ref,i,t/cfg_.knot_ds));
+  nominal.push_back(ref.back());
+  selectTrigger(pose,ref,out);
+  if(cfg_.trigger_enabled&&!already_avoiding&&out.trigger_count==0){
+    approvalPath(out,pose,nominal,INF,"admission_reference");
+    admission_limited=true;admission_cap=out.speed_cap;
+    return finish();
+  }
+
+  double horizon_s=0;for(size_t i=1;i<nominal.size();++i)horizon_s+=distance(nominal[i-1],nominal[i]);
+  const bool handoff_ready=!tunnel_connected_hold_||!continuous_transition_||(aligned_since_>=0&&pose.stamp-aligned_since_>=.3&&!reacquiring_);
+  if(handoff_ready&&!avoidance_session_&&std::abs(d0)<=cfg_.cruise_offset&&
+      std::abs(wrap(pose.yaw-ref[0].yaw))<=cfg_.cruise_heading&&
+      (!last_path_.empty()||std::abs(initial_bending)<.003)&&validate(nominal,pose.stamp)){
+    out.path=nominal;out.clear=true;out.reason="reference_passthrough";
+    return_rejection="none";
+    out.max_curvature=curvature(nominal);last_path_=nominal;spatial_return_active_=false;
+    return finish();
+  }
+  // Preserve one validated world-frame return curve, rather than restarting its
+  // quintic at the measured state on every scan.
+  if(spatial_return_active_&&last_path_.size()>5){
+    size_t j=0;double best=INF;
+    for(size_t i=0;i<last_path_.size();++i){double d=std::hypot(last_path_[i].x-pose.x,last_path_[i].y-pose.y);if(d<best){best=d;j=i;}}
+    std::vector<Reference> remain=tunnel_connected_hold_&&continuous_transition_?trimProgress(last_path_,pose,&best):std::vector<Reference>(last_path_.begin()+j,last_path_.end());
+    double remaining=0;for(size_t i=1;i<remain.size();++i)remaining+=distance(remain[i-1],remain[i]);
+    double keep_distance=std::max(15.,std::abs(pose.speed)*2);
+    if(approach)keep_distance=std::max(keep_distance,out.planning_horizon-5.);
+    std::vector<Reference> connected_return;
+    bool valid_return=best<(tunnel_connected_hold_&&continuous_transition_?.3:.5)&&remaining>keep_distance&&validate(remain,pose.stamp);
+    if(valid_return&&tunnel_connected_hold_&&continuous_transition_)valid_return=connect(pose,remain,pose.stamp,connected_return);
+    if(valid_return){
+      if(!connected_return.empty())remain=std::move(connected_return);
+      out.path=remain;out.clear=true;out.held=true;out.reason="held_spatial_return";
+      return_rejection="none";
+      out.max_curvature=curvature(remain);return finish();
+    }
+    spatial_return_active_=false; // New occupancy or exhausted coverage: reassess.
+  }
+  if(tunnel_connected_hold_&&continuous_transition_&&reacquiring_&&!last_path_.empty()){
+    auto remain=trimProgress(last_path_,pose);std::vector<Reference> connected;
+    if(connect(pose,remain,pose.stamp,connected)&&validate(connected,pose.stamp)){
+      out.path=connected;out.clear=true;out.held=true;out.reason="gps_reacquire_validated_path";out.max_curvature=curvature(connected);return finish();
+    }
+  }
+  // Legacy spatial center return: d,d',d'' -> 0,0,0 over a physical distance.
+  // The body-clear prefix and full swept-path check prevent cutting back through
+  // an unpassed obstacle. Perception-list emptiness is deliberately irrelevant.
+  if(prefix_return&&(avoidance_session_||std::abs(d0)>cfg_.cruise_offset||
+      std::abs(slope)>.005||std::abs(initial_bending)>=.003)){
+    const double v=std::max(std::abs(pose.speed),cfg_.spatial_return_min_speed);
+    const double ta=std::sqrt(5.774*std::abs(d0)/std::max(.1,cfg_.spatial_return_accel));
+    const double tj=std::cbrt(60*std::abs(d0)/std::max(.1,cfg_.spatial_return_jerk));
+    const double initial_length=std::max(cfg_.spatial_return_min_length,
+      std::min(cfg_.spatial_return_max_length,v*std::max(.8,std::max(ta,tj))));
+    for(double length=initial_length;length<=cfg_.spatial_return_max_length+1e-6;length+=1.){
+      if(length+1>horizon_s){return_rejection="insufficient_return_horizon";break;}
+      const double a0=d0,a1=slope*length,a2=.5*initial_bending*length*length;
+      const double a3=-10*a0-6*a1-3*a2,a4=15*a0+8*a1+3*a2,a5=-6*a0-3*a1-a2;
+      std::vector<Reference> candidate;double s=0;bool dynamics=true;
+      for(size_t i=0;i<nominal.size();++i){
+        if(i)s+=distance(nominal[i-1],nominal[i]);
+        const double u=std::min(1.,s/length);
+        double d=0;
+        if(s<length){
+          d=a0+u*(a1+u*(a2+u*(a3+u*(a4+u*a5))));
+          const double dd=(2*a2+u*(6*a3+u*(12*a4+u*20*a5)))/(length*length);
+          const double ddd=(6*a3+u*(24*a4+u*60*a5))/(length*length*length);
+          if(std::abs(dd)*v*v>std::max(cfg_.spatial_return_accel,std::abs(initial_bending)*v*v)+.01||
+             std::abs(ddd)*v*v*v>cfg_.spatial_return_jerk+.01)dynamics=false;
+          if((d0<-.2&&d>cfg_.return_overshoot)||(d0>.2&&d<-cfg_.return_overshoot))dynamics=false;
+        }
+        candidate.push_back(offset(nominal[i],d));
+      }
+      if(!dynamics){return_rejection="return_dynamics";continue;}
+      headings(candidate);std::string rejection;
+      if(!validate(candidate,pose.stamp,&rejection)){return_rejection=rejection;continue;}
+      out.path=candidate;out.clear=true;out.reason="spatial_return_to_reference";
+      out.max_curvature=curvature(candidate);last_path_=candidate;spatial_return_active_=true;
+      return_rejection="none";
+      return finish();
+    }
+  }
+  // Reuse the world path, trim the driven prefix, and validate against new data.
+  Result deferred_hold;bool have_deferred_hold=false;
+  if(last_path_.size()>5){size_t j=0;double best=INF;
+    for(size_t i=0;i<last_path_.size();++i){double d=std::hypot(last_path_[i].x-pose.x,last_path_[i].y-pose.y);if(d<best){best=d;j=i;}}
+    std::vector<Reference> remain=tunnel_connected_hold_&&continuous_transition_?trimProgress(last_path_,pose,&best):std::vector<Reference>(last_path_.begin()+j,last_path_.end());
+    double remaining=0;for(size_t i=1;i<remain.size();++i)remaining+=distance(remain[i-1],remain[i]);
+    double keep_distance=std::max(15.,std::abs(pose.speed)*2);
+    if(approach)keep_distance=std::max(keep_distance,out.planning_horizon-5.);
+    std::vector<Reference> connected_hold;std::string hold_rejection;
+    bool hold_clear=best<.5&&remaining>keep_distance&&validate(remain,pose.stamp);
+    // M8 must validate the current-pose connector BEFORE adopting a held path.
+    // Legacy missions keep their existing path reuse rule.
+    if(hold_clear&&tunnel_connected_hold_)
+      hold_clear=connect(pose,remain,pose.stamp,connected_hold,&hold_rejection);
+    if(hold_clear){
+      if(!connected_hold.empty())remain=std::move(connected_hold);
+      out.path=resample(remain,.1);out.clear=true;out.held=true;out.reason="held_valid_path";out.max_curvature=curvature(out.path);
+      double maxd=0;for(const auto&p:out.path){const auto*r=nearestRoad(p.x,p.y);if(r)maxd=std::max(maxd,std::abs(-(p.x-r->x)*std::sin(r->yaw)+(p.y-r->y)*std::cos(r->yaw)));}
+      out.avoiding=maxd>.25;out.speed_cap=std::min(out.avoiding?cfg_.speedCeiling():9999.,std::sqrt(cfg_.max_lateral_accel/std::max(.001,out.max_curvature)));
+      // A rejected direct return must not discard a still-safe avoidance path.
+      if(!(tunnel&&cfg_.tunnel_hold_extra_clearance>0))return finish();
+      // 자차 앞(차 길이 + 1 m 이후) 부분이 추가 여유까지 통과하면 그대로. 지금 옆에 붙은 물체 때문에 매번 재계획하지 않는다.
+      std::vector<Reference> ahead;double arc=0;
+      for(size_t i=0;i<out.path.size();++i){if(i)arc+=distance(out.path[i-1],out.path[i]);if(arc>=cfg_.front+1.)ahead.push_back(out.path[i]);}
+      bool roomy=true;
+      if(ahead.size()>=2){const double saved=margin_override_;margin_override_=effectiveMargin()+cfg_.tunnel_hold_extra_clearance;
+        roomy=validate(ahead,pose.stamp);margin_override_=saved;}
+      if(roomy)return finish();
+      // 재계획을 시도하고, 실패하면 이 유지 경로(보통 여유는 통과)를 그대로 쓴다. 트리거 등 앞 단계 결과는 유지.
+      deferred_hold=out;have_deferred_hold=true;out.path.clear();out.clear=false;out.held=false;out.avoiding=false;out.reason.clear();
+    }
+  }
+  // 2026-10-14 격자·QP 계획. 터널은 새/낮은 칸 추가 여유와 관측 안 된 땅을 격자 비용으로 피한다(충돌 판정은 보통 여유).
+  auto lattice=[&](int max_attempts)->bool{
+  out.corridor.clear();out.failure_distance=-1;
+  int J=int(std::ceil((cfg_.open_left+cfg_.open_right)/cfg_.lateral_step))+1;
+  std::vector<double> offsets(J);for(int j=0;j<J;++j)offsets[j]=-cfg_.open_right+j*cfg_.lateral_step;
+  std::vector<std::vector<double>> cost(N,std::vector<double>(J,INF));
+  std::vector<std::vector<int>> back(N,std::vector<int>(J,-1));
+  std::vector<std::vector<bool>> valid(N,std::vector<bool>(J,false));
+  for(size_t i=0;i<N;++i)for(int j=0;j<J;++j){auto lim=bounds(ref[i].idx);double d=offsets[j];
+    if(d<lim.first+cfg_.half_width+cfg_.curb_margin||d>lim.second-cfg_.half_width-cfg_.curb_margin)continue;
+    valid[i][j]=bodyClear(offset(ref[i],d),pose.stamp);}
+  // Exact current state at the first knot, rather than snapping the car to the grid.
+  int j0=int(std::lround((d0+cfg_.open_right)/cfg_.lateral_step));j0=std::max(0,std::min(J-1,j0));
+  offsets[j0]=d0;Reference initial=offset(ref[0],d0);initial.yaw=pose.yaw;
+  for(size_t i=1;i<N;++i){auto lim=bounds(ref[i].idx);
+    valid[i][j0]=d0>=lim.first+cfg_.half_width+cfg_.curb_margin&&d0<=lim.second-cfg_.half_width-cfg_.curb_margin&&bodyClear(offset(ref[i],d0),pose.stamp);}
+  if(!bodyClear(initial,pose.stamp,&out.reason))return false;
+  bool hold_side=false;if(observed_gate)for(size_t i=0;i<N;++i)if(!center_observed[i]){hold_side=true;break;}
+  // 새(처음 본 지 얼마 안 된)·낮은 칸에서 추가 여유 안에 드는 격자 칸은 비용(금지 아님). 계획을 두 번 돌리지 않는다.
+  std::vector<std::vector<char>> tight(N);
+  if(tunnel&&cfg_.tunnel_new_obstacle_margin>0){plan_extra_active_=true;
+    for(size_t i=1;i<N;++i){tight[i].assign(J,0);for(int j=0;j<J;++j)if(valid[i][j])tight[i][j]=!bodyClear(offset(ref[i],offsets[j]),pose.stamp);}
+    plan_extra_active_=false;}
+  std::vector<std::vector<float>> unobserved_cost(N);
+  if(observed_gate)for(size_t i=1;i<N;++i)if(!center_observed[i]){unobserved_cost[i].assign(J,0.f);
+    for(int j=0;j<J;++j)if(valid[i][j])unobserved_cost[i][j]=float(1.-observedFraction(offset(ref[i],offsets[j]),pose.stamp));}
+  cost[0][j0]=0;valid[0][j0]=true;
+  if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06){
+    std::fprintf(stderr,"LATTICE d0 %.2f j0 %d speed %.2f\n",d0,j0,pose.speed);
+    for(size_t i=0;i<N&&i<34;++i){auto lim=bounds(ref[i].idx);std::fprintf(stderr,"row %zu idx %d lim %.2f %.2f ",i,ref[i].idx,lim.first,lim.second);
+      for(int j=0;j<J;++j)std::fputc(valid[i][j]?'#':'.',stderr);std::fputc('\n',stderr);}}
+  for(size_t i=1;i<N;++i){for(int j=0;j<J;++j)if(valid[i][j]){
+    double prev_target=0;bool has_previous=false;
+    if(!last_path_.empty()){double best=INF;for(const auto&p:last_path_){double dist=std::hypot(p.x-ref[i].x,p.y-ref[i].y);
+      if(dist<best){best=dist;prev_target=-(p.x-ref[i].x)*std::sin(ref[i].yaw)+(p.y-ref[i].y)*std::cos(ref[i].yaw);}}
+      // 2026-10-07(20:38:44 백): 후진 뒤 정지 상태에서 실패한 직전 경로(3.9 m)를 따르느라 늦고 급한 횡이동을 골라
+      //   매번 검증 실패. 서 있을 때는 연속성이 필요 없으므로 직전 경로 비용을 쓰지 않는다.
+      has_previous=best<5&&std::abs(pose.speed)>=1.;}
+    for(int k=0;k<J;++k){if(cost[i-1][k]>=INF)continue;double dd=offsets[j]-offsets[k];
+      if(std::abs(dd)>cfg_.max_slope*cfg_.knot_ds+.001)continue;
+      Reference p=offset(ref[i-1],offsets[k]),q=offset(ref[i],offsets[j]);double yaw=std::atan2(q.y-p.y,q.x-p.x);
+      p.yaw=q.yaw=yaw;Reference mid=p;mid.x=(p.x+q.x)/2;mid.y=(p.y+q.y)/2;mid.idx=(p.idx+q.idx)/2;
+      if(!bodyClear(p,pose.stamp)||!bodyClear(q,pose.stamp)||!bodyClear(mid,pose.stamp))continue;
+      // 터널: 앞쪽 중심선에 관측 안 된 구간이 있으면(복귀 보류) 복귀 구간 밖에서는 중앙으로 끌지 않는다.
+      //   0.1 d^2 당김은 장애물 옆 최소 횡위치에 바짝 붙게 만들어 평활화 뒤 여유를 침범했다. 지금 횡위치를 유지.
+      double center_weight=center_return[i]?(.1+(cfg_.return_center_weight-.1)*return_ramp[i]):(hold_side?0.:.1);
+      double v=cost[i-1][k]+center_weight*offsets[j]*offsets[j]+15*dd*dd;
+      // 2026-10-07(20:41:06 백): 왼쪽(+3.7 m)으로 첫 장애물을 지나는 중 다음 저상 장애물이 멀리서 좁게 보여
+      //   오른쪽 통과(-0.8 m)를 골랐다가, 가까워져 넓어지자 다시 왼쪽으로 뒤집혀 영구정지했다.
+      //   이미 한쪽으로 1 m 넘게 비켜 있으면 기준경로 반대편으로 건너가는 칸은 큰 비용(같은 쪽 유지).
+      //   터널(벽면 띠가 켜진 차로)에서만. 정적 구간은 좌우 번갈아 피하는 배치가 있다.
+      if(cfg_.wall_surface_band>0&&std::abs(d0)>1.&&offsets[j]*d0<0&&std::abs(offsets[j])>.3)v+=300.*(std::abs(offsets[j])-.3);
+      // 터널: 중심선이 관측되지 않은 구간에서 차체가 관측 안 된 땅(아직 확정 안 된 장애물 자리일 수 있음)에 들어가는 칸은 큰 비용.
+      //   금지는 아니다(그것밖에 없으면 통과). 이미 지나는 쪽(관측된 옆 차로)을 유지하게 한다.
+      if(observed_gate&&!center_observed[i]&&!unobserved_cost[i].empty())v+=60.*unobserved_cost[i][j];
+      if(!tight[i].empty()&&tight[i][j])v+=30.;
+      if(has_previous&&(!center_return[i]||return_ramp[i]<1.))v+=2*(center_return[i]?1.-return_ramp[i]:1.)*std::pow(offsets[j]-prev_target,2);
+      if(v<cost[i][j]){cost[i][j]=v;back[i][j]=k;}
+    }
+  }
+    if(*std::min_element(cost[i].begin(),cost[i].end())>=INF){out.reason="no_connected_corridor";
+      out.failure_distance=i*cfg_.knot_ds;out.boundary_source=boundarySource(ref[i].idx);return false;}
+  }
+  if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06)
+    for(size_t i=0;i<N&&i<9;++i){std::fprintf(stderr,"COST row %zu:",i);for(int j=36;j<J;++j)std::fprintf(stderr," %d:%s",j,cost[i][j]>=INF?"x":std::to_string(int(cost[i][j])).c_str());std::fputc('\n',stderr);}
+  int end=int(std::min_element(cost.back().begin(),cost.back().end())-cost.back().begin());
+  if(cost.back()[end]>=INF){out.reason="no_connected_corridor";return false;}
+  std::vector<int> chosen(N);chosen.back()=end;for(size_t i=N-1;i>0;--i)chosen[i-1]=back[i][chosen[i]];
+  std::vector<double> target(N);std::vector<std::pair<double,double>> limits(N);
+  for(size_t i=0;i<N;++i){int j=chosen[i],lo=j,hi=j;target[i]=offsets[j];
+    while(lo>0&&valid[i][lo-1])--lo;
+    while(hi+1<J&&valid[i][hi+1])++hi;
+    // A contiguous free interval, not the union of spaces on both sides of an obstacle.
+    limits[i]={offsets[lo],offsets[hi]};
+    // Soft target close to the obstacle, never a hard cap that destroys feasibility.
+    // 옆 유지(hold_side) 중에는 목표를 장애물 쪽 통로 끝으로 당기지 않는다(목표가 지그재그 -> QP 실패).
+    if(i>0 && limits[i].first>0 && !hold_side)target[i]=std::min(target[i],limits[i].first+cfg_.corridor_target_extra);
+    if(i>0 && limits[i].second<0 && !hold_side)target[i]=std::max(target[i],limits[i].second-cfg_.corridor_target_extra);limits[i].first=std::min(limits[i].first,target[i]);limits[i].second=std::max(limits[i].second,target[i]);
+    if(center_return[i]&&limits[i].first<=0&&limits[i].second>=0)target[i]*=1.-return_ramp[i];
+    out.corridor.push_back({ref[i].x,ref[i].y,limits[i].first,limits[i].second});
+  }
+  limits[0]={d0,d0};
+  if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06){
+    std::fprintf(stderr,"CHOSEN d0 %.2f:",d0);for(size_t i=0;i<N;++i)std::fprintf(stderr," [%zu %.1f (%.1f,%.1f)%s]",i,target[i],limits[i].first,limits[i].second,center_return[i]?"R":"");std::fputc('\n',stderr);}
+  if(terminal_return<N){
+    double side=terminal_return>1?target[terminal_return-1]:d0;
+    if(std::abs(side)>cfg_.return_tolerance)for(size_t i=terminal_return;i<N;++i){
+      if(limits[i].first<=0&&limits[i].second>=0){
+        if(side<0)limits[i].second=std::min(limits[i].second,cfg_.return_overshoot);
+        else limits[i].first=std::max(limits[i].first,-cfg_.return_overshoot);
+      }
+    }
+  }
+  // Repair failed corner/sweep checks by tightening the same connected corridor
+  // around its searched path. Never accept a smoothed path solely on QP success.
+  std::string failure="solver_failed";
+  for(int attempt=0;attempt<max_attempts;++attempt){
+    StandalonePathProblem qp(N,cfg_.knot_ds,{d0,slope,initial_bending});
+    auto constrained=limits;
+    if(attempt>=2&&!(tunnel&&cfg_.tunnel_recovery_enabled))for(size_t i=1;i<N;++i){double radius=attempt==2?.25:.05;
+      constrained[i].first=std::max(constrained[i].first,target[i]-radius);constrained[i].second=std::min(constrained[i].second,target[i]+radius);}
+    qp.set_x_bounds(constrained);qp.set_dx_bounds(-cfg_.max_slope,cfg_.max_slope);
+    const double shape_accel=cfg_.path_lateral_accel>0?cfg_.path_lateral_accel:cfg_.max_lateral_accel;
+    double bending=attempt==0?std::min(cfg_.max_curvature*.7,shape_accel/(cfg_.target_speed*cfg_.target_speed)):cfg_.max_curvature*.7;
+    // 2026-10-07(20:08:55 백): 복귀 중(기울기 -0.35, 곡률 -0.1) 다음 장애물이 보이면 편안함용 저크/곡률 상한으로는
+    //   복귀를 되돌릴 수 없어 영구 정지했다. 2차 시도는 차량 한계(최대 곡률, 저크 4배)까지 쓴다.
+    //   결과 경로는 아래 validate(차체·최대 곡률)를 그대로 통과해야 한다.
+    if(attempt==1||(tunnel&&cfg_.tunnel_recovery_enabled&&attempt>=2))bending=cfg_.max_curvature;
+    bending=std::max(bending,std::abs(initial_bending));
+    qp.set_ddx_bounds(-bending,bending);qp.set_dddx_bound(cfg_.max_lateral_jerk*((attempt==1||(tunnel&&cfg_.tunnel_recovery_enabled&&attempt>=2))?4.:1.));
+    qp.set_weight_x(.1);qp.set_weight_dx(15);qp.set_weight_ddx(150*cfg_.path_smooth_scale);qp.set_weight_dddx(300*cfg_.path_smooth_scale);
+    qp.set_x_ref(10,target);qp.set_scale_factor({1,1,1});
+    if(!(tunnel&&cfg_.tunnel_recovery_enabled)&&terminal_return<N&&limits.back().first<=0&&limits.back().second>=0)
+      qp.set_end_state_ref({100,50,50},{0,0,0});
+    if(!qp.Optimize(3000)){
+      failure="solver_status_"+std::to_string(qp.status);
+      if(const char* ds=std::getenv("OCC_DEBUG_STAMP"))if(std::abs(pose.stamp-std::atof(ds))<.06)
+        std::fprintf(stderr,"QP attempt %d status %d d0 %.2f slope %.3f init_bend %.4f bending %.4f jerk %.4f maxslope %.2f target0..3 %.2f %.2f %.2f %.2f\n",
+          attempt,qp.status,d0,slope,initial_bending,bending,cfg_.max_lateral_jerk,cfg_.max_slope,target[0],target[1],target[2],target[3]);
+      // Tightening a proven infeasible relaxed corridor cannot restore feasibility.
+      // Reserve repair attempts for solutions which fail the geometric sweep.
+      if(!(tunnel&&cfg_.tunnel_recovery_enabled)&&attempt>=1&&qp.status==OSQP_PRIMAL_INFEASIBLE)break;
+      continue;
+    }
+    // Evaluate the actual continuous piecewise-jerk solution, not straight
+    // chords between 1m knots (which create fictitious curvature spikes).
+    std::vector<Reference> path;
+    for(size_t i=0;i+1<N;++i)for(double t=0;t<cfg_.knot_ds-1e-7;t+=.1){
+      Reference base=referenceAt(ref,i,t/cfg_.knot_ds);
+      double jerk=(qp.opt_ddx()[i+1]-qp.opt_ddx()[i])/cfg_.knot_ds;
+      double d=qp.opt_x()[i]+qp.opt_dx()[i]*t+.5*qp.opt_ddx()[i]*t*t+jerk*t*t*t/6;
+      path.push_back(offset(base,d));
+    }
+    path.push_back(offset(ref.back(),qp.opt_x().back()));headings(path);
+    if(!validate(path,pose.stamp,&failure,&out.failure_distance))continue;
+    bool quintic_used=false;
+    // 장애물 뒤 중앙이 계속 비어 있는 첫 knot(마지막으로 중앙이 막힌 knot 다음).
+    size_t free_after=N;
+    {size_t lb=N;for(size_t i=N;i-->1;)if(!center_free[i]){lb=i;break;}
+     if(lb<N&&lb+1<N)free_after=lb+1;}
+    if(cfg_.return_quintic&&free_after>0&&free_after+1<N&&
+       std::abs(qp.opt_x()[free_after])>cfg_.return_tolerance){
+      // 그 knot 의 상태(d, d', d'')에서 0 으로 가는 5차 곡선. 그 앞(장애물 옆)은 최적화 경로 그대로.
+      // 일반 corridor 최적화는 장애물 뒤가 비면 기울기 한계(0.45 m/m)까지 써서 바로 중앙으로 내려온다(17:09:45 2번).
+      const size_t tr=free_after;
+      const double d_s=qp.opt_x()[tr],dd_s=qp.opt_dx()[tr],ddd_s=qp.opt_ddx()[tr];
+      const double v=std::max(std::abs(pose.speed),cfg_.spatial_return_min_speed);
+      const double ta=std::sqrt(5.774*std::abs(d_s)/std::max(.1,cfg_.return_quintic_accel));
+      const double tj=std::cbrt(60*std::abs(d_s)/std::max(.1,cfg_.spatial_return_jerk));
+      const double L0=std::max(cfg_.spatial_return_min_length,
+        std::min(cfg_.spatial_return_max_length,v*std::max(.8,std::max(ta,tj))));
+      for(double L=L0;L<=cfg_.spatial_return_max_length+1e-6&&!quintic_used;L+=1.){
+        const double a0=d_s,a1=dd_s*L,a2=.5*ddd_s*L*L;
+        const double a3=-10*a0-6*a1-3*a2,a4=15*a0+8*a1+3*a2,a5=-6*a0-3*a1-a2;
+        std::vector<Reference> cand(path.begin(),path.begin()+std::min(path.size(),size_t(tr*std::lround(cfg_.knot_ds/.1))));
+        bool dynamics=true;
+        for(size_t i=tr;i+1<N&&dynamics;++i)for(double t=0;t<cfg_.knot_ds-1e-7;t+=.1){
+          const double s=(i-tr)*cfg_.knot_ds+t,u=std::min(1.,s/L);double d=0;
+          if(s<L){d=a0+u*(a1+u*(a2+u*(a3+u*(a4+u*a5))));
+            const double dd=(2*a2+u*(6*a3+u*(12*a4+u*20*a5)))/(L*L);
+            const double jk=(6*a3+u*(24*a4+u*60*a5))/(L*L*L);
+            (void)jk;
+            if(std::abs(dd)*v*v>std::max(cfg_.return_quintic_accel,std::abs(ddd_s)*v*v)+.01){dynamics=false;break;}
+            if((d_s<-.2&&d>cfg_.return_overshoot)||(d_s>.2&&d<-cfg_.return_overshoot)){dynamics=false;break;}}
+          cand.push_back(offset(referenceAt(ref,i,t/cfg_.knot_ds),d));
+        }
+        if(!dynamics)continue;
+        {const double s_end=(N-1-tr)*cfg_.knot_ds,u=std::min(1.,s_end/L);
+         cand.push_back(offset(ref.back(),s_end<L?a0+u*(a1+u*(a2+u*(a3+u*(a4+u*a5)))):0.));}
+        headings(cand);std::string why;
+        if(validate(cand,pose.stamp,&why)){path=cand;quintic_used=true;}
+      }
+    }
+    out.path=path;out.clear=true;out.reason=attempt?"corridor_repaired":"corridor_optimized";
+    if(quintic_used)out.reason+="_quintic_return";
+    out.returning=return_available&&std::abs(d0)>cfg_.return_tolerance;
+    if(out.returning)out.reason="return_to_reference";
+    out.max_curvature=curvature(path);double maxd=0;for(double d:qp.opt_x())maxd=std::max(maxd,std::abs(d));out.avoiding=maxd>.25;
+    out.speed_cap=std::min(out.avoiding?cfg_.speedCeiling():9999.,std::sqrt(cfg_.max_lateral_accel/std::max(.001,out.max_curvature)));
+    last_path_=path;spatial_return_active_=false;return true;
+  }
+  out.reason=failure=="solver_status_-3"?"corridor_dynamics_infeasible":failure;return false;
+  };
+  const bool use_extra=tunnel&&cfg_.tunnel_new_obstacle_margin>0;
+  bool planned_ok=false;
+  (void)use_extra;planned_ok=lattice(4);
+  if(!planned_ok&&have_deferred_hold){out=deferred_hold;out.reason="held_valid_path_replan_failed";}
+  return finish();
+}
+} // namespace occupancy_avoidance
+
+namespace occupancy_avoidance {
+bool Engine::escapeBodyClear(const Reference& p,double now,bool reverse) const {
+  if(!bodyClear(p,now))return false;
+  if(reverse)for(double a=-cfg_.rear-.2;a<=cfg_.front+.2;a+=.5)
+    for(double b:{-cfg_.half_width,0.,cfg_.half_width}){
+      double x=p.x+std::cos(p.yaw)*a-std::sin(p.yaw)*b;
+      double y=p.y+std::sin(p.yaw)*a+std::cos(p.yaw)*b;
+      bool known=false;int ix=int(std::floor(x/.5)),iy=int(std::floor(y/.5));
+      for(int dx=-1;dx<=1;++dx)for(int dy=-1;dy<=1;++dy){auto it=ground_visibility_.find({ix+dx,iy+dy});
+        if(it!=ground_visibility_.end()&&now>=it->second&&now-it->second<=visibilityHorizon(now))known=true;}
+      if(!known)return false;
+    }
+  return true;
+}
+EscapePlan Engine::jointEscapePlan(const Pose& pose,double bx,double by,double length,
+ const std::vector<Point>& memory,double wheelbase,double steer,double reverse_max,double budget,bool forward_only,const std::vector<DynamicRegion>& dynamic) const {
+  auto request_begin=std::chrono::steady_clock::now();
+  std::vector<Reference> goals;const auto* blocker=nearestRoad(bx,by);const auto* current=nearestRoad(pose.x,pose.y);
+  if(!blocker||!current){EscapePlan p;p.reason="no_reference";return p;}
+  double min_distance=std::max(6.,length*.5+cfg_.rear+5.);double traveled=0;
+  // Keep consecutive S obstacles in the same search. The last reference-lane
+  // obstruction determines the escape end, not a fixed CSV index/first box.
+  for(const auto& bin:obstacle_bins_)for(const auto& p:bin.second){const auto* r=nearestRoad(p.x,p.y);if(!r||r->idx<current->idx)continue;
+    double d=-(p.x-r->x)*std::sin(r->yaw)+(p.y-r->y)*std::cos(r->yaw);
+    if(std::abs(d)>cfg_.half_width+cfg_.obstacle_margin+1.)continue;
+    double ahead=std::hypot(r->x-current->x,r->y-current->y);if(ahead>30.)continue;
+    double from_blocker=std::hypot(r->x-blocker->x,r->y-blocker->y);
+    if(r->idx>=blocker->idx)min_distance=std::max(min_distance,from_blocker+cfg_.rear+5.);}
+
+  // Exit states come from the blocked segment and all following obstacles in the
+  // local window. No endpoint QP requirement; a safe 4 m continuation is required.
+  for(size_t i=std::max(blocker->idx,current->idx);i+1<road_.size();++i){
+    if(i>size_t(std::max(blocker->idx,current->idx)))traveled+=distance(road_[i],road_[i-1]);
+    if(traveled<min_distance||traveled>min_distance+18.)continue;
+    if(int(traveled*10)%40!=0)continue;
+    auto lim=bounds(road_[i].idx);
+    for(double d:{0.,-1.,1.,-2.,2.,-3.,3.,4.}){
+      if(d<lim.first+cfg_.half_width+cfg_.curb_margin||d>lim.second-cfg_.half_width-cfg_.curb_margin)continue;
+      Reference g=road_[i];g.x-=std::sin(g.yaw)*d;g.y+=std::cos(g.yaw)*d;
+      bool ok=true;for(double a=0;a<=4.;a+=.1){Reference q=g;q.x+=std::cos(g.yaw)*a;q.y+=std::sin(g.yaw)*a;if(!bodyClear(q,pose.stamp)){ok=false;break;}}
+      if(ok)goals.push_back(g);
+    }if(goals.size()>=24)break;
+  }
+  // Near-field remembered measured occupancy augments the snapshot. Bucket once;
+  // avoid rectangular unions/convex hulls spanning separate S-shaped obstacles.
+  std::map<std::pair<int,int>,std::vector<Point>> bins;
+  for(const auto& p:memory)bins[{int(std::floor(p.x/2.)),int(std::floor(p.y/2.))}].push_back(p);
+  double minimum=1e9;
+  auto clear=[&](const Reference& p,bool reverse,double time){
+    for(const auto& o:dynamic){
+      double ox=o.x+o.vx*time,oy=o.y+o.vy*time;double pad=cfg_.obstacle_margin+std::min(2.,o.uncertainty*time);
+      std::array<std::pair<double,double>,4> a,b;int k=0;
+      for(auto q:{std::make_pair(-cfg_.rear-pad,-cfg_.half_width-pad),std::make_pair(cfg_.front+pad,-cfg_.half_width-pad),std::make_pair(cfg_.front+pad,cfg_.half_width+pad),std::make_pair(-cfg_.rear-pad,cfg_.half_width+pad)})a[k++]={p.x+std::cos(p.yaw)*q.first-std::sin(p.yaw)*q.second,p.y+std::sin(p.yaw)*q.first+std::cos(p.yaw)*q.second};
+      k=0;for(auto q:{std::make_pair(-o.length*.5,-o.width*.5),std::make_pair(o.length*.5,-o.width*.5),std::make_pair(o.length*.5,o.width*.5),std::make_pair(-o.length*.5,o.width*.5)})b[k++]={ox+std::cos(o.yaw)*q.first-std::sin(o.yaw)*q.second,oy+std::sin(o.yaw)*q.first+std::cos(o.yaw)*q.second};
+      bool overlap=true;for(double h:{p.yaw,p.yaw+M_PI*.5,o.yaw,o.yaw+M_PI*.5}){
+        double amin=1e9,amax=-1e9,bmin=1e9,bmax=-1e9;for(const auto& q:a){double t=q.first*std::cos(h)+q.second*std::sin(h);amin=std::min(amin,t);amax=std::max(amax,t);}for(const auto& q:b){double t=q.first*std::cos(h)+q.second*std::sin(h);bmin=std::min(bmin,t);bmax=std::max(bmax,t);}if(amax<bmin||bmax<amin){overlap=false;break;}}
+      if(overlap)return false;
+    }
+    if(!escapeBodyClear(p,pose.stamp,reverse))return false;
+    double c=std::cos(p.yaw),s=std::sin(p.yaw);int ix=int(std::floor(p.x/2.)),iy=int(std::floor(p.y/2.));
+    for(int a=-3;a<=3;++a)for(int b=-3;b<=3;++b){auto it=bins.find({ix+a,iy+b});if(it==bins.end())continue;
+      for(const auto& q:it->second){double x=c*(q.x-p.x)+s*(q.y-p.y),y=-s*(q.x-p.x)+c*(q.y-p.y);
+        double gap=std::hypot(std::max({-cfg_.rear-x,x-cfg_.front,0.}),std::max(std::abs(y)-cfg_.half_width,0.));
+        if(gap<cfg_.obstacle_margin)return false;minimum=std::min(minimum,gap);}}
+    return true;
+  };
+  double remaining=budget-std::chrono::duration<double>(std::chrono::steady_clock::now()-request_begin).count();
+  if(remaining<=0){EscapePlan p;p.reason="search_timeout";p.compute_ms=budget*1000;return p;}
+  auto out=jointEscape(pose,goals,clear,wheelbase,steer,reverse_max,remaining,forward_only);
+  minimum=1e9;if(out.valid)for(const auto* path:{&out.reverse,&out.forward})for(const auto& p:*path){Pose q;q.x=p.x;q.y=p.y;q.yaw=p.yaw;minimum=std::min(minimum,bodyObstacleDistance(q));
+    double c=std::cos(p.yaw),s=std::sin(p.yaw);for(const auto& m:memory){double x=c*(m.x-p.x)+s*(m.y-p.y),y=-s*(m.x-p.x)+c*(m.y-p.y);minimum=std::min(minimum,std::hypot(std::max({-cfg_.rear-x,x-cfg_.front,0.}),std::max(std::abs(y)-cfg_.half_width,0.)));}}
+  out.minimum_clearance=minimum;out.compute_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-request_begin).count();return out;
+}
+}

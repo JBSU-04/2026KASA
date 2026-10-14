@@ -284,3 +284,10 @@ ghost_lead_max_abs_d_m: 1.2
 # 내린 뒤 감속(고주로). 17:09 백: 양보 시작 1.5 s 동안 자차가 계속 가속했다.
 decel_start_from_ego_speed: true
 decel_start_from_ego_margin_mps: 0.3
+
+# Gap positioning is independent of ordinary ACC/yield-follow tuning.
+gap_response_enabled: true
+gap_shared_speed_enabled: true
+gap_prepare_accel_mps2: 3.0
+gap_prepare_decel_mps2: 3.0
+gap_selected_max_catchup_mps: 6.0

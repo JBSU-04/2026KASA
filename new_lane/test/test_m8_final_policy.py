@@ -26,7 +26,7 @@ def run(policy,end=5.2,y=0.):
     return root['collision_objects'][0]
 
 def test_five_seconds_requires_observed_blocker_and_keeps_dynamic_history():
-    p=StationaryHandoff();o=run(p,4.9);assert not o['m8_restatic']
+    p=StationaryHandoff(seconds=5.);o=run(p,4.9);assert not o['m8_restatic']
     o=frame(5.1);p.update(o,5.1,ROUTE,0);o=o['collision_objects'][0]
     assert o['m8_restatic'] and o['static_certified'] and o['ever_dynamic']
 

@@ -1,3 +1,4 @@
+#include <occupancy_avoidance/M8ApprovedPath.h>
 // 기존 미션 판단을 유지하는 정적 회피 노드: embedded Apollo / explicit Frenet rollback
 //
 // 입력:
@@ -50,10 +51,12 @@ public:
 		loadParams();
         nh_.param("/tunnel_recovery/common_scene_enabled",common_scene_enabled_,true);
         nh_.param("/tunnel_recovery/independent_preslow_enabled",independent_preslow_,false);
-        if(common_scene_enabled_)tunnel_region_=occupancy_avoidance::TunnelRegion::load(nh_);
+        tunnel_region_=occupancy_avoidance::TunnelRegion::load(nh_); // 2026-10-13 공용 장면이 꺼져도 엔진 소유 범위(M8 + exit_hold)에 쓴다
         pnh_.param<std::string>("avoidance_backend",avoidance_backend_,"occupancy");
         pnh_.param("tunnel_verified_hold_only",tunnel_verified_hold_only_,true);
         pnh_.param("tunnel_transient_grace_sec",tunnel_transient_grace_sec_,0.5);
+        pnh_.param("tunnel_hold_keeps_path",tunnel_hold_keeps_path_,true);
+        pnh_.param("tunnel_hold_path_max_age_sec",tunnel_hold_path_max_age_sec_,10.0);
         // 2026-10-07(21:09:45 백): 터널 입구 첫 장애물 접근 중 점이 늘며 직전 경로가 0.6 s 연속 무효 -> 0.5 s 유예를
         //   넘겨 AEB(5.7 -> 2.8 m/s 덜컹). 유예 중에도 상한은 매 주기 줄어든다. 0.8 s 로.
         pnh_.param("embedded_fail_grace_sec",embedded_fail_grace_sec_,.8);
@@ -64,6 +67,7 @@ public:
             throw std::runtime_error("avoidance_backend must be occupancy or frenet");
 
 		local_path_pub_ = nh_.advertise<nav_msgs::Path>("/local_path", 1);
+        m8_approved_pub_=nh_.advertise<occupancy_avoidance::M8ApprovedPath>("/obstacle_avoidance/m8_approved_path",1);
 		global_path_pub_ = nh_.advertise<nav_msgs::Path>("/global_path", 1, true);  // latched
 		avoidance_failed_pub_ = nh_.advertise<std_msgs::Bool>("/avoidance_failed", 1);
 		// 회피/복귀 중일 때만 target_speed_(TARGET_SPEED)를 실어 보냄.
@@ -385,6 +389,10 @@ private:
 		// 한두 스캔 어긋날 수 있다. 그 짧은 동안 입구 벽을 장애물로 커밋하지 않는다.
 		pnh_.param("tunnel_entry_grace_sec", tunnel_entry_grace_sec_, 0.8);
 		pnh_.param("tunnel_mode_hold_sec", tunnel_mode_hold_sec_, 1.0);
+		pnh_.param("tunnel_exit_release_enabled", tunnel_exit_release_enabled_, true); // 2026-10-14 false: 이전 동작
+		pnh_.param("tunnel_exit_release_signal_sec", tunnel_exit_release_signal_sec_, .2);
+		pnh_.param("tunnel_exit_release_offset_m", tunnel_exit_release_offset_m_, .5);
+		pnh_.param("tunnel_exit_release_yaw_rad", tunnel_exit_release_yaw_rad_, .087);
 		{
 			std::vector<double> prof;
 			if (pnh_.getParam("tunnel_wall_profile", prof) && prof.size() % 3 == 0)
@@ -2856,6 +2864,7 @@ private:
             return;
         }
         if(!out.valid){
+            if(tunnel_mode_)embedded_engine_->rejected(out.plan_id,out.rejection);
             // 2026-10-05(20:22 백): 무효 한 프레임마다 실패+속도 0 을 내서 정적 구간에서 6 번 섰다 갔다 했다
             //   (updated_geometry/occupancy/stale 0.1~0.5 s 가 대부분). 엔진 안에서 현재 기하로 검증한 직전 경로
             //   유지(validated_hold_sec)가 먼저 걸리고, 여기서는 연속 embedded_fail_grace_sec 동안만 직전 발행
@@ -2931,6 +2940,9 @@ private:
         local_path_pub_.publish(out.path);
         last_embedded_path_=out.path;last_embedded_stamp_=ros::Time::now();last_embedded_cap_=cap.data;
         if(out.result.avoiding||out.result.returning)embedded_avoiding_stamp_=last_embedded_stamp_;
+        if(tunnel_mode_){occupancy_avoidance::M8ApprovedPath receipt;receipt.header=out.path.header;
+            receipt.path=out.path;receipt.scene_id=out.scene_id;receipt.plan_id=out.plan_id;receipt.coordinate_version=out.coordinate_version;
+            receipt.geometry_stamp.fromSec(std::max(0.,out.geometry_stamp));receipt.valid=true;m8_approved_pub_.publish(receipt);}
         embedded_engine_->published(out.plan_id); // acknowledge reverse only after final owner adoption
     }
 	void planLoop(const ros::TimerEvent &)
@@ -2996,6 +3008,24 @@ private:
 		if (!inM3Zone())
 			m3_avoid_latched_ = false;
 		const bool m3_mode = m3AvoidMode() || (occ_recovery_ && inM3Zone());
+		// 2026-10-13(16:09:08, 16:11:00 백): 터널 회피 도중 정지 노드 hold 가 켜질 때마다 아래에서 회피 상태를 지우고
+		//   기준경로를 내 추종 경로가 장애물 쪽으로 튀었다(5회). M2 처럼 회피 중이면 직전 엔진 회피 경로를 그대로 유지한다.
+		//   정지·출발은 정지 노드가 맡는다. 회피 중이 아니면(직전 엔진 경로 없음/오래됨) 기존 동작.
+		if (tunnel_mode_ && embedded_engine_ && tunnel_hold_keeps_path_ && dynStateFresh() && dyn_hold_ &&
+			!last_embedded_path_.poses.empty() && !embedded_avoiding_stamp_.isZero() &&
+			(ros::Time::now() - embedded_avoiding_stamp_).toSec() <= tunnel_hold_path_max_age_sec_)
+		{
+			nav_msgs::Path held = anchorRemaining(last_embedded_path_);
+			if (held.poses.size() >= 2)
+			{
+				held.header.stamp = ros::Time::now();
+				for (auto &q : held.poses) q.header = held.header;
+				local_path_pub_.publish(held);
+				publishAvoidanceFailed(false);
+				ROS_INFO_THROTTLE(1.0, "[obstacle_avoidance] dynamic hold in tunnel: keeping last avoidance path");
+				return;
+			}
+		}
 		if ((tunnel_mode_ || m3_mode) && dynStateFresh() && dyn_hold_)
 		{
 			latest_ob_x_.clear();
@@ -3098,6 +3128,16 @@ private:
 
         // All existing mission, dynamic, tunnel observation and signal guards above remain authoritative.
         // Embedded mode never enters the legacy candidate/side/radius/fallback selection below.
+        // 2026-10-14(18:16, 18:17 백): 터널 구간 끝(last) 뒤 exit_hold 에서 병합 노드 장면이 먼저 끊겨 엔진이 stale_lidar
+        //   -> 0.3~0.45 s 회피 실패 -> AEB(7.6 -> 6.0, 6.8 -> 3.7 m/s). 구간 끝을 지났고 터널 신호가 끊겼으며
+        //   자차가 기준경로 위(횡·방향 작음)면 기준경로로 넘긴다. 회피 중(횡 큼)이면 기존 처리 그대로.
+        if(embedded_engine_&&tunnel_exit_release_enabled_&&tunnel_mode_&&current_lane_number_==3&&
+           current_waypoint_idx_>tunnel_region_.last&&!last_tunnel_mode_signal_.isZero()&&
+           (ros::Time::now()-last_tunnel_mode_signal_).toSec()>tunnel_exit_release_signal_sec_&&
+           std::abs(c_d)<=tunnel_exit_release_offset_m_&&std::abs(yaw_err)<=tunnel_exit_release_yaw_rad_){
+            ROS_INFO_THROTTLE(1.0,"[obstacle_avoidance] tunnel exit: scene ended at idx %d (d=%.2f) -> reference path",current_waypoint_idx_,c_d);
+            embedded_invalid_since_=ros::Time();publishAvoidanceFailed(false);publishAvoidanceSpeedLimit(false);publishPassthroughPath(s0);return;
+        }
         if(embedded_engine_){publishEmbeddedPath(m3_mode,c_d);return;}
         if(engine_primary_active_ && latest_ob_x_.empty() && std::abs(c_d)<=.2 && std::abs(yaw_err)<=3*M_PI/180.) {
             if(engine_aligned_since_.isZero())engine_aligned_since_=ros::Time::now();
@@ -4286,6 +4326,7 @@ private:
     std::string avoidance_backend_;
     std::unique_ptr<occupancy_avoidance::RosAdapter> embedded_engine_;
     nav_msgs::Path last_embedded_path_;ros::Time last_embedded_stamp_,embedded_invalid_since_;
+    bool tunnel_hold_keeps_path_=true;double tunnel_hold_path_max_age_sec_=10.0;
     ros::Time embedded_avoiding_stamp_;
     double tunnel_obstacle_kick_dist_=-1.0;
     ros::Time tunnel_obstacle_inpath_time_;
@@ -4357,9 +4398,10 @@ private:
 		planning_start=std::max(0,std::min(static_zone_min_idx_,planning_start));
 		return enabled && ((current_lane_number_==0 && current_waypoint_idx_>=planning_start &&
 			current_waypoint_idx_<=static_dynamic_split_idx_) ||
-			(((common_scene_enabled_&&tunnel_region_.contains(current_lane_number_,current_waypoint_idx_))||(!common_scene_enabled_&&current_lane_number_==3&&current_waypoint_idx_>=7000&&current_waypoint_idx_<=9000))));
+			(((common_scene_enabled_&&tunnel_region_.contains(current_lane_number_,current_waypoint_idx_))||(!common_scene_enabled_&&current_lane_number_==3&&current_waypoint_idx_>=tunnel_region_.first&&current_waypoint_idx_<=tunnel_region_.last+tunnel_region_.exit_hold))));
 	}
-	ros::NodeHandle nh_;
+	ros::Publisher m8_approved_pub_;
+    ros::NodeHandle nh_;
 	ros::NodeHandle pnh_;
 	ros::Publisher local_path_pub_;
 	ros::Publisher global_path_pub_;
@@ -4491,6 +4533,7 @@ private:
 	bool tunnel_mode_ = false;
 	double tunnel_entry_grace_sec_ = 0.8;
 	double tunnel_mode_hold_sec_ = 1.0;
+	bool tunnel_exit_release_enabled_ = true;double tunnel_exit_release_signal_sec_ = .2,tunnel_exit_release_offset_m_ = .5,tunnel_exit_release_yaw_rad_ = .087;
 	ros::Time tunnel_enter_time_, last_tunnel_mode_signal_;
 	bool m3_static_avoid_enabled_ = true;
 	bool m3_avoid_latched_ = false;   // M3 정적 전환 회피 중(복귀 끝날 때까지 유지)

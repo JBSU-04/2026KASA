@@ -119,6 +119,10 @@ class FarStaticDetector:
         #     카고박스·우측 저상물 모두 바깥 0.15~0.35 m 가 잘렸다.
         # 근거리 obstacle_perception 의 path_corridor_half_width(1.7)와 같은 값.
         self.path_half = float(rospy.get_param('~path_corridor_half_width_m', 1.7))
+        # 2026-10-14(17:39:16 백): 터널 후반 벽에 붙은 장애물(안쪽 끝 -1.5 / +5.75 m)이 1.7 m 규칙과 벽 띠 군집 탈락으로
+        #   원거리에서 한 번도 제안되지 않았다. M8 은 벽 너머 점을 사전 필터가 지우므로 벽 안쪽 전체를 본다.
+        #   원거리 단독 물체는 병합에서 확정되지 않고 정지 근거도 아니다(미리 인지·선서행용).
+        self.tunnel_path_half = float(rospy.get_param('/tunnel_recovery/far_tunnel_corridor_half_width_m', 7.0))
         self.gather_half = max(self.path_half, float(rospy.get_param('~gather_half_width_m', 7.0)))
         # 넓게 모으면 우측 연석점도 들어와 연석 옆 장애물이 연석과 한 덩어리로
         # 묶여(max_cluster_extent 초과) 통째 버려질 수 있다. 회피 노드의 연석
@@ -155,10 +159,14 @@ class FarStaticDetector:
         self.next_id = 900001
         self.cpp_prefilter=bool(rospy.get_param("/tunnel_recovery/cpp_prefilter_enabled",False))
         import threading
-        self.far_queue=threading.Condition();self.far_pending=None;self.far_processing=threading.Lock()
+        self.far_queue=threading.Condition();self.far_pending=None;self.far_wall_pending=None;self.far_processing=threading.Lock()
         self.filtered_pipeline=bool(rospy.get_param("/tunnel_recovery/filtered_pipeline_enabled",False))
         self.wall_surface=WallSurface.load(rospy.get_param("/tunnel_recovery/wall_profile_file",None)) if self.filtered_pipeline else None
-        self.filtered_pub=rospy.Publisher("/tunnel/filtered_far",PointCloud2,queue_size=1)
+        self.verified_wall=bool(rospy.get_param('/tunnel_recovery/verified_wall_surface_only_enabled',False)) and self.cpp_prefilter
+        self.filtered_pub=rospy.Publisher('/tunnel/filtered_far',PointCloud2,queue_size=1) if not self.verified_wall else None
+        self.wall_input_pub=rospy.Publisher('/tunnel/far_wall_input',PointCloud2,queue_size=1)
+        if self.verified_wall:rospy.Subscriber('/tunnel/filtered_far',PointCloud2,self._cloud,queue_size=1,buff_size=2**24)
+
         self.map_build_pub=rospy.Publisher("/tunnel/filtered_background_input",PointCloud2,queue_size=1)
         self.map_enabled=bool(rospy.get_param("/tunnel_recovery/enabled",True)) and not self.filtered_pipeline
         self.map_stamp=-1e9
@@ -270,9 +278,10 @@ class FarStaticDetector:
     def _far_loop(self):
         while not rospy.is_shutdown():
             with self.far_queue:
-                if self.far_pending is None:self.far_queue.wait(.1)
-                if self.far_pending is None:continue
-                msg=self.far_pending;self.far_pending=None
+                if self.far_pending is None and self.far_wall_pending is None:self.far_queue.wait(.1)
+                if self.far_pending is None and self.far_wall_pending is None:continue
+                if self.far_wall_pending is not None:msg=self.far_wall_pending;self.far_wall_pending=None
+                else:msg=self.far_pending;self.far_pending=None
             with self.far_processing:
                 if self.section!='M8':continue
                 try:self._cloud_process(msg)
@@ -284,12 +293,15 @@ class FarStaticDetector:
             if not hasattr(self,'far_worker'):
                 self.far_worker=threading.Thread(target=self._far_loop,daemon=True);self.far_worker.start()
             with self.far_queue:
+                if any(f.name=='m8_wall_verified' for f in msg.fields):
+                    self.far_wall_pending=msg;self.far_queue.notify();return
                 if self.far_pending is None or msg.header.stamp>self.far_pending.header.stamp:
                     self.far_pending=msg;self.far_queue.notify()
             return
         with self.far_processing:self._cloud_process(msg)
 
     def _cloud_process(self, msg):
+        wall_filtered=self.section=='M8' and any(f.name=='m8_wall_verified' for f in msg.fields)
         annotated=self.section=='M8' and any(f.name=='map_label' for f in msg.fields)
         if self.section=='M8' and not annotated and rospy.Time.now().to_sec()-getattr(self,'map_stamp',-1e9)<.35:return
         stamp = msg.header.stamp.to_sec() or rospy.Time.now().to_sec()
@@ -299,14 +311,14 @@ class FarStaticDetector:
         if scan_pose is None:
             self._empty(stamp);return
         p = _xyz(msg)
-        if self.cpp_prefilter and self.section=='M8':
+        if self.cpp_prefilter and self.section=='M8' and not wall_filtered:
             p=far_ground_working_set(p,self.x_min,self.x_max,self.y_max,self.plane_fit_x,self.section_y_limits.get(self.section,[-self.y_max,self.y_max]))
         height = p[:, 2] - self.ground_z
         h_max = float(self.section_h_max.get(self.section, self.h_max))
-        if self.section in self.plane_sections and not annotated:
+        if self.section in self.plane_sections and not annotated and not wall_filtered:
             plane_h = self._plane_height(p)
             if plane_h is None:
-                if self.section=="M8" and self.filtered_pipeline:self.filtered_pub.publish(filtered_cloud(msg.header,np.empty((0,4))))
+                if self.section=="M8" and self.filtered_pipeline and self.filtered_pub is not None:self.filtered_pub.publish(filtered_cloud(msg.header,np.empty((0,4))))
                 self._empty(stamp); return      # 지면을 못 잡으면 제안하지 않는다
             height = plane_h
             # 2026-10-09(14:56:06 백): 평면 하나는 종단 경사 변화 구간에서 30 m 앞 노면을 0.2 m 위로 띄워
@@ -319,6 +331,7 @@ class FarStaticDetector:
         if annotated:
             a=fields_array(msg,['x','y','z','map_ground','map_label']);finite=np.isfinite(a[:,:3]).all(axis=1)
             a=a[finite];height=a[:,2]-a[:,3];height=np.where(a[:,4]==1,-np.inf,height)
+        if wall_filtered:height=fields_array(msg,['x','y','z','ground_relative'])[:,3]
         h_min = .08 if annotated else float(self.section_h_min.get(self.section, self.h_min))
         keep = ((p[:, 0] >= (0. if annotated else self.x_min)) & (p[:, 0] <= self.x_max) &
                 (np.abs(p[:, 1]) <= self.y_max) &
@@ -329,9 +342,11 @@ class FarStaticDetector:
             keep &= (p[:, 1] >= float(lim[0])) & (p[:, 1] <= float(lim[1]))
         p = p[keep]
         hloc = height[keep]
-        if self.section=="M8" and self.filtered_pipeline:
+        if self.section=="M8" and self.filtered_pipeline and not wall_filtered:
             rows=np.column_stack([p,hloc])
             self.map_build_pub.publish(filtered_cloud(msg.header,rows))
+            if self.verified_wall:
+                self.wall_input_pub.publish(filtered_cloud(msg.header,rows));return
             rows=rows[self.wall_surface.keep(rows,scan_pose,(self.sensor_x,self.sensor_y))]
             self.filtered_pub.publish(filtered_cloud(msg.header,rows))
             p=rows[:,:3].astype(np.float32);hloc=rows[:,3]
@@ -421,7 +436,9 @@ class FarStaticDetector:
                 continue
             # 안쪽 끝(기준경로에 가장 가까운 점)이 코리도 밖이면 경로와 무관
             latp = q[:, 5]
-            if float(np.min(np.abs(latp))) > self.path_half:
+            half = (getattr(self, 'tunnel_path_half', self.path_half)
+                    if (getattr(self, 'section', '') == 'M8' and getattr(self, 'filtered_pipeline', False)) else self.path_half)
+            if float(np.min(np.abs(latp))) > half:
                 continue
             xy = q[:, :2]
             span = np.ptp(xy, axis=0)

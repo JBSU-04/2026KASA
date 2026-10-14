@@ -15,6 +15,7 @@
 
 #include <smpc_lane_change/BehaviorLongitudinalRequest.h>
 #include <smpc_lane_change/merge_acc_policy.hpp>
+#include <smpc_lane_change/gap_speed_policy.hpp>
 #include <smpc_lane_change/BehaviorLongitudinalStatus.h>
 #include <smpc_lane_change/LaneChangeDecision.h>
 #include <smpc_lane_change/LaneChangeStatus.h>
@@ -35,6 +36,11 @@ class AccSpeedPlanner {
     pnh_.param("soft_ttc_sec", soft_ttc_sec_, 4.0);
     pnh_.param("hard_ttc_sec", hard_ttc_sec_, 1.8);
     pnh_.param("min_speed_mps", min_speed_mps_, 0.0);
+    pnh_.param("gap_response_enabled", gap_response_enabled_, true);
+    pnh_.param("gap_shared_speed_enabled", gap_shared_speed_enabled_, true);
+    pnh_.param("gap_selected_max_catchup_mps", gap_selected_max_catchup_mps_, 6.0);
+    pnh_.param("gap_prepare_accel_mps2", gap_prepare_accel_mps2_, 3.0);
+    pnh_.param("gap_prepare_decel_mps2", gap_prepare_decel_mps2_, 3.0);
     pnh_.param("max_accel_mps2", max_accel_mps2_, 1.5);
     pnh_.param("lane_change_max_accel_mps2", lane_change_max_accel_mps2_, 3.5);
     pnh_.param("max_decel_mps2", max_decel_mps2_, 5.0);
@@ -225,6 +231,7 @@ class AccSpeedPlanner {
  private:
   void targetsCallback(const smpc_lane_change::TargetVehicleSet::ConstPtr& msg) {
     targets_ = *msg;
+    gap_speed_policy_.update(*msg);
     targets_stamp_ = ros::Time::now();
     have_targets_ = true;
     // 신뢰할 수 있는 앞차 속도만 기억해 둔다(leadTrustedSpeedMps 의 짧은 홀드용).
@@ -358,6 +365,7 @@ class AccSpeedPlanner {
       return false;
     }
     if (action == smpc_lane_change::BehaviorLongitudinalRequest::ACCELERATE) {
+      if (selectedGapAccelAllowed()) return true;
       // ACCELERATE 는 기본적으로 막혀 있다(behavior_request_apply_accel).
       // 다만 '양보를 막 해제한 직후'에는 짧게 허용한다.
       //
@@ -426,6 +434,28 @@ class AccSpeedPlanner {
     return true;
   }
 
+  bool selectedGapSpeedKnown() const {
+    bool leader=behavior_request_.merge_leader_id<0, follower=behavior_request_.merge_follower_id<0;
+    auto check=[&](const smpc_lane_change::TargetVehicle& v) {
+      if(!v.valid || v.lane_id!=targets_.target_lane_id) return;
+      const auto estimate=gap_speed_policy_.get(v,ros::Time::now().toSec());
+      const bool known=gap_shared_speed_enabled_ ? estimate.known :
+        v.velocity_valid && std::isfinite(v.v_long) && std::isfinite(v.velocity_std) &&
+        v.velocity_std<=lead_max_velocity_std_mps_ && v.observation_age<=.3;
+      if(v.unique_id==behavior_request_.merge_leader_id) leader=known;
+      if(v.unique_id==behavior_request_.merge_follower_id) follower=known;
+    };
+    check(targets_.target_front);check(targets_.target_rear);
+    for(const auto& v:targets_.nearby_vehicles) check(v);
+    return leader && follower && (behavior_request_.merge_leader_id>=0 || behavior_request_.merge_follower_id>=0);
+  }
+  bool selectedGapAccelAllowed() const {
+    return gap_response_enabled_ && have_targets_ &&
+      (ros::Time::now()-targets_stamp_).toSec()<=target_timeout_sec_ &&
+      smpc_lane_change::gapAccelRequest(behavior_request_,targets_,ros::Time::now().toSec(),
+        behavior_request_stamp_.toSec(),behavior_request_timeout_sec_,selectedGapSpeedKnown());
+  }
+
   // 합류용 간격 추종 속도. 목표 간격 = standstill + time_gap * 자차속도,
   // 속도 = 앞차속도 + gain * (간격 - 목표간격), 앞차속도 + max_catchup 이하.
   // 앞차가 멀어지는 동안은 따라 가속하고, 간격이 목표보다 좁으면 앞차보다 느리게 간다.
@@ -435,9 +465,16 @@ class AccSpeedPlanner {
     const double desired = selected_merge ? yield_follow_min_desired_gap_m_ : std::max(yield_follow_min_desired_gap_m_,
         yield_follow_standstill_gap_m_ +
         yield_follow_time_gap_sec_ * ego_speed_mps_);
-    return smpc_lane_change::mergeFollowSpeed(gap,leadTrustedSpeedMps(lead),desired,
-        yield_follow_close_gap_gain_,yield_follow_gap_gain_,yield_follow_max_catchup_mps_,
-        min_speed_mps_,cruise_speed_mps);
+    const auto estimate=gap_speed_policy_.get(lead,ros::Time::now().toSec());
+    const double speed=selected_merge && gap_shared_speed_enabled_
+        ? (estimate.known ? estimate.speed : std::max(0.,ego_speed_mps_)) : leadTrustedSpeedMps(lead);
+    const double catchup=selected_merge && gap_response_enabled_ &&
+        (!gap_shared_speed_enabled_ || estimate.known) ? gap_selected_max_catchup_mps_ : yield_follow_max_catchup_mps_;
+    const double ceiling=selected_merge && gap_shared_speed_enabled_ && !estimate.known
+        ? std::min(cruise_speed_mps,ego_speed_mps_) : cruise_speed_mps;
+    return smpc_lane_change::mergeFollowSpeed(gap,speed,desired,
+        yield_follow_close_gap_gain_,yield_follow_gap_gain_,catchup,
+        min_speed_mps_,ceiling);
   }
 
   bool endpointConnectorActive() const {
@@ -1633,7 +1670,9 @@ class AccSpeedPlanner {
           // planner's requested YIELD rate.  Existing lead/lane-end/rapid
           // braking keeps its original (possibly stronger) safety authority.
           const bool no_external_speed_limit =
-              active_lead == "none" || active_lead == "merge_keep_rolling";
+              active_lead == "none" || active_lead == "merge_keep_rolling" ||
+              (gap_response_enabled_ && gap_align_request &&
+               active_lead.rfind("merge_gap_leader:",0)==0 && !independent_lead_active);
           const bool requested_yield =
               behavior_request_.action ==
                   smpc_lane_change::BehaviorLongitudinalRequest::YIELD &&
@@ -1641,7 +1680,9 @@ class AccSpeedPlanner {
           if (!hard_brake_active && no_external_speed_limit && requested_yield) {
             behavior_yield_slew_active = true;
             behavior_yield_decel_limit_mps2 =
-                std::abs(behavior_request_.requested_accel_mps2);
+                gap_response_enabled_ && gap_align_request
+                  ? std::min(gap_prepare_decel_mps2_,std::abs(behavior_request_.requested_accel_mps2))
+                  : std::abs(behavior_request_.requested_accel_mps2);
           }
           raw_target = behavior_cap;
           soft_target_front_limited_speed = false;
@@ -1739,7 +1780,9 @@ class AccSpeedPlanner {
       // raw_target은 그대로 우선하므로 앞차가 있으면 가속하지 않는다.
       const bool merge_accel_active = laneChangeIntentActive();
       double accel_limit = std::max(0.0, max_accel_mps2_);
-      if (merge_accel_active) {
+      if (selectedGapAccelAllowed() && !hard_brake_active) {
+        accel_limit=std::min(gap_prepare_accel_mps2_,behavior_request_.requested_accel_mps2);
+      } else if (merge_accel_active) {
         accel_limit = std::max(accel_limit, lane_change_max_accel_mps2_);
       } else if (yield_follow || (selected_gap_follow && merge_leader.valid)) {
         accel_limit = std::max(accel_limit, yield_follow_max_accel_mps2_);
@@ -1811,6 +1854,9 @@ class AccSpeedPlanner {
   bool endpoint_connector_active_{false};
   double ego_speed_mps_{0.0};
   double filtered_speed_mps_{0.0};
+  smpc_lane_change::GapSpeedPolicy gap_speed_policy_;
+  bool gap_response_enabled_{true}, gap_shared_speed_enabled_{true};
+  double gap_selected_max_catchup_mps_{6.0},gap_prepare_accel_mps2_{3.0},gap_prepare_decel_mps2_{3.0};
 
   std::string mission_speed_topic_{"/control_feedback/mission_speed_target_mps"};
   double mission_speed_timeout_sec_{0.5};

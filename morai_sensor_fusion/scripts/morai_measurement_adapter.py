@@ -20,6 +20,7 @@ from morai_msgs.msg import EgoVehicleStatus, GPSMessage
 from mission_supervisor.msg import SectionState
 from sensor_msgs.msg import Imu
 from visualization_msgs.msg import Marker,MarkerArray
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32, Float64, String
 
 from morai_sensor_fusion.measurement import (
@@ -205,6 +206,23 @@ class MeasurementAdapter:
         self.lane_stamp = None
         self.xicp_bias=None;self.xicp_yaw_stamp=None
         self.xicp_applied_bias=0.;self.xicp_apply_stamp=None
+        # 2026-10-13 X-ICP 횡보정: GPS 동결 중 DR 횡오차 0.07~0.24 m 가 보정 없이 남았다(22:05~22:07 백, X-ICP 측정만).
+        #   터널 축(지도 road_heading)에 수직인 성분만 쓴다(종방향은 관측 불가). 관측 시각의 /odom + X-ICP 보정이 참값,
+        #   거기서 같은 시각 DR 과 그 뒤 이미 적용한 보정을 빼 DR 자체 오차를 구하고 초당 상한으로 나눠 옮긴다.
+        #   EKF 지연 때문에 /odom 오차를 DR 에 그대로 더하면 과보정된다. frame_update 는 내지 않는다(작은 연속 이동).
+        self.xicp_lateral_enabled=bool(rospy.get_param('/tunnel_recovery/xicp_lateral_correction_enabled',True)) and bool(rospy.get_param('/tunnel_recovery/enabled',True))
+        self.xicp_lateral_rate=float(rospy.get_param('/tunnel_recovery/xicp_lateral_rate_mps',.2))
+        self.xicp_lateral_deadband=float(rospy.get_param('/tunnel_recovery/xicp_lateral_deadband_m',.03))
+        self.xicp_lateral_max=float(rospy.get_param('/tunnel_recovery/xicp_lateral_max_m',.6))
+        self.xicp_lateral_axis=self.tunnel_nominal_heading+math.pi/2.  # 왼쪽 + (X-ICP lat 축과 같다)
+        self.xicp_lateral_pending=0.;self.xicp_lateral_stamp=None;self.xicp_lateral_applied=deque(maxlen=400)
+        self.dr_history=deque(maxlen=400);self.odom_history=deque(maxlen=200)
+        # 2026-10-14 보정 전 순수 DR(차속 + 원래 IMU yaw[격자 수렴각만], GPS·X-ICP·bias 보정 없음).
+        #   장애물 이동 판정의 자차 이동 보상 전용. 측위 보정(yaw bias 0.5 deg 단계, GPS 재획득 1.5 m/s,
+        #   X-ICP 횡 0.2 m/s)이 정지 물체를 '움직인 것'처럼 만들지 않게 한다. 절대 위치는 의미 없음(연속성만).
+        self.dr_raw_enabled=bool(rospy.get_param('/tunnel_recovery/raw_dr_motion_frame_enabled',True))
+        self.dr_raw=None;self.dr_raw_stamp=None;self.dr_raw_yaw=None;self.dr_raw_last_pub=None
+        self.dr_raw_pub=rospy.Publisher('/localization/dr_raw_odom',Odometry,queue_size=20) if self.dr_raw_enabled else None
         self.tunnel_m8_active=False;self.tunnel_section_stamp=rospy.Time(0)
         rospy.Subscriber("/mission/active_section",SectionState,self.mission_section_callback,queue_size=1)
         self.heading_state_pub=rospy.Publisher("/tunnel/heading/state",String,queue_size=1)
@@ -256,6 +274,15 @@ class MeasurementAdapter:
             rospy.Subscriber("/tunnel/lane_yaw_measurement", PoseStamped, self.lane_yaw_callback, queue_size=1)
         rospy.Subscriber(camera_valid_topic, Bool, self.camera_valid_callback, queue_size=5)
         rospy.Subscriber('/tunnel/xicp/yaw_measurement',PoseStamped,self.xicp_yaw_callback,queue_size=1)
+        if self.xicp_lateral_enabled:
+            try:
+                from tunnel_xicp.msg import XicpStatus
+                rospy.Subscriber('/tunnel/xicp/status',XicpStatus,self.xicp_status_callback,queue_size=5)
+                rospy.Subscriber(rospy.get_param('~odom_topic','/odom'),Odometry,self.odom_callback,queue_size=20)
+                self.xicp_lateral_pub=rospy.Publisher('/localization/xicp_lateral_state',String,queue_size=1)
+            except ImportError as e:
+                self.xicp_lateral_enabled=False
+                rospy.logwarn('[fusion_adapter] X-ICP lateral correction disabled: %s',e)
         rospy.Subscriber(rospy.get_param('~wall_yaw_topic', '/tunnel/wall_yaw_error'),
                          Float64, self.wall_yaw_callback, queue_size=5)
         rospy.Subscriber(rospy.get_param('~ekf_pose_topic', '/ekf_pose_with_covariance'),
@@ -327,6 +354,107 @@ class MeasurementAdapter:
             bias=normalize_angle(raw-measured)
             if abs(bias)>math.radians(5.):return
             self.xicp_bias=bias;self.xicp_yaw_stamp=stamp
+
+    @staticmethod
+    def _history_at(rows, t, gap=.12):
+        """(t,x,y) 이력에서 t 시각 위치를 선형 보간. 이웃 간격이 gap 을 넘거나 범위 밖이면 None."""
+        if len(rows) < 2:
+            return None
+        times = [r[0] for r in rows]
+        j = bisect.bisect_left(times, t)
+        if j <= 0 or j >= len(rows) or times[j]-times[j-1] > gap:
+            return None
+        u = (t-times[j-1])/max(times[j]-times[j-1], 1e-9)
+        return (rows[j-1][1]+u*(rows[j][1]-rows[j-1][1]), rows[j-1][2]+u*(rows[j][2]-rows[j-1][2]))
+
+    def odom_callback(self, message):
+        p = message.pose.pose.position
+        with self.lock:
+            self.odom_history.append((message.header.stamp.to_sec(), float(p.x), float(p.y)))
+
+    def xicp_status_callback(self, message):
+        """X-ICP 횡보정 측정 -> DR 자체 횡오차(터널 축 수직, 왼쪽 +)를 남은 보정량으로."""
+        if not getattr(self, 'xicp_lateral_enabled', False):
+            return
+        stamp = message.header.stamp.to_sec(); now = rospy.Time.now().to_sec()
+        if (int(message.state) != 2 or not message.lateral_observable or message.lateral_observability < .95
+                or not math.isfinite(message.lateral_correction) or abs(message.lateral_correction) > self.xicp_lateral_max
+                or not -.05 <= now-stamp <= .3):
+            return
+        with self.lock:
+            if (self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN or not self.tunnel_m8_active
+                    or not -.05 <= now-self.tunnel_section_stamp.to_sec() <= .5):
+                return
+            odom = self._history_at(self.odom_history, stamp)
+            dr = self._history_at(self.dr_history, stamp)
+            if odom is None or dr is None:
+                return
+            ax, ay = math.cos(self.xicp_lateral_axis), math.sin(self.xicp_lateral_axis)
+            # 참값 = odom + 보정. DR 오차 = 참값 - DR(관측 시각) - 그 뒤 이미 적용한 보정.
+            error = (odom[0]-dr[0])*ax+(odom[1]-dr[1])*ay+float(message.lateral_correction)
+            error -= sum(v for t, v in self.xicp_lateral_applied if t > stamp)
+            if abs(error) > self.xicp_lateral_max:
+                return
+            self.xicp_lateral_pending = error if abs(error) >= self.xicp_lateral_deadband else 0.
+            self.xicp_lateral_stamp = stamp
+            state = dict(stamp=stamp, measured=float(message.lateral_correction), dr_error=error,
+                         pending=self.xicp_lateral_pending)
+        pub = getattr(self, 'xicp_lateral_pub', None)
+        if pub is not None:
+            pub.publish(String(data=json.dumps(state, separators=(',', ':'))))
+
+    def _xicp_lateral_step(self, stamp, dt):
+        """lock 안에서. 남은 횡보정을 초당 xicp_lateral_rate 이하로 DR 에 적용. 반환: 이번 이동량(m)."""
+        if not getattr(self, 'xicp_lateral_enabled', False) or self.dr_position is None:
+            return 0.
+        if self.gps_integrity.mode != GpsIntegrityMonitor.FROZEN:
+            self.xicp_lateral_pending = 0.
+            return 0.
+        if self.xicp_lateral_stamp is None or not -.05 <= stamp-self.xicp_lateral_stamp <= 1.0:
+            return 0.  # 오래된 측정으로 계속 밀지 않는다
+        limit = self.xicp_lateral_rate*max(0., min(dt, .1))
+        step = max(-limit, min(limit, self.xicp_lateral_pending))
+        if abs(step) < 1e-6:
+            return 0.
+        ax, ay = math.cos(self.xicp_lateral_axis), math.sin(self.xicp_lateral_axis)
+        self.dr_position = (self.dr_position[0]+step*ax, self.dr_position[1]+step*ay)
+        self.xicp_lateral_pending -= step
+        self.xicp_lateral_applied.append((stamp, step))
+        return step
+
+    def _integrate_raw_dr(self, stamp, yaw, speed):
+        """lock 안에서. 보정 없는 DR 적분. 반환 (x, y, yaw) 또는 None(아직 시작 전)."""
+        if self.dr_raw is None:
+            # 시작점은 지금 DR/GPS 위치(디버깅 편의). 이후로는 어떤 보정도 받지 않는다.
+            if self.dr_position is None:
+                return None
+            self.dr_raw = tuple(self.dr_position); self.dr_raw_stamp = stamp; self.dr_raw_yaw = yaw
+            return (self.dr_raw[0], self.dr_raw[1], yaw)
+        dt = stamp - self.dr_raw_stamp
+        if dt <= 0.:
+            return None
+        if dt <= .5:
+            heading = interpolate_angle(self.dr_raw_yaw, yaw, .5)
+            step = min(dt, self.dr_max_step_dt)
+            self.dr_raw = (self.dr_raw[0]+speed*math.cos(heading)*step, self.dr_raw[1]+speed*math.sin(heading)*step)
+        self.dr_raw_stamp = stamp; self.dr_raw_yaw = yaw
+        return (self.dr_raw[0], self.dr_raw[1], yaw)
+
+    def _publish_raw_dr(self, stamp, yaw, wz, speed):
+        if not getattr(self, 'dr_raw_enabled', False):
+            return
+        with self.lock:
+            state = self._integrate_raw_dr(stamp.to_sec(), yaw, speed)
+            last = self.dr_raw_last_pub
+            if state is None or (last is not None and stamp.to_sec()-last < .019):
+                return
+            self.dr_raw_last_pub = stamp.to_sec()
+        o = Odometry(); o.header.stamp = stamp; o.header.frame_id = 'dr_odom'; o.child_frame_id = self.base_frame
+        o.pose.pose.position.x, o.pose.pose.position.y = state[0], state[1]
+        q = tf.transformations.quaternion_from_euler(0., 0., state[2])
+        o.pose.pose.orientation.x, o.pose.pose.orientation.y, o.pose.pose.orientation.z, o.pose.pose.orientation.w = q
+        o.twist.twist.linear.x = speed; o.twist.twist.angular.z = wz
+        self.dr_raw_pub.publish(o)
 
     def lane_yaw_callback(self, message):
         # Estimate IMU bias at capture time, then preserve all subsequent gyro turns.
@@ -620,6 +748,7 @@ class MeasurementAdapter:
             self.publish_dead_reckoning_pose(stamp,yaw,yaw_var)
             return
         speed, eff_speed_sigma = self.get_effective_speed(stamp)
+        self._publish_raw_dr(stamp, yaw, wz, speed)
         # Keep an independent, continuous dead-reckoning position.  In normal
         # operation each trusted GPS fix anchors it.  Once GPS freezes this
         # state continues from exact simulator speed and absolute IMU yaw, so
@@ -686,9 +815,12 @@ class MeasurementAdapter:
                     self.dr_position = (
                         self.dr_position[0] + speed * math.cos(heading) * step_dt,
                         self.dr_position[1] + speed * math.sin(heading) * step_dt)
+                    self._xicp_lateral_step(stamp.to_sec(), dt)
                 if dt > 0.0:
                     self.dr_stamp = stamp
                     self.dr_yaw = yaw
+                if self.dr_position is not None and getattr(self, 'xicp_lateral_enabled', False):
+                    self.dr_history.append((stamp.to_sec(), self.dr_position[0], self.dr_position[1]))
         output = TwistWithCovarianceStamped()
         output.header.stamp = stamp
         output.header.frame_id = self.base_frame

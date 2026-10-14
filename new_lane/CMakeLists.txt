@@ -87,6 +87,7 @@ target_link_libraries(obstacle_avoidance_node
 
 catkin_install_python(PROGRAMS
   scripts/obstacle_stop_node.py
+  scripts/m3_motion_evidence.py
   scripts/reference_corridor_viz.py
   scripts/tunnel_map_filter.py
   scripts/tunnel_occupancy_geometry.py
@@ -103,7 +104,7 @@ catkin_install_python(PROGRAMS
 )
 
 # Shared detector geometry is imported through the package share path.
-install(FILES scripts/m8_filtered_input.py scripts/temporal_components.py scripts/tunnel_native_scene.py scripts/tunnel_map_boundary.py scripts/tunnel_region.py scripts/tunnel_scene_policy.py scripts/m8_object_policy.py scripts/tunnel_occupancy_geometry.py scripts/tunnel_map_geometry.py scripts/escape_planning.py scripts/obstacle_geometry.py DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/scripts)
+install(FILES scripts/m8_object_scene.py scripts/m8_motion.py scripts/m8_repair_policy.py scripts/m3_motion_evidence.py scripts/m8_filtered_input.py scripts/temporal_components.py scripts/tunnel_native_scene.py scripts/tunnel_map_boundary.py scripts/tunnel_region.py scripts/tunnel_scene_policy.py scripts/m8_object_policy.py scripts/tunnel_occupancy_geometry.py scripts/tunnel_map_geometry.py scripts/escape_planning.py scripts/obstacle_geometry.py DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/scripts)
 
 install(DIRECTORY vendor/autoware_compare_map DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/vendor)
 
@@ -133,7 +134,7 @@ install(DIRECTORY include/new_lane/ DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINA
 add_executable(tunnel_prefilter_node src/tunnel_prefilter_node.cpp)
 target_compile_features(tunnel_prefilter_node PRIVATE cxx_std_14)
 target_include_directories(tunnel_prefilter_node PRIVATE ${JSONCPP_INCLUDE_DIRS})
-target_link_libraries(tunnel_prefilter_node ${catkin_LIBRARIES} ${JSONCPP_LIBRARIES})
+target_link_libraries(tunnel_prefilter_node ${catkin_LIBRARIES} ${JSONCPP_LIBRARIES} ${PCL_LIBRARIES})
 add_dependencies(tunnel_prefilter_node ${catkin_EXPORTED_TARGETS})
 install(TARGETS tunnel_prefilter_node RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 if(CATKIN_ENABLE_TESTING)

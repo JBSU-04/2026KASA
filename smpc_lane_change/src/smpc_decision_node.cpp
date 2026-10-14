@@ -25,6 +25,7 @@
 
 #include <smpc_lane_change/BehaviorLongitudinalRequest.h>
 #include <smpc_lane_change/merge_acc_policy.hpp>
+#include <smpc_lane_change/gap_speed_policy.hpp>
 #include <smpc_lane_change/BehaviorLongitudinalStatus.h>
 #include <smpc_lane_change/BehaviorPlan.h>
 #include <smpc_lane_change/LaneChangeDecision.h>
@@ -34,6 +35,7 @@
 #include <mission_supervisor/SectionState.h>
 #include <waypoint_system/PathSwitchPreview.h>
 #include <waypoint_system/spatial_blend.hpp>
+#include "smpc_lane_change/overtake_policy.hpp"
 
 namespace fs = std::filesystem;
 
@@ -375,7 +377,20 @@ class SmpcDecisionNode {
     pnh_.param("gap_select_slot_margin_m", gap_select_slot_margin_m_, 1.0);
     pnh_.param("gap_select_min_slot_m", gap_select_min_slot_m_, 1.0);
     pnh_.param("gap_select_max_time_sec", gap_select_max_time_sec_, 12.0);
+    pnh_.param("gap_response_enabled", gap_response_enabled_, true);
+    pnh_.param("gap_shared_speed_enabled", gap_shared_speed_enabled_, true);
+    pnh_.param("gap_selected_max_catchup_mps", gap_selected_max_catchup_mps_, 6.0);
+    pnh_.param("gap_fixed_flow_enabled", gap_fixed_flow_enabled_, false);
     pnh_.param("gap_select_accel_mps2", gap_select_accel_mps2_, 1.2);
+    // 2026-10-13 추월(기준 차량 앞 틈) 가속과 기준 차량 가속 판단(overtake_policy.hpp).
+    pnh_.param("gap_select_overtake_accel_mps2", gap_select_overtake_accel_mps2_, 4.0);
+    pnh_.param("gap_ref_accel_window_sec", gap_ref_accel_window_sec_, 1.0);
+    pnh_.param("gap_ref_accel_deadband_mps2", overtake_policy_.deadband, 0.6);
+    pnh_.param("gap_overtake_rel_accel_min_mps2", overtake_policy_.rel_min, 1.0);
+    pnh_.param("gap_overtake_abort_confirm_sec", overtake_policy_.confirm_sec, 0.5);
+    pnh_.param("gap_ref_speed_cap_mps", gap_ref_speed_cap_mps_, 27.8);
+    pnh_.param("gap_overtake_accel_policy_enabled", gap_overtake_accel_policy_enabled_, true);
+    overtake_policy_.ego_overtake_accel = gap_select_overtake_accel_mps2_;
     pnh_.param("gap_select_decel_mps2", gap_select_decel_mps2_, 1.5);
     // 구간별 제한속도 표(gapSpeedCapAt 주석). 상태별 속도와 구역 상한은 MPC 가 쓰는
     // 전역 파라미터(mpc_params.yaml)를 그대로 읽어 두 노드의 값이 어긋나지 않게 한다.
@@ -753,6 +768,7 @@ class SmpcDecisionNode {
 
   void targetsCallback(const smpc_lane_change::TargetVehicleSet::ConstPtr& msg) {
     targets_ = *msg;
+    gap_speed_policy_.update(*msg);
     targets_stamp_ = ros::Time::now();
     have_targets_ = true;
     updateVehicleHistories(*msg);
@@ -766,6 +782,8 @@ class SmpcDecisionNode {
     const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
     ego_yaw_ = std::atan2(siny_cosp, cosy_cosp);
     ego_speed_mps_ = std::hypot(msg->twist.twist.linear.x, msg->twist.twist.linear.y);
+    ego_speed_slope_.add(msg->header.stamp.isZero() ? ros::Time::now().toSec() : msg->header.stamp.toSec(),
+                         ego_speed_mps_, 2.0);
     have_ego_ = true;
   }
 
@@ -794,6 +812,7 @@ class SmpcDecisionNode {
   // 그러면 상대속도가 0 이 되어 '상대속도 때문에' 추가로 감속하거나
   // 가속하지 않고, 거리(gap) 기반 판단만 남는다.
   double leadTrustedLongSpeed(const smpc_lane_change::TargetVehicle& v) const {
+    if(gap_shared_speed_enabled_) return gapVehicleSpeed(v);
     if (!std::isfinite(v.v_long)) return ego_speed_mps_;
     if (!trusted_speed_gate_enabled_) return v.v_long;
     const bool std_ok = !std::isfinite(v.velocity_std) ||
@@ -1126,6 +1145,8 @@ class SmpcDecisionNode {
   void updateOneVehicleHistory(const smpc_lane_change::TargetVehicle& v,
                                const ros::Time& stamp) {
     if (!v.valid || v.unique_id < 0) return;
+    // 판단용 가속도는 속도 표준편차로 거르지 않고 최근 window 초 기울기로 잡음을 흡수한다.
+    if (std::isfinite(v.v_long)) ref_speed_slope_[v.unique_id].add(stamp.toSec(), v.v_long, 2.0);
     auto& h = vehicle_history_[v.unique_id];
     if (!h.initialized) {
       h.initialized = true;
@@ -1410,9 +1431,11 @@ class SmpcDecisionNode {
 
     double accel = 0.0;
     if (v_ref > v0 + kSpeedEps) {
-      accel = std::max(0.0, ego_prediction_max_accel_mps2_);
+      accel = gap_response_enabled_ && gap_latch_valid_
+        ? std::max(0.0,gap_select_accel_mps2_) : std::max(0.0, ego_prediction_max_accel_mps2_);
     } else if (v_ref < v0 - kSpeedEps) {
-      accel = -std::max(0.0, ego_prediction_max_decel_mps2_);
+      accel = -(gap_response_enabled_ && gap_latch_valid_
+        ? std::max(0.0,gap_select_decel_mps2_) : std::max(0.0, ego_prediction_max_decel_mps2_));
     }
 
     if (std::abs(accel) < 1e-6) {
@@ -1653,7 +1676,7 @@ class SmpcDecisionNode {
 
     if (rear) {
       const double gap = std::max(0.0, rearBumperGap(v));
-      const double closing = std::max(0.0, v.v_long - ego_speed_mps_);
+      const double closing = std::max(0.0, leadTrustedLongSpeed(v) - ego_speed_mps_);
       const double ttc = closing > 0.1 ? gap / closing : std::numeric_limits<double>::infinity();
       const double ttc_pressure = std::isfinite(ttc)
           ? pressure01(probability_ttc_safe_sec_ - ttc,
@@ -1678,7 +1701,7 @@ class SmpcDecisionNode {
     const double gap = std::max(0.0, frontBumperGap(v));
     const double desired_gap = std::max(
         current_front_safe_gap_m_, standstill_gap_m_ + time_headway_sec_ * ego_speed_mps_);
-    const double closing = std::max(0.0, ego_speed_mps_ - v.v_long);
+    const double closing = std::max(0.0, ego_speed_mps_ - leadTrustedLongSpeed(v));
     const double ttc = closing > 0.1 ? gap / closing : std::numeric_limits<double>::infinity();
     const double ttc_pressure = std::isfinite(ttc)
         ? pressure01(probability_ttc_safe_sec_ - ttc,
@@ -1929,6 +1952,7 @@ class SmpcDecisionNode {
 
   bool targetVelocityTrusted(
       const smpc_lane_change::TargetVehicle& v) const {
+    if(gap_shared_speed_enabled_) return gap_speed_policy_.get(v,ros::Time::now().toSec()).known;
     if (!v.velocity_valid || !std::isfinite(v.v_long) ||
         !std::isfinite(v.velocity_std) || v.observation_age > 0.3) {
       return false;
@@ -1967,7 +1991,7 @@ class SmpcDecisionNode {
       // merge; geometry/risk checks still run on the executable trajectory.
       return clear_zone;
     }
-    const double closing = std::max(0.0, ego_speed_mps_ - front.v_long + cappedStdMargin(front));
+    const double closing = std::max(0.0, ego_speed_mps_ - (gap_shared_speed_enabled_ ? gapVehicleSpeed(front) : front.v_long) + cappedStdMargin(front));
     if (closing <= 0.1) return true;
     const double gap = std::max(0.0, frontBumperGap(front));
     return gap / closing >= std::max(0.0, activeTargetFrontMinTtc(t, clear_zone));
@@ -1980,7 +2004,7 @@ class SmpcDecisionNode {
     if (!targetVelocityTrusted(rear) && !untrustedNearVehicle(rear, false)) {
       return clear_zone;
     }
-    const double closing = std::max(0.0, rear.v_long - ego_speed_mps_ + cappedStdMargin(rear));
+    const double closing = std::max(0.0, (gap_shared_speed_enabled_ ? gapVehicleSpeed(rear) : rear.v_long) - ego_speed_mps_ + cappedStdMargin(rear));
     if (closing <= 0.1) return true;
     // Once the enlarged low-speed occupancy box is clear, TTC is deliberately
     // only a loose secondary check.  The CHANGE_NOW rollout below models the
@@ -2000,7 +2024,7 @@ class SmpcDecisionNode {
       return true;
     }
     const double gap = std::max(0.0, rearBumperGap(rear));
-    const double rear_speed = std::max(0.0, rear.v_long);
+    const double rear_speed = gap_shared_speed_enabled_ ? gapVehicleSpeed(rear) : std::max(0.0, rear.v_long);
     const double reference_speed = std::max(std::max(0.0, ego_speed_mps_), rear_speed);
     const double required_gap =
         std::max(0.0, activeTargetRearMinHeadway(t, clear_zone)) * reference_speed;
@@ -2018,7 +2042,7 @@ class SmpcDecisionNode {
     const double gap = rearBumperGap(v);
     if (!std::isfinite(gap) || gap < merge_priority_rear_min_gap_m_) return false;
 
-    const double closing = std::max(0.0, v.v_long - ego_speed_mps_);
+    const double closing = std::max(0.0, leadTrustedLongSpeed(v) - ego_speed_mps_);
     const double ttc = closing > 0.1
         ? gap / closing
         : std::numeric_limits<double>::infinity();
@@ -2508,7 +2532,7 @@ class SmpcDecisionNode {
     // policy as TTC: an untrusted derivative falls back to ego speed, leaving
     // the measured geometric gap as the primary evidence.
     const double initial_v_long = targetVelocityTrusted(v)
-        ? std::max(0.0, v.v_long)
+        ? (gap_shared_speed_enabled_ ? gapVehicleSpeed(v) : std::max(0.0, v.v_long))
         : std::max(0.0, ego_speed_mps_);
     const double predicted_v_long =
         std::max(0.0, initial_v_long + mode.accel_mps2 * tau);
@@ -3131,6 +3155,7 @@ class SmpcDecisionNode {
     double front_edge{0.0};
     double v{0.0};
     bool speed_known{false};  // 신뢰/최근 신뢰/위치 변화로 속도를 앎(새 트랙 가정값이 아님)
+    double accel{0.0};        // 2026-10-13 최근 1 s 속도 기울기(데드밴드 적용)
   };
 
   struct MergeGap {
@@ -3176,10 +3201,24 @@ class SmpcDecisionNode {
       if (time <= tc) return v0 * time + 0.5 * a * time * time;
       return v0 * tc + 0.5 * a * tc * tc + v_flow * (time - tc);
     }
-    double vLo(double time) const { return edgeSpeed(v_lo, time); }
-    double vHi(double time) const { return edgeSpeed(v_hi, time); }
-    double lo(double time) const { return lo0 + edgeTravel(v_lo, time); }
-    double hi(double time) const { return hi0 + edgeTravel(v_hi, time); }
+    double vLo(double time) const { return a_lo != 0.0 ? accSpeed(v_lo, a_lo, time) : edgeSpeed(v_lo, time); }
+    double vHi(double time) const { return a_hi != 0.0 ? accSpeed(v_hi, a_hi, time) : edgeSpeed(v_hi, time); }
+    // 2026-10-13 경계 차량별 가속도(데드밴드 적용). 0 이면 기존 흐름/등속 모델.
+    double a_lo{0.0};
+    double a_hi{0.0};
+    double v_edge_max{27.8};
+    double accSpeed(double v0, double a, double time) const {
+      const double vt = a > 0.0 ? std::max(v0, v_edge_max) : 0.0;
+      return a > 0.0 ? std::min(vt, v0 + a * time) : std::max(vt, v0 + a * time);
+    }
+    double accTravel(double v0, double a, double time) const {
+      const double vt = a > 0.0 ? std::max(v0, v_edge_max) : 0.0;
+      const double tc = std::max(0.0, (vt - v0) / a);
+      if (time <= tc) return v0 * time + 0.5 * a * time * time;
+      return v0 * tc + 0.5 * a * tc * tc + vt * (time - tc);
+    }
+    double lo(double time) const { return lo0 + (a_lo != 0.0 ? accTravel(v_lo, a_lo, time) : edgeTravel(v_lo, time)); }
+    double hi(double time) const { return hi0 + (a_hi != 0.0 ? accTravel(v_hi, a_hi, time) : edgeTravel(v_hi, time)); }
     double speed() const {
       if (follower_id >= 0 && leader_id >= 0) return 0.5 * (v_lo + v_hi);
       return follower_id >= 0 ? v_lo : v_hi;
@@ -3199,6 +3238,11 @@ class SmpcDecisionNode {
 
   double gapVehicleSpeed(const smpc_lane_change::TargetVehicle& v,
                          bool* known = nullptr) const {
+    if (gap_shared_speed_enabled_) {
+      const auto estimate=gap_speed_policy_.get(v,ros::Time::now().toSec());
+      if(known) *known=estimate.known;
+      return estimate.known ? estimate.speed : std::max(0.,ego_speed_mps_);
+    }
     if (known) *known = true;
     const ros::Time now = ros::Time::now();
     const bool trusted = targetVelocityTrusted(v);
@@ -3248,6 +3292,24 @@ class SmpcDecisionNode {
     }
   }
 
+  // 기준 차량 가속도(데드밴드 적용). raw 에 원값. 이력이 모자라면 0(등속 가정, 지금과 같음).
+  double refAccel(int id, double now, double* raw = nullptr) const {
+    if (raw) *raw = 0.0;
+    if (!gap_overtake_accel_policy_enabled_ || id < 0) return 0.0;
+    const auto it = ref_speed_slope_.find(id);
+    double a = 0.0;
+    if (it == ref_speed_slope_.end() || now - it->second.lastStamp() > 0.5 ||
+        !it->second.slope(now, gap_ref_accel_window_sec_, 4, a)) return 0.0;
+    if (raw) *raw = a;
+    return smpc_lane_change::accelDeadband(a, overtake_policy_.deadband);
+  }
+  double egoAccelMeasured(double now, bool* valid) const {
+    double a = 0.0;
+    *valid = now - ego_speed_slope_.lastStamp() <= 0.5 &&
+             ego_speed_slope_.slope(now, gap_ref_accel_window_sec_, 4, a);
+    return *valid ? a : 0.0;
+  }
+
   std::vector<GapVehicle> targetLaneGapVehicles(
       const smpc_lane_change::TargetVehicleSet& t) const {
     pruneGapSpeedHistory();
@@ -3261,6 +3323,7 @@ class SmpcDecisionNode {
       g.rear_edge = rearEdgeDeltaS(v);
       g.front_edge = frontEdgeDeltaS(v);
       g.v = gapVehicleSpeed(v, &g.speed_known);
+      g.accel = refAccel(v.unique_id, ros::Time::now().toSec());
       // 자차 뒤에 거의 서 있는 물체는 뒤에서 다가올 수 없으므로 틈을 나누지 않는다.
       //   16:02 백: 목표 차로 40~60 m 뒤 0 m/s 미확정 물체(target_far_candidate id2/3/4)가
       //   잡혔다 사라졌다 하며 같은 자리를 2/1, 4/1, -1/1 로 바꿔 놓았다.
@@ -3350,7 +3413,7 @@ class SmpcDecisionNode {
     if(gap.leader_id>=0 && std::isfinite(gap.leader_rear_edge0)) {
       const double bumper_gap=gap.leader_rear_edge0+gap.edgeTravel(gap.v_hi,time)-ego_pos-.5*ego_length_m_;
       v=std::min(v,smpc_lane_change::mergeFollowSpeed(bumper_gap,gap.vHi(time),
-          merge_follow_gap_m_,merge_follow_close_gain_,merge_follow_gain_,merge_follow_catchup_mps_,v_min,v_max));
+          merge_follow_gap_m_,merge_follow_close_gain_,merge_follow_gain_,gap_response_enabled_ ? gap_selected_max_catchup_mps_ : merge_follow_catchup_mps_,v_min,v_max));
     }
     return std::clamp(v, v_min, v_max);
   }
@@ -3411,7 +3474,7 @@ class SmpcDecisionNode {
         v_cmd = std::min(v_cmd, std::max(0.0, own_v + gap_select_own_lead_gain_ * (own_gap - desired)));
       }
       const double dv = std::clamp(v_cmd - v, -gap_select_decel_mps2_ * dt,
-                                   gap_select_accel_mps2_ * dt);
+                                   std::max(gap_select_accel_mps2_, gap_select_overtake_accel_mps2_) * dt);
       effort += std::abs(dv);
       pos += (v + 0.5 * dv) * dt;
       v += dv;
@@ -3420,6 +3483,7 @@ class SmpcDecisionNode {
 
   // 이 차로에서 틈을 볼 때 쓰는 목표 차로 흐름 속도. 설정되지 않은 차로는 -1(등속 가정).
   double gapFlowSpeedFor(int current_lane_id) const {
+    if (!gap_fixed_flow_enabled_) return -1.0;
     if (gap_select_flow_speed_mps_ <= 0.0 || gap_select_flow_accel_mps2_ <= 0.0) return -1.0;
     return std::find(gap_select_flow_speed_lanes_.begin(), gap_select_flow_speed_lanes_.end(),
                      current_lane_id) != gap_select_flow_speed_lanes_.end()
@@ -3452,6 +3516,7 @@ class SmpcDecisionNode {
       g.hi0 = upper_from(veh.front());
       g.v_hi = veh.front().v;
       g.v_lo = g.v_hi;
+      g.a_hi = g.a_lo = veh.front().accel;
       g.speed_known = veh.front().speed_known;
       gaps.push_back(g);
     }
@@ -3464,6 +3529,8 @@ class SmpcDecisionNode {
       g.hi0 = upper_from(veh[i + 1]);
       g.v_lo = veh[i].v;
       g.v_hi = veh[i + 1].v;
+      g.a_lo = veh[i].accel;
+      g.a_hi = veh[i + 1].accel;
       g.speed_known = veh[i].speed_known && veh[i + 1].speed_known;
       gaps.push_back(g);
     }
@@ -3474,6 +3541,7 @@ class SmpcDecisionNode {
       g.lo0 = lower_from(veh.back());
       g.v_lo = veh.back().v;
       g.v_hi = g.v_lo;
+      g.a_lo = g.a_hi = veh.back().accel;
       g.speed_known = veh.back().speed_known;
       gaps.push_back(g);
     }
@@ -3481,6 +3549,7 @@ class SmpcDecisionNode {
     for (auto& g : gaps) {
       g.v_flow = flow;
       g.a_flow = gap_select_flow_accel_mps2_;
+      g.v_edge_max = gap_ref_speed_cap_mps_;
       evaluateMergeGap(t, g, v_max);
     }
     return gaps;
@@ -3493,7 +3562,11 @@ class SmpcDecisionNode {
                             double accel, double v_cap, double margin) const {
     if (!rear.valid || !std::isfinite(rear.v_long) ||
         !std::isfinite(t.distance_to_lane_end)) return false;
-    const double v_rear = std::max(0.0, rear.v_long);
+    const double v_rear0 = gap_shared_speed_enabled_ ? gapVehicleSpeed(rear) : std::max(0.0, rear.v_long);
+    // 2026-10-13 뒤차가 가속 중이면(우리 추월 가속보다 빠르거나 상대 가속이 작음) 추월하지 않는다.
+    const double a_rear = refAccel(rear.unique_id, ros::Time::now().toSec());
+    if (gap_overtake_accel_policy_enabled_ &&
+        !smpc_lane_change::overtakeAllowedByAccel(a_rear, overtake_policy_)) return false;
     const double gap0 = rearBumperGap(rear);
     const double dt = 0.1;
     double v = std::max(0.0, ego_speed_mps_);
@@ -3507,6 +3580,7 @@ class SmpcDecisionNode {
       const double v_next = std::min(std::max(v, v_cap), v + std::max(0.0, accel) * dt);
       s += 0.5 * (v + v_next) * dt;
       v = v_next;
+      const double v_rear = std::clamp(v_rear0 + a_rear * time, 0.0, std::max(v_rear0, gap_ref_speed_cap_mps_));
       s_rear += v_rear * dt;
       if (s >= t.distance_to_lane_end) return false;
     }
@@ -3724,8 +3798,18 @@ class SmpcDecisionNode {
     // Do not apply a merge-priority relaxation in a future hard gate.  It is
     // safer to wait for a fresh CHANGE_NOW decision than to pre-authorize a
     // reduced rear gap several seconds ahead.
+    projected_gap_rejection_="none";
     const auto check_vehicle = [&](const smpc_lane_change::TargetVehicle& vehicle,
                                    bool front) {
+      const auto reject=[&](const char* why,double time,double gap,double required) {
+        const auto estimate=gap_speed_policy_.get(vehicle,ros::Time::now().toSec());
+        std::ostringstream detail;
+        detail<<why<<",id="<<vehicle.unique_id<<",t="<<time<<",gap="<<gap<<",required="<<required
+          <<",speed="<<(gap_shared_speed_enabled_ && estimate.known ? estimate.speed : vehicle.v_long)
+          <<",source="<<(gap_shared_speed_enabled_ ? estimate.source : "legacy")
+          <<",known="<<estimate.known;
+        projected_gap_rejection_=detail.str();return false;
+      };
       if (!vehicle.valid) return true;
       // 속도를 신뢰할 수 없을 때.
       //
@@ -3760,7 +3844,7 @@ class SmpcDecisionNode {
         const double window =
             std::max(0.0, vehicle_window_end - lane_change_start);
         const double worst_gap = gap_now - worst_closing * window;
-        return worst_gap > required;
+        return worst_gap > required || reject("unknown_speed_gap",window,worst_gap,required);
       }
       // npc_longitudinal_event_modes_enabled_ 가 false 면 여기 오는 modes 는
       // nominal(등속) 하나뿐이다(modesForVehicle 주석 참고). 이 게이트는
@@ -3774,7 +3858,7 @@ class SmpcDecisionNode {
         if (ego.t > vehicle_window_end + 1e-6) break;
         for (const auto& mode : modes) {
           const PredPose tv = predictTargetPose(vehicle, mode, ego.t);
-          if (!tv.valid) return false;
+          if (!tv.valid) return reject("target_coverage",ego.t,0,0);
 
           const double ex = std::cos(ego.yaw);
           const double ey = std::sin(ego.yaw);
@@ -3791,11 +3875,11 @@ class SmpcDecisionNode {
 
           if (front) {
             const double gap = longitudinal - ego_extent - tv_extent;
-            if (!(gap > front_required_gap)) return false;
+            if (!(gap > front_required_gap)) return reject("front_gap",ego.t,gap,front_required_gap);
             const double closing = std::max(0.0, ego.v - tv_forward_speed + cappedStdMargin(vehicle));
             if (closing > 0.1 &&
                 gap / closing < std::max(0.0, front_required_ttc)) {
-              return false;
+              return reject("front_ttc",ego.t,gap/closing,front_required_ttc);
             }
           } else {
             const double gap = -longitudinal - ego_extent - tv_extent;
@@ -3805,7 +3889,7 @@ class SmpcDecisionNode {
               required_gap = std::max(required_gap,
                                       std::max(0.0, low_speed_rear_safe_gap_m_));
             }
-            if (!(gap > required_gap)) return false;
+            if (!(gap > required_gap)) return reject("rear_gap",ego.t,gap,required_gap);
             const double closing = std::max(0.0, tv_forward_speed - ego.v + cappedStdMargin(vehicle));
             const double required_ttc = (!clear_zone &&
                                          low_speed_rear_safety_enabled_ &&
@@ -3813,12 +3897,12 @@ class SmpcDecisionNode {
                 ? std::max(rear_required_ttc, low_speed_rear_min_ttc_sec_)
                 : rear_required_ttc;
             if (closing > 0.1 && gap / closing < std::max(0.0, required_ttc)) {
-              return false;
+              return reject("rear_ttc",ego.t,gap/closing,required_ttc);
             }
             const double headway_reference_speed = std::max(ego.v, tv_forward_speed);
             if (gap < std::max(0.0, rear_required_headway) *
                           headway_reference_speed) {
-              return false;
+              return reject("rear_headway",ego.t,gap,std::max(0.,rear_required_headway)*headway_reference_speed);
             }
           }
         }
@@ -4654,7 +4738,7 @@ class SmpcDecisionNode {
     //   자차가 15.4 -> 0 m/s 로 완전 정지했다. 간격은 이미 -6.7 -> -21.7 m
     //   로 벌어지고 있던 상황이라 양보할 이유가 없었다.
     const double rear_closing_mps =
-        t.target_rear.valid ? (t.target_rear.v_long - ego_speed_mps_) : 0.0;
+        t.target_rear.valid ? (leadTrustedLongSpeed(t.target_rear) - ego_speed_mps_) : 0.0;
     const bool rear_vehicle_actually_closing =
         !t.target_rear.valid ||
         rear_closing_mps > side_vehicle_rear_yield_min_closing_mps_;
@@ -4810,7 +4894,7 @@ class SmpcDecisionNode {
     // separate from occupancy: expanding the approval box would only prolong
     // WAIT_FOR_GAP.  Invalid/stale velocity never triggers this early path.
     const double target_front_closing_mps = t.target_front.valid
-        ? ego_speed_mps_ - t.target_front.v_long : 0.0;
+        ? ego_speed_mps_ - leadTrustedLongSpeed(t.target_front) : 0.0;
     const bool target_front_velocity_fresh = t.target_front.valid &&
         t.target_front.velocity_valid &&
         std::isfinite(t.target_front.velocity_std) &&
@@ -4844,6 +4928,8 @@ class SmpcDecisionNode {
     const bool change_projected_gap_ttc_safe = change_eval.valid &&
         projectedTargetGapTtcSafe(
             t, change_traj, change_now_spec, clear_zone_ttc_relaxed);
+    const std::string change_projected_rejection=change_eval.valid
+        ? projected_gap_rejection_ : "trajectory_invalid,"+change_eval.detail;
     // 차로 끝 정지 합류: 거리 검사를 건너뛰는 대신 목표 차로 뒤차에 대해 별도 기준을
     // 둔다. 정지 상태에서는 안전영역(저속 7 m)과 완화 TTC(0.6 s)가 너무 느슨하다.
     //   13:48 백 재생: 뒤차 13 m / 9~11 m/s 접근 중에 CHANGE 가 확정됐다.
@@ -4854,7 +4940,7 @@ class SmpcDecisionNode {
         if (!v.valid || v.lane_id != t.target_lane_id || v.delta_s >= 0.0) return;
         if (!std::isfinite(v.v_long)) { standstill_rear_ok = false; return; }
         const double gap = rearBumperGap(v);
-        const double closing = std::max(0.0, v.v_long - ego_speed_mps_);
+        const double closing = std::max(0.0, leadTrustedLongSpeed(v) - ego_speed_mps_);
         if (gap < lane_end_standstill_rear_min_gap_m_ ||
             (closing > 0.1 && gap / closing < lane_end_standstill_rear_min_ttc_sec_)) {
           standstill_rear_ok = false;
@@ -5009,6 +5095,52 @@ class SmpcDecisionNode {
           }
         }
       }
+      // 2026-10-13 기준 차량 가속 판단(overtake_policy.hpp). 14:44:35 백: 추월로 정한 기준 차량이
+      //   1.8 m/s^2 로 같이 가속해 나란히 달리다 차로 끝에서 섰다(자차 실측 0.5~1.0 m/s^2).
+      //   - 처음 고를 때: 기준 차량이 가속 중이고 우리 추월 가속보다 빠르거나 상대 가속이 작으면 뒤로.
+      //   - 추월 중: 자차 실측 가속과 비교해 같은 조건이 confirm_sec 이어지면 포기하고 뒤 틈으로.
+      //   포기 상태는 그 기준 차량이 앞으로 지나가거나 바뀔 때까지 유지(앞 틈 재선택 금지).
+      bool overtake_blocked = false;
+      dbg_ot_abort_ = "none";
+      {
+        const double now_ot = ros::Time::now().toSec();
+        double a_ref_raw = 0.0;
+        const double a_ref = ref_vehicle ? refAccel(ref_vehicle->id, now_ot, &a_ref_raw) : 0.0;
+        bool ego_valid = false;
+        const double a_ego = egoAccelMeasured(now_ot, &ego_valid);
+        dbg_a_ref_ = a_ref; dbg_a_ref_raw_ = a_ref_raw; dbg_a_ego_ = a_ego; dbg_a_ego_valid_ = ego_valid;
+        if (gap_overtake_accel_policy_enabled_ && ref_vehicle && ref_vehicle->id >= 0 &&
+            gap_select_side_policy_ != "cost") {
+          const double half_len = 0.5 * ego_length_m_;
+          const bool ego_passed = ref_vehicle->front_edge < -half_len - 1.0;  // 자차가 완전히 앞질렀음
+          const bool ref_passed = ref_vehicle->rear_edge > half_len + 1.0;    // 기준 차량이 완전히 앞으로 지나감
+          const bool latched_overtake = side > 0 && ref_vehicle->id == gap_side_vehicle_id_ && gap_side_ > 0;
+          const std::string why = latched_overtake
+              ? smpc_lane_change::overtakeAbortReason(a_ref, a_ego, ego_valid, overtake_policy_) : std::string();
+          const bool was_aborted = overtake_monitor_.aborted && overtake_monitor_.ref_id == ref_vehicle->id;
+          const bool aborted = overtake_monitor_.update(ref_vehicle->id, now_ot, why, ego_passed, ref_passed,
+                                                        overtake_policy_);
+          if (aborted) {
+            overtake_blocked = true;
+            dbg_ot_abort_ = overtake_monitor_.reason;
+            if (!was_aborted) {
+              gap_latch_valid_ = false;     // 앞 틈 고정을 풀고 뒤 틈으로 다시 고른다
+              gap_pending_valid_ = false;
+              ROS_WARN("[smpc_decision] overtake abort ref=%d (%s): a_ref=%.2f a_ego=%.2f%s",
+                       ref_vehicle->id, overtake_monitor_.reason.c_str(), a_ref, a_ego, ego_valid ? "" : "(cmd)");
+            }
+          } else if (side > 0 && !latched_overtake && !ego_passed &&
+                     !smpc_lane_change::overtakeAllowedByAccel(a_ref, overtake_policy_)) {
+            overtake_blocked = true;
+            dbg_ot_abort_ = "initial_ref_accel";
+          }
+          if (overtake_blocked) {
+            side = -1;
+            gap_side_vehicle_id_ = ref_vehicle->id;
+            gap_side_ = -1;
+          }
+        }
+      }
       const MergeGap* best = cost_best;
       if (side != 0 && ref_vehicle) {
         const MergeGap* preferred = nullptr;
@@ -5020,6 +5152,7 @@ class SmpcDecisionNode {
           if ((side > 0 && ahead_of_ref) || (side < 0 && behind_ref)) preferred = &g;
           if ((side > 0 && behind_ref) || (side < 0 && ahead_of_ref)) opposite = &g;
         }
+        if (overtake_blocked) opposite = nullptr;  // 가속하는 기준 차량 앞 틈(추월)은 고르지 않는다
         // 앞 틈(앞지르기)은 차로 끝까지 여유가 overtake_min_margin 이상 남을 때만 고른다.
         // 여유가 작으면 상대 차량이 조금만 더 빨라져도 불가능이 되고, 그때는 이미 그 차
         // 옆이라 뒤로 빠질 거리도 없다(22:25 백: 여유 12.3 m 로 시작해 2.8 초 뒤 불가능).
@@ -5154,9 +5287,12 @@ class SmpcDecisionNode {
       const double dt_cmd = gap_last_command_valid_ && !gap_last_cmd_stamp_.isZero()
           ? (now_cmd - gap_last_cmd_stamp_).toSec() : -1.0;
       const double prev = (dt_cmd > 0.0 && dt_cmd < 0.5) ? gap_last_filtered_cmd_ : ego_speed_mps_;
-      const double step = std::max(0.0, gap_select_cmd_rate_mps2_) *
-          ((dt_cmd > 0.0 && dt_cmd < 0.5) ? dt_cmd : 0.05);
-      gap_speed_cmd = std::clamp(gap_speed_cmd_raw, prev - step, prev + step);
+      const double dt_step = (dt_cmd > 0.0 && dt_cmd < 0.5) ? dt_cmd : 0.05;
+      const double step = std::max(0.0, gap_select_cmd_rate_mps2_) * dt_step;
+      // 추월(기준 차량 앞 틈) 중 가속은 gap_select_overtake_accel_mps2(4.0) 까지 올린다.
+      const double step_up = gap_rule_side_ > 0
+          ? std::max(step, std::max(0.0, gap_select_overtake_accel_mps2_) * dt_step) : step;
+      gap_speed_cmd = std::clamp(gap_speed_cmd_raw, prev - step, prev + step_up);
       gap_last_filtered_cmd_ = gap_speed_cmd;
       gap_last_cmd_stamp_ = now_cmd;
     }
@@ -5313,6 +5449,7 @@ class SmpcDecisionNode {
           << " tr=" << (target_rear_ttc_safe ? 1 : 0)
           << " rear_hw_ok=" << (target_rear_headway_safe ? 1 : 0)
           << " projected_gap_ttc_ok=" << (change_projected_gap_ttc_safe ? 1 : 0)
+          << " projected_reject=" << change_projected_rejection
           << " low_spd_rear=" << (lowSpeedRearSafetyActive() ? 1 : 0)
           << " risk_eps=" << effective_allowed_risk
           << " rear_priority=" << (target_rear_priority ? 1 : 0)
@@ -5356,6 +5493,10 @@ class SmpcDecisionNode {
           << " gap_vgap=" << (gap_selected ? selected_gap.speed() : -1.0)
           << " gaps=" << gap_feasible_count << "/" << merge_gaps.size()
           << " gap_rule=" << gap_rule_vehicle_id_ << ":" << gap_rule_side_
+          << " a_ref=" << dbg_a_ref_ << " a_ref_raw=" << dbg_a_ref_raw_
+          << " a_ego_meas=" << (dbg_a_ego_valid_ ? dbg_a_ego_ : std::numeric_limits<double>::quiet_NaN())
+          << " a_rel=" << ((dbg_a_ego_valid_ ? dbg_a_ego_ : gap_select_overtake_accel_mps2_) - dbg_a_ref_)
+          << " ot_abort=" << dbg_ot_abort_
           << " gap_eff=" << ((gap_selected && !selected_gap.feasible) ? 1 : 0)
           << " gap_over=" << (gap_selected ? selected_gap.overshoot_m : 0.0)
           << " gap_vlim=" << ((gap_selected && std::isfinite(selected_gap.vlim_min))
@@ -5401,9 +5542,12 @@ class SmpcDecisionNode {
       // 아니면 HOLD 상한(자차보다 높으면 ACC 가 그 속도까지 가속).
       CandidateEval gap_candidate = keep_candidate;
       const bool decel = gap_speed_cmd < ego_speed_mps_ - 0.3;
+      const bool accel = gap_response_enabled_ && gap_selected && selected_gap.speed_known &&
+          gap_speed_cmd > ego_speed_mps_ + 0.3;
       gap_candidate.spec.action = decel ? BehaviorAction::kYieldDecelThenChange
-                                        : BehaviorAction::kHoldThenChange;
-      gap_candidate.spec.prep_accel_mps2 = decel ? -std::abs(gap_select_decel_mps2_) : 0.0;
+          : accel ? BehaviorAction::kAccelThenChange : BehaviorAction::kHoldThenChange;
+      gap_candidate.spec.prep_accel_mps2 = decel ? -std::abs(gap_select_decel_mps2_)
+          : accel ? std::abs(gap_rule_side_ > 0 ? gap_select_overtake_accel_mps2_ : gap_select_accel_mps2_) : 0.0;
       gap_candidate.spec.change_left = true;
       gap_candidate.spec.lane_change_start_sec =
           gap_selected ? selected_gap.align_time : gap_last_align_time_;
@@ -5411,7 +5555,9 @@ class SmpcDecisionNode {
       gap_candidate.spec.name = "gap_align";
       gap_candidate.target_speed_mps = gap_speed_cmd;
       gap_candidate.cost = gap_selected ? selected_gap.cost : 0.0;
-      const std::string gap_reason = std::string("smpc_v3_gap_align_") +
+      const std::string gap_reason = dbg_ot_abort_ != "none"
+          ? std::string("smpc_v3_gap_overtake_abort_") + dbg_ot_abort_
+          : std::string("smpc_v3_gap_align_") +
           (gap_selecting ? "selecting" : !gap_selected ? "keep_last"
                          : selected_gap.aligned_now ? "hold" : decel ? "decel" : "accel");
       publishBehaviorOutputs(t, gap_candidate, false, true, allowed_risk, gap_reason);
@@ -5541,7 +5687,7 @@ class SmpcDecisionNode {
             active_target_front_safe_gap,
             standstill_gap_m_ + target_front_early_yield_time_headway_sec_ *
                                    ego_speed_mps_);
-        const double commanded_speed = t.target_front.v_long +
+        const double commanded_speed = leadTrustedLongSpeed(t.target_front) +
             target_front_early_yield_gap_gain_ *
                 (target_front_gap - desired_gap);
         const double yield_floor = std::max(
@@ -5613,6 +5759,10 @@ class SmpcDecisionNode {
   bool in_exempt_section_{false};
   bool section_has_smpc_executor_{false};
   // 목표 차로 흐름 속도 가정(MergeGap::v_flow)
+  smpc_lane_change::GapSpeedPolicy gap_speed_policy_;
+  bool gap_response_enabled_{true}, gap_shared_speed_enabled_{true}, gap_fixed_flow_enabled_{false};
+  double gap_selected_max_catchup_mps_{6.0};
+  mutable std::string projected_gap_rejection_{"none"};
   std::vector<int> gap_select_flow_speed_lanes_;
   double gap_select_flow_speed_mps_{-1.0};
   double gap_select_flow_accel_mps2_{0.8};
@@ -5655,6 +5805,18 @@ class SmpcDecisionNode {
 
   std::map<int, smpc_lane_change::LanePath> lanes_;
   std::unordered_map<int, VehicleHistory> vehicle_history_;
+  // 2026-10-13 기준 차량·자차 가속(최근 window 초 속도 기울기) 이력과 추월 판단 상태.
+  std::unordered_map<int, smpc_lane_change::SpeedSlope> ref_speed_slope_;
+  smpc_lane_change::SpeedSlope ego_speed_slope_;
+  smpc_lane_change::OvertakeAccelPolicy overtake_policy_;
+  smpc_lane_change::OvertakeAbortMonitor overtake_monitor_;
+  double gap_select_overtake_accel_mps2_{4.0};
+  double gap_ref_accel_window_sec_{1.0};
+  double gap_ref_speed_cap_mps_{27.8};
+  bool gap_overtake_accel_policy_enabled_{true};
+  double dbg_a_ref_{0.0}, dbg_a_ref_raw_{0.0}, dbg_a_ego_{0.0};
+  bool dbg_a_ego_valid_{false};
+  std::string dbg_ot_abort_{"none"};
   std::string waypoint_directory_;
   double lane_start_extension_m_{80.0};
   double lane_start_extension_spacing_m_{0.1};

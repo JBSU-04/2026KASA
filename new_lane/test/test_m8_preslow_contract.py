@@ -56,3 +56,24 @@ def test_stale_far_residual_ignored(n):
     n.far_preslow_cb(points([[22.9,0,-1.4,-1.765,3,.365]]))
     n.preslow_far=(n.preslow_far[0],9.5)
     n.filtered_preslow_cb(points([]));assert not n.kick_pub.values[-1]
+
+def test_preslow_holds_through_empty_frame(n,monkeypatch):
+    # 2026-10-13: 원거리 잔차가 한 프레임 비어도 0.6 s 동안 직전 상한 유지, 그 뒤 해제.
+    n.filtered_preslow_cb(points([[13.9,0,-1.4,-1.765,3,.365]]));cap=n.preslow_cap_pub.values[-1];assert cap<9999.
+    n.filtered_preslow_cb(points([]));assert n.preslow_cap_pub.values[-1]==cap and n.kick_pub.values[-1] is True
+    monkeypatch.setattr(rospy.Time,'now',staticmethod(lambda:rospy.Time.from_sec(10.7)))
+    n.filtered_preslow_cb(points([],10.7));assert n.preslow_cap_pub.values[-1]==9999.
+
+def test_far_detector_object_adds_preslow(n):
+    # 2026-10-13: 원거리 검출기 확정 물체(기준경로 1.3 m 안, 앞 3~start m)도 선서행 근거.
+    n.preslow_start=30.;n.preslow_initial=7.
+    fp=[[19.6,-.4],[20.4,-.4],[20.4,.4],[19.6,.4]]
+    n.far_detector_objects=([dict(id=900001,confirmed=True,last_seen=10.,footprint_world=fp,position_world=[20,0])],10.)
+    n.filtered_preslow_cb(points([]));assert n.kick_pub.values[-1] is True
+    assert abs(n.preslow_cap_pub.values[-1]-(4.+3.*(19.6-5.)/25.))<1e-6
+    assert 'far_detector_object' in n.preslow_state_pub.values[-1]
+
+def test_far_detector_object_outside_corridor_ignored(n):
+    fp=[[19.6,2.],[20.4,2.],[20.4,2.8],[19.6,2.8]]
+    n.far_detector_objects=([dict(id=1,confirmed=True,last_seen=10.,footprint_world=fp)],10.)
+    n.filtered_preslow_cb(points([]));assert not n.kick_pub.values[-1]

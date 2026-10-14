@@ -81,3 +81,21 @@ TEST(TunnelDetectionUnion,ActualLowNongroundIsPreservedWithoutMapEvidence){
  Row low;low.sensor=V(18.,.3,-1.6);low.height=.16;low.valid=true;
  auto rows=mergeDetectionRows({low},{});ASSERT_EQ(rows.size(),1u);EXPECT_DOUBLE_EQ(rows[0].height,.16);
 }
+TEST(TunnelWallBackground,LowWallMismatchUsesSurfaceDistanceNotRoadDistance){
+ Map m;syntheticMap(m);m.wall_surface_background=true;
+ // Actual elevated map surface, 8cm away: old 5.5cm floor gate misses it.
+ V wall(10,3.08,-.2);EXPECT_FALSE(m.matches(wall,m.floor_distance));EXPECT_TRUE(m.backgroundMatches(wall,.235,true));
+ // 9cm obstacle above mapped road is not background despite 12cm map radius.
+ EXPECT_FALSE(m.backgroundMatches(V(10,0,-.345),.09,true));
+ EXPECT_FALSE(m.backgroundMatches(V(10,2.7,-.2),.235,true));
+ m.wall_surface_background=false;EXPECT_FALSE(m.backgroundMatches(wall,.235,true));
+}
+TEST(TunnelWallBackground,CurvedLowWallAndUnmappedProtrusion){
+ Map m;syntheticMap(m);
+ for(double x=5;x<15;x+=.05)m.points->push_back(pcl::PointXYZ(x,2.5+.2*std::sin(x),-.2));
+ m.tree.setInputCloud(m.points);m.indexMap();m.wall_surface_background=true;
+ V p(10,2.5+.2*std::sin(10),-.2);
+ EXPECT_TRUE(m.backgroundMatches(p+V(0,.07,0),.235,true));
+ EXPECT_FALSE(m.backgroundMatches(p-V(0,.25,0),.235,true));
+ EXPECT_FALSE(m.backgroundMatches(V(100,100,-.2),.235,true));
+}

@@ -31,6 +31,9 @@ int main(int argc,char**argv){
     else if(flag=="--connector-shortest")config.connector_smooth=false;
     else if(flag.find("--ceiling-skip=")==0)config.ceiling_skip_height=std::stod(flag.substr(15));
     else if(flag.find("--wall-band=")==0)config.wall_surface_band=std::stod(flag.substr(12));
+    else if(flag.find("--return-observed=")==0)config.tunnel_return_observed_free=std::stoi(flag.substr(18))!=0;
+    else if(flag.find("--hold-extra=")==0)config.tunnel_hold_extra_clearance=std::stod(flag.substr(13));
+    else if(flag.find("--new-margin=")==0)config.tunnel_new_obstacle_margin=std::stod(flag.substr(13));
     else if(flag.find("--target-extra=")==0)config.corridor_target_extra=std::stod(flag.substr(15));
     else if(flag.find("--path-smooth-scale=")==0)config.path_smooth_scale=std::stod(flag.substr(20));
     else if(flag.find("--path-lateral-accel=")==0)config.path_lateral_accel=std::stod(flag.substr(21));

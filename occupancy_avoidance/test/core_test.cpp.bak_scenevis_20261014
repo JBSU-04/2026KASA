@@ -1,0 +1,632 @@
+#include "occupancy_avoidance/core.hpp"
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <cmath>
+int main(int argc,char**argv){testing::InitGoogleTest(&argc,argv);return RUN_ALL_TESTS();}
+using namespace occupancy_avoidance;
+namespace {
+std::vector<Reference> road(){std::vector<Reference> r;for(int i=0;i<=800;++i)r.push_back({302500.+i*.1,4124000.,0,i});return r;}
+Pose pose(double stamp=1.){return {stamp,302500.,4124000.,0,0,8};}
+std::vector<Point> ground(){std::vector<Point> p;for(double x=4;x<40;x+=.5)for(double y=-3;y<=3;y+=.5)p.push_back({x,y,-1.765});return p;}
+void observe(Engine&e,const std::vector<Point>&p){for(int i=0;i<3;++i)e.integrate(pose(1+i*.1),p);}
+}
+TEST(Occupancy,GroundDoesNotBecomeObstacle){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());EXPECT_EQ(e.count(),0u);auto r=e.plan(pose(1.2),road());EXPECT_TRUE(r.clear)<<r.reason;}
+TEST(Occupancy,StaticSurfaceSurvivesOcclusion){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();p.push_back({12,1,-1.3});observe(e,p);ASSERT_GT(e.staticCount(),0u);
+  e.integrate(pose(2),ground());EXPECT_GT(e.staticCount(),0u);}
+TEST(Occupancy,DuplicateScanCannotConfirm){Engine e;auto p=ground();p.push_back({12,1,-1.3});for(int i=0;i<5;++i)e.integrate(pose(),p);EXPECT_EQ(e.staticCount(),0u);}
+TEST(Occupancy,Float64UTMDoesNotQuantize){Engine e;auto p=ground();p.push_back({12,1.02,-1.3});observe(e,p);EXPECT_GT(e.count(),0u);}
+TEST(Corridor,ConstraintParticipatesInSearch){Engine e;e.setRoad(road(),{{0,800,2.4,5.5}});auto p=ground();
+  // Object occupies the right half: right passage is impossible because of curb.
+  for(double x=16;x<=18;x+=.15)for(double y=-1.8;y<=.1;y+=.15)p.push_back({x,y,-1.3});
+  observe(e,p);
+  auto r=e.plan(pose(1.2),road());ASSERT_TRUE(r.clear)<<r.reason;bool went_left=false;
+  for(const auto&q:r.path){EXPECT_GE(q.y-4124000.,-2.4+1.05-1e-5);went_left|=q.y-4124000.>1.2;}
+  EXPECT_TRUE(went_left);}
+TEST(Corridor,NoExtraHalfWidthOnBodyCorners){Engine e;e.setRoad(road(),{{0,800,2.,5.}});observe(e,ground());auto p=road();for(auto&q:p)q.y-=.94;
+  EXPECT_TRUE(e.validate(p,1.2));for(auto&q:p)q.y-=.02;EXPECT_FALSE(e.validate(p,1.2));}
+TEST(Corridor,PhysicalCornerCannotCrossCurb){Engine e;e.setRoad(road(),{{0,800,2,5}});observe(e,ground());
+  std::vector<Reference> p={{302500,4123999.1,-.2,0},{302501,4123998.9,-.2,10}};EXPECT_FALSE(e.validate(p,1.2));}
+TEST(Corridor,StaleScanCannotIssuePath){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());auto r=e.plan(pose(2),road());EXPECT_FALSE(r.clear);EXPECT_EQ(r.reason,"stale_lidar");}
+TEST(Corridor,FullBlockStops){Engine e;e.setRoad(road(),{{0,800,2,2}});auto p=ground();for(double y=-2;y<=2;y+=.1)p.push_back({12,y,-1.3});observe(e,p);EXPECT_FALSE(e.plan(pose(1.2),road()).clear);}
+TEST(Connector,RemoteCollisionDoesNotInvalidateSafeStoppingPrefix){
+ Engine e;e.setRoad(road(),{{0,800,5.,5.}});observe(e,ground());
+ auto initial=e.plan(pose(1.2),road());ASSERT_TRUE(initial.clear);
+ auto points=ground();for(double y=-.4;y<=.4;y+=.1)points.push_back({27,y,-1.3});
+ for(int i=0;i<3;++i)e.integrate(pose(1.3+i*.1),points);
+ std::string why;EXPECT_FALSE(e.validate(initial.path,1.5,&why));
+ std::vector<Reference> prefix;for(const auto&p:initial.path)if(p.x<=302520.)prefix.push_back(p);
+ std::vector<Reference> connected;ASSERT_TRUE(e.connect(pose(1.5),prefix,1.5,connected,&why))<<why;
+ EXPECT_TRUE(e.validate(connected,1.5));
+ EXPECT_GE(connected.back().x-connected.front().x,8.*8./(2*2.)+1.);
+}
+TEST(Connector,NearCollisionCannotUseStoppingPrefix){
+ Engine e;e.setRoad(road(),{{0,800,5.,5.}});observe(e,ground());auto initial=e.plan(pose(1.2),road());ASSERT_TRUE(initial.clear);
+ auto points=ground();for(double y=-.4;y<=.4;y+=.1)points.push_back({6,y,-1.3});
+ for(int i=0;i<3;++i)e.integrate(pose(1.3+i*.1),points);
+ std::vector<Reference> prefix;for(const auto&p:initial.path)if(p.x<=302520.)prefix.push_back(p);
+ std::vector<Reference> connected;std::string why;EXPECT_FALSE(e.connect(pose(1.5),prefix,1.5,connected,&why));
+}
+TEST(Corridor,ClearNominalRoadPassesThroughWithoutOffsetHistory){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());auto a=e.plan(pose(1.2),road());ASSERT_TRUE(a.clear);auto b=e.plan(pose(1.2),road());ASSERT_TRUE(b.clear);EXPECT_EQ(b.reason,"reference_passthrough");for(const auto&p:b.path)EXPECT_DOUBLE_EQ(p.y,4124000.);}
+TEST(Occupancy,OnlyThreeSameHeightReturnedBeamsClearStatic){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();p.push_back({12,1,-1.3});observe(e,p);ASSERT_GT(e.staticCount(),0u);
+  auto beams=ground();double scale=1.765/1.3;beams.push_back({12*scale,scale,-1.765});
+  e.integrate(pose(1.3),beams);EXPECT_GT(e.staticCount(),0u);e.integrate(pose(1.4),beams);EXPECT_GT(e.staticCount(),0u);
+  e.integrate(pose(1.5),beams);EXPECT_EQ(e.staticCount(),0u);}
+TEST(Occupancy,MovingRegionCannotStayInPersistentLayer){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();p.push_back({12,1,-1.3});observe(e,p);ASSERT_GT(e.staticCount(),0u);
+  e.integrate(pose(1.3),p,{},{{302513.1,4124001,0,1,1}});EXPECT_EQ(e.staticCount(),0u);
+  e.integrate(pose(2),ground());EXPECT_EQ(e.count(),0u);}
+TEST(Corridor,LiveTunnelMeasurementReplacesDriftedMappedBoundary){Engine e;e.setRoad(road(),{{0,800,2,5}});observe(e,ground());
+  LiveEdges live;live.pose=pose(1.2);live.right=2.3;live.left=4.7;live.valid=true;e.setLiveEdges(live);
+  auto b=e.bounds(50);EXPECT_NEAR(b.first,-2.3,1e-6);EXPECT_NEAR(b.second,4.7,1e-6);}
+TEST(Corridor,ReplanningPreservesMeasuredTurningState){Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});
+  e.integrate(pose(1),ground());auto turning=pose(1.1);turning.x+=.8;turning.y+=.008;turning.yaw=.02;
+  e.integrate(turning,ground());r.erase(r.begin(),r.begin()+8);auto result=e.plan(turning,r);
+  ASSERT_TRUE(result.clear)<<result.reason;ASSERT_GT(result.path.size(),4u);
+  const auto&a=result.path[0];const auto&b=result.path[3];
+  EXPECT_GT((b.yaw-a.yaw)/std::hypot(b.x-a.x,b.y-a.y),.003);
+}
+TEST(Return,ClearRoadReturnsFromEitherSideWithoutResidualOffset){
+  for(double side:{-1.,1.}){
+    Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});auto p=pose();p.y+=side*1.2;
+    e.integrate(p,ground());auto result=e.plan(p,r);
+    ASSERT_TRUE(result.clear)<<result.reason;EXPECT_TRUE(result.returning);
+    EXPECT_NEAR(result.path.front().y,p.y,.01);
+    EXPECT_NEAR(result.path.back().y,4124000.,.05);
+    auto at12=std::min_element(result.path.begin(),result.path.end(),[](const Reference&a,const Reference&b){return std::abs(a.x-302512.)<std::abs(b.x-302512.);});
+    EXPECT_LT(std::abs(at12->y-4124000.),.35);
+    EXPECT_TRUE(e.validate(result.path,p.stamp));
+    for(const auto&q:result.path)EXPECT_GE(side*(q.y-4124000.),-.1001);
+  }
+}
+TEST(Speed,NominalCurveDoesNotRetainAvoidanceCurvatureCap){
+  Engine e;std::vector<Reference> r;
+  for(int i=0;i<=800;++i){double angle=i*.1/50.;r.push_back({302500.+50*std::sin(angle),4124000.+50*(1-std::cos(angle)),angle,i});}
+  e.setRoad(r,{});observe(e,ground());auto result=e.plan(pose(1.2),r);
+  ASSERT_TRUE(result.clear)<<result.reason;EXPECT_GT(result.max_curvature,.01);
+  EXPECT_EQ(result.motion_state,"CRUISE");EXPECT_EQ(result.speed_cap,9999.);
+}
+TEST(Speed,ReturnCompletionReleasesCapAfterStableAlignment){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});
+  auto initial=pose(1.2);initial.y+=1.2;e.integrate(initial,ground());
+  auto a=e.plan(initial,r);ASSERT_TRUE(a.clear);EXPECT_LE(a.speed_cap,8.333);
+  auto current=pose(5.2);current.x+=25;e.integrate(current,ground());r.erase(r.begin(),r.begin()+250);
+  auto b=e.plan(current,r);ASSERT_TRUE(b.clear)<<b.reason;EXPECT_LE(b.speed_cap,8.333);
+  current.stamp=5.8;e.integrate(current,ground());auto c=e.plan(current,r);
+  ASSERT_TRUE(c.clear)<<c.reason;EXPECT_EQ(c.motion_state,"CRUISE");EXPECT_EQ(c.speed_cap,9999.);
+}
+TEST(Speed,FutureAvoidanceCapAccountsForBrakingDistance){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,2.4,5.5}});auto p=ground();
+  for(double x=20;x<=22;x+=.15)for(double y=-1.8;y<=.1;y+=.15)p.push_back({x,y,-1.3});observe(e,p);
+  auto far=e.plan(pose(1.2),r);ASSERT_TRUE(far.clear)<<far.reason;
+  auto point=std::min_element(far.path.begin(),far.path.end(),[](const Reference&a,const Reference&b){return std::abs(a.x-302510.)<std::abs(b.x-302510.);});
+  auto current=pose(3.2);current.x=point->x;current.y=point->y;current.yaw=point->yaw;e.integrate(current,ground());
+  r.erase(r.begin(),r.begin()+100);auto near=e.plan(current,r);ASSERT_TRUE(near.clear)<<near.reason;
+  EXPECT_GE(far.speed_cap,near.speed_cap);EXPECT_EQ(near.speed_limit_reason,"avoidance_distance_profile");
+}
+TEST(Boundary,LiveStraightLineStopsAtSixMetersAndCurveDirection){
+  Engine e;auto r=road();e.setRoad(r,{});observe(e,ground());
+  LiveEdges live;live.pose=pose(1.2);live.right=3.5;live.left=6.8;live.valid=true;e.setLiveEdges(live);
+  EXPECT_EQ(e.boundarySource(50),"live_local");EXPECT_EQ(e.boundarySource(70),"open");
+  r[50].yaw=.10;e.setRoad(r,{});EXPECT_EQ(e.boundarySource(50),"open");
+  EXPECT_FALSE(e.boundaryKnown(50,false));
+}
+TEST(Boundary,CurvedEntranceRemainsTraversableWithoutStraightExtrapolation){
+  Engine e;std::vector<Reference> r;
+  for(int i=0;i<=800;++i){double angle=i*.1/50.;r.push_back({302500.+50*std::sin(angle),4124000.-50*(1-std::cos(angle)),-angle,i});}
+  e.setRoad(r,{});observe(e,ground());
+  LiveEdges live;live.pose=pose(1.2);live.right=1.5;live.left=3;live.valid=true;e.setLiveEdges(live);
+  EXPECT_EQ(e.boundarySource(250),"open");auto result=e.plan(pose(1.2),r);
+  ASSERT_TRUE(result.clear)<<result.reason;EXPECT_TRUE(e.validate(result.path,1.2));
+}
+TEST(Occupancy,GroundGridSurfaceFollowsFarRampWithoutRemovingLowObject){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto terrain=ground();
+  for(auto&p:terrain)p.z+=std::max(0.,p.x-20)*.01;
+  for(int i=0;i<3;++i)e.integrate(pose(1+i*.1),terrain,terrain);
+  EXPECT_EQ(e.count(),0u);
+  auto returns=terrain;returns.push_back({32,0,-1.765+.12+.08});
+  for(int i=0;i<3;++i)e.integrate(pose(1.3+i*.1),returns,terrain);
+  EXPECT_GT(e.staticCount(),0u);EXPECT_FALSE(e.validate(road(),1.5));
+}
+TEST(Occupancy,LowerFarGroundSupportCannotInventObstacleOnFlatRoad){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto returns=ground(),support=returns;
+  for(auto&p:support)if(p.x>25)p.z-=.10;
+  for(int i=0;i<3;++i)e.integrate(pose(1+i*.1),returns,support);
+  EXPECT_EQ(e.count(),0u);EXPECT_TRUE(e.plan(pose(1.2),road()).clear);
+}
+TEST(Return,UsesClearGapBeforeNextObstacleInsteadOfOnlyFinalTail){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();
+  for(double x=37;x<=43;x+=.2)for(double y=0;y<=.2;y+=.1)cloud.push_back({x,y,-1.3});
+  auto current=pose();current.y-=1.2;
+  // Shift returns so the object is on the reference, independent of ego offset.
+  auto ground_cloud=ground();for(auto&p:cloud)p.y+=1.2;
+  for(int i=0;i<3;++i){current.stamp=1+i*.1;e.integrate(current,cloud,ground_cloud);}
+  auto result=e.plan(current,road());ASSERT_TRUE(result.clear)<<result.reason;
+  auto at12=std::min_element(result.path.begin(),result.path.end(),[](const Reference&a,const Reference&b){return std::abs(a.x-302512.)<std::abs(b.x-302512.);});
+  EXPECT_LT(std::abs(at12->y-4124000.),.35);EXPECT_TRUE(e.validate(result.path,current.stamp));
+}
+TEST(Return,SafeAvoidanceIsHeldWhileObstacleStillBlocksReference){
+  Engine e;e.setRoad(road(),{{0,800,2.4,5.5}});auto p=ground();
+  for(double x=16;x<=18;x+=.15)for(double y=-1.8;y<=.1;y+=.15)p.push_back({x,y,-1.3});observe(e,p);
+  auto a=e.plan(pose(1.2),road());ASSERT_TRUE(a.clear)<<a.reason;
+  auto b=e.plan(pose(1.2),road());ASSERT_TRUE(b.clear)<<b.reason;
+  EXPECT_TRUE(b.held);EXPECT_TRUE(e.validate(b.path,1.2));
+}
+TEST(Return,ReleasesSlowOffsetHoldWithoutReplanningEveryFrame){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});
+  auto initial=pose(1.2);initial.y+=3.5;e.integrate(initial,ground());
+  auto a=e.plan(initial,r);ASSERT_TRUE(a.clear)<<a.reason;
+  auto current=initial;current.stamp=1.3;current.speed=0;e.integrate(current,ground());
+  auto b=e.plan(current,r);ASSERT_TRUE(b.clear)<<b.reason;
+  EXPECT_TRUE(b.held);EXPECT_EQ(b.reason,"held_spatial_return");
+  EXPECT_NEAR(b.path.back().y,4124000.,.05);EXPECT_TRUE(e.validate(b.path,current.stamp));
+  auto c=e.plan(current,r);EXPECT_TRUE(c.clear);EXPECT_TRUE(c.held);
+}
+TEST(Return,SpatialCurveIsAnchoredInWorldAcrossProgress){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});
+  auto initial=pose(1.2);initial.y-=1.2;e.integrate(initial,ground());
+  auto a=e.plan(initial,r);ASSERT_TRUE(a.clear);ASSERT_EQ(a.reason,"spatial_return_to_reference");
+  const auto point=a.path[50];auto current=pose(1.9);
+  current.x=point.x;current.y=point.y;current.yaw=point.yaw;
+  e.integrate(current,ground());r.erase(r.begin(),r.begin()+50);
+  auto b=e.plan(current,r);ASSERT_TRUE(b.clear);EXPECT_EQ(b.reason,"held_spatial_return");
+  EXPECT_NEAR(b.path.front().x,point.x,.01);EXPECT_NEAR(b.path.front().y,point.y,.01);
+  EXPECT_DOUBLE_EQ(b.path.back().y,a.path.back().y);
+}
+TEST(Return,NewOccupancyInvalidatesFrozenReturn){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});
+  auto current=pose(1.2);current.y-=1.2;e.integrate(current,ground());
+  auto a=e.plan(current,r);ASSERT_TRUE(a.clear);ASSERT_EQ(a.reason,"spatial_return_to_reference");
+  const auto obstacle=a.path[100];auto cloud=ground();
+  cloud.push_back({obstacle.x-current.x-1.1,obstacle.y-current.y,-1.3});
+  current.stamp=1.3;e.integrate(current,cloud);
+  EXPECT_FALSE(e.validate(a.path,current.stamp));
+  auto b=e.plan(current,r);EXPECT_NE(b.reason,"held_spatial_return");
+  if(b.clear){EXPECT_TRUE(e.validate(b.path,current.stamp));}
+}
+TEST(Return,StationarySpatialReturnHasUsablePointSpacing){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=pose(1.2);p.speed=0;p.y+=1.2;
+  e.integrate(p,ground());auto result=e.plan(p,road());ASSERT_TRUE(result.clear)<<result.reason;
+  EXPECT_EQ(result.reason,"spatial_return_to_reference");EXPECT_LT(result.max_curvature,.18);
+  EXPECT_NEAR(result.path.back().y,4124000.,1e-7);
+  EXPECT_GT(std::hypot(result.path[1].x-result.path[0].x,result.path[1].y-result.path[0].y),.09);
+}
+TEST(Approach,PlansForFarObstacleBeforeStaticMissionStart){
+  auto r=road();for(auto&q:r)q.idx+=2200;
+  Config solver;solver.trigger_enabled=false;Engine e(solver);e.setRoad(r,{{0,5000,3.4,5.5}});auto cloud=ground();
+  cloud.push_back({48,0,-1.3});observe(e,cloud);
+  auto result=e.plan(pose(1.2),r);ASSERT_TRUE(result.clear)<<result.reason;
+  EXPECT_GE(result.planning_horizon,49.);EXPECT_TRUE(result.avoiding);
+  EXPECT_TRUE(e.validate(result.path,1.2));
+  Config old;old.trigger_enabled=false;old.length=60;old.horizon=43;old.static_planning_start_idx=2400;
+  Engine previous(old);previous.setRoad(r,{{0,5000,3.4,5.5}});observe(previous,cloud);
+  auto before=previous.plan(pose(1.2),r);ASSERT_TRUE(before.clear);
+  EXPECT_EQ(before.planning_horizon,40.);EXPECT_FALSE(before.avoiding);
+}
+TEST(Approach,SecondObstacleKeepsPreviousHorizonAndGeometry){
+  auto r=road();for(auto&q:r)q.idx+=3200;
+  Config old;old.length=60;old.horizon=43;
+  Engine current,previous(old);
+  current.setRoad(r,{{0,5000,3.4,5.5}});previous.setRoad(r,{{0,5000,3.4,5.5}});
+  auto cloud=ground();for(double x=16;x<18;x+=.2)cloud.push_back({x,0,-1.3});
+  observe(current,cloud);observe(previous,cloud);
+  auto a=current.plan(pose(1.2),r),b=previous.plan(pose(1.2),r);
+  ASSERT_TRUE(a.clear)<<a.reason;ASSERT_TRUE(b.clear)<<b.reason;
+  EXPECT_EQ(a.planning_horizon,b.planning_horizon);ASSERT_EQ(a.path.size(),b.path.size());
+  for(size_t i=0;i<a.path.size();++i){EXPECT_NEAR(a.path[i].x,b.path[i].x,1e-4);EXPECT_NEAR(a.path[i].y,b.path[i].y,1e-4);}
+}
+TEST(Approach,PartialDistantBlockKeepsValidatedPrefixWithCoverageCap){
+  auto r=road();for(auto&q:r)q.idx+=2200;
+  Engine e;e.setRoad(r,{{0,5000,3.4,5.5}});auto cloud=ground();
+  for(double y=-4;y<6;y+=.1)cloud.push_back({28,y,-1.3});observe(e,cloud);
+  auto a=e.plan(pose(1.2),r);ASSERT_TRUE(a.clear)<<a.reason;
+  EXPECT_EQ(a.reason.find("approach_safe_prefix_"),0u);EXPECT_GT(a.approach_blockage_distance,20);
+  EXPECT_GT(a.speed_cap,0);EXPECT_LT(a.speed_cap,12);EXPECT_TRUE(e.validate(a.path,1.2));
+  EXPECT_DOUBLE_EQ(e.config().obstacle_margin,.2);
+  auto b=e.plan(pose(1.2),r);ASSERT_TRUE(b.clear);EXPECT_LT(b.speed_cap,12);
+}
+TEST(Approach,NearFullBlockCannotBeBypassedWithShortPrefix){
+  auto r=road();for(auto&q:r)q.idx+=2200;
+  Engine e;e.setRoad(r,{{0,5000,3.4,5.5}});auto cloud=ground();
+  for(double y=-4;y<6;y+=.1)cloud.push_back({8,y,-1.3});observe(e,cloud);
+  auto a=e.plan(pose(1.2),r);EXPECT_FALSE(a.clear);EXPECT_EQ(a.speed_cap,0);
+  EXPECT_DOUBLE_EQ(e.config().obstacle_margin,.2);
+}
+TEST(Approach,RandomPlacementUsesObservedGeometryInsteadOfFixedObstacleIndex){
+  auto r=road();for(auto&q:r)q.idx+=2250;
+  for(double distance:{18.,32.,48.})for(double side:{-.3,.3})for(double width:{.4,1.2}){
+    Config solver;solver.trigger_enabled=false;Engine e(solver);e.setRoad(r,{{0,5000,4.5,4.5}});auto cloud=ground();
+    for(double x=distance;x<=distance+.6;x+=.2)
+      for(double y=side-width/2;y<=side+width/2+.001;y+=.1)cloud.push_back({x,y,-1.3});
+    observe(e,cloud);auto result=e.plan(pose(1.2),r);
+    ASSERT_TRUE(result.clear)<<distance<<","<<side<<","<<width<<":"<<result.reason;
+    EXPECT_TRUE(e.validate(result.path,1.2));
+    auto closest=std::min_element(result.path.begin(),result.path.end(),[&](const Reference&a,const Reference&b){
+      return std::abs(a.x-(302501.1+distance))<std::abs(b.x-(302501.1+distance));});
+    EXPECT_LT(side*(closest->y-4124000.),0);
+    EXPECT_DOUBLE_EQ(e.config().obstacle_margin,.2);
+  }
+}
+
+TEST(Admission,OutsidePolesRemainMappedWithoutStartingAvoidance){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();
+  for(double x=8;x<25;x+=1)cloud.push_back({x,1.8,-1.3});observe(e,cloud);
+  auto r=e.plan(pose(1.2),road());ASSERT_TRUE(r.clear)<<r.reason;
+  EXPECT_EQ(r.trigger_count,0);EXPECT_FALSE(r.avoiding);EXPECT_GT(r.static_voxels,0u);
+  auto collision=r.path;for(auto&q:collision)q.y+=1.;EXPECT_FALSE(e.validate(collision,1.2));
+}
+TEST(Admission,ThirtyMetersSelectsNearSurfaceNotCenter){
+  Engine far;far.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({32,0,-1.3});observe(far,cloud);
+  auto a=far.plan(pose(1.2),road());ASSERT_TRUE(a.clear);EXPECT_EQ(a.trigger_count,0);EXPECT_FALSE(a.avoiding);EXPECT_LT(a.speed_cap,9999);
+  Engine near;near.setRoad(road(),{{0,800,3.4,5.5}});cloud.push_back({28,0,-1.3});observe(near,cloud);
+  auto b=near.plan(pose(1.2),road());ASSERT_TRUE(b.clear)<<b.reason;EXPECT_GT(b.trigger_count,0);EXPECT_TRUE(b.avoiding);
+}
+TEST(Admission,TransientCollisionCannotStartSteering){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({8,0,-1.3});e.integrate(pose(),cloud);
+  auto r=e.plan(pose(),road());EXPECT_EQ(r.trigger_count,0);EXPECT_FALSE(r.avoiding);EXPECT_NE(r.speed_cap,9999);
+}
+TEST(Admission,PolicyDoesNotChangeObservedGeometry){
+  Config c;c.trigger_enabled=false;Engine before(c),after;
+  before.setRoad(road(),{{0,800,3.4,5.5}});after.setRoad(road(),{{0,800,3.4,5.5}});
+  auto cloud=ground();for(double x:{12.,28.,35.})for(double y:{0.,1.8})cloud.push_back({x,y,-1.3});
+  for(int i=0;i<3;++i){auto p=pose(1+i*.1);before.integrate(p,cloud);after.integrate(p,cloud);
+    before.plan(p,road());after.plan(p,road());
+    EXPECT_EQ(before.geometryDigest(),after.geometryDigest());EXPECT_EQ(before.count(),after.count());EXPECT_EQ(before.staticCount(),after.staticCount());
+    for(const auto&layer:before.grid().getLayers())EXPECT_TRUE(before.grid()[layer].isApprox(after.grid()[layer],0));}
+}
+TEST(Admission,HeldTargetDoesNotRefreshFromSidePoles){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({20,0,-1.3});observe(e,cloud);
+  auto a=e.plan(pose(1.2),road());ASSERT_GT(a.trigger_count,0);
+  auto side=ground();side.push_back({8,2,-1.3});e.integrate(pose(2),side);
+  auto b=e.plan(pose(2),road());EXPECT_TRUE(b.trigger_held);
+  e.integrate(pose(4.3),side);auto d=e.plan(pose(4.3),road());EXPECT_EQ(d.trigger_count,0);EXPECT_FALSE(d.trigger_held);
+}
+namespace {
+TrafficState signal(double target,bool required=true,double stamp=1.2){TrafficState t;t.enabled=t.seen=true;t.required=required;t.distance=target+6.845;t.stop_target=target;t.distance_stamp=t.required_stamp=stamp;return t;}
+}
+TEST(Traffic,InsufficientReturnSpaceHoldsNominalBeforeObstacle){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({20,0,-1.3});observe(e,cloud);e.setTraffic(signal(26));
+  auto r=e.plan(pose(1.2),road());ASSERT_TRUE(r.clear)<<r.reason;EXPECT_TRUE(r.traffic_held);EXPECT_FALSE(r.avoiding);
+  EXPECT_EQ(r.reason,"traffic_return_space_hold");EXPECT_LT(r.speed_cap,8.333);
+  for(const auto&p:r.path)EXPECT_NEAR(p.y,4124000.,1e-8);
+  e.setTraffic(signal(26,false));auto g=e.plan(pose(1.2),road());ASSERT_TRUE(g.clear)<<g.reason;EXPECT_FALSE(g.traffic_held);EXPECT_TRUE(g.avoiding);
+}
+TEST(Traffic,CompletedReturnBeforeStopMayStart){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({10,0,-1.3});observe(e,cloud);e.setTraffic(signal(65));
+  auto r=e.plan(pose(1.2),road());ASSERT_TRUE(r.clear)<<r.reason;EXPECT_FALSE(r.traffic_held);EXPECT_GT(r.trigger_count,0);EXPECT_TRUE(r.avoiding);
+}
+TEST(Traffic,StaleGreenCannotApproveNewAvoidance){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({20,0,-1.3});observe(e,cloud);e.setTraffic(signal(26,false,.1));
+  auto r=e.plan(pose(1.2),road());EXPECT_TRUE(r.traffic_held);EXPECT_EQ(r.reason,"traffic_input_stale_hold");EXPECT_FALSE(r.avoiding);
+}
+TEST(Traffic,AlreadyOffsetDoesNotSnapBackOnRed){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({20,0,-1.3});observe(e,cloud);e.setTraffic(signal(26));
+  auto p=pose(1.2);p.y-=1.2;auto r=e.plan(p,road());EXPECT_FALSE(r.traffic_held);
+  if(r.clear)EXPECT_NEAR(r.path.front().y,p.y,.01);
+}
+
+TEST(Admission,MovingAcrossThirtyMetersDoesNotResetSize){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});auto cloud=ground();
+  for(double y=-.5;y<=.5;y+=.1)cloud.push_back({32,y,-1.3});observe(e,cloud);
+  auto a=e.plan(pose(1.2),r);ASSERT_EQ(a.trigger_count,0);size_t n=e.staticCount();
+  auto near=pose(1.7);near.x+=4;cloud=ground();for(double y=-.5;y<=.5;y+=.1)cloud.push_back({28,y,-1.3});
+  e.integrate(near,cloud);r.erase(r.begin(),r.begin()+40);auto b=e.plan(near,r);
+  EXPECT_GT(b.trigger_count,0);EXPECT_GE(e.staticCount(),n);EXPECT_TRUE(b.clear)<<b.reason;
+}
+TEST(Admission,BodyEdgeCanTriggerWhileObjectCenterIsOutside){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();
+  for(double y=1.3;y<=2.7;y+=.1)cloud.push_back({20,y,-1.3});observe(e,cloud);
+  auto r=e.plan(pose(1.2),road());EXPECT_GT(r.trigger_count,0);EXPECT_GT(r.static_voxels,0u);
+}
+TEST(Traffic,FreshDistanceCannotHideStaleRequiredFlag){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({20,0,-1.3});observe(e,cloud);
+  auto t=signal(26,false);t.required_stamp=.1;e.setTraffic(t);
+  auto r=e.plan(pose(1.2),road());EXPECT_TRUE(r.traffic_held);EXPECT_FALSE(r.avoiding);
+}
+
+TEST(Admission,NearbyDifferentCsvSegmentCannotStealTriggerOwnership){
+  auto reference=road(),all=reference;
+  for(int i=0;i<=200;++i)all.push_back({302510.+i*.1,4124000.21,0,2000+i});
+  Engine e;e.setRoad(all,{});auto cloud=ground();cloud.push_back({20,.2,-1.3});observe(e,cloud);
+  auto r=e.plan(pose(1.2),reference);EXPECT_GT(r.trigger_count,0);EXPECT_LT(r.trigger_nearest,22.);
+}
+
+TEST(Admission,TurningContinuityCannotBypassThirtyMeterApproval){
+  Engine e;auto r=road();e.setRoad(r,{{0,800,3.4,5.5}});auto cloud=ground();cloud.push_back({32,0,-1.3});observe(e,cloud);
+  auto turning=pose(1.3);turning.x+=.8;turning.y+=.008;turning.yaw=.02;
+  e.integrate(turning,ground());r.erase(r.begin(),r.begin()+8);
+  auto result=e.plan(turning,r);EXPECT_EQ(result.trigger_count,0);EXPECT_FALSE(result.avoiding);
+  for(const auto&p:result.path)EXPECT_LE(std::abs(p.y-4124000.),.2);
+}
+
+TEST(Recovery,VirtualPlanningDoesNotChangeLivePathOrGeometry) {
+  Engine a,b;auto r=road();a.setRoad(r,{{0,800,3.4,5.5}});b.setRoad(r,{{0,800,3.4,5.5}});
+  auto p=ground();observe(a,p);observe(b,p);
+  auto before=a.geometryDigest();auto trial=pose(1.2);trial.y+=1.;
+  auto hypothetical=a.evaluateEscape(trial,r);EXPECT_TRUE(hypothetical.clear)<<hypothetical.reason;
+  EXPECT_EQ(before,a.geometryDigest());
+  auto ar=a.plan(pose(1.2),r),br=b.plan(pose(1.2),r);
+  ASSERT_EQ(ar.path.size(),br.path.size());EXPECT_EQ(ar.reason,br.reason);
+  for(size_t i=0;i<ar.path.size();++i){EXPECT_DOUBLE_EQ(ar.path[i].x,br.path[i].x);EXPECT_DOUBLE_EQ(ar.path[i].y,br.path[i].y);}
+}
+TEST(Recovery,UnknownRearSpaceCannotAuthorizeReverse) {
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());
+  std::vector<Reference> path={{302500,4124000,0,0},{302497,4124000,0,0}};
+  std::string reason;EXPECT_FALSE(e.validateReverse(path,1.2,&reason));EXPECT_EQ(reason,"reverse_unobserved");
+}
+TEST(Recovery,ReverseUsesVehicleHeadingAndFullBody) {
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();
+  for(double x=-10;x<0;x+=.3)for(double y=-2;y<=2;y+=.3)p.push_back({x,y,-1.765});
+  for(double x=-3.6;x<=-3.2;x+=.1)for(double y=-.5;y<=.5;y+=.1)p.push_back({x,y,-1.3});
+  observe(e,p);
+  std::vector<Reference> path={{302500,4124000,0,0},{302497,4124000,0,0}};
+  std::string reason;EXPECT_FALSE(e.validateReverse(path,1.2,&reason));
+}
+TEST(Recovery,ConditionalBoundaryDoesNotDeleteAccumulatedGeometry) {
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();p.push_back({12,1.6,-1.2});observe(e,p);
+  auto digest=e.geometryDigest();e.updateEdges({{0,800,3.4,1.4}});
+  EXPECT_EQ(digest,e.geometryDigest());e.updateEdges({{0,800,3.4,5.5}});EXPECT_EQ(digest,e.geometryDigest());
+}
+TEST(Recovery,KnownGroundAllowsSafeReverse) {
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();
+  for(double x=-6;x<1;x+=.25)for(double y=-2;y<=2;y+=.25)p.push_back({x,y,-1.765});
+  observe(e,p);std::vector<Reference> reverse={{302500,4124000,0,0},{302497,4124000,0,0}};
+  std::string reason;EXPECT_TRUE(e.validateReverse(reverse,1.2,&reason))<<reason;
+}
+TEST(Divider,RequiresThreeIndependentScansAndExpires) {
+  Engine e;e.setRoad(road(),{{100,300,3.4,5.5}});e.setConditionalDividers({{100,300,-1,1.5}});
+  EXPECT_NEAR(e.bounds(200).second,8.05,1e-6);
+  auto p=ground();for(double x:{14.,20.,26.})p.push_back({x,1.6,-1.2});
+  e.integrate(pose(1),p);e.integrate(pose(1.1),p);EXPECT_TRUE(e.conditionalDividers(1.1).empty());
+  e.integrate(pose(1.1),p);EXPECT_TRUE(e.conditionalDividers(1.1).empty());
+  e.integrate(pose(1.2),p);EXPECT_FALSE(e.conditionalDividers(1.2).empty());EXPECT_NEAR(e.bounds(200).second,1.5,1e-6);
+  e.integrate(pose(2.3),ground());EXPECT_TRUE(e.conditionalDividers(2.3).empty());EXPECT_NEAR(e.bounds(200).second,8.05,1e-6);
+}
+TEST(Divider,ContinuousLargeObjectCannotBecomePoleBoundary) {
+  Engine e;e.setRoad(road(),{{100,300,3.4,5.5}});e.setConditionalDividers({{100,300,-1,1.5}});
+  auto p=ground();for(double x=14;x<28;x+=.1)p.push_back({x,1.6,-1.2});observe(e,p);
+  EXPECT_TRUE(e.conditionalDividers(1.2).empty());
+}
+TEST(Tunnel,RemoteFullBlockAllowsOnlyStoppingSafePrefix) {
+  Engine e;auto r=road();for(auto& q:r)q.idx+=7000;
+  e.setRoad(r,{{7000,7800,3.5,3.5}});auto p=ground();
+  for(double y=-3.5;y<=3.5;y+=.1)p.push_back({30,y,-1.3});observe(e,p);
+  auto start=pose(1.2);start.y+=1.2;
+  auto out=e.plan(start,r);
+  ASSERT_TRUE(out.clear)<<out.reason;
+  EXPECT_LT(out.path.back().x-302500.,30.);
+  EXPECT_TRUE(e.validate(out.path,start.stamp));
+  double coverage=0;for(size_t i=1;i<out.path.size();++i)coverage+=std::hypot(out.path[i].x-out.path[i-1].x,out.path[i].y-out.path[i-1].y);
+  EXPECT_LE(out.speed_cap*out.speed_cap/(2*e.config().braking),coverage+1e-3);
+}
+
+TEST(Embedded,ConnectorTracksActualPoseInsteadOfRejectingFixedDistanceGate){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());
+  auto path=road();auto current=pose(1.2);current.x+=.73;current.y+=.4;current.yaw=-.04;
+  std::vector<Reference> connected;std::string why;
+  ASSERT_TRUE(e.connect(current,path,1.2,connected,&why))<<why;
+  ASSERT_GT(connected.size(),10u);EXPECT_DOUBLE_EQ(connected.front().x,current.x);
+  EXPECT_DOUBLE_EQ(connected.front().y,current.y);EXPECT_NEAR(connected.front().yaw,current.yaw,1e-5);
+  EXPECT_TRUE(e.validate(connected,1.2));EXPECT_NEAR(connected.back().y,4124000.,1e-6);
+}
+TEST(Embedded,ConnectorCannotJumpAcrossOccupiedRegion){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto samples=ground();
+  // The destination path is clear; the current body/connection is blocked.
+  for(double x=0;x<5;x+=.15)for(double y=1.3;y<2.5;y+=.15)samples.push_back({x,y,-1.3});
+  observe(e,samples);auto current=pose(1.2);current.y+=2.;
+  std::vector<Reference> connected;std::string why;
+  EXPECT_FALSE(e.connect(current,road(),1.2,connected,&why));EXPECT_TRUE(connected.empty());
+}
+TEST(Embedded,ConnectorValidatesFutureNarrowingNotOnlyEntry){
+  Engine e;e.setRoad(road(),{{0,199,3.4,5.5},{200,800,1.25,5.5}});observe(e,ground());
+  auto path=road();for(auto& p:path)p.y-=1.5;
+  auto current=pose(1.2);current.y-=1.5;std::vector<Reference> connected;std::string why;
+  EXPECT_FALSE(e.connect(current,path,1.2,connected,&why));EXPECT_TRUE(connected.empty());
+}
+TEST(Embedded,PlanningSnapshotNeverReplacesLiveOccupancy){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());auto trial=e.planningSnapshot();
+  auto before=trial->geometryDigest();auto result=trial->plan(pose(1.2),road());ASSERT_TRUE(result.clear);
+  EXPECT_EQ(before,trial->geometryDigest());auto samples=ground();samples.push_back({12,0,-1.3});
+  e.integrate(pose(1.3),samples);auto live=e.geometryDigest();EXPECT_NE(live,before);
+  e.adoptPlanning(*trial);EXPECT_EQ(e.geometryDigest(),live);EXPECT_DOUBLE_EQ(e.lastScan(),1.3);
+  EXPECT_FALSE(e.validate(result.path,1.3));
+}
+TEST(Embedded,ConnectorExpiresEvenWhenStoredPathIsClear){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});observe(e,ground());
+  std::vector<Reference> connected;std::string why;auto current=pose(2.);
+  EXPECT_FALSE(e.connect(current,road(),2.,connected,&why));EXPECT_TRUE(connected.empty());
+}
+
+TEST(Admission,OriginalCertifiedPolygonAdmitsSparseRawWithoutChangingGeometry){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto samples=ground();
+  for(double x=20;x<21;x+=.2)for(double y=-.4;y<.5;y+=.2)samples.push_back({x,y,-1.3});
+  e.integrate(pose(1),samples);ASSERT_EQ(e.staticCount(),0u);
+  auto baseline=e.planningSnapshot();auto withheld=baseline->plan(pose(1),road());EXPECT_EQ(withheld.trigger_count,0);
+  auto digest=e.geometryDigest();CertifiedTrigger hint;
+  hint.stamp=1.;hint.footprint={{302521.,4123999.6,0},{302522.,4123999.6,0},{302522.,4124000.5,0},{302521.,4124000.5,0}};
+  e.setCertifiedTriggers({hint});auto trial=e.planningSnapshot();auto result=trial->plan(pose(1),road());
+  ASSERT_TRUE(result.clear)<<result.reason;EXPECT_EQ(result.trigger_reason,"certified_static_geometry");
+  EXPECT_GT(result.trigger_count,0);double offset=0;for(const auto& p:result.path)offset=std::max(offset,std::abs(p.y-4124000.));
+  EXPECT_GT(offset,1.);EXPECT_EQ(digest,e.geometryDigest());EXPECT_EQ(digest,trial->geometryDigest());EXPECT_TRUE(trial->validate(result.path,1.));
+}
+TEST(Admission,StaleOutsideAndPassedCertificatesDoNotAdmit){
+  for(int type=0;type<3;++type){Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});e.integrate(pose(5),ground());
+    CertifiedTrigger h;h.stamp=type==0?1.:5.;double x=type==2?-5.:20.,y=type==1?3.:0.;
+    h.footprint={{302500.+x,4124000.+y,0},{302501.+x,4124000.+y,0},{302501.+x,4124000.+y+.2,0}};
+    e.setCertifiedTriggers({h});auto result=e.plan(pose(5),road());EXPECT_EQ(result.trigger_count,0)<<type;
+  }
+}
+
+TEST(Occupancy,RayClearReceiptsExcludeExpiryAndOcclusion){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto p=ground();p.push_back({12,1,-1.3});observe(e,p);
+  EXPECT_TRUE(e.measuredRayCleared().empty());e.integrate(pose(1.3),{{6,.5,-.65}},ground());EXPECT_TRUE(e.measuredRayCleared().empty());
+  auto beams=ground();double scale=1.765/1.3;beams.push_back({12*scale,scale,-1.765});
+  e.integrate(pose(1.4),beams);e.integrate(pose(1.5),beams);EXPECT_TRUE(e.measuredRayCleared().empty());
+  e.integrate(pose(1.6),beams);EXPECT_FALSE(e.measuredRayCleared().empty());
+  e.integrate(pose(2),ground());EXPECT_TRUE(e.measuredRayCleared().empty());
+}
+TEST(Return,M8HeldPathStartsAtActualPose){
+  Engine e;e.setRoad(road(),{{0,800,2.4,5.5}});e.setTunnelConnectedHold(true);auto cloud=ground();
+  for(double x=16;x<=18;x+=.15)for(double y=-1.8;y<=.1;y+=.15)cloud.push_back({x,y,-1.3});observe(e,cloud);
+  auto a=e.plan(pose(1.2),road());ASSERT_TRUE(a.clear)<<a.reason;
+  auto current=pose(1.2);current.y+=.1;current.yaw=.015;
+  auto b=e.plan(current,road());ASSERT_TRUE(b.clear)<<b.reason;
+  ASSERT_TRUE(b.held)<<b.reason;EXPECT_NEAR(b.path.front().x,current.x,.01);EXPECT_NEAR(b.path.front().y,current.y,.01);EXPECT_TRUE(e.validate(b.path,1.2));
+}
+
+#include "occupancy_avoidance/scene_tracking.hpp"
+TEST(CommonScene,ConsumersShareExactMeasuredAndHeldGeometry){
+ Engine source,consumer;source.setRoad(road(),{{0,800,5,5}});consumer.setRoad(road(),{{0,800,5,5}});
+ auto p=ground();for(double y=-.3;y<=.3;y+=.1)p.push_back({12,y,-1.3});observe(source,p);
+ auto snap=source.exportScene();ASSERT_TRUE(consumer.importScene(snap));EXPECT_EQ(source.count(),consumer.count());EXPECT_EQ(source.staticCount(),consumer.staticCount());
+ EXPECT_EQ(source.validate(road(),1.2),consumer.validate(road(),1.2));
+ EXPECT_FALSE(consumer.importScene(snap));
+ source.integrate(pose(1.3),ground());ASSERT_TRUE(consumer.importScene(source.exportScene()));EXPECT_EQ(source.staticCount(),consumer.staticCount());
+}
+TEST(CommonScene,UnknownFloorNeverBecomesFixedInConsumer){
+ Engine source,consumer;auto p=ground();p.push_back({12,0,-1.3,NAN,0});observe(source,p);ASSERT_TRUE(consumer.importScene(source.exportScene()));EXPECT_EQ(consumer.staticCount(),0u);
+}
+TEST(CommonScene,ThreeScanRayClearPropagatesToAllConsumers){
+ Engine source,consumer;auto p=ground();p.push_back({8,0,-1.3});observe(source,p);ASSERT_TRUE(consumer.importScene(source.exportScene()));EXPECT_GT(consumer.staticCount(),0u);
+ // A collinear obstacle-height return behind the old voxel gives a real clear ray.
+ std::vector<Point> rays{{16,0,-.835}};
+ for(int i=0;i<3;++i){source.integrate(pose(1.3+i*.1),rays);consumer.importScene(source.exportScene());EXPECT_EQ(source.staticCount(),consumer.staticCount());}
+}
+TEST(CommonScene,CoordinateRebasePreservesRelativeObstacle){
+ Engine source;observe(source,{{10,1,-1.3}});auto before=source.exportScene();ASSERT_FALSE(before.voxels.empty());
+ source.rebaseEvidence(.12,-.05);auto after=source.exportScene();EXPECT_NEAR(after.pose.x-before.pose.x,.12,1e-6);EXPECT_NEAR(after.voxels[0].point.x-before.voxels[0].point.x,.12,1e-6);
+}
+TEST(CommonScene,BoxGrowthIsNotMotion){
+ SurfaceTracker t;std::vector<std::pair<double,double>> a{{10,0},{10,.2},{10,.4},{10,.6}};t.begin(1.);auto first=t.update(1.,a,a);
+ auto bigger=a;bigger.push_back({10,1.});bigger.push_back({10,1.2});t.begin(1.1);auto next=t.update(1.1,bigger,bigger);EXPECT_EQ(first.id,next.id);EXPECT_NE(next.motion,"dynamic");
+}
+TEST(CommonScene,IndependentSurfaceTranslationConfirmsMotion){
+ SurfaceTracker t;std::vector<std::pair<double,double>> a{{10,0},{10,.23},{10.1,.45},{10.3,.2}};
+ t.begin(1.);auto first=t.update(1.,a,a);
+ for(auto&q:a)q.first+=.4;t.begin(1.1);auto second=t.update(1.1,a,a);EXPECT_NE(second.motion,"dynamic");
+ for(auto&q:a)q.first+=.4;t.begin(1.2);auto third=t.update(1.2,a,a);EXPECT_EQ(third.id,first.id);EXPECT_EQ(third.motion,"dynamic");EXPECT_NEAR(third.vx,4.,.01);
+}
+TEST(CommonScene,CoordinateShiftIsNotObjectMovement){
+ SurfaceTracker t;std::vector<std::pair<double,double>> a{{10,0},{10,.23},{10.1,.45},{10.3,.2}};t.begin(1.);auto first=t.update(1.,a,a);
+ t.rebase(.3,.1);for(auto&q:a){q.first+=.3;q.second+=.1;}t.begin(1.1);auto second=t.update(1.1,a,a);EXPECT_EQ(second.id,first.id);EXPECT_EQ(second.motion,"static");
+}
+TEST(CommonScene,OcclusionDoesNotReplaceSurfaceWithBoundingBox){
+ SurfaceTracker t;std::vector<std::pair<double,double>> a{{10,0},{10,.23},{10.1,.45}};t.begin(1);auto first=t.update(1,a,a);
+ t.begin(1.1);auto second=t.update(1.1,a,a);EXPECT_EQ(second.motion,"static");t.begin(1.2);auto held=t.update(1.2,a,{});EXPECT_EQ(held.motion,"static");EXPECT_EQ(held.stamp,1.1);
+}
+TEST(CommonScene,MalformedSceneDoesNotReplaceValidGeometry){
+ Engine e;observe(e,{{12,0,-1.3}});auto before=e.count();auto scene=e.exportScene();scene.pose.stamp+=.1;scene.voxels.push_back({{NAN,0,0},true,scene.pose.stamp});
+ EXPECT_FALSE(e.importScene(scene));EXPECT_EQ(e.count(),before);EXPECT_EQ(e.lastScan(),1.2);
+}
+TEST(CommonScene,ReacquireKeepsValidatedPathInsteadOfRestartingReturn){
+ Engine e;auto r=road();e.setRoad(r,{{0,800,5,5}});e.setTunnelConnectedHold(true);
+ auto initial=pose(1.2);initial.y-=1.2;e.integrate(initial,ground());auto a=e.plan(initial,r);ASSERT_TRUE(a.clear);
+ auto current=initial;current.stamp=1.3;e.integrate(current,ground());e.setReacquiring(true);auto b=e.plan(current,r);ASSERT_TRUE(b.clear);EXPECT_TRUE(b.held);EXPECT_TRUE(e.validate(b.path,current.stamp));
+}
+TEST(CommonScene,UnsupportedFarResidualDoesNotBlockCorridorButNearRiskSurvives){
+ Engine far,near;auto p=ground();p.push_back({15,0,-1.3,-1.765,5});observe(far,p);EXPECT_EQ(far.count(),0u);
+ auto q=ground();q.push_back({4,1.2,-1.3,-1.765,5});observe(near,q);EXPECT_GT(near.count(),0u);EXPECT_EQ(near.staticCount(),0u);
+}
+TEST(CommonScene,GpsNormalRetargetsTranslatedReturnToTrueReferenceOnce){
+ Engine e;auto r=road();e.setRoad(r,{{0,800,5,5}});e.setTunnelConnectedHold(true);
+ auto p=pose(1.2);p.y-=1.2;e.integrate(p,ground());auto a=e.plan(p,r);ASSERT_TRUE(a.clear);
+ e.setReacquiring(true);e.rebaseEvidence(0,.3);e.rebasePlanning(0,.3);p.y+=.3;p.stamp=1.3;e.integrate(p,ground());
+ e.setReacquiring(false);auto b=e.plan(p,r);ASSERT_TRUE(b.clear)<<b.reason;EXPECT_NEAR(b.path.back().y,4124000.,.05);EXPECT_TRUE(e.validate(b.path,p.stamp));
+}
+TEST(CommonScene,NearBlindEvidenceDoesNotExpireIntoFalseFreeSpace){
+ Engine e;auto r=road();e.setRoad(r,{{0,800,5,5}});e.setNearMemory(10.);
+ auto p=ground();p.push_back({4,1.2,-1.3,-1.765,5});observe(e,p);auto count=e.count();ASSERT_GT(count,0u);
+ e.integrate(pose(2.),ground());EXPECT_GT(e.count(),0u);EXPECT_EQ(e.staticCount(),0u);
+ e.integrate(pose(12.),ground());EXPECT_EQ(e.count(),0u);
+}
+TEST(CommonScene,HeldGeometryKeepsIdentityWithoutInventingFreshMotionEvidence){
+ SurfaceTracker t;std::vector<std::pair<double,double>> a{{10,0},{10,.23},{10.1,.45}};t.begin(1.);auto first=t.update(1.,a,a);
+ for(int i=1;i<150;++i){double now=1.+i*.1;t.begin(now);auto held=t.update(now,a,{});EXPECT_EQ(held.id,first.id);EXPECT_EQ(held.stamp,1.);EXPECT_NE(held.motion,"dynamic");}
+}
+
+TEST(Corridor,M8LiveFitCannotWidenMeasuredWallRestriction){
+ Engine e;e.setRoad(road(),{{0,800,2.,5.}});e.setStrictSceneMargins(true);observe(e,ground());
+ LiveEdges live;live.valid=true;live.pose=pose(1.2);live.right=4.;live.left=7.;
+ e.setLiveEdges(live);
+ auto safe=road();for(auto&q:safe)q.y-=.94;EXPECT_TRUE(e.validate(safe,1.2));
+ auto crossing=road();for(auto&q:crossing)q.y-=1.1;EXPECT_FALSE(e.validate(crossing,1.2));
+}
+TEST(Corridor,M8OpenEntranceHasNoInventedProfileWall){
+ Engine e;e.setStrictSceneMargins(true);e.setRoad(road(),{{0,800,-1,-1}});observe(e,ground());
+ auto p=road();for(auto&q:p)q.y-=2.;EXPECT_TRUE(e.validate(p,1.2));
+}
+
+TEST(Admission,NativeSparseStaticCellsAdmitWithoutFillingDiagnosticBox){
+ Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});e.integrate(pose(1),ground());
+ auto digest=e.geometryDigest();CertifiedTrigger h;h.stamp=1.;h.measured_cells=true;
+ h.footprint={{302520.,4124000.,0}};e.setCertifiedTriggers({h});
+ auto result=e.plan(pose(1),road());EXPECT_GT(result.trigger_count,0);
+ EXPECT_EQ(result.trigger_reason,"certified_static_geometry");EXPECT_EQ(e.geometryDigest(),digest);
+}
+TEST(Admission,SeparatedNativeSideCellsCannotBridgeEmptyReferenceCorridor){
+ Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});e.integrate(pose(1),ground());
+ CertifiedTrigger h;h.stamp=1.;h.measured_cells=true;
+ h.footprint={{302520.,4123997.,0},{302520.,4124003.,0}};e.setCertifiedTriggers({h});
+ auto result=e.plan(pose(1),road());EXPECT_EQ(result.trigger_count,0);
+}
+
+TEST(Admission,FilteredTunnelCellsCannotApproveWithoutMissionCertificate){
+  Engine e;e.setRoad(road(),{{0,800,3.4,5.5}});auto samples=ground();
+  for(double x=20;x<21;x+=.2)for(double y=-.4;y<.5;y+=.2)samples.push_back({x,y,-1.3});
+  observe(e,samples);ASSERT_GT(e.staticCount(),0u);e.setCertifiedAdmissionOnly(true);
+  auto result=e.planningSnapshot()->plan(pose(1.2),road());EXPECT_EQ(result.trigger_count,0);
+  CertifiedTrigger h;h.stamp=1.2;h.footprint={{302521.,4123999.6,0},{302522.,4123999.6,0},{302522.,4124000.5,0},{302521.,4124000.5,0}};
+  e.setCertifiedTriggers({h});auto approved=e.planningSnapshot()->plan(pose(1.2),road());EXPECT_GT(approved.trigger_count,0);
+}
+
+// 2026-10-14(13:00:31, 13:01:26 백) 터널: 사고 현장(A)을 왼쪽으로 지난 뒤, 15 m 뒤 아직 확정 안 된 저상 장애물(B) 자리로
+//   일찍 복귀하는 경로 -> B 가 늦게 보여 무효 -> 재계획 실패. 관측된 빈 곳으로만 복귀, 유지 경로 추가 여유.
+namespace {
+const double OFF=3.8;  // 자차 횡위치(왼쪽 우회 중, 실제 백 +3.8)
+std::vector<Reference> tunnelRoad(){std::vector<Reference> r;for(int i=0;i<=800;++i)r.push_back({302500.+i*.1,4124000.,0,7400+i});return r;}
+Pose tpose(double stamp){return {stamp,302500.,4124000.+OFF,0,0,4};}
+// 센서 좌표(자차 기준) 장면: 지면(가려진 칸 제외) + A(차량) + 선택적 B(저상 장애물, 지면 위 0.35 m)
+std::vector<Point> scene(bool b_visible,double b_lat_lo,double b_lat_hi,bool hide_b_ground){
+  std::vector<Point> p;
+  for(double x=4;x<40;x+=.5)for(double y=-8;y<=4;y+=.5){
+    double lat=y+OFF;
+    if(hide_b_ground&&x>=20&&x<=30&&lat>=-1.&&lat<=2.)continue;  // B 자리와 그 뒤 그림자: 지면 미관측
+    p.push_back({x,y,-1.765});}
+  for(double x=6;x<=10;x+=.1)for(double lat=-1.;lat<=1.8;lat+=.1)p.push_back({x,lat-OFF,-1.0});          // A: 차량 높이(왼쪽 끝 +1.8)
+  if(b_visible)for(double x=24;x<=25.2;x+=.1)for(double lat=b_lat_lo;lat<=b_lat_hi;lat+=.1)p.push_back({x,lat-OFF,-1.765+.35});
+  return p;
+}
+double latAt(const std::vector<Reference>& path,double x){double best=1e9,lat=0;
+  for(const auto&q:path){double d=std::abs(q.x-(302500.+x));if(d<best){best=d;lat=q.y-4124000.;}}return lat;}
+}
+TEST(TunnelReturn,UnobservedLowObstacleSpotIsNotAReturnTarget){
+  for(bool gate:{false,true}){SCOPED_TRACE(gate?"gate":"legacy");
+    Config c;c.trigger_enabled=false;c.tunnel_return_observed_free=gate;c.tunnel_hold_extra_clearance=0;c.tunnel_new_obstacle_margin=0;
+    Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+    auto p=scene(false,0,0,true);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);
+    auto r=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(r.clear)<<r.reason;
+    const double lat=latAt(r.path,24.5);
+    if(gate)EXPECT_GT(lat,2.5)<<"관측 안 된 B 자리로 복귀하면 안 된다";
+    else EXPECT_LT(lat,2.0)<<"이전 동작: A 뒤로 바로 복귀(회귀 기준)";
+  }
+}
+TEST(TunnelReturn,ObservedFreeStretchStillReturns){
+  Config c;c.trigger_enabled=false;c.tunnel_hold_extra_clearance=0;c.tunnel_new_obstacle_margin=0;
+  Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+  auto p=scene(false,0,0,false);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);
+  auto r=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(r.clear)<<r.reason;
+  EXPECT_LT(std::abs(latAt(r.path,32.)),2.0)<<"지면이 보이는 빈 구간에서는 지금처럼 복귀";
+}
+TEST(TunnelHold,NewObstacleBesideHeldPathTriggersReplan){
+  for(double extra:{0.,.4}){SCOPED_TRACE(extra);
+    Config c;c.trigger_enabled=false;c.tunnel_hold_extra_clearance=extra;c.tunnel_new_obstacle_margin=0;
+    Engine e(c);e.setRoad(tunnelRoad(),{{7400,8200,3.95,6.95}});
+    auto p=scene(false,0,0,true);for(int i=0;i<3;++i)e.integrate(tpose(1+i*.1),p);  // B 자리 미관측 -> 첫 경로는 옆 유지
+    auto first=e.plan(tpose(1.2),tunnelRoad());ASSERT_TRUE(first.clear)<<first.reason;
+    // 유지 경로 오른쪽 0.35 m 에 B 가 나타남(보통 여유 0.27 은 통과, 추가 여유 포함 0.67 은 미통과)
+    double lo=1e9;for(double x=23.;x<=27.;x+=.2)lo=std::min(lo,latAt(first.path,x));
+    const double edge=lo-.95-.35;ASSERT_GT(edge,.5);
+    auto q=scene(true,edge-1.2,edge,true);for(int i=0;i<4;++i)e.integrate(tpose(1.3+i*.1),q);
+    auto second=e.plan(tpose(1.65),tunnelRoad());ASSERT_TRUE(second.clear)<<second.reason;
+    if(extra>0){EXPECT_NE(second.reason,"held_valid_path");EXPECT_GT(latAt(second.path,24.6)-.95-edge,.35);}
+    else EXPECT_EQ(second.reason,"held_valid_path");
+  }
+}

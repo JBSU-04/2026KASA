@@ -58,6 +58,7 @@ class Map {
   struct Query {uint32_t x,y,z;uint64_t radius;bool operator==(const Query&o)const{return x==o.x&&y==o.y&&z==o.z&&radius==o.radius;}};
   struct QHash {size_t operator()(const Query&k)const{return size_t(k.x)*73856093u^size_t(k.y)*19349663u^size_t(k.z)*83492791u^size_t(k.radius);}};
   bool voxel_search=true;double voxel_leaf=.05;
+  bool wall_surface_background=false;
   std::unordered_set<K3,KHash> map_voxels;
   mutable std::unordered_map<Query,bool,QHash> match_cache;
   mutable size_t cache_hits=0,cache_queries=0;
@@ -97,6 +98,19 @@ class Map {
     if(!close)close=tree.radiusSearch(q,radius,ids,distances,1)>0;
     if(match_cache.size()<250000)match_cache.emplace(key,close);
     return close;
+  }
+  bool backgroundMatches(const V&w,double height,bool height_valid)const {
+    const double radius=height_valid&&height<.25?floor_distance:distance;
+    if(matches(w,radius))return true;
+    if(!wall_surface_background||!height_valid||height<.08||height>=.25)return false;
+    const double floor_z=ground(w);if(!std::isfinite(floor_z))return false;
+    // Never enlarge the road-removal radius: accept only verified elevated
+    // map surfaces. Curved walls/columns need no plane fit or shape threshold.
+    std::vector<int>ids;std::vector<float>d;
+    pcl::PointXYZ q((w-origin).x(),(w-origin).y(),(w-origin).z());
+    if(tree.radiusSearch(q,distance,ids,d)==0)return false;
+    for(int id:ids)if((*points)[id].z+origin.z()-floor_z>=.08)return true;
+    return false;
   }
   double ground(const V&w)const {
     // Exact nearest three within the existing 1.2 m support radius, using
@@ -186,7 +200,7 @@ inline std::vector<Row> classify(const std::vector<V>&xyz,const Pose&p,Map*map,c
   std::vector<Row>rows;rows.reserve(xyz.size());double c=std::cos(p.yaw),s=std::sin(p.yaw);
   for(const auto&q:xyz){if(!q.allFinite())continue;Row r;r.sensor=q;V b=q+sensor;r.world=V(p.x+c*b.x()-s*b.y(),p.y+s*b.x()+c*b.y(),p.z+b.z());r.inside=b.x()>-.79&&b.x()<3.85&&std::abs(b.y())<.95;
     bool roi=q.x()>=-15&&q.x()<=40&&std::abs(q.y())<=12&&q.z()+sensor_height<=3.2;
-    if(map&&roi){double g=map->ground(r.world);r.valid=std::isfinite(g);if(r.valid){r.height=r.world.z()-g;r.ground=q.z()-r.height;}double threshold=r.valid&&r.height<.25?map->floor_distance:map->distance;r.bg=map->matches(r.world,threshold);}
+    if(map&&roi){double g=map->ground(r.world);r.valid=std::isfinite(g);if(r.valid){r.height=r.world.z()-g;r.ground=q.z()-r.height;}r.bg=map->backgroundMatches(r.world,r.height,r.valid);}
     rows.push_back(r);}
   // Preserve the Python restore condition without a second floor lookup.
   std::vector<double>before;before.reserve(rows.size());for(const auto&r:rows)before.push_back(r.height);localGround(rows,sensor_height);

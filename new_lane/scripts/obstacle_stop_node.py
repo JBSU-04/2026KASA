@@ -17,8 +17,14 @@ from contextlib import nullcontext
 import sys
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from tunnel_occupancy_geometry import swept_owned_cells,body_cells_risk
+from m8_repair_policy import fresh as m8_fresh, verified_motion, static_certificate, owned_cells, owned_risk, inspection_required
+try:
+    from occupancy_avoidance.msg import M8ApprovedPath, TunnelScene
+except ImportError:
+    M8ApprovedPath = TunnelScene = None
 from obstacle_geometry import footprint, body_overlap, overlap, rectangle
-from apollo_motion_bridge.risk import swept_conflict
+from apollo_motion_bridge.risk import swept_conflict, interval
+from m3_motion_evidence import MotionEvidence
 import math
 import numpy as np
 
@@ -98,6 +104,8 @@ class ObstacleStopNode:
         self.tunnel_wall_min_top_elevation = float(rospy.get_param(
             '~tunnel_wall_min_top_elevation', 2.2))
         self.tunnel_dynamic_min_top = float(rospy.get_param('~tunnel_dynamic_min_top', 0.25))
+        self.tunnel_rigid_motion_owner = bool(rospy.get_param('/tunnel_recovery/rigid_motion_enabled', True))
+        self.tunnel_candidate_vel_std = float(rospy.get_param('~tunnel_candidate_vel_std', 1.0))
         self.tunnel_dynamic_min_size = float(rospy.get_param('~tunnel_dynamic_min_size', 0.6))
         self.tunnel_wall_min_length = float(rospy.get_param(
             '~tunnel_wall_min_length', 1.5))
@@ -121,7 +129,7 @@ class ObstacleStopNode:
         self.tunnel_static_avoid_enabled = bool(rospy.get_param('~tunnel_static_avoid_enabled', True))
         self.tunnel_static_confirm_sec = float(rospy.get_param('~tunnel_static_confirm_sec', 0.8))
         self.tunnel_unknown_stop_distance = float(rospy.get_param('~tunnel_unknown_stop_distance_m', 10.0))
-        self.tunnel_dynamic_restatic_sec = float(rospy.get_param('~tunnel_dynamic_restatic_sec', 3.0))
+        self.tunnel_dynamic_restatic_sec = float(rospy.get_param('/tunnel_recovery/stationary_handoff_sec',3.0) if rospy.get_param('/tunnel_recovery/object_scene_enabled',True) else rospy.get_param('~tunnel_dynamic_restatic_sec',3.0))
         # ★ 2026-09-29 (19:23 백) 터널 미확정 정지 보완.
         #   (1) 원거리 정적 확정 이어받기: far 검출(raw_temporal_far, 세계좌표 누적이라
         #       본래 정적)이 확정한 자리(tunnel_far_static_match_m 안)에 생긴 근거리
@@ -301,6 +309,9 @@ class ObstacleStopNode:
         self.m3_rear_overhang = float(rospy.get_param('~m3_rear_overhang_m', 0.79))
         self.m3_body_half_width = float(rospy.get_param('~m3_body_half_width_m', 1.25))
         self._m3_approach_hits = {}    # id -> (연속 횟수, 마지막 측정 시각)
+        self.m3_measured_policy = bool(rospy.get_param('~m3_measured_policy', True))
+        self.m3_motion_fresh_sec = float(rospy.get_param('~m3_motion_fresh_sec', .35))
+        self._m3_evidence = MotionEvidence(self.m3_motion_fresh_sec, .3, self.m3_jump_speed)
         self._m3_world_vel = {}        # id -> 최근 세계좌표 이동 속도 (vx, vy)
         # M2/M3 경계: 동적구간 판정을 물체가 놓인 기준경로 idx 로(자차 idx 가 split 을 넘어도
         # 옆을 지나는 M2 정적 장애물로는 정지하지 않는다, 10-04 22:33 백).
@@ -317,6 +328,16 @@ class ObstacleStopNode:
         self._frame_static = set()
         self._stop_by_dynamic = False
         self._state_lock = threading.RLock()
+        self.m8_repair_path=bool(rospy.get_param('/tunnel_recovery/repair_path_policy_enabled',True))
+        self.m8_verified_motion=bool(rospy.get_param('/tunnel_recovery/verified_motion_policy_enabled',True))
+        self.m8_object_scene=bool(rospy.get_param('/tunnel_recovery/object_scene_enabled',True))
+        self._m8_scene_id=0
+        self._m8_coordinate_version=0;self._m8_approval=None;self._m8_scene_geometry={}
+        self._m8_approval_lock=threading.Lock()
+        if (self.m8_repair_path or self.m8_object_scene) and M8ApprovedPath is not None:
+            rospy.Subscriber('/obstacle_avoidance/m8_approved_path',M8ApprovedPath,self.m8_approved_path_cb,queue_size=1)
+            rospy.Subscriber('/tunnel/obstacle_scene' if self.m8_object_scene else '/tunnel/perception_scene_native',TunnelScene,self.m8_scene_geometry_cb,queue_size=1)
+
         self.coverage_pub = rospy.Publisher("/obstacle_stop/path_speed_limit_mps", Float64, queue_size=1)
         self._bg_motion_history = {}
         self._first_stop_reason = None
@@ -404,7 +425,6 @@ class ObstacleStopNode:
         rospy.Subscriber('/final_waypoint', Lane, self.waypoint_callback, queue_size=1)
         self.occupancy_cells=None;self.occupancy_cells_stamp=-1e9;self.occupancy_resolution=.1
         if rospy.get_param('/tunnel_recovery/common_scene_enabled',True) and rospy.get_param('/tunnel_recovery/native_scene_enabled',True):
-            from occupancy_avoidance.msg import TunnelScene
             from tunnel_native_scene import scene_dict
             rospy.Subscriber('/tunnel/perception_scene_native',TunnelScene,lambda m:self.occupancy_geometry_cb(scene_dict(m)),queue_size=1,buff_size=2**24,tcp_nodelay=True)
         else:
@@ -470,8 +490,52 @@ class ObstacleStopNode:
             self.ego_yaw = math.atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z))
             self.ego_pose_time = msg.header.stamp.to_sec()
 
+    def m8_scene_geometry_cb(self,msg):
+        from tunnel_native_scene import scene_dict,final_root
+        try:root=final_root(scene_dict(msg))
+        except (ValueError,TypeError):return
+        with self._state_lock:
+            if getattr(self,'m8_object_scene',False):
+                self._m8_scene_id=msg.scene_id
+                root['mission_mode']=msg.mission_mode
+                if not -.05<=rospy.Time.now().to_sec()-msg.header.stamp.to_sec()<=.35:return
+                if msg.mission_mode=='tunnel':self.obstacle_info_callback(root)
+                return
+            self._m8_scene_geometry={int(o['id']):o for o in root['collision_objects']}
+
+    def m8_approved_path_cb(self,msg):
+        if not msg.valid or msg.header.frame_id!='map' or msg.path.header.seq!=int(msg.plan_id):return
+        stamp=msg.header.stamp.to_sec()
+        if stamp!=msg.path.header.stamp.to_sec() or not -.05<=rospy.Time.now().to_sec()-stamp<=.5:return
+        xy=np.array([[p.pose.position.x,p.pose.position.y]for p in msg.path.poses])
+        if len(xy)<2 or not np.isfinite(xy).all():return
+        with getattr(self,'_m8_approval_lock',nullcontext()):
+            self._m8_approval=(xy,stamp,int(msg.plan_id),int(msg.coordinate_version),int(getattr(msg,'scene_id',0)))
+
+    def _adopt_m8_approval(self):
+        with getattr(self,'_m8_approval_lock',nullcontext()):
+            approval=getattr(self,'_m8_approval',None)
+        if approval is None:return
+        xy,stamp,plan,coordinate=approval[:4]
+        if stamp+1e-6<getattr(self,'local_path_time',-1e9):return  # 더 새 /local_path 를 낡은 영수증으로 덮지 않는다
+        self._m8_decision_approval=approval
+        self.local_path_xy=xy;self.local_path_time=stamp
+        self.local_path_s=np.r_[0.,np.cumsum(np.linalg.norm(np.diff(xy,axis=0),axis=1))]
+        self._path_snapshot=(xy,self.local_path_s,stamp)
+        self._m8_coordinate_version=coordinate
+
+    def _m8_owned_risk(self,o,now):
+        if not getattr(self,'m8_repair_path',False):return None
+        a=getattr(self,'_m8_decision_approval',getattr(self,'_m8_approval',None))
+        if a is None or not -.05<=now-a[1]<=.5 or getattr(self,'ego_xy',None) is None:return None
+        return owned_risk(o,a[0],(*self.ego_xy,getattr(self,'ego_yaw',0.)),now,a[3],
+                          max(10.,abs(getattr(self,'ego_speed',0.))*.3+getattr(self,'ego_speed',0.)**2/5.+4.))
+
     def local_path_callback(self, msg):
         with getattr(self, '_state_lock', nullcontext()):
+            # 2026-10-13: 승인 영수증(M8ApprovedPath)은 회피 노드의 유지(held) 분기에서는 나가지 않는다.
+            #   /local_path 를 버리면 그 동안 정지 판단이 낡은 경로를 본다. 같은 경로이므로 계속 받고,
+            #   더 새 영수증이 있을 때만 _adopt_m8_approval 이 계획 ID 와 함께 덮어쓴다.
             if msg.header.frame_id != 'map':
                 return
             stamp = msg.header.stamp.to_sec()
@@ -538,13 +602,15 @@ class ObstacleStopNode:
 
     def future_body_conflict(self,obs,now):
         """Static/unknown geometry: actual future rectangles, never old corridor."""
+        if getattr(self,'m8_repair_path',False) and self.mission_mode=='tunnel' and self.current_lane_number==3:
+            return self._m8_owned_risk(obs,now)
         xy=getattr(self,'local_path_xy',None);ego=getattr(self,'ego_xy',None)
         if xy is None or len(xy)<2 or ego is None or not -.05<=now-getattr(self,'local_path_time',-1e9)<=.5:return None
         v=np.diff(xy,axis=0);length=np.linalg.norm(v,axis=1)
         if np.any(length<1e-6):return None
         u=np.clip(np.sum((ego-xy[:-1])*v,axis=1)/(length*length),0,1)
         j=int(np.argmin(np.linalg.norm(xy[:-1]+u[:,None]*v-ego,axis=1)))
-        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+        if ((getattr(self,'tunnel_cells_authoritative_enabled',False) or getattr(self,'m8_object_scene',False)) and
                 getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',-1)==3):
             stamp=float(obs.get('collision_geometry_stamp',-1e9))
             if not obs.get('collision_geometry_valid',False) or not -.05<=now-stamp<=.35:return None
@@ -598,11 +664,12 @@ class ObstacleStopNode:
                                                         int(o.get('observed_track_id',-2)))]
             if not matches: return False
             for o in matches:
-                if (o.get('perception_source') != 'common_scene' or
+                if ((o.get('perception_source') != 'common_scene' and not getattr(self,'m8_repair_path',False)) or
                     o.get('motion_state') == 'dynamic' or
-                    not o.get('static_certified',False) or
+                    not (static_certificate(o,now,getattr(self,'_m8_coordinate_version',0)) if getattr(self,'m8_repair_path',False) else o.get('static_certified',False)) or
                     not -.05 <= now-float(o.get('last_seen',-1e9)) <= .35 or
-                    self.actual_body_risk(o) or self.tunnel_handoff_conflict(o,now) is not False):
+                    (self._m8_owned_risk(o,now) is not False if getattr(self,'m8_repair_path',False) else
+                     self.actual_body_risk(o) or self.tunnel_handoff_conflict(o,now) is not False)):
                     return False
         return True
 
@@ -753,7 +820,11 @@ class ObstacleStopNode:
 
     def actual_body_risk(self,obs):
         ego=getattr(self,'ego_xy',None)
-        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+        if getattr(self,'m8_repair_path',False) and self.mission_mode=='tunnel' and self.current_lane_number==3 and ego is not None:
+            cells=owned_cells(obs,rospy.Time.now().to_sec(),getattr(self,'_m8_coordinate_version',0))
+            if cells is not None:return body_cells_risk(cells,ego,getattr(self,'ego_yaw',0.))
+            if getattr(self,'m8_object_scene',False):return False # caller reports inspection unavailable, never box collision
+        if (getattr(self,'tunnel_cells_authoritative_enabled' ,False) and
                 getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',0)==3 and
                 obs.get('collision_geometry_valid',False) and ego is not None and
                 -.05<=rospy.Time.now().to_sec()-float(obs.get('collision_geometry_stamp',-1e9))<=.35):
@@ -841,13 +912,16 @@ class ObstacleStopNode:
             if not allow_prefix or arc[-1]-origin<=self.ttc_ego_front_m:return None
             horizon=min(horizon,max(0.,(arc[-1]-origin-self.ttc_ego_front_m)/max(speed,.01)))
         owned_cells=None
-        if (getattr(self,'tunnel_cells_authoritative_enabled',False) and
+        if ((getattr(self,'tunnel_cells_authoritative_enabled',False) or getattr(self,'m8_object_scene',False)) and
                 getattr(self,'mission_mode','')=='tunnel' and getattr(self,'current_lane_number',-1)==3):
             stamp=float(obs.get('collision_geometry_stamp',-1e9))
             if not obs.get('collision_geometry_valid',False) or not -.05<=now-stamp<=.35:return None
             owned_cells=np.asarray(obs.get('occupied_cells_world',[]),float).reshape((-1,2))
+            if not len(owned_cells) or not np.isfinite(owned_cells).all():return None
         radius = min(1.5,max(.15,float(obs.get('radius',.35))))
         std = max(0.,float(obs.get('vel_std',0.)))
+        if obs.get('dynamic_candidate', False) and obs.get('motion_state') != 'dynamic':
+            std = max(std, float(getattr(self, 'tunnel_candidate_vel_std', 1.0)))  # 확정 전 후보는 예측 폭을 넓힌다
         for t in np.arange(0., horizon+1e-6, .1):
             at = origin+speed*t
             k = min(int(np.searchsorted(arc,at,side='right')-1),len(v)-1)
@@ -1179,6 +1253,14 @@ class ObstacleStopNode:
         """세계좌표 이동으로 '기준경로 쪽으로 다가옴'을 판정. (통과, 사유, 세계 속도)."""
         pw = obs.get('position_world')
         h = self._pos_hist.get(oid)
+        if getattr(self, 'm3_measured_policy', False):
+            now = rospy.Time.now().to_sec()
+            self._m3_evidence.update(obs, now)
+            h = self._m3_evidence.history(obs, now)
+            if len(h) < 2:
+                self._m3_approach_hits.pop(oid, None)
+                self._m3_world_vel.pop(oid, None)
+                return False, self._m3_evidence.details.get(oid, {}).get('reason', 'no_history'), 0.0
         if not pw or len(pw) < 2 or not h or len(h) < 2:
             self._m3_approach_hits.pop(oid, None)
             return False, 'no_history', 0.0
@@ -1284,6 +1366,35 @@ class ObstacleStopNode:
         if hits < need:
             return False, 'confirming_%d' % hits, speed
         return True, 'approach_%.2fmps_t%.1f' % (toward, t_reach), speed
+
+    def _m3_time_overlap(self, obs):
+        """Time overlap on the local reference tangent; symmetric for both sides."""
+        pw = obs.get('position_world', [])
+        pe = obs.get('position_ego', [])
+        vel = self._m3_world_vel.get(int(obs.get('id', -1)))
+        if len(pw) < 2 or len(pe) < 2 or vel is None:
+            return False, None
+        pl = self._path_lateral(float(pw[0]), float(pw[1]))
+        yaw = getattr(self, 'ego_yaw', None)
+        if pl is None or yaw is None:
+            return False, None
+        lat, tx, ty = pl
+        c, sn = math.cos(yaw), math.sin(yaw)
+        # Ego-frame relative position projected onto the reference tangent.
+        wx, wy = c*pe[0]-sn*pe[1], sn*pe[0]+c*pe[1]
+        along = tx*wx+ty*wy
+        vx = tx*vel[0]+ty*vel[1]-max(0., self.ego_speed)*(tx*c+ty*sn)
+        vy = -ty*vel[0]+tx*vel[1]
+        hl = max(0., float(obs.get('length', 0.)))*.5
+        hw = max(0., float(obs.get('width', 0.)))*.5
+        longitudinal = interval(along, vx, -self.m3_rear_overhang-hl,
+                                self.m3_front_overhang+hl, self.m3_approach_horizon_s)
+        lateral = interval(lat, vy, -self.m3_path_corridor_radius-hw,
+                           self.m3_path_corridor_radius+hw, self.m3_approach_horizon_s)
+        if longitudinal is None or lateral is None:
+            return False, None
+        start, end = max(longitudinal[0], lateral[0]), min(longitudinal[1], lateral[1])
+        return (True, start) if start <= end else (False, None)
 
     def _m3_pass_through(self, obs):
         """횡단 물체: 멈출 수 있으면 None(정지). 못 멈추고 차 꼬리가 먼저 지나가면 여유 시간[s], 아니면 None."""
@@ -1703,6 +1814,29 @@ class ObstacleStopNode:
         2) A dynamically identified object outside it needs a fresh velocity
            vector and a predicted time-overlap with the ego swept corridor.
         """
+        if tunnel and obs.get('perception_source')=='common_scene' and getattr(self,'m8_repair_path',False):
+            oid=int(obs.get('id',-1))
+            if obs.get('background_excluded',False):return False,'background_excluded'
+            if self.actual_body_risk(obs):return True,'common_scene_near_body'
+            candidate=bool(obs.get('dynamic_candidate')) and verified_motion(obs,now,getattr(self,'_m8_coordinate_version',0))
+            if obs.get('motion_state')=='dynamic' or candidate:
+                self._frame_dyn.add(oid)
+                vector=obs.get('observed_velocity') or obs.get('velocity_world') or obs.get('velocity')
+                if not m8_fresh(obs.get('last_seen'),now):return True,'common_scene_motion_observation_expired'
+                if vector is None:return True,'common_scene_motion_vector_unavailable'
+                result=self._driven_predictive_conflict(obs,vector,allow_prefix=True)
+                if result is not None:return result[0],'common_scene_dynamic_'+result[1]
+                return True,'common_scene_dynamic_path_unknown'
+            if static_certificate(obs,now,getattr(self,'_m8_coordinate_version',0)):
+                self._frame_static.add(oid);self._frame_dyn.discard(oid)
+                if obs.get('m8_restatic',False):
+                    self._dynamic_seen.pop(oid,None);self._tunnel_dynamic_seen.pop(oid,None);self._dyn_hyst.pop(oid,None)
+            risk=self._m8_owned_risk(obs,now)
+            if risk is not None:return bool(risk),'common_scene_owned_body_collision' if risk else 'common_scene_owned_remaining_clear'
+            required=inspection_required(obs,getattr(self,'local_path_xy',None),
+                (*getattr(self,'ego_xy',(0.,0.)),getattr(self,'ego_yaw',0.)),getattr(self,'ego_speed',0.))
+            return required,('common_scene_owned_geometry_or_path_unavailable' if required else
+                             'common_scene_geometry_unknown_outside_stopping_region')
         if tunnel and obs.get('perception_source')=='common_scene':
             if obs.get('m8_restatic',False):
                 oid=int(obs.get('id',-1))
@@ -1742,6 +1876,15 @@ class ObstacleStopNode:
                            speed >= 0.8)
         if tunnel and not getattr(self,'shared_detector_policy',False) and obs.get('static_certified', False) and not self._coherent_measured_motion(oid):
             tracker_dynamic = coherent_motion = False
+        # 2026-10-13 터널 정적·동적 판정 소유는 근거리 검출기(외곽 강체 이동, m8_motion.RigidMotion)다.
+        #   여기서 속도 크기로 근거를 다시 쌓지 않는다(원거리 사고 차량 중심 흔들림 0.6~1.2 m/s -> 가짜 동적).
+        #   원거리 검출기 물체는 원거리 검출기가 dynamic 이라고 하지 않으면 동적이 아니다.
+        if tunnel and getattr(self,'shared_detector_policy',False) and getattr(self,'tunnel_rigid_motion_owner',True):
+            # 후보(dynamic_candidate)는 동적 목록·hold 에 넣지 않고 아래 경로 침범 예측에만 쓴다(16:09/16:11 백 오탐 hold).
+            tracker_dynamic = obs.get('motion_state') == 'dynamic'
+            coherent_motion = False
+            if obs.get('source') == 'raw_temporal_far' and obs.get('motion_state') != 'dynamic':
+                tracker_dynamic = False
         evidence = fresh and (tracker_dynamic or coherent_motion)
 
         # Once a track has stayed in place, a later box-fit wobble must clear
@@ -1882,6 +2025,8 @@ class ObstacleStopNode:
                          (stationary_sec >= self.tunnel_static_confirm_sec or
                           obs.get('motion_state') == 'static'))))
         if shared_m8:
+            if tunnel and getattr(self,'m8_repair_path',False):
+                verified_static=static_certificate(obs,now,getattr(self,'_m8_coordinate_version',0))
             static_ready=verified_static and not dynamic_confirmed
             if static_ready:
                 recent=False
@@ -1914,14 +2059,28 @@ class ObstacleStopNode:
                     return True, 'tunnel_blind_hold'
                 # 2026-10-12(19:09:58 백): 입구·출구의 높이 0.12 m, 0.3 m 크기 연석·지면 조각이 동적 경로 예측 정지를 걸었다.
                 #   작은 저상 물체는 동적 예측 정지 대상에서 빼고 아래 정적 판단(주행 경로 점유)만 받는다.
-                if (dynamic_confirmed or recent) and self.tunnel_dynamic_too_small(obs):
+                if (dynamic_confirmed or recent) and self.tunnel_dynamic_too_small(obs) and not (getattr(self,'m8_verified_motion',False) and verified_motion(obs,now,getattr(self,'_m8_coordinate_version',0))):
                     dynamic_confirmed=recent=False
+                # 2026-10-13 확정 전 동적 후보(강체 이동 1회, 횡단 물체 첫 0.2~0.4 s): 경로 침범이 예측될 때만 정지.
+                if (not dynamic_confirmed and not recent and obs.get('dynamic_candidate', False) and
+                        obs.get('motion_state') != 'dynamic' and fresh and
+                        (verified_motion(obs,now,getattr(self,'_m8_coordinate_version',0)) if getattr(self,'m8_verified_motion',False) else not self.tunnel_dynamic_too_small(obs))):
+                    vector=obs.get('observed_velocity') or obs.get('velocity')
+                    if vector and len(vector)>=2 and all(math.isfinite(float(v)) for v in vector[:2]):
+                        swept=self._driven_predictive_conflict(obs,vector,allow_prefix=True)
+                        if swept is not None and swept[0]:
+                            return True,('tunnel_candidate_'+swept[1])
                 if dynamic_confirmed or recent:
                     vector=obs.get('velocity') if velocity_valid else obs.get('observed_velocity')
                     if fresh and vector and len(vector)>=2 and all(math.isfinite(float(v)) for v in vector[:2]):
                         swept=self._driven_predictive_conflict(obs,vector,allow_prefix=True)
                         if swept is not None:
                             return swept[0],('tunnel_dynamic_'+swept[1])
+                if getattr(self,'m8_repair_path',False) and not dynamic_confirmed and not recent:
+                    risk=self._m8_owned_risk(obs,now)
+                    if risk is False:return False,'tunnel_owned_remaining_body_clear'
+                    if risk is True:return True,'tunnel_owned_remaining_body_collision'
+                    self._m8_geometry_unknown_reason='owned_geometry_or_approval_unavailable'
                 # Unavailable paths retain the conservative reference fallback.
                 if dynamic_confirmed or recent:
                     velocity = obs.get('velocity', [])
@@ -2028,6 +2187,13 @@ class ObstacleStopNode:
                 return False, 'outside_m3_' + why
             if not (dynamic_confirmed or speed_w >= self.m3_approach_untracked_speed):
                 return False, 'outside_m3_not_dynamic_%.2f' % speed_w
+            if getattr(self, 'm3_measured_policy', False):
+                conflict, when = self._m3_time_overlap(obs)
+                self._m3_evidence.details.setdefault(oid, {}).update(
+                    predicted_conflict_sec=when, approach_side='left' if
+                    float(obs.get('position_ego', [0., 0.])[1]) > 0 else 'right')
+                if not conflict:
+                    return False, 'outside_m3_no_time_overlap'
             passing = self._m3_pass_through(obs)
             if passing is not None:
                 return False, 'm3_pass_through_%.2fs' % passing
@@ -2075,13 +2241,15 @@ class ObstacleStopNode:
             self.last_obstacle_info_time = rospy.Time.now()
 
             try:
-                data = json.loads(msg.data)
+                data = msg if isinstance(msg,dict) else json.loads(msg.data)
+                if not isinstance(msg,dict) and getattr(self,'m8_object_scene',False) and data.get('mission_mode')=='tunnel':return
             except ValueError:
                 return
 
             # 고주로(lane_number != 0, 1/2/3차선)에서는 도심 정적/동적 장애물 정지 노드가 절대 개입하지 않는다.
             # 고주로의 앞차 추종 및 차선 안전 간격 제어는 ACC/SMPC 가 전담한다.
             self.mission_mode = data.get('mission_mode', '')
+            if self.mission_mode=='tunnel' and isinstance(msg,dict):self._m8_coordinate_version=int(data.get('coordinate_version',0))
             tunnel = self.mission_mode == 'tunnel' and self.current_lane_number == 3
             is_highway = (self.current_lane_number is not None and self.current_lane_number != 0 and not tunnel)
             if is_highway:
@@ -2106,6 +2274,13 @@ class ObstacleStopNode:
             handoff_guard_ids = set()
             cleared_handoff_ids = set()
             obs_list = data.get('collision_objects', data.get('obstacles', []))
+            if tunnel and getattr(self,'m8_repair_path',False):
+                self._adopt_m8_approval()
+                for o in obs_list:
+                    geometry=getattr(self,'_m8_scene_geometry',{}).get(int(o.get('id',-1)))
+                    if geometry is not None and geometry.get('coordinate_version',0)==self._m8_coordinate_version and abs(float(geometry.get('last_seen',-1e9))-float(o.get('last_seen',-1e9)))<1e-4:
+                        for key in ('occupied_cells_world','collision_geometry_stamp','collision_geometry_valid','collision_geometry_reason','coordinate_version'):
+                            if key in geometry:o[key]=geometry[key]
             self._bg_validation_objects = obs_list if tunnel else []
             self._frame_dyn = set()
             self._frame_static = set()
@@ -2139,6 +2314,28 @@ class ObstacleStopNode:
             if tunnel and not getattr(self,'shared_detector_policy',False):
                 self._associate_fragments(obs_list, t_now)
             for obs in obs_list:
+                if tunnel and getattr(self,'m8_object_scene',False) and obs.get('perception_source')=='common_scene':
+                    # Native occupancy must be checked before legacy centroid,
+                    # nominal-corridor, height, infrastructure and passed gates.
+                    body=self.actual_body_risk(obs)
+                    movement=verified_motion(obs,t_now,getattr(self,'_m8_coordinate_version',0))
+                    if self.require_confirmed and not obs.get('confirmed',False) and not body and not movement:
+                        stop_decisions.append(dict(id=int(obs['id']),stop=False,reason='unconfirmed_preslow_only',geometry_source='native_owned_cells'))
+                        continue
+                    is_near_this_obs,why=self._dynamic_zone_stop(obs,True,True,True,t_now,tunnel=True)
+                    dynamic=movement or (obs.get('motion_state')=='dynamic' and m8_fresh(obs.get('last_seen'),t_now))
+                    if dynamic:
+                        self._frame_dyn.add(int(obs['id']))
+                        if obs.get('dynamic_confirmed'):self._ever_dyn[int(obs['id'])]=float(obs.get('last_seen',t_now))
+                    if is_near_this_obs:near=True;near_dynamic=near_dynamic or dynamic
+                    stop_decisions.append(dict(id=int(obs['id']),stop=bool(is_near_this_obs),reason=why,
+                        path='owned_remaining',geometry_source='native_owned_cells',
+                        observation_age_sec=t_now-float(obs.get('last_seen',-1e9)),
+                        occupancy_valid=bool(obs.get('collision_geometry_valid')),
+                        current_body_risk=body,scene_id=getattr(self,'_m8_scene_id',0),
+                        coordinate_version=getattr(self,'_m8_coordinate_version',0),
+                        m8_plan_id=getattr(self,'_m8_decision_approval',(None,None,None,None))[2] if getattr(self,'_m8_decision_approval',None) else None))
+                    continue
                 if obs.get('infrastructure_candidate', False):
                     continue  # retained by the path planner as collision geometry
                 if tunnel and not getattr(self,'shared_detector_policy',False) and self._is_tunnel_wall_piece(obs):
@@ -2250,7 +2447,11 @@ class ObstacleStopNode:
                         'occupancy_reason':obs.get('occupancy_reason'),
                         'geometry_source':'world_footprint' if obs.get('footprint_world') else 'legacy_rectangle',
                         'local_path_age_sec': t_now-getattr(self, 'local_path_time', -1e9),
+                        'm8_plan_id':getattr(self,'_m8_decision_approval',(None,None,None,None))[2] if getattr(self,'_m8_decision_approval',None) else None,
+                        'coordinate_version':getattr(self,'_m8_coordinate_version',0),
                         'path_fallback_reason': self._local_path_unavailable_reason(obs, t_now),
+                        'm3_motion_evidence': (dict(self._m3_evidence.details.get(int(obs.get('id', -1)), {}))
+                            if not tunnel and getattr(self, 'm3_measured_policy', False) else None),
                         'wall_reason': getattr(self,'_wall_reason','none')})
                     if (self.handoff_guard_enabled and
                             why in ('tunnel_dynamic_became_static',
@@ -2352,6 +2553,8 @@ class ObstacleStopNode:
             live = {int(o.get('id', -1)) for o in obs_list}
             self._pos_hist = {k: v for k, v in self._pos_hist.items() if k in live}
             self._m3_approach_hits = {k: v for k, v in self._m3_approach_hits.items() if k in live}
+            if self.m3_measured_policy:
+                self._m3_evidence.prune(live)
             self._m3_world_vel = {k: v for k, v in self._m3_world_vel.items() if k in live}
             self._m3_still_since = {k: v for k, v in self._m3_still_since.items() if k in live}
             self._dyn_hyst = {k: v for k, v in self._dyn_hyst.items() if k in live}
@@ -2360,6 +2563,20 @@ class ObstacleStopNode:
             self._measured_static = {k: v for k, v in getattr(self, '_measured_static', {}).items()
                                      if k in live and t_now-v[1] <= .5}
 
+            if tunnel and getattr(self,'m8_repair_path',False):
+                latest=getattr(self,'_m8_approval',None)
+                used=getattr(self,'_m8_decision_approval',None)
+                if latest is not None and latest is not used and -.05<=t_now-latest[1]<=.5:
+                    self._adopt_m8_approval()
+                    owners={int(o['id']):o for o in obs_list}
+                    for decision in stop_decisions:
+                        o=owners.get(int(decision.get('id',-1)))
+                        reason=decision.get('reason','')
+                        path_reason=('in_path_unknown' in reason or reason.startswith('tunnel_owned_') or reason.startswith('common_scene_owned_') or 'static' in reason)
+                        if (decision.get('stop') and path_reason and o is not None and
+                            static_certificate(o,t_now,self._m8_coordinate_version) and self._m8_owned_risk(o,t_now) is False):
+                            decision.update(stop=False,reason='newer_approved_owned_path_clear',plan_id=latest[2])
+                    near=any(d.get('stop') for d in stop_decisions)
             now = rospy.Time.now()
             if near:
                 self.stop_hold_until = now + rospy.Duration(self.stop_hold_sec)
@@ -2411,6 +2628,8 @@ class ObstacleStopNode:
                 m3_risk = self._m3_risk_speed(obs_list)
                 self.m3_risk_pub.publish(Float64(data=m3_risk[0]))
             self.dyn_state_pub.publish(String(data=json.dumps({
+                'scene_id':getattr(self,'_m8_scene_id',0) if tunnel else 0,
+                'coordinate_version':getattr(self,'_m8_coordinate_version',0) if tunnel else 0,
                 'm3_risk_speed': None if m3_risk is None else round(m3_risk[0], 2),
                 'm3_risk_limiting_id': None if m3_risk is None else m3_risk[1],
                 'm3_risk_candidates': None if m3_risk is None else m3_risk[2],

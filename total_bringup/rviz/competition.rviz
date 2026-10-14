@@ -437,6 +437,102 @@ Visualization Manager:
       Namespaces: {}
       Queue Size: 2
       Value: false
+    - Class: rviz/PointCloud2
+      Name: "[필터] 근거리 필터 점 (GroundGrid+벽 제거)"
+      Topic: /tunnel/filtered_points
+      Enabled: true
+      Value: true
+      Color Transformer: FlatColor
+      Color: 255; 255; 255
+      Alpha: 1
+      Position Transformer: XYZ
+      Style: Flat Squares
+      Size (Pixels): 3
+      Size (m): 0.05
+      Queue Size: 1
+      Decay Time: 0
+      Selectable: false
+    - Class: rviz/PointCloud2
+      Name: "[필터] 원거리 필터 점 (원거리 지면 제거)"
+      Topic: /tunnel/filtered_far
+      Enabled: true
+      Value: true
+      Color Transformer: FlatColor
+      Color: 0; 200; 255
+      Alpha: 1
+      Position Transformer: XYZ
+      Style: Flat Squares
+      Size (Pixels): 3
+      Size (m): 0.07
+      Queue Size: 1
+      Decay Time: 0
+      Selectable: false
+    - Class: rviz/PointCloud2
+      Name: "[필터] 지도 분류 근거리 (회색 배경→빨강 확정)"
+      Topic: /tunnel/map_classified
+      Enabled: true
+      Value: true
+      Color Transformer: Intensity
+      Channel Name: map_label
+      Autocompute Intensity Bounds: false
+      Min Intensity: 1
+      Max Intensity: 3
+      Use rainbow: false
+      Invert Rainbow: false
+      Min Color: 120; 120; 120
+      Max Color: 255; 0; 0
+      Alpha: 1
+      Position Transformer: XYZ
+      Style: Flat Squares
+      Size (Pixels): 3
+      Size (m): 0.08
+      Queue Size: 1
+      Decay Time: 0
+      Selectable: false
+    - Class: rviz/PointCloud2
+      Name: "[필터] 지도 분류 원거리 (회색 배경→빨강 확정)"
+      Topic: /tunnel/map_classified_far
+      Enabled: true
+      Value: true
+      Color Transformer: Intensity
+      Channel Name: map_label
+      Autocompute Intensity Bounds: false
+      Min Intensity: 1
+      Max Intensity: 3
+      Use rainbow: false
+      Invert Rainbow: false
+      Min Color: 120; 120; 120
+      Max Color: 255; 0; 0
+      Alpha: 1
+      Position Transformer: XYZ
+      Style: Flat Squares
+      Size (Pixels): 3
+      Size (m): 0.08
+      Queue Size: 1
+      Decay Time: 0
+      Selectable: false
+    - Class: rviz/PointCloud2
+      Name: "[필터] 사전 필터가 지운 점 (경계밖 파랑/벽면 노랑/벽밑 주황)"
+      Topic: /tunnel/prefilter_removed
+      Enabled: false
+      Value: false
+      Color Transformer: Intensity
+      Channel Name: removed_reason
+      Autocompute Intensity Bounds: false
+      Min Intensity: 1
+      Max Intensity: 3
+      Use rainbow: true
+      Invert Rainbow: false
+      Min Color: 0; 0; 0
+      Max Color: 255; 255; 255
+      Alpha: 0.8
+      Position Transformer: XYZ
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.03
+      Queue Size: 1
+      Decay Time: 0
+      Selectable: false
   Enabled: true
   Global Options:
     Background Color: 22; 22; 26
