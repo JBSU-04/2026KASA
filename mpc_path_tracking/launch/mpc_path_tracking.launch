@@ -1,36 +1,56 @@
 <launch>
-	<!-- 실험용 오버라이드. 기본값은 mpc_params.yaml 과 동일하므로
-	     인자를 안 주면 기존 거동 그대로다.
-	       N 45 -> 30 : horizon 2.25s -> 1.50s, 솔브 비용 감소
-	     IPOPT 는 단일 스레드라 코어를 늘려도 소용없다. 문제를 줄여야 한다. -->
+	<!-- MPC horizon 스텝 수 (yaml 의 N 을 덮어쓴다). -->
 	<arg name="N" default="30"/>
-	<!-- MPC 출력 토픽. mpc_path_tracking.h 는 /ctrl_cmd 를 하드코딩하므로
-	     remap 으로만 바꿀 수 있다. obstacle_stop_node 가 최종단으로 들어가는
-	     원본(정동적) 구성에서는 /ctrl_cmd_raw 로 내보내고, 정지 노드가
-	     /ctrl_cmd 를 최종 발행한다.
-	     remap 은 노드 안에만 건다. control_feedback_monitor 는 최종 /ctrl_cmd 를
-	     그대로 보게 둬야 실제로 차에 나간 명령을 기록한다. -->
+	<!-- MPC 출력 토픽. 노드는 /ctrl_cmd 로 내므로 remap 으로 바꾼다(정지 노드를 최종단에 둘 때 /ctrl_cmd_raw).
+	     remap 은 노드 안에만 건다. control_feedback_monitor 는 최종 /ctrl_cmd 를 그대로 기록한다. -->
 	<arg name="ctrl_cmd_topic" default="/ctrl_cmd"/>
-	<!-- MPC 가 외부 ACC 목표속도로 구독하는 토픽. 기본은 smpc_lane_change 의
-	     원본 이름(/smpc/target_speed_mps) 그대로다.
-	     enable_behavior(SMPC 차선변경)를 켜면 acc_speed_planner_node 와
-	     smpc_decision_node 가 이 이름을 자기들끼리도 내부적으로 주고받으므로
-	     그 이름 자체는 절대 안 건드린다 - 대신 이 remap 으로 "우리 MPC 가
-	     실제로 듣는 이름"만 따로 뗀다. control.launch 가 이걸
-	     /smpc/target_speed_mps_gated 로 넘기면, constraint_to_speed_cap 이
-	     M6/M7(고주로)에서만 ACC 원본값을 그 이름으로 중계하고 그 외 구간은
-	     자기 미션 캡을 낸다 - 그래서 ACC 는 고주로 밖에서는 MPC 에 전혀
-	     영향을 못 준다(랩 전체에서 계속 값을 내고 있어도). -->
+	<!-- MPC 가 구독하는 외부 ACC 목표속도 토픽. control.launch 는 고주로에서만 ACC 값을 중계하는
+	     /smpc/target_speed_mps_gated 를 넘긴다(SMPC 내부 토픽 이름은 건드리지 않는다). -->
 	<arg name="external_acc_topic" default="/smpc/target_speed_mps"/>
-	<!-- false 면 MPC 가 SMPC ACC 목표속도를 무시한다(mission_speed/curvature 만
-	     사용). SMPC 의 차선변경 판단은 그대로 두고 속도 개입만 끊는 스위치라,
-	     ACC 가 원인인지 분리 검증할 때 쓴다. -->
+	<!-- false 면 외부 ACC 목표속도를 무시한다(mission_speed/curvature 만 사용). -->
 	<arg name="external_acc_enabled" default="true"/>
 	<rosparam command="load" file="$(find mpc_path_tracking)/config/mpc_params.yaml" />
-	<!-- mpc.h 는 전역 NodeHandle 로 파라미터를 읽는다(ros::NodeHandle nh).
-	     따라서 노드 private 이 아니라 전역 /N 을 덮어써야 적용된다.
-	     yaml 로드 뒤에 두어야 순서상 이 값이 이긴다. -->
+	<!-- 파라미터는 전역 NodeHandle 로 읽으므로 전역 /N 을 yaml 로드 뒤에 덮어쓴다. -->
 	<param name="/N" value="$(arg N)"/>
+	<!-- 고정 τ 조향 지연보상 override (음수 = yaml 값). -->
+	<arg name="steer_delay_s" default="-1"/>
+	<arg name="steer_delay_model_lf" default="-1"/>
+	<param if="$(eval float(arg('steer_delay_s')) >= 0)" name="/steer/actuator_delay_s" value="$(arg steer_delay_s)"/>
+	<param if="$(eval float(arg('steer_delay_model_lf')) >= 0)" name="/steer/delay_model_lf" value="$(arg steer_delay_model_lf)"/>
+	<!-- 지연보상 v2 override (빈 문자열 / 음수 = yaml 값). -->
+	<arg name="delay_comp" default=""/>
+	<arg name="dc_act_base_s" default="-1"/>
+	<arg name="dc_act_frame_k" default="-1"/>
+	<arg name="dc_state_k" default="-1"/>
+	<arg name="dc_state_c_s" default=""/>
+	<param if="$(eval arg('delay_comp') != '')" name="/delay_comp/enabled" value="$(arg delay_comp)"/>
+	<param if="$(eval float(arg('dc_act_base_s')) >= 0)" name="/delay_comp/actuation_base_s" value="$(arg dc_act_base_s)"/>
+	<param if="$(eval float(arg('dc_act_frame_k')) >= 0)" name="/delay_comp/actuation_frame_k" value="$(arg dc_act_frame_k)"/>
+	<param if="$(eval float(arg('dc_state_k')) >= 0)" name="/delay_comp/state_k" value="$(arg dc_state_k)"/>
+	<!-- state_c_s 는 음수일 수 있어 빈 문자열을 "yaml 값" 표시로 쓴다. -->
+	<param if="$(eval arg('dc_state_c_s') != '')" name="/delay_comp/state_c_s" value="$(arg dc_state_c_s)"/>
+	<!-- 시험 전용: MPC 계산 시간에 인위 지연을 더해 느린 PC 를 흉내 낸다(기본 0). -->
+	<arg name="test_extra_compute_s" default="0.0"/>
+	<param name="/delay_comp/test_extra_compute_s" value="$(arg test_extra_compute_s)"/>
+	<!-- MPC 모델 Lf / 조향 비용 배율 override (음수 = yaml 값). -->
+	<arg name="mpc_lf" default="-1"/>
+	<arg name="steer_cost_scale" default="-1"/>
+	<param if="$(eval float(arg('mpc_lf')) > 0)" name="/Lf" value="$(arg mpc_lf)"/>
+	<param if="$(eval float(arg('steer_cost_scale')) > 0)" name="/cost_weight/steer_scale" value="$(arg steer_cost_scale)"/>
+	<!-- 도심 곡선 횡가속 한계 override (빈 문자열 = yaml 값). -->
+	<arg name="urban_alat" default=""/>
+	<param if="$(eval arg('urban_alat') != '')" name="/urban_control/curvature_lateral_accel_limit_mps2" value="$(arg urban_alat)"/>
+	<!-- 속도 피드포워드 override (빈 문자열 = yaml 값). -->
+	<arg name="throttle_ff" default=""/>
+	<arg name="throttle_ff_steer_zero" default=""/>
+	<param if="$(eval arg('throttle_ff_steer_zero') != '')" name="/longitudinal/throttle_ff_steer_zero_rad" value="$(arg throttle_ff_steer_zero)"/>
+	<param if="$(eval arg('throttle_ff') != '')" name="/longitudinal/throttle_ff_gain" value="$(arg throttle_ff)"/>
+	<!-- MPC 상태 입력 override: odom | ekf (빈 문자열 = yaml 값). -->
+	<arg name="mpc_state_source" default=""/>
+	<param if="$(eval arg('mpc_state_source') != '')" name="/state_input/source" value="$(arg mpc_state_source)"/>
+	<!-- 조향 변화 비용 배율 override (음수 = yaml 값). -->
+	<arg name="steer_change_scale" default="-1"/>
+	<param if="$(eval float(arg('steer_change_scale')) > 0)" name="/cost_weight/steer_change_scale" value="$(arg steer_change_scale)"/>
 	<param name="external_acc/enabled" value="$(arg external_acc_enabled)"/>
 	<node name="mpc_path_tracking_node" pkg="mpc_path_tracking" type="mpc_path_tracking" output="screen">
 		<remap from="/ctrl_cmd" to="$(arg ctrl_cmd_topic)"/>
@@ -48,8 +68,4 @@
 		<param name="report_rate_hz" value="20.0" />
 		<param name="output_dir" value="$(find mpc_path_tracking)/data" />
 	</node>
-
-<!-- <node pkg="tf2_ros" type="static_transform_publisher" name="base_to_map" args="0 0 0 0 0 0 map base_link" /> -->
-
-
 </launch>

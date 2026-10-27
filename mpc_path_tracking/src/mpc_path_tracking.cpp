@@ -38,8 +38,5 @@ Eigen::VectorXd MPC::polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals, int o
 
     auto Q = A.householderQr();
     auto result = Q.solve(yvals);
-    //cout << "result is : " << result << endl;
-    //cout << "---------------------" << endl;
     return result;
 }
-

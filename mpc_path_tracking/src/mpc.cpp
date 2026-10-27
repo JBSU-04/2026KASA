@@ -15,7 +15,7 @@ void FG_eval::operator()(ADvector &fg, const ADvector &vars)
 
     // 가중치는 Solve() 진입 시 updateCostWeights() 가 한 번만 계산해서 넣어준다.
     // 이 함수는 IPOPT 가 매 반복마다 호출하므로 여기서 파라미터 서버를 조회하면
-    // solve 시간이 수십 ms 단위로 늘어난다(실측 59ms/최대 113ms).
+    // solve 시간이 수십 ms 단위로 늘어난다.
 
     fg[0] += delta_start_cost_weight *
              CppAD::pow(vars[delta_start] - previous_delta_cost_reference, 2);
@@ -25,16 +25,13 @@ void FG_eval::operator()(ADvector &fg, const ADvector &vars)
     {
         fg[0] += cte_cost_effective_weight * CppAD::pow(vars[cte_start + t] - ref_cte, 2);
         fg[0] += epsi_cost_effective_weight * CppAD::pow(vars[epsi_start + t] - ref_epsi, 2);
-        // fg[0] += v_weight * CppAD::pow(vars[v_start + t] - vars[v_target_start + t - 1], 2);
         
-        // 수정 0206
         if (t < N - 1) {
             fg[0] += v_weight * CppAD::pow(vars[v_start + t] - vars[v_target_start + t], 2);
         } else {
             // 마지막 스텝은 마지막 v_target을 그대로 사용
             fg[0] += v_weight * CppAD::pow(vars[v_start + t] - vars[v_target_start + (N - 2)], 2);
         }
-        // 수정 0206
     }
 
     // Costs for steering (delta) and acceleration (a)
@@ -89,7 +86,6 @@ void FG_eval::operator()(ADvector &fg, const ADvector &vars)
         AD<double> psi_des0 = CppAD::atan(coeffs[1] + 2 * coeffs[2] * x0 + 3 * coeffs[3] * CppAD::pow(x0, 2));
 
         // Setting up the rest of the model constraints
-        
         
         fg[1 + x_start + t] = x1 - (x0 + v0 * CppAD::cos(psi0) * dt);
         fg[1 + y_start + t] = y1 - (y0 + v0 * CppAD::sin(psi0) * dt);
@@ -191,7 +187,6 @@ void MPC::updateCostWeights()
 vector<double> MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs)
 {
     bool ok = true;
-    //size_t i;
 
     typedef CPPAD_TESTVECTOR(double) Dvector;
 
@@ -277,9 +272,50 @@ vector<double> MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs)
     FG_eval fg_eval(coeffs);
 
     updateCostWeights();
+    // 조향 비용 배율: 모델 Lf 를 바꾸면 같은 회전에 필요한 조향이 Lf 에 비례해 커지므로,
+    // 기존 튜닝의 공격성을 유지하려면 조향 항(delta_start/delta/delta_change)을 (Lf_old/Lf_new)^2 로 줄인다.
+    {
+        double steer_scale = 1.0;
+        nh.param<double>("cost_weight/steer_scale", steer_scale, 1.0);
+        steer_scale = std::max(0.05, std::min(steer_scale, 5.0));
+        // delta_change(조향 변화율)만 따로 줄일 수 있게 한다. 기본은 steer_scale 과 같다.
+        double change_scale = steer_scale;
+        nh.param<double>("cost_weight/steer_change_scale", change_scale, steer_scale);
+        change_scale = std::max(0.05, std::min(change_scale, 5.0));
+        this->delta_start_cost_weight *= steer_scale;
+        this->delta_cost_effective_weight *= steer_scale;
+        this->delta_change_cost_effective_weight *= change_scale;
+    }
 
-    fg_eval.ref_v = this->ref_v;               // 또는 ref_v (스코프에 맞게)
-    fg_eval.dt    = this->dt;                  // 네가 쓰는 dt 변수
+    // 직선 감쇠(기본 꺼짐, scale 1.0): 앞으로 preview_s 동안 경로가 거의 직선이면 조향·조향변화 비용을 키운다.
+    // 속도가 아니라 경로 곡률로 판단해, 앞에 곡선이 보이면(평균 곡률 >= kappa_zero) 1.0 이라 곡선 진입은 그대로다.
+    {
+        double sd_scale = 1.0, k_full = 0.004, k_zero = 0.012, sd_preview = 2.5;
+        nh.param<double>("straight_damping/scale", sd_scale, 1.0);
+        if (std::fabs(sd_scale - 1.0) > 1e-9 && !is_highway_mode && !is_avoidance_mode) {
+            nh.param<double>("straight_damping/kappa_full", k_full, 0.004);
+            nh.param<double>("straight_damping/kappa_zero", k_zero, 0.012);
+            nh.param<double>("straight_damping/preview_s", sd_preview, 2.5);
+            sd_scale = std::max(0.2, std::min(sd_scale, 5.0));
+            const double v = std::max(1.0, static_cast<double>(state[3]));
+            double ksum = 0.0;
+            const int n = 12;
+            for (int i = 0; i <= n; ++i) {
+                const double xs = v * sd_preview * i / n;
+                const double d1 = coeffs[1] + 2.0 * coeffs[2] * xs + 3.0 * coeffs[3] * xs * xs;
+                const double d2 = 2.0 * coeffs[2] + 6.0 * coeffs[3] * xs;
+                ksum += std::fabs(d2) / std::pow(1.0 + d1 * d1, 1.5);
+            }
+            const double kmean = ksum / (n + 1);
+            const double straightness = std::max(0.0, std::min(1.0, (k_zero - kmean) / std::max(1e-6, k_zero - k_full)));
+            const double f = 1.0 + straightness * (sd_scale - 1.0);
+            this->delta_cost_effective_weight *= f;
+            this->delta_change_cost_effective_weight *= f;
+        }
+    }
+
+    fg_eval.ref_v = this->ref_v;
+    fg_eval.dt    = this->dt;
     fg_eval.k_v   = this->k_v;
     fg_eval.Lf    = this->Lf;
     fg_eval.previous_delta_cost_reference = this->previous_delta_cost_reference;
@@ -308,11 +344,9 @@ vector<double> MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs)
     // magnitude.
     options += "Sparse  true        forward\n";
     options += "Sparse  true        reverse\n";
-    //0307
     // NOTE: Currently the solver has a maximum time limit of 0.5 seconds.
     // Change this as you see fit.
     options += "Numeric max_cpu_time          0.5\n";
-    //0307
 
     // place to return solution
     CppAD::ipopt::solve_result<Dvector> solution;
@@ -329,7 +363,6 @@ vector<double> MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs)
     this->delta_cost_effective_weight = fg_eval.delta_cost_effective_weight;
     this->delta_change_cost_effective_weight = fg_eval.delta_change_cost_effective_weight;
     
-
     // Returns the first actuator values, along with predicted x and y values to plot in the simulator
     vector<double> result;
     result.push_back(solution.x[delta_start]);
@@ -346,12 +379,6 @@ vector<double> MPC::Solve(Eigen::VectorXd state, Eigen::VectorXd coeffs)
 
 Eigen::VectorXd MPC::predict_FutureState(float velocity_actual, float delta, float cte, float epsi, double target_velocity, double dt)
 {
-    // pred_px = 0;
-    // pred_py = 0;
-    // pred_psi = 0;
-    // pred_v = velocity_actual + k_v * (target_velocity - velocity_actual) * dt;
-    // pred_cte = cte + velocity_actual * sin(epsi) * dt;
-    // pred_epsi = epsi + pred_psi;
 
     pred_px = velocity_actual * dt;
     pred_py = 0;

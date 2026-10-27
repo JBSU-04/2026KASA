@@ -10,9 +10,13 @@
 #include <waypoint_maker/Waypoint.h>
 #include <waypoint_maker/State.h>
 #include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/TwistWithCovarianceStamped.h>
 #include <std_msgs/Int32.h>	
 #include <std_msgs/Float64.h>
+#include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Bool.h>
+#include <std_msgs/String.h>
 #include <geometry_msgs/Pose2D.h>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
@@ -29,22 +33,20 @@
 #include <array>
 #include <string>
 
-//0307
 #include <sensor_msgs/Imu.h>
 #include <morai_msgs/CtrlCmd.h>
 #include <morai_msgs/EgoVehicleStatus.h>
 #include <morai_msgs/CollisionData.h>
-//0307
 #include <new_platform_control/new_platform_control.h>
 
 #include <new_lane/lidar_topic_msg.h>
-
 
 #include <tf/transform_broadcaster.h>
 #include <tf/tf.h>
 #include "ros/time.h"
 
 #include <mpc/mpc.h>
+#include <mpc_path_tracking/steering_delay.h>
 
 #define INTER_TIME_PLUS 1000000000
 #define INTER_TIME_MIN 90000000
@@ -55,7 +57,6 @@
 
 class ROSCONTROL: public MPC {
 	
-
 protected:
 	ros::NodeHandle nh_;
 	ros::NodeHandle private_nh_;
@@ -83,7 +84,6 @@ protected:
 	bool have_prev_twist_;
 	double prev_twist_;
 
-
     int waypoints_size_;
 	int waypoint_min_;
 	int closest_waypoint_;
@@ -92,17 +92,6 @@ protected:
     bool is_lane_;
     bool is_course_;
 	bool is_control_;
-
-	//added 0305 수정
-	// bool is_course_gps_;
-	// bool heading_init_;	
-	// vector<double> heading_vec;
-	// 초기 yaw->course 에서 얻는다. 
-	// double initial_yaw_;
-	// double gps_yaw_;
-	// bool not_first;
-
-
 
 	double dist_;
 	int current_mission_state_;
@@ -120,7 +109,6 @@ protected:
 	double dt_info;
 	int mpc_step_info;
 
-	//erp state
 	int get_gear;
     int get_speed;
     int get_steer;
@@ -136,7 +124,6 @@ protected:
 	double speed_lower_nominal_{0.0};    // 기본 속도 하한(m/s)
 	double speed_limit_urban_max_mps_{15.0};   // 도심 최고속도 상한(m/s)
 	double speed_limit_highway_max_mps_{25.0}; // 고주로 최고속도 상한(m/s)
-
 
 	bool is_acc;
 	int acc_index;
@@ -163,7 +150,6 @@ protected:
 		ros::Publisher mission_speed_target_pub_;
 		ros::Publisher is_highway_mode_pub_;
 
-	// ros::Subscriber course_sub_;
 	ros::Subscriber odom_sub_;
 	ros::Subscriber lane_sub_;
 	ros::Subscriber final_waypoint_sub_;
@@ -198,15 +184,12 @@ protected:
 		bool avoidance_speed_limit_was_active_{false};
 		bool static_speed_scale_was_active_{false};
 
-	// ros::Subscriber imu_sub_;
-
 	morai_msgs::CtrlCmd ackermann_msg_;
 	PlatformConnector platform_;
 
 	tf::TransformBroadcaster tf_broadcaster_; // TF Broadcaster 선언
 
 	// MPC Variables
-	// float dt = 0.1;
 	float steer;
 
 	float velocity_actual;
@@ -215,7 +198,6 @@ protected:
 
 	double input_steer_;
 	double input_speed_;
-	// x
 	double rk_;
 	int prev_mission_state_;
 
@@ -238,7 +220,24 @@ protected:
 		double brake_rate_limit_per_sec_{3.0};
 		double last_commanded_brake_{0.0};
 		double throttle_integral_{0.0};
+		double throttle_integral_band_mps_{0.0};
 		double throttle_pedal_deadband_{0.0};
+		// 목표속도 램프 피드포워드(0 = 끔). 페달 = gain * 목표가속도 / (페달 1.0 의 실측 가속도).
+		double throttle_ff_gain_{0.0};
+		double throttle_ff_accel_per_pedal_{3.5};
+		double throttle_ff_tau_s_{0.3};
+		double throttle_ff_min_accel_{0.6};
+		double throttle_ff_taper_mps_{1.0};
+		double throttle_ff_steer_zero_rad_{0.10};
+		// 규정 3-2 속도 보호: 속도 예외 구간(determineIsHighway) 밖에서 실제 속도가 cut 를 넘으면 가속 0,
+		// brake_at 을 넘으면 brake 를 건다. 60 km/h 를 한 번만 넘어도 15 s 패널티라 목표와 무관하게 막는다.
+		// (speed_limit/hard_limit_* 는 control_arbiter 용인데 대회 launch 는 arbiter 를 띄우지 않는다.)
+		bool legal_guard_enabled_{true};
+		double legal_guard_cut_mps_{16.2};
+		double legal_guard_brake_at_mps_{16.4};
+		double legal_guard_brake_{0.3};
+		double ff_prev_target_mps_{-1.0};
+		double ff_target_accel_{0.0};
 		double steering_command_sign_{-1.0};
 		double steering_command_rate_limit_radps_{1.0};
 		bool steering_output_lpf_enabled_{false};
@@ -246,6 +245,57 @@ protected:
 		double steering_output_lpf_alpha_high_speed_{0.75};
 		double previous_steering_command_rad_{0.0};
 		bool have_previous_steering_command_{false};
+		// 조향 지연보상(민성 0929 이식). 0 이면 꺼짐(기존 0.05 s 단일 예측만 사용).
+		// 매 주기 getParamCached 로 다시 읽으므로 rosparam set 으로 실행 중 바꿀 수 있다.
+		double steering_actuator_delay_s_{0.0};
+		// 이력 적분에 쓸 Lf. 0 이하면 MPC 모델 Lf 를 그대로 쓴다.
+		double steering_delay_model_lf_{0.0};
+		std::deque<mpc_tracking::TimedSteering> steering_history_;
+		ros::Publisher steering_delay_pub_;
+		// 지연보상 v2(조건 불변): 상태 지연(실측) + MPC 계산 지연(실측) + 조향 지연(τ0 + 프레임 대기).
+		// delay_comp/enabled 가 true 면 위의 고정 τ(steer/actuator_delay_s) 경로 대신 이것을 쓴다.
+		bool dc_enabled_{false};
+		double dc_state_k_{1.0}, dc_state_c_s_{0.010}, dc_state_max_s_{0.12};
+		double dc_act_base_s_{0.06}, dc_act_frame_k_{0.5}, dc_model_lf_{4.2};
+		double dc_fallback_period_s_{0.020}, dc_compute_max_s_{0.10};
+		double dc_period_s_{-1.0}, dc_last_imu_stamp_{0.0};
+		std::deque<double> dc_intervals_;
+		// 실효 Lf 실시간 측정: MORAI 상태 패킷(같은 패킷의 실제 바퀴각·요레이트·속도)으로
+		// Lf = v*delta/yaw_rate 를 곡선에서만 천천히 갱신한다. 차량 고유값이라 조건과 무관해야 한다.
+		bool dc_lf_online_{true};
+		double dc_test_extra_compute_s_{0.0};   // 시험 전용: 느린 PC 의 계산 시간을 흉내 낸다(기본 0)
+		double dc_lf_est_{-1.0}, dc_lf_x_{0.0}, dc_lf_y_{0.0}, dc_lf_last_stamp_{0.0};
+		ros::Time dc_last_imu_rx_;
+		double dc_compute_s_{0.03};
+		ros::WallTime dc_pred_wall_;
+		bool dc_pred_pending_{false};
+		ros::Time last_odom_stamp_;
+		double odom_yaw_rate_{0.0};
+		// 상태 입력: odom = ekf_odom_output 가 자기 50 Hz 타이머로 다시 찍어 내는 /odom,
+		// ekf = 같은 값을 EKF 원본 토픽에서 바로 받는다(재발행 대기 8~18 ms 가 없고 stamp 가 EKF 계산 시각).
+		std::string state_source_{"odom"};
+		ros::Subscriber ekf_pose_sub_, ekf_twist_sub_;
+		bool ekf_twist_ok_{false};
+		double ekf_yaw_rate_{0.0};
+		double ekf_vx_{0.0};
+		// MPC 입력 위치 필터(state_filter/enabled). GPS(NMEA)가 0.15~0.19 m 계단으로 와서 생기는 EKF 위치·헤딩
+		// 떨림을 직선에서만 거른다: 차속·요레이트로 적분하고 횡위치·헤딩만 EKF 쪽으로 tau 로 맞춘다(진행방향은 EKF).
+		// 커브·회전 중, 정지·후진, GPS 음영/복귀 중에는 EKF 값을 그대로 쓴다.
+		bool sf_enabled_{false};
+		double sf_pos_tau_s_{1.0}, sf_yaw_tau_s_{1.0};
+		double sf_kappa_full_{0.004}, sf_kappa_zero_{0.012}, sf_preview_s_{2.5};
+		double sf_wz_full_{0.03}, sf_wz_zero_{0.10};
+		double sf_s_up_rate_{0.5}, sf_s_last_t_{0.0};
+		double sf_max_lat_m_{0.04}, sf_max_yaw_rad_{0.3 * M_PI / 180.0};
+		double sf_reset_pos_m_{0.3}, sf_reset_yaw_rad_{3.0 * M_PI / 180.0};
+		bool sf_init_{false};
+		double sf_x_{0.0}, sf_y_{0.0}, sf_yaw_{0.0}, sf_last_stamp_{0.0}, sf_straightness_{0.0};
+		int sf_reset_count_{0};
+		std::string gps_mode_{"normal"};
+		ros::Subscriber gps_mode_sub_;
+		ros::Publisher sf_debug_pub_;
+		ros::Subscriber dc_imu_sub_;
+		ros::Publisher dc_debug_pub_;
 		bool have_competition_feedback_{false};
 		double competition_speed_mps_{0.0};
 		double competition_wheel_angle_deg_{0.0};
@@ -262,7 +312,7 @@ protected:
         double urban_curvature_speed_rate_up_mps2_{1.0};
 		double avoidance_lateral_accel_limit_mps2_{3.0};
 		double avoidance_curvature_min_speed_mps_{3.0};
-		// 회피 곡률 속도 프로파일을 쓰는 구간(2026-09-26: M2 + 음영구간 M8).
+		// 회피 곡률 속도 프로파일을 쓰는 구간(M2, 음영구간 M8).
 		std::vector<std::string> avoidance_sections_{"M2", "M8"};
 		double curvature_min_speed_mps_{3.5};
 		double curvature_max_speed_mps_{0.0};
@@ -295,7 +345,6 @@ protected:
 		double missionStateTargetSpeedMps() const;
 		bool determineIsHighway() const;
 
-
 public:
 	ros::Time ex_stamp;
     ROSCONTROL() 
@@ -313,14 +362,10 @@ public:
 		ros::Time::init();
 		MPC mpc;
 		
-
-		
-
         ex_x_ = 0.0;
 		ex_y_ = 0.0;
 		ex_time_ = 0;
         inter_time_ = 0;
-
 
         cur_course_ = .0;
         cur_speed_ = .0;
@@ -333,15 +378,6 @@ public:
         is_lane_ = false;
         is_course_ = false;
 		is_control_ = false;
-
-		//0305 수정
-		// is_course_gps_ = false;
-		// heading_init_ = false;
-		// initial_yaw_ = 0.0;
-		// gps_yaw_ = 0.0;
-		// not_first = false;
-
-
 
 		dist_ = 100.0;
 		current_mission_state_ = -1;
@@ -383,8 +419,6 @@ public:
 			path_end_min_polyfit_points_ = 4;
 		}
 
-
-		//0307
 		ackermann_pub_ = nh_.advertise<morai_msgs::CtrlCmd>("/ctrl_cmd", 1);
 		nh_.param<int>("longitudinal/command_type", longitudinal_command_type_, 1);
 		nh_.param<double>("longitudinal/throttle_kp", throttle_kp_, 0.25);
@@ -396,6 +430,21 @@ public:
 			nh_.param<double>("longitudinal/kick_brake_limit", kick_brake_limit_, 0.60);
 			nh_.param<double>("longitudinal/brake_rate_limit_per_sec", brake_rate_limit_per_sec_, 3.0);
 			nh_.param<double>("longitudinal/throttle_pedal_deadband", throttle_pedal_deadband_, 0.0);
+			nh_.param<double>("longitudinal/throttle_integral_band_mps", throttle_integral_band_mps_, 0.0);
+			nh_.param<double>("longitudinal/throttle_ff_gain", throttle_ff_gain_, 0.0);
+			nh_.param<double>("longitudinal/throttle_ff_accel_per_pedal_mps2", throttle_ff_accel_per_pedal_, 3.5);
+			nh_.param<double>("longitudinal/throttle_ff_tau_s", throttle_ff_tau_s_, 0.3);
+			nh_.param<double>("longitudinal/throttle_ff_min_accel_mps2", throttle_ff_min_accel_, 0.6);
+			nh_.param<double>("longitudinal/throttle_ff_taper_mps", throttle_ff_taper_mps_, 1.0);
+			throttle_ff_taper_mps_ = std::max(0.1, throttle_ff_taper_mps_);
+			nh_.param<double>("longitudinal/throttle_ff_steer_zero_rad", throttle_ff_steer_zero_rad_, 0.10);
+			throttle_ff_steer_zero_rad_ = std::max(0.01, throttle_ff_steer_zero_rad_);
+			nh_.param<bool>("longitudinal/legal_guard/enabled", legal_guard_enabled_, true);
+			nh_.param<double>("longitudinal/legal_guard/cut_mps", legal_guard_cut_mps_, 16.2);
+			nh_.param<double>("longitudinal/legal_guard/brake_at_mps", legal_guard_brake_at_mps_, 16.4);
+			nh_.param<double>("longitudinal/legal_guard/brake", legal_guard_brake_, 0.3);
+			throttle_ff_accel_per_pedal_ = std::max(0.5, throttle_ff_accel_per_pedal_);
+			throttle_ff_tau_s_ = std::max(0.0, throttle_ff_tau_s_);
 		nh_.param<double>("steer/command_sign", steering_command_sign_, -1.0);
 		nh_.param<double>("steer/command_rate_limit_radps", steering_command_rate_limit_radps_, 1.0);
 		nh_.param<bool>("steer/output_lpf_enabled", steering_output_lpf_enabled_, false);
@@ -403,6 +452,12 @@ public:
 		steering_output_lpf_alpha_ = clampValue(steering_output_lpf_alpha_, 0.0, 1.0);
 		nh_.param<double>("steer/output_lpf_alpha_high_speed", steering_output_lpf_alpha_high_speed_, 0.75);
 		steering_output_lpf_alpha_high_speed_ = clampValue(steering_output_lpf_alpha_high_speed_, 0.0, 1.0);
+		nh_.param<double>("steer/actuator_delay_s", steering_actuator_delay_s_, 0.0);
+		steering_actuator_delay_s_ = clampValue(steering_actuator_delay_s_, 0.0, 0.5);
+		nh_.param<double>("steer/delay_model_lf", steering_delay_model_lf_, 0.0);
+		ROS_INFO("[MPC] steering delay compensation: delay=%.3f s (0=off), integration Lf=%.2f",
+				 steering_actuator_delay_s_,
+				 steering_delay_model_lf_ > 0.0 ? steering_delay_model_lf_ : Lf);
 		nh_.param<bool>("mission_speed/enabled", mission_speed_enabled_, true);
 		nh_.param<double>("mission_speed/default_mps", mission_speed_default_mps_, ref_v_nominal_);
 		mission_speed_state_mps_.fill(mission_speed_default_mps_);
@@ -436,7 +491,6 @@ public:
 		nh_.param<bool>("curvature_speed/use_waypoint_rk", curvature_use_waypoint_rk_, true);
 		nh_.param<bool>("curvature_speed/fallback_to_polyfit", curvature_fallback_to_polyfit_, true);
 		curvature_percentile_ = clampValue(curvature_percentile_, 0.0, 1.0);
-			//0307
 			rviz_predicted_path_ = nh_.advertise<nav_msgs::Path>("/rviz_predicted_path", 1);
 			vis_pub_ = nh_.advertise<visualization_msgs::Marker>("pose",1);
 			mpc_target_speed_pub_ = nh_.advertise<std_msgs::Float64>(
@@ -451,10 +505,64 @@ public:
 				"/control_feedback/mission_speed_target_mps", 10);
 			is_highway_mode_pub_ = nh_.advertise<std_msgs::Bool>(
 				"/control_feedback/is_highway_mode", 10);
+			steering_delay_pub_ = nh_.advertise<std_msgs::Float64>(
+				"/control_feedback/steering_delay_s", 10);
+			// [period_s, odom_age_s, state_delay_s, compute_s, actuation_s, enabled]
+			dc_debug_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
+				"/control_feedback/delay_comp", 10);
+			nh_.param<bool>("delay_comp/enabled", dc_enabled_, false);
+			nh_.param<double>("delay_comp/state_k", dc_state_k_, 1.0);
+			nh_.param<double>("delay_comp/state_c_s", dc_state_c_s_, 0.010);
+			nh_.param<double>("delay_comp/state_max_s", dc_state_max_s_, 0.12);
+			nh_.param<double>("delay_comp/actuation_base_s", dc_act_base_s_, 0.06);
+			nh_.param<double>("delay_comp/actuation_frame_k", dc_act_frame_k_, 0.5);
+			nh_.param<double>("delay_comp/model_lf", dc_model_lf_, 4.2);
+			nh_.param<double>("delay_comp/fallback_period_s", dc_fallback_period_s_, 0.020);
+			nh_.param<double>("delay_comp/compute_max_s", dc_compute_max_s_, 0.10);
+			nh_.param<bool>("delay_comp/lf_online", dc_lf_online_, true);
+			nh_.param<double>("delay_comp/test_extra_compute_s", dc_test_extra_compute_s_, 0.0);
+			dc_imu_sub_ = nh_.subscribe("/imu", 50, &ROSCONTROL::DelayImuCallback, this);
+			ROS_INFO("[MPC] delay_comp %s: d_state=%.2f*T+%.3f+odom_age (max %.2f), tau_act=%.3f+%.2f*T, Lf=%.2f, fallback T=%.3f",
+					 dc_enabled_ ? "ON" : "off", dc_state_k_, dc_state_c_s_, dc_state_max_s_,
+					 dc_act_base_s_, dc_act_frame_k_, dc_model_lf_, dc_fallback_period_s_);
 
-		// course_sub_ = nh_.subscribe("course", 1, &ROSCONTROL::CourseCallback, this);
-		odom_sub_ = nh_.subscribe("/odom", 1, &ROSCONTROL::OdomCallback, this);
-		lane_sub_ = nh_.subscribe("/local_path", 1, &ROSCONTROL::PathCallback, this);
+		nh_.param<std::string>("state_input/source", state_source_, std::string("odom"));
+		if (state_source_ == "ekf") {
+			ekf_pose_sub_ = nh_.subscribe("/ekf_pose_with_covariance", 1, &ROSCONTROL::EkfPoseCallback, this);
+			ekf_twist_sub_ = nh_.subscribe("/ekf_twist_with_covariance", 1, &ROSCONTROL::EkfTwistCallback, this);
+		} else {
+			state_source_ = "odom";
+			odom_sub_ = nh_.subscribe("/odom", 1, &ROSCONTROL::OdomCallback, this);
+		}
+		ROS_INFO("[MPC] state input: %s", state_source_ == "ekf"
+				 ? "EKF raw (/ekf_pose_with_covariance + /ekf_twist_with_covariance)" : "/odom");
+		nh_.param<bool>("state_filter/enabled", sf_enabled_, false);
+		nh_.param<double>("state_filter/pos_tau_s", sf_pos_tau_s_, 1.0);
+		nh_.param<double>("state_filter/yaw_tau_s", sf_yaw_tau_s_, 1.0);
+		nh_.param<double>("state_filter/kappa_full", sf_kappa_full_, 0.004);
+		nh_.param<double>("state_filter/kappa_zero", sf_kappa_zero_, 0.012);
+		nh_.param<double>("state_filter/preview_s", sf_preview_s_, 2.5);
+		nh_.param<double>("state_filter/yaw_rate_full_radps", sf_wz_full_, 0.03);
+		nh_.param<double>("state_filter/yaw_rate_zero_radps", sf_wz_zero_, 0.10);
+		nh_.param<double>("state_filter/straightness_up_rate_per_s", sf_s_up_rate_, 0.5);
+		nh_.param<double>("state_filter/max_lat_offset_m", sf_max_lat_m_, 0.04);
+		double sf_max_yaw_deg = 0.3;
+		nh_.param<double>("state_filter/max_yaw_offset_deg", sf_max_yaw_deg, 0.3);
+		sf_max_yaw_rad_ = sf_max_yaw_deg * M_PI / 180.0;
+		nh_.param<double>("state_filter/reset_pos_m", sf_reset_pos_m_, 0.3);
+		double sf_reset_yaw_deg = 3.0;
+		nh_.param<double>("state_filter/reset_yaw_deg", sf_reset_yaw_deg, 3.0);
+		sf_reset_yaw_rad_ = sf_reset_yaw_deg * M_PI / 180.0;
+		if (sf_enabled_) {
+			gps_mode_sub_ = nh_.subscribe("/localization/gps_mode", 5, &ROSCONTROL::GpsModeCallback, this);
+			// [straightness, lateral EKF-filter (m), yaw EKF-filter (deg), reset count, gps normal]
+			sf_debug_pub_ = nh_.advertise<std_msgs::Float64MultiArray>("/control_feedback/state_filter", 10);
+		}
+		ROS_INFO("[MPC] state filter %s: tau pos %.2f s, yaw %.2f s, straight kappa %.4f..%.4f over %.1f s, yaw rate %.2f..%.2f rad/s, ramp %.2f /s, max offset %.3f m / %.2f deg, reset %.2f m / %.1f deg",
+				 sf_enabled_ ? "ON" : "off", sf_pos_tau_s_, sf_yaw_tau_s_, sf_kappa_full_, sf_kappa_zero_,
+				 sf_preview_s_, sf_wz_full_, sf_wz_zero_, sf_s_up_rate_, sf_max_lat_m_, sf_max_yaw_deg,
+				 sf_reset_pos_m_, sf_reset_yaw_deg);
+		lane_sub_ =nh_.subscribe("/local_path", 1, &ROSCONTROL::PathCallback, this);
 		final_waypoint_sub_ = nh_.subscribe("/final_waypoint", 1, &ROSCONTROL::FinalWaypointCallback, this);
 		state_sub_ = nh_.subscribe("/gps_state",1,&ROSCONTROL::StateCallback,this);
 		lidar_topic_sub_=  nh_.subscribe("lidar_topic", 1, &ROSCONTROL::LidarLaneCallback, this);
@@ -485,11 +593,7 @@ public:
 				 path_end_approach_trigger_m_, path_end_approach_decel_mps2_,
 				 path_end_stop_margin_m_);
 
-		// heading_vec.clear();
-		// imu_sub_ = nh_.subscribe("imu",1,&ROSCONTROL::ImuCallback,this);
-
     }
-	//0307
 	void ErpCallback(const erp_driver::erpStatusMsg::ConstPtr &msg){
         
         get_gear = msg->gear;
@@ -503,73 +607,6 @@ public:
 		Get_MPH_Speed_ = Get_Kmh_Speed_ / 3.6;
        
     }
-	//0307
-
-	// void CourseCallback(const std_msgs::Float32::ConstPtr &course_msg) {
-	// 	double temp_course = 0.0;
-
-	// 	// nmea_parser에서 publish하는 진북기준 heading(deg)
-	// 	temp_course = course_msg->data;
-
-	// 	is_course_gps_ = true;
-		
-	// 	if(is_course_gps_ && !heading_init_){ // default = 10;
-	// 		heading_vec.push_back((double)temp_course);
-	// 		//gps - atan 좌표계 통일 -> temp_course : 진북 기준, 시계 방향, 0 ~ π / 반시계 방향, 0 ~ -π	
-
-
-	// 		//도 
-	// 		cur_course_ = -1 * temp_course + 90;
-	// 		if(cur_course_ < 180){
-	// 			cur_course_ += 360;
-	// 		}
-	// 		// 라디안으로 바꾸기
-	// 		cur_course_ = cur_course_ * (M_PI/180);
-
-
-	// 		// cur_course_ = temp_course;
-	// 		is_course_ = true;
-	// 		is_course_gps_ = false;
-	// 	}
-	// 	if(!heading_init_ &&  heading_vec.size() >= 10 && !not_first){  // default = 10;
-	// 		double max = *max_element(heading_vec.begin(), heading_vec.end());
-	// 		double min = *min_element(heading_vec.begin(), heading_vec.end());
-	// 		if(abs(max - min) > 180){
-	// 			for(int i = 0; i < heading_vec.size(); i++){
-	// 				if(heading_vec[i] > 180){
-	// 					heading_vec[i] = heading_vec[i] - 360;
-	// 				}
-	// 			}
-	// 		}
-	// 	// 평균값 사용
-	// 		for(int i = 0; i < heading_vec.size();i++){
-	// 			initial_yaw_ += heading_vec[i];
-	// 		}
-	// 		initial_yaw_ /= heading_vec.size();
-	// 		initial_yaw_ *= (M_PI/180);
-	// 		heading_init_ = true;
-
-	// 		not_first = true;
-	// 		// 분산 활용해서 확룰 가장 높은거 선택하는 코드 작성하기
-	// 	}
-	// 	if(!heading_init_ && not_first){
-	// 		initial_yaw_ = temp_course * M_PI / 180;
-	// 		heading_init_ = true;
-	// 	}
-
-
-	// 	//cout << "heading init      : " << heading_init_ << endl;
-	// 	//cout << "inital yaw(deg)   : " << initial_yaw_*180/M_PI << endl;
-	// 	//cout << "heading vector size" << heading_vec.size() << endl;
-	// 	//cout << "GPS Yaw is : " << cur_course_ << endl;
-	// 	gps_yaw_ = temp_course;
-	// }
-
-
-	
-	// double getCmdSpeedKmh() const { return cmd_speed_kmh_; }
-	// double getCmdSteerDeg() const { return cmd_steer_deg_; }
-	// bool   hasCmd() const { return cmd_valid_; }
 
 	static inline double applyACC_kmh(double spd_state_kmh, bool is_acc, int acc_index)
 	{
@@ -586,7 +623,6 @@ public:
 
 			double delta = 0.0;
 
-			// if (spd_state_kmh == 22.0) delta = (91.7 * sig - 75.53);
 			if (spd_state_kmh == 20.0) delta = (83.3 * sig - 68.67);
 			else if (spd_state_kmh == 18.0) delta = (75.0 * sig - 61.8);
 			else if (spd_state_kmh == 16.0) delta = (66.7 * sig - 54.93);
@@ -604,8 +640,39 @@ public:
 		return input_speed_kmh;
 	}
 
+	// EKF 원본 입력. /odom 과 값은 같고(ekf_odom_output 은 그대로 복사만 한다), 그 노드의
+	// 유한값 검사만 똑같이 둔다. EKF 는 같은 주기에 pose -> twist 순으로 내고 MPC 는 루프마다
+	// 콜백을 몰아서 처리하므로 odom_yaw_rate_ 는 solve 시점에 같은 주기의 twist 값이 된다.
+	void EkfTwistCallback(const geometry_msgs::TwistWithCovarianceStamped::ConstPtr &msg)
+	{
+		ekf_twist_ok_ = std::isfinite(msg->twist.twist.linear.x) && std::isfinite(msg->twist.twist.angular.z);
+		if (!ekf_twist_ok_) return;
+		ekf_yaw_rate_ = msg->twist.twist.angular.z;
+		odom_yaw_rate_ = ekf_yaw_rate_;
+		ekf_vx_ = msg->twist.twist.linear.x;
+	}
 
-    void OdomCallback(const nav_msgs::Odometry::ConstPtr &odom_msg) 
+	void GpsModeCallback(const std_msgs::String::ConstPtr &msg)
+	{
+		gps_mode_ = msg->data;
+	}
+
+	void EkfPoseCallback(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &msg)
+	{
+		const auto &p = msg->pose.pose;
+		const bool finite = std::isfinite(p.position.x) && std::isfinite(p.position.y) &&
+			std::isfinite(p.orientation.x) && std::isfinite(p.orientation.y) &&
+			std::isfinite(p.orientation.z) && std::isfinite(p.orientation.w) &&
+			std::isfinite(msg->pose.covariance[0]) && std::isfinite(msg->pose.covariance[7]);
+		if (!ekf_twist_ok_ || !finite) return;
+		nav_msgs::Odometry::Ptr odom(new nav_msgs::Odometry);
+		odom->header = msg->header;
+		odom->pose = msg->pose;
+		odom->twist.twist.angular.z = ekf_yaw_rate_;
+		OdomCallback(odom);
+	}
+
+    void OdomCallback(const nav_msgs::Odometry::ConstPtr &odom_msg)
 	{
 		ros::Time cur_stamp = odom_msg->header.stamp;
 		cur_pose_.pose.position = odom_msg->pose.pose.position;
@@ -614,27 +681,12 @@ public:
 
 		// map -> base_link TF is owned by odom_information.
 		// Do not publish the same transform from the controller.
-		// broadcastTransform();
 		double cur_time_sec = cur_stamp.toSec();
 		double ex_time_sec = ex_stamp.toSec();
-
 
 		double dt = cur_time_sec - ex_time_sec;
 		if (dt <= 1e-3) dt = 0.1;
 
-		// const double v_twist = odom_msg->twist.twist.linear.x;
-
-		// // 1. 최대 속도로 gps 노이즈 방지
-		// const double V_MAX = 10.0;     // erp: -> 36 km/h (최대속도 : 23?이니까)
-		// bool twist_good = std::isfinite(v_twist) && (std::fabs(v_twist) <= V_MAX);
-
-
-
-
-		// if (twist_good) {
-		// cur_speed_ = v_twist;
-		// } else {
-		// fallback
 		if (dt > SOME_MIN && dt < SOME_MAX){
 			cur_speed_ = getSpeed(ex_x_, ex_y_,
 								odom_msg->pose.pose.position.x,
@@ -646,12 +698,14 @@ public:
 		// update prev (항상 업데이트: 점프 감지 안정적)
 
 		ex_stamp = cur_stamp;
+		last_odom_stamp_ = cur_stamp;
+		odom_yaw_rate_ = std::isfinite(odom_msg->twist.twist.angular.z) ? odom_msg->twist.twist.angular.z : 0.0;
+		if (state_source_ == "odom" && std::isfinite(odom_msg->twist.twist.linear.x)) {
+			ekf_vx_ = odom_msg->twist.twist.linear.x;
+		}
 		ex_x_ = cur_pose_.pose.position.x;
 		ex_y_ = cur_pose_.pose.position.y;
 		is_pose_ = true;
-
-
-
 
 		tf::Quaternion q(odom_msg->pose.pose.orientation.x,
 						odom_msg->pose.pose.orientation.y,
@@ -665,64 +719,12 @@ public:
 
 		is_course_ = true;
 
-		//cout << "cur_course is : " << cur_course_ << endl;
-		// cur_course_ = yaw * (180.0 / M_PI);
-
-		// if(heading_init_){
-
-		// 	is_course_ = true;
-
-		// 	tf::Quaternion q(odom_msg->pose.pose.orientation.x,
 		// 					odom_msg->pose.pose.orientation.y,
 		// 					odom_msg->pose.pose.orientation.z,
-		// 					odom_msg->pose.pose.orientation.w);
-		// 	tf::Matrix3x3 m(q);
-		// 	double roll, pitch, yaw;
-		// 	m.getRPY(roll,pitch,yaw);
 
-		// 	// yaw 는 라디안 
-		// 	cur_course_ = yaw;
-
-		// 	//cout << "cur_course is : " << cur_course_ << endl;
-		// 	// cur_course_ = yaw * (180.0 / M_PI);
-
-		// }
-
-		// tf::Quaternion q(odom_msg->pose.pose.orientation.x,
 		// 				 odom_msg->pose.pose.orientation.y,
 		// 				 odom_msg->pose.pose.orientation.z,
-		// 				 odom_msg->pose.pose.orientation.w);
-		// tf::Matrix3x3 m(q);
-		// double roll, pitch, yaw;
-		// m.getRPY(roll,pitch,yaw);
-		// cur_course_ = yaw;
-		// //cout << "cur_course is : " << cur_course_ << endl;
-		// // cur_course_ = yaw * (180.0 / M_PI);
-		// is_course_ = true;
 
-		// visualization_msgs::Marker marker;
-		// marker.header.frame_id = "map";
-		// marker.header.stamp = ros::Time();
-		// marker.ns = "my_namespace";
-		// marker.id = 0;
-		// marker.type = visualization_msgs::Marker::SPHERE;
-		// marker.action = visualization_msgs::Marker::ADD;
-		// marker.pose.position.x = odom_msg->pose.pose.position.x;
-		// marker.pose.position.y = odom_msg->pose.pose.position.y;
-		// marker.pose.position.z = odom_msg->pose.pose.position.z;
-		// marker.pose.orientation.x = 0.0;
-		// marker.pose.orientation.y = 0.0;
-		// marker.pose.orientation.z = 0.0;
-		// marker.pose.orientation.w = 1.0;
-		// marker.scale.x = 0.3;
-		// marker.scale.y = 0.3;
-		// marker.scale.z = 0.1;
-		// marker.color.a = 1.0; // Don't forget to set the alpha!
-		// marker.color.r = 1.0;
-		// marker.color.g = 0.0;
-		// marker.color.b = 0.0;
-
-		// vis_pub_.publish( marker );
 	}
 
 	void PathCallback(const nav_msgs::Path::ConstPtr& path_msg)
@@ -737,7 +739,6 @@ public:
 	        wp.waypoint_index = index++;
 	        wp.pose = pose_stamped;  // geometry_msgs::PoseStamped 그대로 복사
 	        
-
 	        waypoints_.push_back(wp);
 	    }
 
@@ -764,25 +765,19 @@ public:
 		transform.header.frame_id = "map";          
 		transform.child_frame_id = "base_link";     
 
-
 		transform.transform.translation.x = cur_pose_.pose.position.x;
 		transform.transform.translation.y = cur_pose_.pose.position.y;
 		transform.transform.translation.z = cur_pose_.pose.position.z;
 
-
 		geometry_msgs::Quaternion orientation = cur_pose_.pose.orientation;
-
 
 		if (std::isnan(orientation.x) || std::isnan(orientation.y) ||
 			std::isnan(orientation.z) || std::isnan(orientation.w) ||
 			(orientation.x == 0 && orientation.y == 0 &&
 			orientation.z == 0 && orientation.w == 0)) {
-			// ROS_WARN("[TF BROADCASTER] Invalid quaternion detected. Using identity quaternion.");
 			
-
 			double yaw = cur_course_; 
 			
-
 			tf::Quaternion tf_quat;
 			tf_quat.setRPY(0.0, 0.0, yaw);  
 			
@@ -797,30 +792,12 @@ public:
 		tf_broadcaster_.sendTransform(transform);
 	}
 
-
-
-
-
 	void StateCallback(const waypoint_maker::State::ConstPtr &state_msg)
 	{
 		dist_ = state_msg->dist;
 		current_mission_state_ = state_msg->current_state;
 		loader_number_ = state_msg->lane_number;
 	}
-
-    // void ImuCallback(const sensor_msgs::Imu::ConstPtr &imu_msg)
-	// {
-	// 	tf::Quaternion q(imu_msg->orientation.x, imu_msg->orientation.y,
-	// 		imu_msg->orientation.z, imu_msg->orientation.w);
-	// 	tf::Matrix3x3 m(q);
-	// 	double roll, pitch, yaw;
-	// 	m.getRPY(roll,pitch,yaw);
-	// 	cur_course_ = yaw;
-	// 	//cout << "cur_course is : " << cur_course_ << endl;
-	// 	// cur_course_ = yaw * (180.0 / M_PI);
-	// 	is_course_ = true;
-	// }
-
 
 	void LidarLaneCallback(const new_lane::lidar_topic_msg::ConstPtr &msg)
 	{
@@ -837,6 +814,52 @@ public:
 		have_external_acc_target_ = true;
 	}
 
+		// MORAI 센서 갱신 주기 T: /imu 새 샘플(브리지가 같은 stamp 는 버린다) 간격의 EMA.
+		// MORAI 는 프레임마다 한 번만 센서를 갱신하므로 T 는 그 PC 의 시뮬레이터 프레임 간격이다.
+		void DelayImuCallback(const sensor_msgs::Imu::ConstPtr &msg)
+		{
+			const double stamp = msg->header.stamp.toSec();
+			if (stamp <= 0.0) return;
+			if (dc_last_imu_stamp_ > 0.0) {
+				const double d = stamp - dc_last_imu_stamp_;
+				if (d <= 1e-6) return;
+				if (d > 0.005 && d < 0.2) {
+					// 최근 15개 간격의 중앙값: 시작 직후 큰 간격이나 순간 튐에 끌려가지 않는다.
+					dc_intervals_.push_back(d);
+					while (dc_intervals_.size() > 15) dc_intervals_.pop_front();
+					if (dc_intervals_.size() >= 5) {
+						std::vector<double> sorted(dc_intervals_.begin(), dc_intervals_.end());
+						std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+						dc_period_s_ = sorted[sorted.size() / 2];
+					}
+				}
+			}
+			dc_last_imu_stamp_ = stamp;
+			dc_last_imu_rx_ = ros::Time::now();
+		}
+
+		void updateEffectiveLf(const morai_msgs::EgoVehicleStatus &msg)
+		{
+			const double stamp = msg.header.stamp.toSec();
+			if (stamp <= dc_lf_last_stamp_ + 1e-6) return;          // MORAI 가 같은 샘플을 두 번 보낸다
+			const double dt = dc_lf_last_stamp_ > 0.0 ? std::min(stamp - dc_lf_last_stamp_, 0.2) : 0.05;
+			dc_lf_last_stamp_ = stamp;
+			const double v = std::hypot(msg.velocity.x, msg.velocity.y);
+			// wheel_angle 은 deg, /ctrl_cmd 와 부호가 반대 -> MPC 부호(yaw_rate = -v*delta/Lf) 와 같다.
+			// MORAI 상태 패킷의 angular_velocity.z 는 ROS(반시계 +) 와 부호가 반대다(실측 비 -1.00).
+			const double delta = msg.wheel_angle * M_PI / 180.0;
+			const double yaw_rate = -msg.angular_velocity.z;
+			if (!std::isfinite(v) || !std::isfinite(delta) || !std::isfinite(yaw_rate)) return;
+			const double a = 1.0 - std::exp(-dt / 0.5);                  // 0.5 s 저역통과(정상 상태 비)
+			dc_lf_x_ += a * (-v * delta - dc_lf_x_);
+			dc_lf_y_ += a * (yaw_rate - dc_lf_y_);
+			if (v < 3.0 || std::fabs(dc_lf_y_) < 0.08 || dc_lf_x_ * dc_lf_y_ <= 0.0) return;   // 곡선에서만
+			const double lf = dc_lf_x_ / dc_lf_y_;
+			if (lf < 3.0 || lf > 6.0) return;
+			const double b = 1.0 - std::exp(-dt / 3.0);                  // 3 s 시정수로 천천히
+			dc_lf_est_ = dc_lf_est_ <= 0.0 ? lf : dc_lf_est_ + b * (lf - dc_lf_est_);
+		}
+
 		void CompetitionCallback(const morai_msgs::EgoVehicleStatus::ConstPtr &msg)
 		{
 			competition_speed_mps_ = std::hypot(msg->velocity.x, msg->velocity.y);
@@ -844,6 +867,7 @@ public:
 			// opposite sign convention from /ctrl_cmd.steering.
 			competition_wheel_angle_deg_ = msg->wheel_angle;
 			have_competition_feedback_ = true;
+			updateEffectiveLf(*msg);
 		}
 
 		void AvoidanceSpeedCallback(const std_msgs::Float64::ConstPtr &msg)
@@ -864,7 +888,6 @@ public:
 		{
 			in_exempt_section_ = msg->speed_limit_exempt;
 			active_section_id_ = msg->section_id;
-            // Entry obstacle control uses the existing M8 avoidance tune;
             // cruise section ID and all numerical MPC fitting stay unchanged.
             const bool entry = msg->index_valid && active_section_id_=="M7B" &&
                 std::find(msg->executors.begin(),msg->executors.end(),"static_obstacle")!=msg->executors.end() &&
@@ -1102,6 +1125,24 @@ public:
 
 			previous_steering_command_rad_ = command;
 			have_previous_steering_command_ = true;
+			// 지연보상용 명령 이력(MPC 부호 기준). 1 s 넘게 끊기거나 시계가 역행하면 비운다.
+			const double now = ros::Time::now().toSec();
+			if (!steering_history_.empty() &&
+				(now < steering_history_.back().time_s || now - steering_history_.back().time_s > 1.0)) {
+				steering_history_.clear();
+			}
+			if (std::fabs(steering_command_sign_) > 1e-6) {
+				steering_history_.push_back({now, command / steering_command_sign_});
+			}
+			if (dc_pred_pending_) {
+				// 예측 시점 -> 명령 확정까지 걸린 실제 시간. 올라갈 때는 바로, 내려갈 때는 천천히 따라간다.
+				const double sample = std::min((ros::WallTime::now() - dc_pred_wall_).toSec(), dc_compute_max_s_);
+				dc_compute_s_ = sample > dc_compute_s_ ? sample : dc_compute_s_ + 0.1 * (sample - dc_compute_s_);
+				dc_pred_pending_ = false;
+			}
+			while (steering_history_.size() > 1 && steering_history_[1].time_s < now - 1.0) {
+				steering_history_.pop_front();
+			}
 			return command;
 		}
 
@@ -1113,6 +1154,8 @@ public:
 
 		if (target_speed_mps <= 0.05) {
 			throttle_integral_ = 0.0;
+			ff_prev_target_mps_ = 0.0;
+			ff_target_accel_ = 0.0;
 			ackermann_msg_.accel = 0.0;
 			double desired_stop_brake = brake_limit;
 			const double max_brake_increase = brake_rate_limit_per_sec_ * dt;
@@ -1125,11 +1168,43 @@ public:
 		}
 
 		const double speed_error = target_speed_mps - actual_speed_mps;
-		throttle_integral_ += speed_error * dt;
+		// band > 0 이면 목표 근처에서만 적분한다(가속·감속 램프 중 와인드업 없이 정속 오차만 없앤다).
+		// 0 이면 기존처럼 항상 적분.
+		if (throttle_integral_band_mps_ <= 0.0 || std::fabs(speed_error) < throttle_integral_band_mps_) {
+			throttle_integral_ += speed_error * dt;
+		}
+		// 목표보다 빠른데 양(+)의 적분이 남아 있으면 지운다. 없으면 고주로(20 m/s 유지 페달)에서 쌓인 적분이
+		// 예외 구간 끝(목표 16.0)을 지나서도 페달을 밀어 16.1~16.28 m/s 로 5 s 달렸다(M7B).
+		if (throttle_integral_band_mps_ > 0.0 && speed_error < -0.1 && throttle_integral_ > 0.0) {
+			throttle_integral_ = 0.0;
+		}
 		throttle_integral_ = clampValue(throttle_integral_, -throttle_integral_limit_,
 											 throttle_integral_limit_);
 
-		const double pedal = throttle_kp_ * speed_error + throttle_ki_ * throttle_integral_;
+		// 목표속도 램프 피드포워드: 목표가 올라가는 기울기만큼 페달을 미리 준다.
+		// PI 만으로는 3 m/s^2 램프에 페달 0.9 가 필요해 오차가 ~4 m/s 벌어진 뒤에야 따라갔다.
+		// 올라갈 때만 쓰고(감속은 기존 PI·브레이크 그대로), 목표가 일정하면 0 이라 정속 거동은 같다.
+		// - 정속 중 목표 잡음(평활 기울기 p95 0.17, p99 1.2 m/s^2)은 버리고 램프(중앙값 2.5)만 쓴다.
+		// - 목표와의 오차가 taper 보다 작아지면 비례해서 줄인다. 없으면 램프 끝에서 응답 지연만큼
+		//   목표를 넘었다(출발 가속 끝 16.0 -> 16.6 m/s).
+		double pedal_ff = 0.0;
+		if (throttle_ff_gain_ > 0.0) {
+			if (ff_prev_target_mps_ >= 0.0) {
+				const double accel_raw = (target_speed_mps - ff_prev_target_mps_) / dt;
+				ff_target_accel_ += dt / (throttle_ff_tau_s_ + dt) * (accel_raw - ff_target_accel_);
+			}
+			const double accel_ff = ff_target_accel_ > throttle_ff_min_accel_
+				? std::min(ff_target_accel_, throttle_ff_accel_per_pedal_) : 0.0;
+			const double taper = clampValue(speed_error / throttle_ff_taper_mps_, 0.0, 1.0);
+			// 조향 중(곡선 출구)에는 쓰지 않는다. 곡선 정확도는 출구에서 늦게 가속하던 PI 거동에 맞춰져 있어
+			// 출구에서 바로 밟으면 바깥으로 밀렸다(R11 0.43 m, 중앙선 접촉).
+			const double steer_taper = clampValue(
+				1.0 - std::fabs(steering_angle) / throttle_ff_steer_zero_rad_, 0.0, 1.0);
+			pedal_ff = throttle_ff_gain_ * taper * steer_taper * accel_ff / throttle_ff_accel_per_pedal_;
+		}
+		ff_prev_target_mps_ = target_speed_mps;
+
+		const double pedal = throttle_kp_ * speed_error + throttle_ki_ * throttle_integral_ + pedal_ff;
 
 		// 데드밴드: |pedal| 이 이 값보다 작으면 가속·제동 모두 0(타행).
 		// 없으면 pedal 이 0을 지날 때마다 가속<->제동이 뒤집혀 차가 덜컹인다.
@@ -1172,6 +1247,15 @@ public:
 		const double accel_limit_now =
 			is_highway ? throttle_accel_limit_exempt_ : throttle_accel_limit_;
 		setThrottleCommand(target_velocity, actual_speed, 0.05, brake_limit_now, accel_limit_now);
+		if (legal_guard_enabled_ && !is_highway) {
+			if (actual_speed > legal_guard_cut_mps_) {
+				ackermann_msg_.accel = 0.0;
+			}
+			if (actual_speed > legal_guard_brake_at_mps_ && ackermann_msg_.brake < legal_guard_brake_) {
+				ackermann_msg_.brake = legal_guard_brake_;
+				last_commanded_brake_ = legal_guard_brake_;
+			}
+		}
 		ackermann_msg_.velocity = 0.0;
 		ackermann_msg_.acceleration = 0.0;
 
@@ -1224,12 +1308,6 @@ public:
         double distance = sqrt(pow((cur_x - ex_x ), 2) + pow((cur_y - ex_y), 2));
         double speed = distance / dt;
 		
-
-		//cout << "cur_speed is : " << speed << endl;
-		//cout << "---------------" << endl;
- 
-        // cout << "distance   :: " << distance << endl;
-        // cout << "time   "  << inter_time_ <<  "    ::    speed  " << speed << endl;
         return speed;
 	}
 
@@ -1252,7 +1330,6 @@ public:
 	}
 
 	void modelPredictiveController() {
-		//0306 추가 -> morai 에서 테스트 완료
 		is_control_ = false;
 		
     	getClosestWaypoint(cur_pose_);
@@ -1272,7 +1349,6 @@ public:
 			return;
 		}
 
-		// if(is_pose_ && is_lane_)
     	if(is_pose_ && is_course_ && is_lane_ && waypoints_size_ >= path_end_min_polyfit_points_) 
 		{
     	    is_control_ = true;
@@ -1280,24 +1356,73 @@ public:
     	    double px = ex_x_;
     	    double py = ex_y_;
 
-			// // 수정 0206	
-    	    // double px = cur_pose_.pose.position.x;
-    	    // double py = cur_pose_.pose.position.y;
-			// // 수정 0206
-			
-			//0307
-    	    // double psi = wrapToPi(-cur_course_ + M_PI/2.0);
     	    double psi = cur_course_;
-			//0307
-    	    // double velocity = cur_speed_; // 10km/h -> m/s
-			//0307
-			// double velocity = Get_MPH_Speed_;
 			double velocity = have_competition_feedback_ ? competition_speed_mps_ : cur_speed_;
-			//0307
 			double dt_ = 0.05;
-			//0307
-			// double steer = Get_steer_;
-			//0307
+
+			// MPC 입력 위치 필터(기본 꺼짐): 직선에서 GPS 계단으로 생긴 EKF 위치·헤딩 잔떨림만 걸러낸다.
+			// 새 EKF 샘플마다 차속·요레이트로 적분하고, EKF 쪽으로 tau*직선도 로 맞춘다(직선도 0 이면 EKF 그대로).
+			if (sf_enabled_) {
+				const double stamp = last_odom_stamp_.toSec();
+				const double dt_f = stamp - sf_last_stamp_;
+				const double ekf_yaw = psi;
+				bool reset = !sf_init_ || gps_mode_ != "normal" || ekf_vx_ < 0.3 || dt_f < 0.0 || dt_f > 0.5;
+				if (!reset && dt_f > 1e-4) {
+					const double yaw_mid = sf_yaw_ + 0.5 * odom_yaw_rate_ * dt_f;
+					sf_x_ += velocity * std::cos(yaw_mid) * dt_f;
+					sf_y_ += velocity * std::sin(yaw_mid) * dt_f;
+					sf_yaw_ = wrapToPi(sf_yaw_ + odom_yaw_rate_ * dt_f);
+					const double s = clampValue(sf_straightness_, 0.0, 1.0);
+					const double tau_p = sf_pos_tau_s_ * s;
+					const double tau_y = sf_yaw_tau_s_ * s;
+					const double a_p = tau_p > 1e-3 ? 1.0 - std::exp(-dt_f / tau_p) : 1.0;
+					const double a_y = tau_y > 1e-3 ? 1.0 - std::exp(-dt_f / tau_y) : 1.0;
+					// 진행방향은 EKF 를 그대로 따른다(조향과 무관하고, 고속에서 EKF 시각 어긋남만큼 차이가 커져
+					// 리셋을 일으켰다). 횡위치·헤딩만 tau 로 맞춘다.
+					const double c = std::cos(sf_yaw_), sn = std::sin(sf_yaw_);
+					const double ex = px - sf_x_, ey = py - sf_y_;
+					const double d_along = ex * c + ey * sn;
+					const double d_lat = -ex * sn + ey * c;
+					sf_x_ += d_along * c - a_p * d_lat * sn;
+					sf_y_ += d_along * sn + a_p * d_lat * c;
+					sf_yaw_ = wrapToPi(sf_yaw_ + a_y * wrapToPi(ekf_yaw - sf_yaw_));
+					// EKF 와의 차이 상한: 출발·커브 직후 EKF 헤딩이 1~2 deg 틀린 동안 그 헤딩으로 적분해 위치가 밀리는 것을
+					// 막는다. GPS 계단 잡음(횡 +-2~4 cm, 헤딩 +-0.2 deg)만 걸러지도록 이 폭 밖으로는 못 나가게 한다.
+					{
+						const double dyaw = wrapToPi(ekf_yaw - sf_yaw_);
+						if (std::fabs(dyaw) > sf_max_yaw_rad_) {
+							sf_yaw_ = wrapToPi(ekf_yaw - std::copysign(sf_max_yaw_rad_, dyaw));
+						}
+						const double c2 = std::cos(sf_yaw_), s2 = std::sin(sf_yaw_);
+						const double lat = -(px - sf_x_) * s2 + (py - sf_y_) * c2;
+						const double over = lat - clampValue(lat, -sf_max_lat_m_, sf_max_lat_m_);
+						sf_x_ -= over * s2;
+						sf_y_ += over * c2;
+					}
+					if (std::fabs((1.0 - a_p) * d_lat) > sf_reset_pos_m_ ||
+						std::fabs(wrapToPi(ekf_yaw - sf_yaw_)) > sf_reset_yaw_rad_) {
+						reset = true;
+						++sf_reset_count_;
+					}
+				}
+				if (reset) {
+					sf_x_ = px;
+					sf_y_ = py;
+					sf_yaw_ = ekf_yaw;
+					sf_init_ = true;
+				}
+				sf_last_stamp_ = stamp;
+				std_msgs::Float64MultiArray sf_dbg;
+				sf_dbg.data = {sf_straightness_,
+							   -(px - sf_x_) * std::sin(sf_yaw_) + (py - sf_y_) * std::cos(sf_yaw_),
+							   wrapToPi(ekf_yaw - sf_yaw_) * 180.0 / M_PI,
+							   static_cast<double>(sf_reset_count_),
+							   gps_mode_ == "normal" ? 1.0 : 0.0};
+				sf_debug_pub_.publish(sf_dbg);
+				px = sf_x_;
+				py = sf_y_;
+				psi = sf_yaw_;
+			}
 
 			const bool is_highway = determineIsHighway();
 
@@ -1349,7 +1474,7 @@ public:
 		// 추종용 coeffs 는 근거리 정밀도를 위해 짧게(<=24m) 유지해야 한다 - 늘리면
 		// R=20m 커브에서 0~5m 피팅오차가 3.6cm -> 62cm 로 악화된다.
 		// 반면 커브 감속은 v^2/(2a) 만큼 미리 봐야 하므로(15 m/s 기준 23m) 짧은
-		// fit 으로는 늦는다. 실측(18:06) 13.6 m/s 진입에서 17.6m 까지만 보여
+		// fit 으로는 늦는다. 13.6 m/s 진입에서 17.6m 까지만 보여
 		// 감속이 커브 안에서 시작됐고 조향 40deg 포화 + cte 8.9m 로 발산했다.
 		// 그래서 속도를 보는 쪽만 긴 fit 을 따로 만든다.
 		Eigen::VectorXd preview_coeffs = coeffs;
@@ -1383,15 +1508,33 @@ public:
 			}
 		}
 
+			if (sf_enabled_) {
+				// 다음 주기 필터용 직선도: 앞으로 preview_s 동안 경로 평균 곡률(긴 preview fit)과 실측 요레이트.
+				const double x_end = std::max(1.0, std::min(std::max(1.0, velocity) * sf_preview_s_,
+															 preview_x.size() > 0 ? preview_x.maxCoeff() : 1.0));
+				double ksum = 0.0;
+				const int n = 12;
+				for (int i = 0; i <= n; ++i) {
+					const double xs = x_end * i / n;
+					const double d1 = preview_coeffs[1] + 2.0 * preview_coeffs[2] * xs + 3.0 * preview_coeffs[3] * xs * xs;
+					const double d2 = 2.0 * preview_coeffs[2] + 6.0 * preview_coeffs[3] * xs;
+					ksum += std::fabs(d2) / std::pow(1.0 + d1 * d1, 1.5);
+				}
+				const double kmean = ksum / (n + 1);
+				const double s_k = clampValue((sf_kappa_zero_ - kmean) / std::max(1e-6, sf_kappa_zero_ - sf_kappa_full_), 0.0, 1.0);
+				const double s_w = clampValue((sf_wz_zero_ - std::fabs(odom_yaw_rate_)) / std::max(1e-6, sf_wz_zero_ - sf_wz_full_), 0.0, 1.0);
+				// 커브 직후 1~2 s 동안 EKF 헤딩이 0.5~1 deg 어긋나 있어, 필터가 바로 켜지면 그 오차를 붙잡고 적분해
+				// 횡위치가 밀린다. 그래서 직선도는 천천히만 올린다.
+				const double now_s = ros::Time::now().toSec();
+				const double dt_s = sf_s_last_t_ > 0.0 ? clampValue(now_s - sf_s_last_t_, 0.0, 0.5) : 0.0;
+				sf_s_last_t_ = now_s;
+				sf_straightness_ = std::min(s_k * s_w, sf_straightness_ + std::max(0.0, sf_s_up_rate_) * dt_s);
+			}
+
 			// ✅ (B) FIT 로그는 여기 (polyfit 직후)
-			// ROS_WARN_THROTTLE(0.5,
-			// "[FIT] c0=%.4f c1=%.4f c2=%.4f c3=%.4f | epsi=-atan(c1)=%.3f",
-			// coeffs[0], coeffs[1], coeffs[2], coeffs[3], -atan(coeffs[1]));
 
 			const double cte = polyeval(coeffs, 0);
     	    const double epsi = -atan(coeffs[1]); // const add
-    	    // const double cte = polyeval(coeffs, 0);
-    	    // const double epsi = -atan(coeffs[1]); // const add
 
 			// ===== ACC 적용: Solve 한 번에만 ref_v / speed_upperBound 잠깐 낮추기 =====
 			const double ref_v_saved = ref_v;
@@ -1487,44 +1630,6 @@ public:
 				static_speed_scale_target_mps = ref_v;
 			}
 
-			// // ref_v는 m/s 이므로 km/h로 바꿔 follower 로직에 넣음
-			// double spd_state_kmh = ref_v * 3.6;
-
-			// // follower 로직은 12/14/16/18/20만 지원 -> MPC ref_v가 21~22면 20으로 맞춰서 동작하게 함
-			// spd_state_kmh = std::round(spd_state_kmh / 2.0) * 2.0;
-			// if (spd_state_kmh < 12.0) spd_state_kmh = 12.0;
-			// if (spd_state_kmh > 20.0) spd_state_kmh = 20.0;
-
-			// double acc_kmh = applyACC_kmh(spd_state_kmh, is_acc, acc_index);
-
-			// // ERP-42 최고속도 제한
-			// const double max_kmh = 20.0;
-			// if (acc_kmh > max_kmh) acc_kmh = max_kmh;
-			// if (acc_kmh < 0.0) acc_kmh = 0.0;
-
-			// const double acc_ms = acc_kmh / 3.6;
-
-			// // acc_ms가 0이면 정지명령만 내리고 Solve 스킵(딱 ACC 목적)
-			// if (acc_ms < 0.01) {
-			// 	target_velocity = 0.0;
-			// 	// steering_angle  = 0.0;   // 0.0은 유지 못하고 핸들이 돌릴수도있음 주석: 핸들 유지
-			// 	is_control_ = true;      // 아래 publish 블록 타게
-
-			// 	// command 세팅epsi = -atan(coeffs[1]);
-			// 	cmd_speed_kmh_ = 0.0;
-			// 	cmd_steer_deg_ = (steering_angle) * 180.0 / M_PI;
-			// 	cmd_valid_ = true;
-
-			// 	is_pose_ = false;
-			// 	return;
-			// }
-
-			// // 이번 Solve에만 적용 (m/s)
-			// ref_v = acc_ms;
-			// speed_upperBound = acc_ms;
-			// speed_lowerBound = 0.0;
-
-
 			bool applied_acc_limit = false;
 
 			// New ACC path: target speed is computed from actual longitudinal gap and
@@ -1557,13 +1662,9 @@ public:
 			}
 
 			if (is_acc) {
-				//0307
-				// double spd_state_kmh = ref_v * 3.6;
 				//morai
 				double spd_state_kmh = cur_speed_ * 3.6;
 				//erp
-				// double spd_state_kmh = Get_MPH_Speed_ *3.6;
-				//0307
 
 				spd_state_kmh = std::round(spd_state_kmh / 2.0) * 2.0;
 				if (spd_state_kmh < 12.0) spd_state_kmh = 12.0;
@@ -1582,11 +1683,8 @@ public:
 
 					cmd_speed_kmh_ = 0.0;
 
-					// 아래 publish와 부호 일관성 유지 (너의 ERP 기준에 맞춰 한쪽으로 통일)
-					//0307 -> steering angle 부호 모두 확인 morai는 cmd(최종)에 -를 붙여줌
-					// cmd_steer_deg_ = (steering_angle) * 180.0 / M_PI;
+					// 조향 부호는 아래 publish 와 같게 맞춘다(MORAI 최종 명령은 부호가 반대).
 					cmd_steer_deg_ = (-steering_angle) * 180.0 / M_PI;
-					//0307
 					cmd_valid_ = true;
 					publishTargetSpeed(target_velocity);
 					ref_v = ref_v_saved;
@@ -1605,19 +1703,86 @@ public:
 			}
 
     	    Eigen::VectorXd state(6);
-			//0307
-    	    // state = predict_FutureState(velocity, steer, cte, epsi, target_velocity, dt_);
 				const double actual_steering =
 					(have_previous_steering_command_ && std::fabs(steering_command_sign_) > 1e-6)
 						? previous_steering_command_rad_ / steering_command_sign_
 						: steering_angle;
 				previous_delta_cost_reference = actual_steering;
 				state = predict_FutureState(velocity, actual_steering, cte, epsi, target_velocity, dt_);
-			//0307
+				if (dc_enabled_) {
+					// 지연보상 v2: 조건(PC 부하, 센서 주기, 계산 시간)이 바뀌어도 같은 결과를 내도록
+					// PC 에 따라 바뀌는 지연은 매 주기 실측하고, 차량 고유 지연만 고정값으로 둔다.
+					const ros::Time now_t = ros::Time::now();
+					const double now = now_t.toSec();
+					double period = dc_period_s_;
+					if (period <= 0.0 || dc_last_imu_rx_.isZero() || (now_t - dc_last_imu_rx_).toSec() > 0.5) {
+						period = dc_fallback_period_s_;
+					}
+					period = clampValue(period, 0.005, 0.2);
+					const double odom_age = last_odom_stamp_.isZero() ? 0.0
+						: clampValue((now_t - last_odom_stamp_).toSec(), 0.0, 0.2);
+					const double state_delay = clampValue(dc_state_k_ * period + dc_state_c_s_ + odom_age,
+						0.0, dc_state_max_s_);
+					const double compute = clampValue(dc_compute_s_, 0.0, dc_compute_max_s_);
+					const double actuation = std::max(0.0, dc_act_base_s_ + dc_act_frame_k_ * period);
+					if (!steering_history_.empty() &&
+						(now < steering_history_.back().time_s || now - steering_history_.back().time_s > 1.0)) {
+						steering_history_.clear();
+					}
+					// 1) /odom 은 state_delay 만큼 늦다: 실측 속도·요레이트로 현재 시점까지 당긴다.
+					const auto lag_pose = mpc_tracking::measuredMotion(velocity, odom_yaw_rate_, state_delay);
+					// 2) 지금부터 새 명령이 차량에 반영될 때까지(계산 + 조향 지연) 차량은 이미 보낸
+					//    명령(계산 중에는 직전 명령 유지)을 따른다: 명령 이력을 실효 Lf 로 적분한다.
+					double lf = dc_model_lf_ > 0.0 ? dc_model_lf_ : Lf;
+					if (dc_lf_online_ && dc_lf_est_ > 0.0) lf = clampValue(dc_lf_est_, 3.5, 5.0);
+					const auto act_pose = mpc_tracking::predictSteeringDelay(
+						velocity, lf, now + compute, actuation + compute, steering_history_);
+					const auto pose = mpc_tracking::compose(lag_pose, act_pose);
+					const auto errors = mpc_tracking::trackingErrorsAt(
+						pose, std::array<double, 4>{{coeffs[0], coeffs[1], coeffs[2], coeffs[3]}});
+					state << pose.x, pose.y, pose.yaw, velocity, errors[0], wrapToPi(errors[1]);
+					dc_pred_wall_ = ros::WallTime::now();
+					dc_pred_pending_ = true;
+					std_msgs::Float64MultiArray dbg;
+					dbg.data = {period, odom_age, state_delay, compute, actuation, 1.0, lf};
+					dc_debug_pub_.publish(dbg);
+					publishFloat64(steering_delay_pub_, state_delay + compute + actuation);
+				} else {
+				// 조향 지연보상(민성 0929): 이미 파이프라인에 들어간 명령을 delay 만큼
+				// 적분한 미래 자세에서 MPC 를 시작하고, 그 자세에서 cte/epsi 를 다시 계산한다.
+				{
+					double delay = steering_actuator_delay_s_;
+					nh_.getParamCached("steer/actuator_delay_s", delay);
+					delay = clampValue(delay, 0.0, 0.5);
+					if (std::fabs(delay - steering_actuator_delay_s_) > 1e-9) {
+						ROS_INFO("[MPC] steering delay compensation changed: %.3f -> %.3f s",
+								 steering_actuator_delay_s_, delay);
+						steering_actuator_delay_s_ = delay;
+					}
+					double model_lf = steering_delay_model_lf_;
+					nh_.getParamCached("steer/delay_model_lf", model_lf);
+					steering_delay_model_lf_ = model_lf;
+					if (delay > 0.0) {
+						const double now = ros::Time::now().toSec();
+						if (!steering_history_.empty() &&
+							(now < steering_history_.back().time_s || now - steering_history_.back().time_s > 1.0)) {
+							steering_history_.clear();
+						}
+						const double lf = model_lf > 0.0 ? model_lf : Lf;
+						const auto pose = mpc_tracking::predictSteeringDelay(
+							velocity, lf, now, delay, steering_history_);
+						const auto errors = mpc_tracking::trackingErrorsAt(
+							pose, std::array<double, 4>{{coeffs[0], coeffs[1], coeffs[2], coeffs[3]}});
+						state << pose.x, pose.y, pose.yaw, velocity,
+							errors[0], wrapToPi(errors[1]);
+					}
+					publishFloat64(steering_delay_pub_, delay);
+				}
+				}
 
     	    auto output = Solve(state, coeffs);
+			if (dc_test_extra_compute_s_ > 0.0) ros::WallDuration(std::min(dc_test_extra_compute_s_, 0.2)).sleep();
 			
-
     	    steering_angle = output[0];
 			target_velocity = output[1];
 
@@ -1651,8 +1816,7 @@ public:
 			//   v_allow = sqrt(2 * a * max(0, 남은거리 - margin))
 			// /local_path 는 앞쪽 일부만 담고 있으므로, 창이 가득 찬 동안에는
 			// 남은 호장이 창 길이로 잘려 이 clamp 가 걸리지 않는다. 실제로
-			// 경로 끝이 창 안에 들어온 뒤에만(2026-09-15 18:01 백 기준 t=362.8,
-			// 끝점 45 m 전) 동작한다.
+			// 경로 끝이 창 안에 들어온 뒤에만(끝점 약 45 m 전) 동작한다.
 			if (path_end_stop_enabled_ && waypoints_size_ >= path_end_min_polyfit_points_) {
 				double remaining_s = 0.0;
 				for (int i = 1; i < waypoints_size_; i++) {
@@ -1675,11 +1839,6 @@ public:
 			}
 
 			publishTargetSpeed(target_velocity);
-
-			// // ===== ACC 임시 적용값 원복 =====
-			// ref_v = ref_v_saved;
-			// speed_upperBound = speed_ub_saved;
-			// speed_lowerBound = speed_lb_saved;
 
 			if (applied_mission_speed || applied_curve_speed_limit || applied_acc_limit ||
 				applied_avoidance_speed_limit || applied_static_speed_scale || (current_max_speed_limit > 0.0)) {
@@ -1708,7 +1867,6 @@ public:
 				curvature_preview_distance_m_,
 				cost);
 
-
     	    // 차량 좌표계 변환된 경로 rviz
     	    nav_msgs::Path predicted_path_rviz;
 			predicted_path_rviz.header.frame_id = "base_link";
@@ -1727,80 +1885,19 @@ public:
     	            loc.pose.position.y = predicted_y[i];
 
     	            loc.pose.position.z = 0.0;
-    	            // if(i % 10 == 0){
     	                predicted_path_rviz.poses.emplace_back(loc);
-    	            // }
     	        }
 			}
 			rviz_predicted_path_.publish(predicted_path_rviz);
     	}
 
-		//0307
-    	// if (is_control_)
-    	// {
-    	//     ackermann_msg_.longlCmdType = 2;
-    	//     ackermann_msg_.velocity = target_velocity * 3.6; // km/h
-    	//     ackermann_msg_.steering = -steering_angle;
-		// 	// if (accelation >= 0) {
-		// 	// 	ackermann_msg_.accel = accelation;
-		// 	// 	ackermann_msg_.brake = 0;
-		// 	// }
-		// 	// else {
-		// 	// 	ackermann_msg_.brake = accelation;
-		// 	// 	ackermann_msg_.accel = 0;
-		// 	// }
-			
-			
-	
-    	//     ackermann_pub_.publish(ackermann_msg_);
-    	// }
-    	// is_pose_ = false;
-		// // is_course_ = false;
-
-		// if (is_control_)
-		// {
-		// 	// speed: km/h (PlatformConnector 입력용)
-		// 	cmd_speed_kmh_ = target_velocity * 3.6;
-
-		// // 	// 최종 안전 클램프 (ERP-42 최고속도 22 km/h)
-	    // // if (cmd_speed_kmh_ > 20.0) cmd_speed_kmh_ = 20.0;
-    	// // if (cmd_speed_kmh_ < 0.0)  cmd_speed_kmh_ = 0.0;
-
-		// 	// steer: deg (PlatformConnector 입력용)
-		// 	// 기존 Morai는 rad를 그대로 넣었지만, ERP쪽은 deg 기반이라 변환 필요
-		// 	cmd_steer_deg_ = (steering_angle) * 180.0 / M_PI;
-
-		// 	cmd_valid_ = true;
-		// }
-		// else
-		// {
-		// 	cmd_speed_kmh_ = 0.0;
-		// 	cmd_steer_deg_ = 0.0;
-		// 	cmd_valid_ = false;
-		// }
-
-		// is_pose_ = false;
-		// is_course_ = false;
-		//0307
-
 		if (is_control_)
     	{
 	    	publishControlCommand();
-			// if (accelation >= 0) {
-			// 	ackermann_msg_.accel = accelation;
-			// 	ackermann_msg_.brake = 0;
-			// }
-			// else {
-			// 	ackermann_msg_.brake = accelation;
-			// 	ackermann_msg_.accel = 0;
-			// }
 			
-			
-	
     	}
     	is_pose_ = false;
 		is_course_ = false;
-
 
 	}
 private:
@@ -1809,7 +1906,5 @@ private:
   bool   cmd_valid_ = false;
 
 };
-
-
 
 #endif
